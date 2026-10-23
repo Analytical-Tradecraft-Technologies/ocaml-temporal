@@ -1,3 +1,12 @@
+(** Typed workflow definitions and the deterministic operations available
+    inside workflow code.
+
+    A workflow is a direct-style OCaml function that Temporal can replay from
+    its history. Workflow code must not perform I/O, read the wall clock, use
+    unseeded randomness, or mutate process-global state; it uses the
+    replay-safe helpers here, such as {!sleep}, {!now}, and {!random_int},
+    together with {!Activity} and {!Child_workflow}. *)
+
 (** The type of an OCaml function that implements a workflow. It receives a
     decoded input and returns either the workflow output or a structured error.
     The function must obey Temporal's workflow determinism rules. *)
@@ -74,21 +83,27 @@ val sleep : Duration.t -> (unit, Error.t) result
 
 (** Sends a typed signal to another workflow execution. The operation is
     represented as a future because Temporal acknowledges delivery in a later
-    activation; [run_id] may be empty when the server should resolve the
-    current run for the workflow ID. *)
+    activation. Omitting [run_id] lets the server resolve the current run for
+    [workflow_id]; an explicit [run_id] targets that run and, like
+    [workflow_id], must be non-empty, valid UTF-8, NUL-free, and at most
+    65,536 bytes, or the future resolves with a typed defect. *)
 val signal_external_workflow :
   workflow_id:string ->
-  run_id:string ->
+  ?run_id:string ->
   signal:'input Signal.t ->
   input:'input ->
+  unit ->
   (unit, Error.t) Future.t
 
 (** Requests cancellation of another workflow execution and returns a future
-    resolved by Temporal's acknowledgement or structured failure. *)
+    resolved by Temporal's acknowledgement or structured failure. [run_id]
+    follows {!signal_external_workflow}: omitted selects the current run, and
+    an explicit value must be a valid non-empty run ID. *)
 val cancel_external_workflow :
   workflow_id:string ->
-  run_id:string ->
+  ?run_id:string ->
   reason:string ->
+  unit ->
   (unit, Error.t) Future.t
 
 (** Returns the exact timestamp attached to the activation currently executing
@@ -98,11 +113,11 @@ val cancel_external_workflow :
     a typed defect rather than reading the host wall clock. *)
 val now : unit -> (Time.t, Error.t) result
 
-(** Returns a deterministic pseudo-random integer in [0, bound).  The stream
-    is seeded by Temporal for the workflow run and replayed from the same
-    initialization and reset metadata, so the result is stable for an identical call
-    sequence.  [bound] must be positive; invalid bounds and calls outside a
-    workflow return a typed defect. *)
+(** Returns a deterministic pseudo-random integer [n] with [0 <= n < bound].
+    The stream is seeded by Temporal for the workflow run and replayed from
+    the same initialization and reset metadata, so the result is stable for an
+    identical call sequence. [bound] must be positive; invalid bounds and calls
+    outside a workflow return a typed defect. *)
 val random_int : bound:int -> (int, Error.t) result
 
 (** Returns the deployment/build identity attached to the current workflow
@@ -128,11 +143,154 @@ type start_metadata = {
     workflow, or in a synthetic execution lacking metadata, returns a defect. *)
 val start_metadata : unit -> (start_metadata, Error.t) result
 
+(** Read-only metadata about the workflow run executing the caller. Values
+    come only from Temporal's activations, never from the host clock or
+    process state, so a replay observes the same identity. The type is
+    abstract so later releases can add fields compatibly.
+
+    Identity fields are fixed for the run. History fields and {!is_replaying}
+    describe the activation that was current when {!info} was called; call
+    {!info} again after a suspension to observe newer values. *)
+module Info : sig
+  (** A snapshot of run identity and current-activation history facts. *)
+  type t
+
+  (** Identity of the workflow that started this run as a child. *)
+  type parent = { namespace : string; workflow_id : string; run_id : string }
+
+  (** Why the server suggested continuing as new.
+      - [`History_size_too_large]: the history byte size passed the
+        namespace's suggestion threshold.
+      - [`Too_many_history_events]: the history event count passed that
+        threshold.
+      - [`Too_many_updates]: the run accepted many workflow updates, which
+        count toward a per-run limit. *)
+  type continue_as_new_reason =
+    [ `History_size_too_large | `Too_many_history_events | `Too_many_updates ]
+
+  (** Returns the workflow ID shared by every run of this execution chain. *)
+  val workflow_id : t -> string
+
+  (** Returns the ID of this run. *)
+  val run_id : t -> string
+
+  (** Returns the run ID of the first run in this continue-as-new, retry, or
+      cron chain, or [None] when Temporal did not report it. *)
+  val first_execution_run_id : t -> string option
+
+  (** Returns the registered workflow type name. *)
+  val workflow_type : t -> string
+
+  (** Returns the Temporal namespace of this run, which is the namespace of
+      the worker executing it. *)
+  val namespace : t -> string
+
+  (** Returns the worker task queue that delivers this run's workflow tasks. *)
+  val task_queue : t -> string
+
+  (** Returns the 1-based workflow retry attempt of this run. *)
+  val attempt : t -> int
+
+  (** How Temporal created this run from an earlier run of the same
+      workflow ID.
+      - [`Continue_as_new]: the previous run called {!continue_as_new}.
+      - [`Retry]: the previous run failed or timed out and the workflow
+        retry policy started this run.
+      - [`Cron_schedule]: a cron schedule fired. OCaml workers currently
+        reject cron-initiated runs before workflow code starts, so this
+        constructor is reserved and is not observed today. *)
+  type continuation_initiator = [ `Continue_as_new | `Retry | `Cron_schedule ]
+
+  (** Returns the run ID this run was continued or retried from, or [None]
+      for the first run of a chain, including a run started by a Temporal
+      Schedule. *)
+  val continued_from_run_id : t -> string option
+
+  (** Returns why Temporal started this run from {!continued_from_run_id},
+      or [None] for a first run or when Temporal did not report a reason. *)
+  val continuation_initiator : t -> continuation_initiator option
+
+  (** Returns the execution timeout recorded when the chain started
+      ([?execution_timeout] on [Client.start]). It bounds the whole chain,
+      across retries and continue-as-new. [None] means Temporal recorded no
+      limit. Durations are rounded up to whole milliseconds. These timeout
+      accessors are recorded metadata: the server enforces them, and reading
+      one schedules nothing. *)
+  val execution_timeout : t -> Duration.t option
+
+  (** Returns this run's run timeout ([?run_timeout] on [Client.start]), or
+      [None] when Temporal recorded no limit. *)
+  val run_timeout : t -> Duration.t option
+
+  (** Returns the workflow task timeout ([?task_timeout] on [Client.start]).
+      Temporal normally records its 10 second default when the starter
+      supplied none, so this is usually [Some _]. *)
+  val task_timeout : t -> Duration.t option
+
+  (** Returns the workflow retry policy ([?retry_policy] on [Client.start]),
+      or [None] when the run is not retried. Temporal fills omitted policy
+      fields with its defaults before recording the start event, so the
+      result is the effective policy rather than the literal request.
+      Intervals are rounded up to whole milliseconds. Temporal does not
+      validate a policy whose maximum attempts is 1, so another SDK can
+      record one that {!Retry_policy.make} would reject (for
+      example a backoff coefficient below 1.0); such a policy is also
+      reported as [None]. *)
+  val retry_policy : t -> Retry_policy.t option
+
+  (** Returns the parent workflow, or [None] for a top-level workflow. *)
+  val parent : t -> parent option
+
+  (** Returns when the server started this run, if Temporal reported it. *)
+  val start_time : t -> Time.t option
+
+  (** Returns whether Temporal was replaying history for the activation
+      current when this snapshot was taken. See {!val-is_replaying}. *)
+  val is_replaying : t -> bool
+
+  (** Returns the number of history events Temporal reported with the
+      activation current when this snapshot was taken. *)
+  val history_length : t -> int
+
+  (** Returns the history size in bytes reported with that activation, or
+      [None] when the activation carried no size. *)
+  val history_size_bytes : t -> int option
+
+  (** Returns whether the server suggested continuing as new with that
+      activation, typically because history is growing large. Workflows that
+      run indefinitely should check it at a safe point and call
+      {!continue_as_new}. *)
+  val continue_as_new_suggested : t -> bool
+
+  (** Returns the reasons the server gave with that activation's
+      continue-as-new suggestion, in the order Temporal reported them. The
+      list is empty whenever {!val-continue_as_new_suggested} is [false], and
+      may also be empty when it is [true] because older servers suggest
+      continue-as-new without naming a reason. Like the suggestion itself,
+      the reasons come only from activation metadata and are replayed
+      deterministically. *)
+  val continue_as_new_reasons : t -> continue_as_new_reason list
+end
+
+(** Returns metadata for the current workflow run. Calling it outside workflow
+    execution, or in a synthetic execution that never received Temporal's
+    initialization activation, returns a typed defect. *)
+val info : unit -> (Info.t, Error.t) result
+
+(** Returns [true] while the current activation replays existing history and
+    [false] for new progress or outside workflow execution. Use it only for
+    side effects that are not part of workflow state, such as suppressing
+    duplicate log lines; branching workflow commands on it breaks
+    determinism. *)
+val is_replaying : unit -> bool
+
 (** Returns whether workflow code should take the new branch identified by
     [id]. On a new execution the first call returns [true] and records a patch
     marker; replay returns [true] only when Core reports that marker, otherwise
-    it returns [false]. The decision is retained per workflow run and every
-    call emits Core's idempotent marker command.
+    it returns [false] and records nothing. The first answer for [id] is
+    retained for the workflow run, so later calls and later history
+    notifications cannot change it. Calls whose answer is [true] emit Core's
+    idempotent marker command.
 
     Patch IDs must be non-empty, valid UTF-8, NUL-free, and at most 65,536
     bytes. Invalid IDs or calls outside workflow execution raise
@@ -159,13 +317,28 @@ val deprecate_patch : id:string -> unit
 (** Merges encoded values into Temporal's indexed search attributes. The
     update is deterministic and becomes visible only after the workflow task
     is accepted. Duplicate, empty, malformed, or oversized keys raise
-    [Invalid_argument] as programmer misuse; payload ownership is copied. *)
+    [Invalid_argument] as programmer misuse; payload ownership is copied. An
+    empty list is a no-op and emits no command, because Temporal rejects an
+    empty upsert.
+
+    Temporal Server decodes search-attribute values itself rather than
+    through the worker's codecs. Each value must therefore be a [json/plain]
+    encoding of the attribute's registered type, such as the output of
+    {!Codec.string}, {!Codec.int}, or {!Codec.bool}; a [binary/null] payload
+    (for example {!Codec.option} encoding [None]) removes the key. A custom
+    codec built with [~encoding:"json/plain"] that emits valid JSON of the
+    registered type is accepted like a built-in one. Other encodings, such
+    as {!Codec.bytes} ([binary/plain]) or a custom encoding name, are
+    rejected by the server, which fails the workflow task on every retry
+    until the code is corrected. *)
 val upsert_search_attributes : (string * Payload.t) list -> unit
 
 (** Ends the current run and starts a new run of [definition] with [input].
     This operation never returns to the calling workflow fiber. It is
     deterministic: the input is encoded through the definition's codec before
-    the successor command is emitted. A codec failure fails the current run
-    with a typed error; calling it outside workflow execution is programmer
-    misuse and raises [Invalid_argument]. *)
+    the successor command is emitted. A codec failure fails only the current
+    workflow task, like any propagated [Codec] error: no continue-as-new
+    command is emitted and the run stays open so a corrected worker can replay
+    it. Calling it outside workflow execution is programmer misuse and raises
+    [Invalid_argument]. *)
 val continue_as_new : ('input, 'output) t -> 'input -> 'value

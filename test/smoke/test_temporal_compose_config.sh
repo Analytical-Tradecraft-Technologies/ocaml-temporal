@@ -58,6 +58,9 @@ require_text 'patch-replay-driver:'
 require_text 'parent-child-restart-worker-one:'
 require_text 'parent-child-restart-worker-two:'
 require_text 'parent-child-restart-driver:'
+# The official-SDK interop driver (#517) runs in the pinned Python image only.
+require_text 'sdk-interop-python:'
+require_text '/workspace/test/integration/sdk_interop/python/run-driver.sh'
 require_text 'TEMPORAL_TWO_BINARY_LIVE: "1"'
 require_text 'smoke_worker.exe'
 require_text 'smoke_driver.exe'
@@ -181,7 +184,7 @@ require_source_text "$worker_dune" 'temporal-sdk'
 require_source_text "$worker_dune" 'temporal_two_binary_smoke_common'
 require_source_text "$worker" 'module Worker = Temporal.Worker'
 require_source_text "$worker" \
-  'Worker.create ?max_cached_workflows ~target_url ~namespace'
+  'Worker.create ~options ~target_url ~namespace'
 require_source_text "$worker" 'Worker.run worker'
 require_source_text "$worker" 'Worker.shutdown worker'
 # Keep both live query handlers registered. The typed-input handler is on a
@@ -199,7 +202,7 @@ require_source_absent "$worker" 'Client.wait'
 # refactor cannot silently reconnect the driver to the noisy all-workflow
 # worker and reintroduce the original cache-pressure race.
 require_source_text "$cache_worker" 'module Worker = Temporal.Worker'
-require_source_text "$cache_worker" '~max_cached_workflows:1'
+require_source_text "$cache_worker" 'Worker.Options.make ~max_cached_workflows:1'
 require_source_text "$cache_worker" 'Worker.run worker'
 require_source_absent "$cache_worker" 'Client.start'
 
@@ -370,9 +373,9 @@ require_source_text "$worker" \
   'Worker.activity Definitions.heartbeat_timeout_retry_activity'
 
 require_source_text "$definitions" \
-  'Temporal.Activity.Retry_policy.make'
+  'Temporal.Retry_policy.make'
 require_source_text "$definitions" \
-  '~non_retryable_error_types:[ "activity" ] ()'
+  '~non_retryable_error_types:[ "SmokeInvalidInput" ] ()'
 require_source_text "$definitions" \
   'Temporal.Activity.define ~name:"smoke.non_retryable_activity"'
 require_source_text "$definitions" \
@@ -509,7 +512,26 @@ require_master_smoke_text() {
 }
 require_master_smoke_text 'make test-temporal-live-ci'
 require_master_smoke_text 'name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
-require_master_smoke_text 'timeout-minutes: 45'
+require_master_smoke_text 'timeout-minutes: 93'
+# Every step carries its own timeout and the job timeout covers their sum, so
+# a hung scenario step times out on its own and the always() evidence uploads
+# after it still run before GitHub kills the job (#504, #519).
+smoke_budget=$(printf '%s\n' "$master_smoke" | awk '
+  /^    timeout-minutes:/ { job = $2 }
+  /^      - name:/ { steps++ }
+  /^        timeout-minutes:/ { timed++; sum += $2 }
+  END { printf "%d %d %d %d\n", job, steps, timed, sum }')
+read -r smoke_job smoke_steps smoke_timed smoke_sum <<EOF
+$smoke_budget
+EOF
+if [ "$smoke_steps" -eq 0 ] || [ "$smoke_steps" -ne "$smoke_timed" ]; then
+  echo "every Temporal integration step needs timeout-minutes ($smoke_timed of $smoke_steps have one)" >&2
+  exit 1
+fi
+if [ "$smoke_sum" -gt "$smoke_job" ]; then
+  echo "Temporal integration step timeouts ($smoke_sum min) exceed the job timeout ($smoke_job min)" >&2
+  exit 1
+fi
 require_master_smoke_text 'OCAML_VERSION: "5.5.1"'
 require_source_text "$makefile" '$(MAKE) test-temporal-integration'
 require_source_text "$makefile" '$(MAKE) test-temporal-worker-restart'

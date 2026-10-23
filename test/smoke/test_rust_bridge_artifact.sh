@@ -22,6 +22,8 @@ EOF
 chmod +x "$temporary_root/bin/cargo"
 export PATH="$temporary_root/bin:$PATH"
 export CARGO_TARGET_DIR="$temporary_root/target"
+# The fixture outputs live in Cargo's dev-profile directory (target/debug).
+export OCAML_TEMPORAL_BUILD_PROFILE=dev
 printf 'archive fixture\n' >"$temporary_root/target/debug/libocaml_temporal_core_bridge.a"
 case "$(uname -s)" in
   Darwin) dynamic=libocaml_temporal_core_bridge.dylib ;;

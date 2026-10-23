@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-query-response.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-query-response.schema.json",
   "title": "OCaml Temporal native client query response",
   "description": "Closed JSON document emitted after Temporal answered an output-only query. Query rejection and RPC failures use the separate client-error document rather than a result object.",
   "type": "object",

@@ -5,6 +5,7 @@
 
 module Bridge = Temporal_core_bridge.Native_bridge
 module Supervisor = Sdk_supervisor.Native
+module Shared_runtime = Sdk_shared_runtime
 module Client_protocol = Temporal_protocol.Client_protocol
 module Workflow_protocol = Temporal_protocol.Workflow_protocol
 module Failure_diagnostic = Temporal_protocol.Failure_diagnostic
@@ -16,5 +17,13 @@ module Native_worker_execution = Temporal_runtime.Native_worker_execution
 module Native_activity_execution = Temporal_runtime.Native_activity_execution
 module Native_worker_loop = Temporal_runtime.Native_worker_loop
 module Native_worker_policy = Temporal_runtime.Native_worker_policy
+module Native_worker_metrics = Temporal_runtime.Native_worker_metrics
+module Native_worker_owner = Temporal_runtime.Native_worker_owner
 module Native_worker_observer = Temporal_runtime.Native_worker_observer
+module Native_worker_watchdog = Temporal_runtime.Native_worker_watchdog
+module Native_worker_idle = Temporal_runtime.Native_worker_idle
+module Native_worker_shutdown = Temporal_runtime.Native_worker_shutdown
 module Future = Temporal_future_kernel
+module Execution = Temporal_runtime.Execution
+module Test_environment = Temporal_runtime.Test_environment
+module Control_protocol = Temporal_protocol.Control_protocol

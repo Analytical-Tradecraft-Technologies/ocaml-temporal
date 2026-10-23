@@ -145,9 +145,6 @@ module Priority = struct
                           ~fairness_weight_bits;
                     }))
 
-  (** Alias for callers who prefer constructor terminology. *)
-  let create = make
-
   (** Returns the optional positive priority key. *)
   let priority_key value = value.priority_key
 
@@ -284,12 +281,106 @@ module Async_handle = struct
     |> Result.map_error Error_private.of_base
 end
 
+(** Public projection of the private activity task metadata. The private
+    record already holds immutable, validated values, so accessors only
+    convert representations. *)
+module Info = struct
+  type t = Temporal_base.Activity_context.info
+
+  (** Scheduling workflow identity; see the interface. *)
+  type workflow = { workflow_id : string; run_id : string; workflow_type : string }
+
+  (** Returns the namespace reported by Core. *)
+  let namespace (info : t) = info.namespace
+
+  (** Every dispatched task has a scheduling workflow: the bridge fails
+      standalone activities back to Core before dispatch, so the private
+      record always carries a validated workflow identity. *)
+  let workflow (info : t) =
+    {
+      workflow_id = info.workflow_id;
+      run_id = info.workflow_run_id;
+      workflow_type = info.workflow_type;
+    }
+
+  (** Returns the retry-stable activity ID. *)
+  let activity_id (info : t) = info.activity_id
+
+  (** Returns the activity type name. *)
+  let activity_type (info : t) = info.activity_type
+
+  (** Returns the 1-based attempt number. *)
+  let attempt (info : t) = info.attempt
+
+  (** Returns whether Core runs this attempt in the local-activity lane. *)
+  let is_local (info : t) = info.is_local
+
+  (** Converts a timestamp the protocol decoder already range-checked. A
+      failure would mean that private validation was bypassed, which is an
+      internal invariant violation rather than an operational error. *)
+  let time = function
+    | None -> None
+    | Some ({ seconds; nanoseconds } : Temporal_base.Activity_context.timestamp)
+      -> (
+        match Time.of_unix ~seconds ~nanoseconds with
+        | Ok time -> Some time
+        | Error _ ->
+            invalid_arg "activity task timestamp escaped protocol validation")
+
+  (** Returns the first scheduling time of the activity. *)
+  let scheduled_time (info : t) = time info.scheduled_time
+
+  (** Returns the scheduling time of this attempt. *)
+  let current_attempt_scheduled_time (info : t) =
+    time info.current_attempt_scheduled_time
+
+  (** Returns the server start time of this attempt. *)
+  let started_time (info : t) = time info.started_time
+
+  (** The largest value [Duration.of_ms] accepts: the protobuf duration
+      maximum truncated to whole milliseconds. *)
+  let maximum_duration_ms = 315_576_000_000_999L
+
+  (** Re-wraps a private millisecond duration in the public type. The value is
+      clamped to [maximum_duration_ms] rather than passed through unchecked:
+      rounding the valid protobuf maximum up to whole milliseconds exceeds the
+      public bound by one, and metadata access must not raise. The native
+      adapter already clamps, so this only keeps the accessor total for any
+      other producer of the private record. *)
+  let duration =
+    Option.map (fun duration ->
+        Duration.of_ms
+          (Int64.min (Temporal_base.Duration.to_ms duration) maximum_duration_ms))
+
+  (** Returns the effective schedule-to-close timeout. *)
+  let schedule_to_close_timeout (info : t) =
+    duration info.schedule_to_close_timeout
+
+  (** Returns the effective start-to-close timeout. *)
+  let start_to_close_timeout (info : t) = duration info.start_to_close_timeout
+
+  (** Returns the effective heartbeat timeout. *)
+  let heartbeat_timeout (info : t) = duration info.task_heartbeat_timeout
+end
+
 (** Accessors for the attempt-scoped asynchronous context. *)
 module Async_context = struct
   type 'output t = 'output async_context
 
   (** Returns the retained completion capability. *)
   let handle context = Temporal_base.Async_activity.handle context
+
+  (** Returns the start task's metadata, or a defect for a context built
+      without a Temporal task. *)
+  let info context =
+    match Temporal_base.Async_activity.info context with
+    | Some info -> Ok info
+    | None ->
+        Error
+          (Error.defect
+             ~message:
+               "Temporal.Activity.Async_context.info is unavailable for this \
+                activity context")
 end
 
 (** Encodes and submits one typed heartbeat value for the current activity. *)
@@ -307,11 +398,46 @@ let heartbeat (context : context) (codec : 'a Codec.t) (value : 'a) =
       Temporal_base.Activity_context.heartbeat context [ payload ]
       |> Result.map_error Error_private.of_base
 
+(** Public view of the cancellation the native adapter publishes to an
+    attempt's private context. The record is immutable and holds no native
+    state, so it is shared rather than copied. *)
+module Cancellation = struct
+  (** The base variant, re-exported so no conversion is needed. *)
+  type reason = Temporal_base.Activity_context.cancel_reason =
+    | Requested
+    | Timed_out
+    | Not_found
+    | Worker_shutdown
+    | Paused
+    | Reset
+
+  (** Abstract in the interface so fields can be added compatibly. *)
+  type t = Temporal_base.Activity_context.cancellation
+
+  (** Primary reason. *)
+  let reason (cancellation : t) = cancellation.reason
+
+  (** Every reported reason, primary first. *)
+  let reasons (cancellation : t) = cancellation.reasons
+
+  (** The same error a cancelled heartbeat returns, copied to a public value. *)
+  let to_error cancellation =
+    Error_private.of_base
+      (Temporal_base.Activity_context.cancelled_error cancellation)
+end
+
 (** Safe operations exposed to contextual activity implementations. *)
 module Context = struct
   (** Alias used by contextual activity helpers; the private context controls
       attempt lifetime and copies payloads at every public boundary. *)
   type t = context
+
+  (** Reads the adapter-published cancellation cell without blocking. *)
+  let cancellation context = Temporal_base.Activity_context.cancellation context
+
+  (** Reads the owning worker's stop flags without blocking. *)
+  let is_worker_shutting_down context =
+    Temporal_base.Activity_context.worker_shutting_down context
 
   (** Sends one typed heartbeat value. *)
   let heartbeat context codec value = heartbeat context codec value
@@ -331,7 +457,8 @@ module Context = struct
     Temporal_base.Activity_context.heartbeat context payloads
     |> Result.map_error Error_private.of_base
 
-  (** Returns details retained from the preceding heartbeat attempt. *)
+  (** Returns the previous attempt's heartbeat details; this attempt's own
+      heartbeats never change the value. *)
   let details context =
     Temporal_base.Activity_context.details context
     |> List.map
@@ -347,6 +474,18 @@ module Context = struct
     Temporal_base.Activity_context.heartbeat_timeout context
     |> Option.map (fun duration ->
            Duration.of_ms (Temporal_base.Duration.to_ms duration))
+
+  (** Returns the native task metadata, or a defect for a synthetic context
+      whose backend has no Temporal task to describe. *)
+  let info context =
+    match Temporal_base.Activity_context.info context with
+    | Some info -> Ok info
+    | None ->
+        Error
+          (Error.defect
+             ~message:
+               "Temporal.Activity.Context.info is unavailable for this \
+                activity context")
 end
 
 (** Cancellation policy carried by a scheduled activity command. The closed
@@ -379,154 +518,6 @@ let runtime_cancellation_type = function
       Temporal_sdk_kernel.Activation.Wait_cancellation_completed
   | Abandon -> Temporal_sdk_kernel.Activation.Abandon
 
-module Retry_policy = struct
-  (** The public retry policy keeps the source float for accessors and its
-      exact IEEE-754 representation for the JSON bridge.  Storing both avoids
-      re-parsing a decimal value during every command while ensuring that
-      replay sees precisely the bits selected by the caller. *)
-  type t = {
-    (* Delay before the first retry attempt, represented exactly in ms. *)
-    initial_interval : Duration.t;
-    (* Finite multiplier applied to each retry delay. *)
-    backoff_coefficient : float;
-    (* Canonical unsigned IEEE-754 bits used by the JSON bridge. *)
-    backoff_coefficient_bits : string;
-    (* Upper bound applied to computed retry delays. *)
-    maximum_interval : Duration.t;
-    (* Maximum attempt count; zero means that Temporal imposes no limit. *)
-    maximum_attempts : int;
-    (* Error type names that should fail without another attempt. *)
-    non_retryable_error_types : string list;
-  }
-
-  (** Formats an arbitrary 64-bit bit pattern as the canonical unsigned
-      decimal required by the bridge protocol.  OCaml's [Int64.to_string]
-      treats patterns with the high bit set as negative, so the conversion
-      uses two base-[2^32] limbs and repeated division by ten instead. *)
-  let unsigned_int64_decimal bits =
-    if Int64.compare bits 0L >= 0 then Int64.to_string bits
-    else
-      let base = 4_294_967_296L in
-      let high = Int64.logand (Int64.shift_right_logical bits 32) 0xffff_ffffL in
-      let low = Int64.logand bits 0xffff_ffffL in
-      let rec digits high low acc =
-        if Int64.equal high 0L && Int64.equal low 0L then acc
-        else
-          let high_quotient = Int64.div high 10L in
-          let high_remainder = Int64.rem high 10L in
-          let combined =
-            Int64.add (Int64.mul high_remainder base) low
-          in
-          let low_quotient = Int64.div combined 10L in
-          let digit = Int64.to_int (Int64.rem combined 10L) in
-          digits high_quotient low_quotient
-            (Char.chr (Char.code '0' + digit) :: acc)
-      in
-      let characters = digits high low [] in
-      String.concat "" (List.map (String.make 1) characters)
-
-  (** Validates names embedded in the retry policy.  Keeping this validation at
-      construction means a policy cannot later fail merely because a worker
-      tries to serialize it. *)
-  let validate_non_retryable_error_type index value =
-    let field = "non_retryable_error_types[" ^ string_of_int index ^ "]" in
-    if String.equal value "" then
-      Error (Error.defect ~message:(field ^ " must not be empty"))
-    else if String.contains value '\000' then
-      Error (Error.defect ~message:(field ^ " must not contain NUL"))
-    else if String.length value > 65_536 then
-      Error (Error.defect ~message:(field ^ " exceeds 65536 bytes"))
-    else if not (Temporal_base.Codec.valid_utf_8 value) then
-      Error (Error.defect ~message:(field ^ " must be valid UTF-8"))
-    else Ok ()
-
-  (** Validates and constructs a policy without allowing invalid values to
-      cross into workflow history.  The checks mirror Temporal Core's retry
-      policy constraints and are deliberately expressed as [result] values so
-      routine configuration failures never use exceptions as control flow. *)
-  let make ~initial_interval ~backoff_coefficient ~maximum_interval
-      ~maximum_attempts ?(non_retryable_error_types = []) () =
-    let initial_ms = Duration.to_ms initial_interval in
-    let maximum_ms = Duration.to_ms maximum_interval in
-    let invalid message = Error (Error.defect ~message) in
-    if Int64.compare initial_ms 0L <= 0 then
-      invalid "retry policy initial_interval must be positive"
-    else if Int64.compare maximum_ms initial_ms < 0 then
-      invalid
-        "retry policy maximum_interval must be at least initial_interval"
-    else
-      match classify_float backoff_coefficient with
-      | FP_nan | FP_infinite ->
-          invalid "retry policy backoff_coefficient must be finite"
-      | FP_zero | FP_subnormal | FP_normal when backoff_coefficient < 1.0 ->
-          invalid "retry policy backoff_coefficient must be at least 1.0"
-      | FP_zero | FP_subnormal | FP_normal ->
-          let maximum_int32 = Int32.to_int Int32.max_int in
-          if maximum_attempts < 0 || maximum_attempts > maximum_int32 then
-            invalid
-              "retry policy maximum_attempts must be between 0 and Int32.max_int"
-          else
-            let rec validate_types index = function
-              | [] -> Ok ()
-              | value :: rest -> (
-                  match validate_non_retryable_error_type index value with
-                  | Error _ as error -> error
-                  | Ok () -> validate_types (index + 1) rest)
-            in
-            (match validate_types 0 non_retryable_error_types with
-            | Error _ as error -> error
-            | Ok () ->
-                Ok
-                  {
-                    initial_interval;
-                    backoff_coefficient;
-                    backoff_coefficient_bits =
-                      unsigned_int64_decimal
-                        (Int64.bits_of_float backoff_coefficient);
-                    maximum_interval;
-                    maximum_attempts;
-                    non_retryable_error_types =
-                      List.map Fun.id non_retryable_error_types;
-                  })
-
-  (** The [create] spelling is useful at call sites that treat policies as
-      immutable values rather than mutable builders. *)
-  let create ~initial_interval ~backoff_coefficient ~maximum_interval
-      ~maximum_attempts ?non_retryable_error_types () =
-    make ~initial_interval ~backoff_coefficient ~maximum_interval
-      ~maximum_attempts ?non_retryable_error_types ()
-
-  (** Returns the exact delay before the first retry. *)
-  let initial_interval policy = policy.initial_interval
-
-  (** Returns the multiplier applied to the previous retry delay. *)
-  let backoff_coefficient policy = policy.backoff_coefficient
-
-  (** Returns the upper bound for a retry delay. *)
-  let maximum_interval policy = policy.maximum_interval
-
-  (** Returns the attempt cap, where zero means unlimited attempts. *)
-  let maximum_attempts policy = policy.maximum_attempts
-
-  (** A fresh list protects the policy's immutable representation from callers
-      that retain and mutate a list value they received from an accessor. *)
-  let non_retryable_error_types policy =
-    List.map Fun.id policy.non_retryable_error_types
-end
-
-(* Copies a validated public policy into the private runtime record.  This is
-   the only place where the public activity module knows the bridge's compact
-   representation; the public signature keeps those details hidden. *)
-let runtime_retry_policy policy =
-  Temporal_sdk_kernel.Activation
-  .{
-    initial_interval = Duration.to_ms (Retry_policy.initial_interval policy);
-    backoff_coefficient_bits = policy.backoff_coefficient_bits;
-    maximum_interval = Duration.to_ms (Retry_policy.maximum_interval policy);
-    maximum_attempts = Retry_policy.maximum_attempts policy;
-    non_retryable_error_types = Retry_policy.non_retryable_error_types policy;
-  }
-
 (** Validates optional identifiers before a deterministic command sequence is
     allocated. *)
 let validate_optional_identifier field = function
@@ -540,6 +531,17 @@ let validate_optional_identifier field = function
   | Some value when not (Temporal_base.Codec.valid_utf_8 value) ->
       Error (Error.defect ~message:(field ^ " must be valid UTF-8"))
   | Some _ -> Ok ()
+
+(** Rejects close timeouts of zero before any command is emitted. Temporal
+    treats a zero duration as unset, so a zero schedule-to-close timeout with no
+    start-to-close timeout makes the server reject the command on every
+    workflow task retry, and a zero local-activity timeout expires immediately.
+    Schedule-to-start and heartbeat timeouts keep Temporal's zero-means-unset
+    meaning. *)
+let validate_close_timeout field = function
+  | Some duration when Int64.equal (Duration.to_ms duration) 0L ->
+      Error (Error.defect ~message:(field ^ " must be positive"))
+  | _ -> Ok ()
 
 (* Supplies the typed error used when a caller tries to schedule an activity
    without an active workflow execution. *)
@@ -567,14 +569,22 @@ let failed_handle error =
 
 (** Verifies an optional structured-cancellation scope before encoding and
     again afterward, since application codec code can cancel that scope. A
-    cancelled or foreign scope cannot cause a new Temporal command. *)
+    query can read [Scope.check], but may never schedule a scoped command. *)
 let check_scope = function
   | None -> Ok ()
-  | Some scope -> Scope.check scope
+  | Some scope -> (
+      match Temporal_sdk_kernel.Workflow_context_store.current () with
+      | Some context
+        when Temporal_sdk_kernel.Workflow_context_store.in_owner_turn context ->
+          Scope.check scope
+      | _ ->
+          Error
+            (Error.defect
+               ~message:"scoped activity start used outside a workflow scheduler turn"))
 
 (** Schedules an activity after validating command options and encoding input.
-    Option validation deliberately happens first: a malformed activity ID or
-    task queue must not invoke an application codec, allocate workflow state,
+    Option validation deliberately happens first: a malformed activity ID,
+    task queue, or zero close timeout must not invoke an application codec, allocate workflow state,
     or perform any user conversion before the request is rejected. The native
     runtime receives a base payload; its result decoder is converted back to
     public errors at the same boundary. *)
@@ -592,7 +602,17 @@ let start_handle_internal ?scope ?activity_id ?task_queue ?schedule_to_close_tim
       match validate_optional_identifier "task queue" task_queue with
       | Error error -> failed_handle error
       | Ok () -> (
-          match Codec_private.encode_base definition.input input with
+      match
+        Result.bind
+          (validate_close_timeout "schedule-to-close timeout"
+             schedule_to_close_timeout)
+          (fun () ->
+            validate_close_timeout "start-to-close timeout"
+              start_to_close_timeout)
+      with
+      | Error error -> failed_handle error
+      | Ok () -> (
+          match Codec_private.encode_arguments definition.input input with
           | Error error -> failed_handle (Error_private.of_base error)
           | Ok input -> (
               match check_scope scope with
@@ -616,7 +636,7 @@ let start_handle_internal ?scope ?activity_id ?task_queue ?schedule_to_close_tim
                   (* All optional durations are now exact integer milliseconds;
                      the runtime owns default timeout insertion and validation. *)
                   let retry_policy =
-                    Option.map runtime_retry_policy retry_policy
+                    Option.map Retry_policy_private.to_runtime retry_policy
                   in
                   let schedule_result =
                     if local then
@@ -667,7 +687,7 @@ let start_handle_internal ?scope ?activity_id ?task_queue ?schedule_to_close_tim
                       {
                         future = Future_private.of_internal future;
                         cancel = request_cancel;
-                      })))))
+                      }))))))
 
 (* Public wrapper keeps the implementation-only [local] switch out of the
    published signature; local callers use the dedicated [start_local] helper. *)

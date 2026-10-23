@@ -21,10 +21,13 @@ module Future = T.Future
 module Interaction = T.Interaction
 module Payload = T.Payload
 module Query = T.Query
+module Replay = T.Replay
 module Result_syntax = T.Result_syntax
+module Runtime = T.Runtime
 module Runtime_info = T.Runtime_info
 module Scope = T.Scope
 module Signal = T.Signal
+module Testing = T.Testing
 module Time = T.Time
 module Update = T.Update
 module Worker = T.Worker
@@ -127,14 +130,96 @@ let _activity_context_heartbeat_timeout :
     T.Activity.context -> T.Duration.t option =
   T.Activity.Context.heartbeat_timeout
 
+let _activity_context_info :
+    T.Activity.context -> (T.Activity.Info.t, T.Error.t) result =
+  T.Activity.Context.info
+
+let _activity_context_cancellation :
+    T.Activity.context -> T.Activity.Cancellation.t option =
+  T.Activity.Context.cancellation
+
+let _activity_context_is_worker_shutting_down : T.Activity.context -> bool =
+  T.Activity.Context.is_worker_shutting_down
+
+let _activity_cancellation_reason :
+    T.Activity.Cancellation.t -> T.Activity.Cancellation.reason =
+  T.Activity.Cancellation.reason
+
+let _activity_cancellation_reasons :
+    T.Activity.Cancellation.t -> T.Activity.Cancellation.reason list =
+  T.Activity.Cancellation.reasons
+
+let _activity_cancellation_to_error : T.Activity.Cancellation.t -> T.Error.t =
+  T.Activity.Cancellation.to_error
+
+(* The reason variant is closed and exhaustively matchable. *)
+let _activity_cancellation_reason_label :
+    T.Activity.Cancellation.reason -> string = function
+  | T.Activity.Cancellation.Requested -> "requested"
+  | Timed_out -> "timed_out"
+  | Not_found -> "not_found"
+  | Worker_shutdown -> "worker_shutdown"
+  | Paused -> "paused"
+  | Reset -> "reset"
+
+let _activity_info_namespace : T.Activity.Info.t -> string =
+  T.Activity.Info.namespace
+
+let _activity_info_workflow :
+    T.Activity.Info.t -> T.Activity.Info.workflow =
+  T.Activity.Info.workflow
+
+let _activity_info_activity_id : T.Activity.Info.t -> string =
+  T.Activity.Info.activity_id
+
+let _activity_info_activity_type : T.Activity.Info.t -> string =
+  T.Activity.Info.activity_type
+
+let _activity_info_attempt : T.Activity.Info.t -> int = T.Activity.Info.attempt
+let _activity_info_is_local : T.Activity.Info.t -> bool = T.Activity.Info.is_local
+
+let _activity_info_scheduled_time : T.Activity.Info.t -> T.Time.t option =
+  T.Activity.Info.scheduled_time
+
+let _activity_info_current_attempt_scheduled_time :
+    T.Activity.Info.t -> T.Time.t option =
+  T.Activity.Info.current_attempt_scheduled_time
+
+let _activity_info_started_time : T.Activity.Info.t -> T.Time.t option =
+  T.Activity.Info.started_time
+
+let _activity_info_schedule_to_close_timeout :
+    T.Activity.Info.t -> T.Duration.t option =
+  T.Activity.Info.schedule_to_close_timeout
+
+let _activity_info_start_to_close_timeout :
+    T.Activity.Info.t -> T.Duration.t option =
+  T.Activity.Info.start_to_close_timeout
+
+let _activity_info_heartbeat_timeout : T.Activity.Info.t -> T.Duration.t option =
+  T.Activity.Info.heartbeat_timeout
+
+let _activity_async_context_info :
+    unit T.Activity.async_context -> (T.Activity.Info.t, T.Error.t) result =
+  T.Activity.Async_context.info
+
+(* Record fields of the public workflow identity are part of the contract. *)
+let _activity_info_workflow_fields
+    ({ workflow_id; run_id; workflow_type } : T.Activity.Info.workflow) =
+  ignore (workflow_id : string);
+  ignore (run_id : string);
+  ignore (workflow_type : string)
+
 let _activity_execute :
+    ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?task_queue:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
     ?schedule_to_start_timeout:T.Duration.t ->
     ?start_to_close_timeout:T.Duration.t ->
     ?heartbeat_timeout:T.Duration.t ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?priority:T.Activity.Priority.t ->
     ?cancellation_type:T.Activity.cancellation_type ->
     ?do_not_eagerly_execute:bool ->
     ('input, 'output) T.Activity.t ->
@@ -150,56 +235,45 @@ let _activity_cancel :
     'output T.Activity.handle -> (unit, T.Error.t) result =
   T.Activity.cancel
 
-let _activity_heartbeat :
-    T.Activity.context -> 'a T.Codec.t -> 'a -> (unit, T.Error.t) result =
-  T.Activity.heartbeat
-
 let _activity_retry_policy_make :
     initial_interval:T.Duration.t ->
     backoff_coefficient:float ->
     maximum_interval:T.Duration.t ->
     maximum_attempts:int ->
     ?non_retryable_error_types:string list ->
-    unit -> (T.Activity.Retry_policy.t, T.Error.t) result =
-  T.Activity.Retry_policy.make
-
-let _activity_retry_policy_create :
-    initial_interval:T.Duration.t ->
-    backoff_coefficient:float ->
-    maximum_interval:T.Duration.t ->
-    maximum_attempts:int ->
-    ?non_retryable_error_types:string list ->
-    unit -> (T.Activity.Retry_policy.t, T.Error.t) result =
-  T.Activity.Retry_policy.create
+    unit -> (T.Retry_policy.t, T.Error.t) result =
+  T.Retry_policy.make
 
 let _activity_retry_policy_initial_interval :
-    T.Activity.Retry_policy.t -> T.Duration.t =
-  T.Activity.Retry_policy.initial_interval
+    T.Retry_policy.t -> T.Duration.t =
+  T.Retry_policy.initial_interval
 
 let _activity_retry_policy_backoff :
-    T.Activity.Retry_policy.t -> float =
-  T.Activity.Retry_policy.backoff_coefficient
+    T.Retry_policy.t -> float =
+  T.Retry_policy.backoff_coefficient
 
 let _activity_retry_policy_maximum_interval :
-    T.Activity.Retry_policy.t -> T.Duration.t =
-  T.Activity.Retry_policy.maximum_interval
+    T.Retry_policy.t -> T.Duration.t =
+  T.Retry_policy.maximum_interval
 
 let _activity_retry_policy_maximum_attempts :
-    T.Activity.Retry_policy.t -> int =
-  T.Activity.Retry_policy.maximum_attempts
+    T.Retry_policy.t -> int =
+  T.Retry_policy.maximum_attempts
 
 let _activity_retry_policy_non_retryable :
-    T.Activity.Retry_policy.t -> string list =
-  T.Activity.Retry_policy.non_retryable_error_types
+    T.Retry_policy.t -> string list =
+  T.Retry_policy.non_retryable_error_types
 
 let _activity_start_handle :
+    ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?task_queue:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
     ?schedule_to_start_timeout:T.Duration.t ->
     ?start_to_close_timeout:T.Duration.t ->
     ?heartbeat_timeout:T.Duration.t ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?priority:T.Activity.Priority.t ->
     ?cancellation_type:T.Activity.cancellation_type ->
     ?do_not_eagerly_execute:bool ->
     ('input, 'output) T.Activity.t ->
@@ -207,13 +281,15 @@ let _activity_start_handle :
   T.Activity.start_handle
 
 let _activity_start :
+    ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?task_queue:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
     ?schedule_to_start_timeout:T.Duration.t ->
     ?start_to_close_timeout:T.Duration.t ->
     ?heartbeat_timeout:T.Duration.t ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?priority:T.Activity.Priority.t ->
     ?cancellation_type:T.Activity.cancellation_type ->
     ?do_not_eagerly_execute:bool ->
     ('input, 'output) T.Activity.t ->
@@ -221,8 +297,11 @@ let _activity_start :
   T.Activity.start
 
 let _child_start :
+    ?scope:T.Scope.t ->
     ?cancellation_type:T.Child_workflow.cancellation_type ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?task_queue:string ->
+    ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
@@ -230,8 +309,11 @@ let _child_start :
   T.Child_workflow.start
 
 let _child_start_handle :
+    ?scope:T.Scope.t ->
     ?cancellation_type:T.Child_workflow.cancellation_type ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?task_queue:string ->
+    ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input -> 'output T.Child_workflow.handle =
@@ -241,14 +323,21 @@ let _child_future :
     'output T.Child_workflow.handle -> ('output, T.Error.t) T.Future.t =
   T.Child_workflow.future
 
+let _child_started :
+    'output T.Child_workflow.handle -> (string, T.Error.t) T.Future.t =
+  T.Child_workflow.started
+
 let _child_cancel :
     ?reason:string ->
     'output T.Child_workflow.handle -> (unit, T.Error.t) result =
   T.Child_workflow.cancel
 
 let _child_execute :
+    ?scope:T.Scope.t ->
     ?cancellation_type:T.Child_workflow.cancellation_type ->
-    ?retry_policy:T.Activity.Retry_policy.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?task_queue:string ->
+    ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
@@ -276,12 +365,28 @@ let _codec_option : 'a T.Codec.t -> 'a option T.Codec.t = T.Codec.option
 let _codec_string : string T.Codec.t = T.Codec.string
 let _codec_bytes : bytes T.Codec.t = T.Codec.bytes
 let _codec_unit : unit T.Codec.t = T.Codec.unit
+let _codec_is_unit : 'a T.Codec.t -> bool = T.Codec.is_unit
+let _codec_int : int T.Codec.t = T.Codec.int
+let _codec_int64 : int64 T.Codec.t = T.Codec.int64
+let _codec_bool : bool T.Codec.t = T.Codec.bool
+let _codec_float : float T.Codec.t = T.Codec.float
+let _codec_json : Yojson.Safe.t T.Codec.t = T.Codec.json
+
+let _codec_json_conv :
+    to_json:('a -> Yojson.Safe.t) ->
+    of_json:(Yojson.Safe.t -> ('a, T.Error.t) result) ->
+    'a T.Codec.t =
+  T.Codec.json_conv
 
 let _duration_of_ms : int64 -> T.Duration.t = T.Duration.of_ms
+let _duration_of_seconds : int64 -> T.Duration.t = T.Duration.of_seconds
+let _duration_of_minutes : int64 -> T.Duration.t = T.Duration.of_minutes
+let _duration_of_hours : int64 -> T.Duration.t = T.Duration.of_hours
 let _duration_to_ms : T.Duration.t -> int64 = T.Duration.to_ms
 
 let _error_make :
     ?non_retryable:bool ->
+    ?error_type:string ->
     ?details:T.Payload.t list ->
     category:T.Error.category ->
     message:string ->
@@ -291,6 +396,11 @@ let _error_make :
 let _error_view : T.Error.t -> T.Error.view = T.Error.view
 let _error_kind : T.Error.t -> string = T.Error.kind
 let _error_message : T.Error.t -> string = T.Error.message
+let _error_error_type : T.Error.t -> string option = T.Error.error_type
+
+(* The application failure type is also part of the inspectable view record. *)
+let _error_view_error_type (view : T.Error.view) : string option =
+  view.error_type
 let _error_codec : message:string -> T.Error.t = T.Error.codec
 let _error_defect : message:string -> T.Error.t = T.Error.defect
 
@@ -402,6 +512,9 @@ let _signal_handler_name : T.Signal.Handler.t -> string = T.Signal.Handler.name
 let _signal_handler_dispatch :
     T.Signal.Handler.t -> T.Payload.t -> (unit, T.Error.t) result =
   T.Signal.Handler.dispatch
+let _signal_handler_dispatch_payloads :
+    T.Signal.Handler.t -> T.Payload.t list -> (unit, T.Error.t) result =
+  T.Signal.Handler.dispatch_payloads
 
 let _query_define :
     name:string -> output:'output T.Codec.t -> 'output T.Query.t =
@@ -480,8 +593,14 @@ let _update_handler_handle :
 let _update_handler_name : T.Update.Handler.t -> string = T.Update.Handler.name
 let _update_handler_dispatch :
     ?run_validator:bool ->
+    ?on_validated:(unit -> unit) ->
     T.Update.Handler.t -> T.Payload.t -> (T.Payload.t, T.Error.t) result =
   T.Update.Handler.dispatch
+let _update_handler_dispatch_payloads :
+    ?run_validator:bool ->
+    ?on_validated:(unit -> unit) ->
+    T.Update.Handler.t -> T.Payload.t list -> (T.Payload.t, T.Error.t) result =
+  T.Update.Handler.dispatch_payloads
 
 let _interaction_create :
     ?signals:T.Signal.Handler.t list ->
@@ -514,6 +633,11 @@ let _interaction_update :
    these are the operations an installed consumer must be able to compose. *)
 let _client_create :
     ?identity:string ->
+    ?io_threads:int ->
+    ?runtime:T.Runtime.t ->
+    ?max_pending_waits:int ->
+    ?max_pending_starts:int ->
+    ?max_in_flight_calls:int ->
     target_url:string ->
     namespace:string ->
     unit -> (T.Client.t, T.Error.t) result =
@@ -522,6 +646,15 @@ let _client_create :
 let _client_start :
     T.Client.t ->
     ?request_id:string ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
+    ?id_conflict_policy:T.Client.id_conflict_policy ->
+    ?id_reuse_policy:T.Client.id_reuse_policy ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?rpc_timeout:T.Duration.t ->
     workflow:('input, 'output) T.Workflow.t ->
     task_queue:string ->
     id:string ->
@@ -529,12 +662,44 @@ let _client_start :
     unit -> (('input, 'output) T.Client.handle, T.Error.t) result =
   T.Client.start
 
+(* The conflict policy is a closed polymorphic variant, so an exhaustive
+   match here breaks if a constructor is added or renamed. *)
+let _client_id_conflict_policy_name : T.Client.id_conflict_policy -> string =
+  function
+  | `Fail -> "fail"
+  | `Use_existing -> "use_existing"
+  | `Terminate_existing -> "terminate_existing"
+
+(* The reuse policy is closed in the same way (#499). *)
+let _client_id_reuse_policy_name : T.Client.id_reuse_policy -> string =
+  function
+  | `Allow_duplicate -> "allow_duplicate"
+  | `Allow_duplicate_failed_only -> "allow_duplicate_failed_only"
+  | `Reject_duplicate -> "reject_duplicate"
+
 let _client_follow :
     T.Client.t ->
     workflow:('input, 'output) T.Workflow.t ->
     T.Client.execution ->
     (('input, 'output) T.Client.handle, T.Error.t) result =
   T.Client.follow
+
+let _client_get_handle :
+    T.Client.t ->
+    ?run_id:string ->
+    workflow:('input, 'output) T.Workflow.t ->
+    id:string ->
+    unit ->
+    (('input, 'output) T.Client.handle, T.Error.t) result =
+  T.Client.get_handle
+
+(* A completed result carries its output and the optional cron or retry
+   successor as an inline record, like the failed and timed-out results. *)
+let _client_completed_fields :
+    'output T.Client.terminal_result -> ('output * T.Client.execution option) option =
+  function
+  | T.Client.Completed { output; successor } -> Some (output, successor)
+  | _ -> None
 
 let _client_execution_fields (execution : T.Client.execution) : string * string * string =
   (execution.namespace, execution.workflow_id, execution.run_id)
@@ -547,6 +712,7 @@ let _client_wait :
 let _client_cancel :
     ?request_id:string ->
     ?reason:string ->
+    ?rpc_timeout:T.Duration.t ->
     ('input, 'output) T.Client.handle ->
     (unit, T.Error.t) result =
   T.Client.cancel
@@ -554,6 +720,7 @@ let _client_cancel :
 let _client_reset :
     ?request_id:string ->
     ?reason:string ->
+    ?rpc_timeout:T.Duration.t ->
     workflow_task_finish_event_id:int64 ->
     ('input, 'output) T.Client.handle ->
     (T.Client.execution, T.Error.t) result =
@@ -561,6 +728,7 @@ let _client_reset :
 
 let _client_signal :
     ?request_id:string ->
+    ?rpc_timeout:T.Duration.t ->
     ('workflow_input, 'workflow_output) T.Client.handle ->
     signal:'signal T.Signal.t ->
     input:'signal ->
@@ -568,12 +736,14 @@ let _client_signal :
   T.Client.signal
 
 let _client_query :
+    ?rpc_timeout:T.Duration.t ->
     ('workflow_input, 'workflow_output) T.Client.handle ->
     query:'query T.Query.t ->
     ('query, T.Error.t) result =
   T.Client.query
 
 let _client_query_with_input :
+    ?rpc_timeout:T.Duration.t ->
     ('workflow_input, 'workflow_output) T.Client.handle ->
     query:('input, 'query) T.Query.typed ->
     input:'input -> ('query, T.Error.t) result =
@@ -583,7 +753,38 @@ let _client_workflow_id :
     ('input, 'output) T.Client.handle -> string =
   T.Client.workflow_id
 
-let _client_run_id : ('input, 'output) T.Client.handle -> string = T.Client.run_id
+let _client_run_id : ('input, 'output) T.Client.handle -> string option =
+  T.Client.run_id
+let _client_started : ('input, 'output) T.Client.handle -> bool = T.Client.started
+let _client_already_started : T.Error.t -> T.Client.execution option =
+  T.Client.already_started
+let _client_is_at_capacity : T.Error.t -> bool = T.Client.is_at_capacity
+let _client_is_start_outcome_uncertain : T.Error.t -> bool =
+  T.Client.is_start_outcome_uncertain
+let _client_is_query_failed : T.Error.t -> bool = T.Client.is_query_failed
+let _client_rpc_status : T.Error.t -> T.Client.rpc_status option =
+  T.Client.rpc_status
+
+(** Witnesses every [Client.rpc_status] constructor, so removing or renaming
+    one breaks this installed-consumer build. *)
+let _client_rpc_status_name : T.Client.rpc_status -> string = function
+  | `Cancelled -> "Cancelled"
+  | `Unknown -> "Unknown"
+  | `Invalid_argument -> "InvalidArgument"
+  | `Deadline_exceeded -> "DeadlineExceeded"
+  | `Not_found -> "NotFound"
+  | `Already_exists -> "AlreadyExists"
+  | `Permission_denied -> "PermissionDenied"
+  | `Resource_exhausted -> "ResourceExhausted"
+  | `Failed_precondition -> "FailedPrecondition"
+  | `Aborted -> "Aborted"
+  | `Out_of_range -> "OutOfRange"
+  | `Unimplemented -> "Unimplemented"
+  | `Internal -> "Internal"
+  | `Unavailable -> "Unavailable"
+  | `Data_loss -> "DataLoss"
+  | `Unauthenticated -> "Unauthenticated"
+  | `Termination_outcome_uncertain -> "TerminationOutcomeUncertain"
 let _client_shutdown : T.Client.t -> (unit, T.Error.t) result = T.Client.shutdown
 
 let _worker_workflow :
@@ -600,7 +801,8 @@ let _worker_activity :
 let _worker_create :
     ?identity:string ->
     ?options:T.Worker.Options.t ->
-    ?max_cached_workflows:int ->
+    ?io_threads:int ->
+    ?runtime:T.Runtime.t ->
     target_url:string ->
     namespace:string ->
     task_queue:string ->
@@ -613,8 +815,121 @@ let _workflow_current_deployment_version :
     unit -> T.Workflow.deployment_version option =
   T.Workflow.current_deployment_version
 
+let _workflow_info : unit -> (T.Workflow.Info.t, T.Error.t) result =
+  T.Workflow.info
+
+let _workflow_is_replaying : unit -> bool = T.Workflow.is_replaying
+let _workflow_info_workflow_id : T.Workflow.Info.t -> string =
+  T.Workflow.Info.workflow_id
+let _workflow_info_run_id : T.Workflow.Info.t -> string = T.Workflow.Info.run_id
+
+let _workflow_info_first_execution_run_id : T.Workflow.Info.t -> string option =
+  T.Workflow.Info.first_execution_run_id
+
+let _workflow_info_workflow_type : T.Workflow.Info.t -> string =
+  T.Workflow.Info.workflow_type
+
+let _workflow_info_namespace : T.Workflow.Info.t -> string =
+  T.Workflow.Info.namespace
+
+let _workflow_info_task_queue : T.Workflow.Info.t -> string =
+  T.Workflow.Info.task_queue
+
+let _workflow_info_attempt : T.Workflow.Info.t -> int = T.Workflow.Info.attempt
+
+let _workflow_info_continued_from_run_id : T.Workflow.Info.t -> string option =
+  T.Workflow.Info.continued_from_run_id
+
+let _workflow_info_continuation_initiator :
+    T.Workflow.Info.t -> T.Workflow.Info.continuation_initiator option =
+  T.Workflow.Info.continuation_initiator
+
+(* Exhaustive match: adding an initiator must be a visible API change. *)
+let _workflow_info_continuation_initiator_name :
+    T.Workflow.Info.continuation_initiator -> string = function
+  | `Continue_as_new -> "continue-as-new"
+  | `Retry -> "retry"
+  | `Cron_schedule -> "cron"
+
+let _workflow_info_execution_timeout : T.Workflow.Info.t -> T.Duration.t option =
+  T.Workflow.Info.execution_timeout
+
+let _workflow_info_run_timeout : T.Workflow.Info.t -> T.Duration.t option =
+  T.Workflow.Info.run_timeout
+
+let _workflow_info_task_timeout : T.Workflow.Info.t -> T.Duration.t option =
+  T.Workflow.Info.task_timeout
+
+let _workflow_info_retry_policy :
+    T.Workflow.Info.t -> T.Retry_policy.t option =
+  T.Workflow.Info.retry_policy
+
+let _workflow_info_parent : T.Workflow.Info.t -> T.Workflow.Info.parent option =
+  T.Workflow.Info.parent
+
+let _workflow_info_start_time : T.Workflow.Info.t -> T.Time.t option =
+  T.Workflow.Info.start_time
+
+let _workflow_info_is_replaying : T.Workflow.Info.t -> bool =
+  T.Workflow.Info.is_replaying
+
+let _workflow_info_history_length : T.Workflow.Info.t -> int =
+  T.Workflow.Info.history_length
+
+let _workflow_info_history_size_bytes : T.Workflow.Info.t -> int option =
+  T.Workflow.Info.history_size_bytes
+
+let _workflow_info_continue_as_new_suggested : T.Workflow.Info.t -> bool =
+  T.Workflow.Info.continue_as_new_suggested
+
+let _workflow_info_continue_as_new_reasons :
+    T.Workflow.Info.t -> T.Workflow.Info.continue_as_new_reason list =
+  T.Workflow.Info.continue_as_new_reasons
+
+(* The reason variant is closed; an exhaustive match pins its constructors. *)
+let _workflow_info_continue_as_new_reason_name :
+    T.Workflow.Info.continue_as_new_reason -> string = function
+  | `History_size_too_large -> "history_size_too_large"
+  | `Too_many_history_events -> "too_many_history_events"
+  | `Too_many_updates -> "too_many_updates"
+
+(* Record fields of the public parent identity are part of the contract. *)
+let _workflow_info_parent_fields
+    ({ namespace; workflow_id; run_id } : T.Workflow.Info.parent) =
+  ignore (namespace : string);
+  ignore (workflow_id : string);
+  ignore (run_id : string)
+
 let _worker_run : T.Worker.t -> (unit, T.Error.t) result = T.Worker.run
 let _worker_shutdown : T.Worker.t -> (unit, T.Error.t) result = T.Worker.shutdown
+
+(* Bounded shutdown report (#495). The record is destructured and the
+   teardown variant matched exhaustively, so a changed field or a new
+   constructor is a visible API change. *)
+let _worker_shutdown_with_report :
+    T.Worker.t -> (T.Worker.Shutdown_report.t, T.Error.t) result =
+  T.Worker.shutdown_with_report
+
+let _worker_shutdown_report_is_clean : T.Worker.Shutdown_report.t -> bool =
+  T.Worker.Shutdown_report.is_clean
+
+let _worker_shutdown_report_fields
+    ({
+       elapsed;
+       lanes_stopped;
+       abandoned_activity_callbacks;
+       abandoned_workflow_activations;
+       native_teardown;
+     } :
+      T.Worker.Shutdown_report.t) =
+  ignore (elapsed : T.Duration.t);
+  ignore (lanes_stopped : bool);
+  ignore (abandoned_activity_callbacks : int);
+  ignore (abandoned_workflow_activations : int);
+  match (native_teardown : T.Worker.Shutdown_report.teardown) with
+  | `Completed -> "completed"
+  | `Detached -> "detached"
+let _worker_request_shutdown : T.Worker.t -> unit = T.Worker.request_shutdown
 
 (* The remaining small modules still participate in the public contract. *)
 let _condition_wait_until : (unit -> bool) -> (unit, T.Error.t) result =
@@ -626,6 +941,31 @@ let _condition_wait_until_result :
 
 let _runtime_abi_version : unit -> (int32, T.Error.t) result =
   T.Runtime_info.native_bridge_abi_version
+
+(* A shared runtime is an explicit resource: created, counted, and shut down
+   by the application, with typed results on every path (#832). *)
+let _runtime_create :
+    ?io_threads:int ->
+    ?metrics:T.Runtime.Metrics.t ->
+    unit ->
+    (T.Runtime.t, T.Error.t) result =
+  T.Runtime.create
+let _runtime_attached : T.Runtime.t -> int = T.Runtime.attached
+
+(* Opt-in Prometheus export of Core's worker and client metrics (#500). *)
+let _runtime_metrics_prometheus :
+    ?global_tags:(string * string) list ->
+    ?counters_total_suffix:bool ->
+    ?unit_suffix:bool ->
+    ?durations_as_seconds:bool ->
+    bind_address:string ->
+    unit ->
+    (T.Runtime.Metrics.t, T.Error.t) result =
+  T.Runtime.Metrics.prometheus
+let _runtime_metrics_address : T.Runtime.t -> string option =
+  T.Runtime.metrics_address
+let _runtime_shutdown : T.Runtime.t -> (unit, T.Error.t) result =
+  T.Runtime.shutdown
 
 let _scope_create : unit -> (T.Scope.t, T.Error.t) result = T.Scope.create
 let _scope_with_scope :
@@ -684,3 +1024,385 @@ let _routed_child definition input =
   T.Child_workflow.start ~id:"cross-sdk-child" ~task_queue:"go-llm-worker"
     ~parent_close_policy:T.Child_workflow.Parent_close_policy.Abandon
     definition input
+
+(* Values below completed the witness for #841.  Since then the in-tree
+   [test/api_witness] gate fails `dune runtest` when any value exported by a
+   public interface is not referenced here, so a new public value must gain an
+   explicit annotation in the same change that exports it. *)
+
+(* Activity priorities and local activities. *)
+let _activity_priority_make :
+    ?priority_key:int ->
+    ?fairness_key:string ->
+    ?fairness_weight:float ->
+    unit -> (T.Activity.Priority.t, T.Error.t) result =
+  T.Activity.Priority.make
+
+let _activity_priority_key : T.Activity.Priority.t -> int option =
+  T.Activity.Priority.priority_key
+
+let _activity_priority_fairness_key : T.Activity.Priority.t -> string option =
+  T.Activity.Priority.fairness_key
+
+let _activity_priority_fairness_weight :
+    T.Activity.Priority.t -> float option =
+  T.Activity.Priority.fairness_weight
+
+let _activity_start_local :
+    ?activity_id:string ->
+    ?schedule_to_close_timeout:T.Duration.t ->
+    ?schedule_to_start_timeout:T.Duration.t ->
+    ?start_to_close_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?cancellation_type:T.Activity.cancellation_type ->
+    ('input, 'output) T.Activity.t ->
+    'input -> ('output, T.Error.t) T.Future.t =
+  T.Activity.start_local
+
+let _activity_execute_local :
+    ?activity_id:string ->
+    ?schedule_to_close_timeout:T.Duration.t ->
+    ?schedule_to_start_timeout:T.Duration.t ->
+    ?start_to_close_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?cancellation_type:T.Activity.cancellation_type ->
+    ('input, 'output) T.Activity.t ->
+    'input -> ('output, T.Error.t) result =
+  T.Activity.execute_local
+
+(* Client termination, visibility listing, and workflow updates. *)
+let _client_terminate :
+    ?reason:string ->
+    ?rpc_timeout:T.Duration.t ->
+    ('input, 'output) T.Client.handle -> (unit, T.Error.t) result =
+  T.Client.terminate
+
+let _client_list_visibility :
+    ?page_size:int ->
+    ?page_token:string ->
+    ?rpc_timeout:T.Duration.t ->
+    T.Client.t ->
+    query:string ->
+    unit -> (T.Client.visibility_page, T.Error.t) result =
+  T.Client.list_visibility
+
+let _client_execution_status_cases : T.Client.execution_status -> int = function
+  | `Running -> 1
+  | `Completed -> 2
+  | `Failed -> 3
+  | `Canceled -> 4
+  | `Terminated -> 5
+  | `Continued_as_new -> 6
+  | `Timed_out -> 7
+  | `Paused -> 8
+  | `Unknown value -> value
+
+let _client_visibility_page_fields (page : T.Client.visibility_page) :
+    (string * string * string * string * T.Client.execution_status) list
+    * string option =
+  ( List.map
+      (fun (execution : T.Client.visibility_execution) ->
+        ( execution.workflow_id,
+          execution.run_id,
+          execution.workflow_type,
+          execution.task_queue,
+          execution.status ))
+      page.executions,
+    page.next_page_token )
+
+let _client_start_update :
+    ?update_id:string ->
+    ?rpc_timeout:T.Duration.t ->
+    ('workflow_input, 'workflow_output) T.Client.handle ->
+    update:('input, 'output) T.Update.t ->
+    input:'input ->
+    unit -> (('input, 'output) T.Client.update_handle, T.Error.t) result =
+  T.Client.start_update
+
+let _client_wait_update :
+    ('input, 'output) T.Client.update_handle -> ('output, T.Error.t) result =
+  T.Client.wait_update
+
+let _client_update_id : ('input, 'output) T.Client.update_handle -> string =
+  T.Client.update_id
+
+(* Scope cancellation callbacks. *)
+let _scope_on_cancel :
+    ?until:('value, 'error) T.Future.t ->
+    T.Scope.t ->
+    (unit -> (unit, T.Error.t) result) ->
+    (unit, T.Error.t) result =
+  T.Scope.on_cancel
+
+(* Worker options. *)
+let _worker_options_default : T.Worker.Options.t = T.Worker.Options.default
+
+let _worker_options_make :
+    ?versioning:T.Worker.Options.versioning ->
+    ?max_cached_workflows:int ->
+    ?workflow_activation_deadline:T.Worker.Options.activation_deadline ->
+    ?max_concurrent_workflow_tasks:int ->
+    ?workflow_task_pollers:T.Worker.Options.workflow_task_pollers ->
+    ?sticky_queue_schedule_to_start_timeout:T.Duration.t ->
+    ?graceful_shutdown_period:T.Duration.t ->
+    ?shutdown_teardown_timeout:T.Duration.t ->
+    ?max_heartbeat_throttle_interval:T.Duration.t ->
+    ?default_heartbeat_throttle_interval:T.Duration.t ->
+    ?max_worker_activities_per_second:float ->
+    ?max_task_queue_activities_per_second:float ->
+    unit -> (T.Worker.Options.t, T.Error.t) result =
+  T.Worker.Options.make
+
+let _worker_options_versioning :
+    T.Worker.Options.t -> T.Worker.Options.versioning =
+  T.Worker.Options.versioning
+
+let _worker_options_max_cached_workflows : T.Worker.Options.t -> int option =
+  T.Worker.Options.max_cached_workflows
+
+let _worker_options_workflow_activation_deadline :
+    T.Worker.Options.t -> [ `After of T.Duration.t | `Disabled ] =
+  T.Worker.Options.workflow_activation_deadline
+
+(* Worker resource and shutdown options (#498). The poller variant is
+   matched exhaustively so a new constructor is a visible API change. *)
+let _worker_options_workflow_task_pollers :
+    T.Worker.Options.t -> T.Worker.Options.workflow_task_pollers =
+  T.Worker.Options.workflow_task_pollers
+
+let _worker_options_workflow_task_pollers_shape :
+    T.Worker.Options.workflow_task_pollers -> int * int * int = function
+  | T.Worker.Options.Fixed count -> (count, count, count)
+  | T.Worker.Options.Autoscaling { minimum; maximum; initial } ->
+      (minimum, maximum, initial)
+
+let _worker_options_max_concurrent_workflow_tasks : T.Worker.Options.t -> int =
+  T.Worker.Options.max_concurrent_workflow_tasks
+
+let _worker_options_sticky_queue_schedule_to_start_timeout :
+    T.Worker.Options.t -> T.Duration.t =
+  T.Worker.Options.sticky_queue_schedule_to_start_timeout
+
+let _worker_options_graceful_shutdown_period :
+    T.Worker.Options.t -> T.Duration.t =
+  T.Worker.Options.graceful_shutdown_period
+
+let _worker_options_shutdown_teardown_timeout :
+    T.Worker.Options.t -> T.Duration.t =
+  T.Worker.Options.shutdown_teardown_timeout
+
+let _worker_options_max_heartbeat_throttle_interval :
+    T.Worker.Options.t -> T.Duration.t =
+  T.Worker.Options.max_heartbeat_throttle_interval
+
+let _worker_options_default_heartbeat_throttle_interval :
+    T.Worker.Options.t -> T.Duration.t =
+  T.Worker.Options.default_heartbeat_throttle_interval
+
+let _worker_options_max_worker_activities_per_second :
+    T.Worker.Options.t -> float option =
+  T.Worker.Options.max_worker_activities_per_second
+
+let _worker_options_max_task_queue_activities_per_second :
+    T.Worker.Options.t -> float option =
+  T.Worker.Options.max_task_queue_activities_per_second
+
+let _worker_options : T.Worker.t -> T.Worker.Options.t = T.Worker.options
+
+(* Workflow activation watchdog health for liveness probes. *)
+let _worker_health : T.Worker.t -> T.Worker.Health.t = T.Worker.health
+
+let _worker_health_fields : T.Worker.Health.t -> string option =
+  function
+  | T.Worker.Health.Healthy -> None
+  | T.Worker.Health.Stuck_workflow_activation
+      {
+        workflow_type = _;
+        workflow_id = _;
+        run_id;
+        is_replaying = _;
+        elapsed = _;
+        abandoned = _;
+      } ->
+      Some run_id
+
+let _worker_health_abandonment : T.Worker.Health.abandonment -> string =
+  function
+  | `Task_failed -> "task failed"
+  | `Queries_failed -> "queries failed"
+  | `Eviction_acknowledged -> "eviction acknowledged"
+  | `Not_acknowledged -> "not acknowledged"
+
+(* External workflow commands and search attributes from workflow code. *)
+let _workflow_signal_external_workflow :
+    workflow_id:string ->
+    ?run_id:string ->
+    signal:'input T.Signal.t ->
+    input:'input -> unit -> (unit, T.Error.t) T.Future.t =
+  T.Workflow.signal_external_workflow
+
+let _workflow_cancel_external_workflow :
+    workflow_id:string ->
+    ?run_id:string ->
+    reason:string -> unit -> (unit, T.Error.t) T.Future.t =
+  T.Workflow.cancel_external_workflow
+
+let _workflow_upsert_search_attributes :
+    (string * T.Payload.t) list -> unit =
+  T.Workflow.upsert_search_attributes
+
+(* In-process, time-skipping workflow test environment. *)
+let _testing_workflow :
+    ?signals:T.Signal.Handler.t list ->
+    ?queries:T.Query.Handler.t list ->
+    ?updates:T.Update.Handler.t list ->
+    ('input, 'output) T.Workflow.t -> T.Testing.registered_workflow =
+  T.Testing.workflow
+
+let _testing_mock_workflow :
+    ?signals:T.Signal.Handler.t list ->
+    ?queries:T.Query.Handler.t list ->
+    ?updates:T.Update.Handler.t list ->
+    ('input, 'output) T.Workflow.t ->
+    ('input -> ('output, T.Error.t) result) ->
+    T.Testing.registered_workflow =
+  T.Testing.mock_workflow
+
+let _testing_activity :
+    ('input, 'output) T.Activity.t -> T.Testing.registered_activity =
+  T.Testing.activity
+
+let _testing_mock_activity :
+    ('input, 'output) T.Activity.t ->
+    ('input -> ('output, T.Error.t) result) ->
+    T.Testing.registered_activity =
+  T.Testing.mock_activity
+
+let _testing_create :
+    ?namespace:string ->
+    ?task_queue:string ->
+    ?start_time:T.Time.t ->
+    ?max_activity_attempts:int ->
+    workflows:T.Testing.registered_workflow list ->
+    activities:T.Testing.registered_activity list ->
+    unit -> (T.Testing.t, T.Error.t) result =
+  T.Testing.create
+
+let _testing_shutdown : T.Testing.t -> unit = T.Testing.shutdown
+let _testing_now : T.Testing.t -> T.Time.t = T.Testing.now
+
+let _testing_skip : T.Testing.t -> T.Duration.t -> (unit, T.Error.t) result =
+  T.Testing.skip
+
+let _testing_start :
+    ?id:string ->
+    T.Testing.t ->
+    ('input, 'output) T.Workflow.t ->
+    'input -> (('input, 'output) T.Testing.handle, T.Error.t) result =
+  T.Testing.start
+
+let _testing_result :
+    ?timeout:T.Duration.t ->
+    ('input, 'output) T.Testing.handle -> ('output, T.Error.t) result =
+  T.Testing.result
+
+let _testing_execute :
+    ?id:string ->
+    ?timeout:T.Duration.t ->
+    T.Testing.t ->
+    ('input, 'output) T.Workflow.t -> 'input -> ('output, T.Error.t) result =
+  T.Testing.execute
+
+let _testing_signal :
+    ('input, 'output) T.Testing.handle ->
+    'signal T.Signal.t -> 'signal -> (unit, T.Error.t) result =
+  T.Testing.signal
+
+let _testing_query :
+    ('input, 'output) T.Testing.handle ->
+    'query T.Query.t -> ('query, T.Error.t) result =
+  T.Testing.query
+
+let _testing_query_with_input :
+    ('input, 'output) T.Testing.handle ->
+    ('query_input, 'query) T.Query.typed ->
+    'query_input -> ('query, T.Error.t) result =
+  T.Testing.query_with_input
+
+let _testing_update :
+    ?timeout:T.Duration.t ->
+    ('input, 'output) T.Testing.handle ->
+    ('update_input, 'update_output) T.Update.t ->
+    'update_input -> ('update_output, T.Error.t) result =
+  T.Testing.update
+
+let _testing_cancel :
+    ('input, 'output) T.Testing.handle -> (unit, T.Error.t) result =
+  T.Testing.cancel
+
+let _testing_workflow_id : ('input, 'output) T.Testing.handle -> string =
+  T.Testing.workflow_id
+
+let _testing_run_id : ('input, 'output) T.Testing.handle -> string =
+  T.Testing.run_id
+
+(* Offline history replay against registered workflow definitions. The
+   failure match names every constructor so a removed or renamed verdict
+   breaks the consumer build. *)
+let _replay_workflow :
+    ?signals:T.Signal.Handler.t list ->
+    ?queries:T.Query.Handler.t list ->
+    ?updates:T.Update.Handler.t list ->
+    ('input, 'output) T.Workflow.t -> T.Replay.registered_workflow =
+  T.Replay.workflow
+
+let _replay_history_max_bytes : int = T.Replay.History.max_bytes
+
+let _replay_history_of_protobuf :
+    workflow_id:string -> string -> (T.Replay.History.t, T.Error.t) result =
+  T.Replay.History.of_protobuf
+
+let _replay_history_workflow_id : T.Replay.History.t -> string =
+  T.Replay.History.workflow_id
+
+let _replay_failure_message : T.Replay.failure -> string =
+  T.Replay.failure_message
+
+let _replay_failure_kind : T.Replay.failure -> string = function
+  | T.Replay.Nondeterminism
+      {
+        run_id = (_ : string);
+        message = (_ : string);
+        mismatch =
+          {
+            T.Replay.workflow_id = (_ : string);
+            workflow_type = (_ : string option);
+            event_id = (_ : int64 option);
+            event_type = (_ : string option);
+            command = (_ : string option);
+            reason = (_ : string);
+          };
+      } ->
+      "nondeterminism"
+  | T.Replay.Workflow_task_failed
+      { run_id = (_ : string option); message = (_ : string) } ->
+      "workflow_task_failed"
+  | T.Replay.Invalid_history { message = (_ : string) } -> "invalid_history"
+  | T.Replay.Unsupported_history { message = (_ : string) } ->
+      "unsupported_history"
+  | T.Replay.Replay_error (_ : T.Error.t) -> "replay_error"
+
+let _replay :
+    ?namespace:string ->
+    ?task_queue:string ->
+    workflows:T.Replay.registered_workflow list ->
+    T.Replay.History.t -> (unit, T.Replay.failure) result =
+  T.Replay.replay
+
+let _replay_all :
+    ?namespace:string ->
+    ?task_queue:string ->
+    workflows:T.Replay.registered_workflow list ->
+    T.Replay.History.t list ->
+    (T.Replay.History.t * (unit, T.Replay.failure) result) list =
+  T.Replay.replay_all

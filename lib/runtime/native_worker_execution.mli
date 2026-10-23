@@ -26,12 +26,29 @@ module type SUPERVISOR = sig
     t ->
     (Temporal_protocol.Workflow_protocol.activation option, error) result
 
-  (** Submits one complete semantic activation result. The supervisor performs
-      canonical validation and retires the exact native lease identified by
-      [completion.run_id]. *)
+  (** Submits one complete activation result as the canonical bytes from its
+      single encoder pass, and retires the exact native lease named by the
+      completion's run ID. The adapter has already validated the completion
+      while encoding it, so the supervisor passes these bytes on without
+      encoding them again (issue #846). A retried submission is given the same
+      value, byte for byte.
+
+      [completion] is the typed value those bytes were encoded from, supplied
+      read-only so a test or benchmark source can inspect the submitted
+      commands without parsing the JSON a second time. The encoded value is
+      authoritative: a source must submit only its bytes and must never
+      re-encode or mutate [completion]. [completion] may alias payload buffers
+      owned by workflow code, so unlike the bytes it is not a snapshot. The
+      production supervisor ignores it.
+
+      [abandon_activation] calls this from the watchdog thread while the
+      workflow lane is still inside workflow code, so an implementation must
+      accept a call from a Domain other than the one that polled. The two
+      calls never overlap for one adapter. *)
   val complete_workflow :
     t ->
-    Temporal_protocol.Workflow_protocol.completion ->
+    completion:Temporal_protocol.Workflow_protocol.completion ->
+    Temporal_protocol.Encoded_workflow_completion.t ->
     (unit, error) result
 
   (** Stable, bounded classification for a supervisor error. *)
@@ -40,6 +57,18 @@ module type SUPERVISOR = sig
   (** Stable diagnostic for a supervisor error. Implementations must omit
       payload bytes, credentials, task tokens, and unbounded remote text. *)
   val error_message : error -> string
+
+  (** Classifies a failed [complete_workflow] without inspecting free-form
+      text. [true] asserts that the exact native lease is still outstanding,
+      so resubmitting the same retained completion cannot duplicate it. Every
+      other failure must return [false]; the adapter then never submits that
+      completion again (issue #843). *)
+  val error_is_retryable : error -> bool
+
+  (** Classifies an exception raised by [complete_workflow]. An exception is
+      an uncertain acknowledgement, so production supervisors return [false]
+      unless they define a private, explicitly transient exception category. *)
+  val exception_is_retryable : exn -> bool
 end
 
 (** Stable diagnostic exposed by this private worker loop. It is safe to log
@@ -61,6 +90,32 @@ type activation_info = {
     asynchronous cross-language callback. The same value may be delivered to
     the completion observer after Core has acknowledged the activation
     completion. *)
+
+type abandonment =
+  [ `Task_failed | `Queries_failed | `Eviction_acknowledged | `Not_acknowledged ]
+(** What the watchdog submitted in place of the lane's completion and whether
+    the supervisor acknowledged it. [`Task_failed]: an ordinary activation's
+    workflow task was failed. [`Queries_failed]: a query-only activation's
+    queries were answered with failures; the workflow task was not failed.
+    [`Eviction_acknowledged]: an eviction-only activation received its empty
+    acknowledgement. [`Not_acknowledged]: encoding or submission failed, so
+    the task, query, or eviction is left to time out. *)
+
+type stuck_activation = {
+  run_id : string;
+  workflow_id : string option;
+  workflow_type : string option;
+  is_replaying : bool;
+  elapsed_ms : int;
+  abandoned : abandonment;
+}
+(** Bounded identity of an activation abandoned by the non-yielding-code
+    watchdog (#493). [workflow_id] and [workflow_type] are [None] only when the
+    activation neither initialized the run nor matched a cached run.
+    [elapsed_ms] is the watchdog's lower bound on the time the activation had
+    spent in workflow code. [abandoned] describes the watchdog's replacement
+    completion and its acknowledgement. No payload,
+    task token, or failure text is retained. *)
 
 (** One workflow definition registered with the worker. The existential
     wrapper preserves the input/output codec relationship while allowing one
@@ -157,12 +212,17 @@ module Make (Supervisor : SUPERVISOR) : sig
       non-UTF-8 values return a typed configuration error instead of failing
       the first workflow activation. A valid queue is copied into every
       execution context so an activity without an explicit queue is sent back
-      to the same queue as its workflow worker. No native operation is
+      to the same queue as its workflow worker. [namespace] is the worker's
+      Temporal namespace; it is validated with the same rules (reported at
+      path [$.namespace]) and copied into every execution context so
+      [Temporal.Workflow.info] can report it, because Core activations do not
+      carry it. Both default to ["default"]. No native operation is
       performed and no workflow function is called during creation. *)
   val create :
     ?on_activation:(activation_info -> unit) ->
     ?on_completion:(activation_info -> unit) ->
     ?task_queue:string ->
+    ?namespace:string ->
     supervisor:Supervisor.t ->
     workflows:registered_workflow list ->
     unit ->
@@ -177,14 +237,51 @@ module Make (Supervisor : SUPERVISOR) : sig
       Core without allowing a completed child to remain leased. *)
   val poll : t -> (outcome, error_view) result
 
-  (** Retries all completions whose native acknowledgement previously failed.
-      The adapter mutex remains held while this operation runs, so no new
-      activation can overtake an older lease. [Ok ()] proves that the pending
-      map is empty. [Error _] leaves the exact completion in place. The caller
-      must either retry it after an explicitly safe transient classification or
-      force-retire the native graph and then call [discard] on a terminal path;
-      it must never silently drop this completion while Rust still owns it. *)
+  (** Retries completions whose native acknowledgement previously failed with
+      an explicitly retryable classification. The adapter mutex remains held
+      while this operation runs, so no new activation can overtake an older
+      lease. [Ok ()] proves that the pending map is empty. [Error _] leaves the
+      exact completion in place. A completion whose earlier failure was not
+      classified retryable is never resubmitted: [drain] (and [poll]) return
+      its recorded error without a native call. The caller must either retry
+      after an explicitly safe transient classification or force-retire the
+      native graph and then call [discard] on a terminal path; it must never
+      silently drop this completion while Rust still owns it. *)
   val drain : t -> (unit, error_view) result
+
+  (** Returns the epoch of the activation currently executing workflow code
+      (codecs, observers, handlers, or workflow fibers), or [None] while the
+      lane polls, waits, or submits a completion. Each leased activation gets
+      a fresh epoch. This is a lock-free read intended for the watchdog
+      Domain; it never blocks on the lane. *)
+  val running_epoch : t -> int option
+
+  (** [abandon_activation t ~epoch ~elapsed_ms] releases the lease of
+      activation [epoch] if it is still executing workflow code. The watchdog
+      and the lane race on one atomic claim, so exactly one of them completes
+      the native lease: on winning, this submits a failure completion through
+      the supervisor (a task failure, an empty eviction acknowledgement, or
+      failed query answers, exactly as an adapter-level rejection would),
+      records the sticky {!stuck} report with the matching {!abandonment},
+      logs one bounded diagnostic, and returns it. When the lane later returns, its completion is dropped
+      without a native call and, unless the activation only answered
+      queries, its run is removed (a task failure makes Core evict it); the poll reports [Rejected] with code
+      [activation_deadline_exceeded], or [Error] when the watchdog's
+      submission was not acknowledged. Returns [None] when [epoch] is no
+      longer running or the lane claimed the lease first.
+
+      This is the only operation that calls [Supervisor.complete_workflow]
+      without the adapter mutex, from a Domain other than the lane. It never
+      interrupts, resumes, or inspects workflow code, and never runs while
+      the lane is itself inside a supervisor call for this adapter. *)
+  val abandon_activation :
+    t -> epoch:int -> elapsed_ms:int -> stuck_activation option
+
+  (** The first activation abandoned by the watchdog, if any. The report is
+      sticky for the lifetime of the adapter: workflow code that failed to
+      yield may have corrupted process state, so recovery is a process
+      restart. *)
+  val stuck : t -> stuck_activation option
 
   (** Discards all retained completion bytes and shuts down every OCaml-owned
       execution after terminal native cleanup. This is irreversible and must
@@ -192,6 +289,20 @@ module Make (Supervisor : SUPERVISOR) : sig
       it never attempts another completion. *)
   val discard : t -> unit
 
+  (** [drain] without waiting (#495): [None] when the adapter lock is held,
+      which means the workflow lane is still between poll and completion
+      (running workflow code or a supervisor call for it). Bounded shutdown
+      uses it so an abandoned activation can never block the drain. *)
+  val try_drain : t -> (unit, error_view) result option
+
+  (** [discard] without waiting: [false] when the adapter lock is held, in
+      which case nothing was discarded. *)
+  val try_discard : t -> bool
+
+  (** Whether an activation is between poll and completion now, including
+      one whose lease the watchdog already released while its code still
+      runs. A lock-free read, safe from any thread. *)
+  val activation_in_flight : t -> bool
 end
 
 (** Wraps a public workflow definition in the private existential registration

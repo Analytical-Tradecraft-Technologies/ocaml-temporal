@@ -6,6 +6,8 @@
     child-workflow handles to emit their real Temporal cancellation commands.
     Every operation on a scope is owner-checked, so a handle cannot be read or
     mutated from another Domain or after its workflow scheduler has shut down. *)
+
+(** A cancellation scope owned by one workflow execution. *)
 type t
 
 (** Creates a scope for the workflow execution currently running on this
@@ -52,14 +54,19 @@ val on_cancel :
 val is_cancelled : t -> (bool, Error.t) result
 
 (** Checks the scope without waiting. An active scope returns [Ok ()]; a
-    cancelled scope returns a typed [`Cancelled] error; and a foreign Domain
-    or stale handle returns a typed ownership defect. *)
+    cancelled scope returns a typed [`Cancelled] error. A synchronous query
+    handler may check its own live scope while workflow fibers are paused,
+    but cannot cancel or await it. A foreign Domain, other execution, or stale
+    handle returns a typed ownership defect. *)
 val check : t -> (unit, Error.t) result
 
 (** Awaits [future] while observing [scope]. A cancellation requested before
-    the future completes returns a typed [`Cancelled] error. Errors from the
-    future itself pass through unchanged. The future must belong to the same
-    workflow execution as the scope. *)
+    the future completes returns a typed [`Cancelled] error. If the scope is
+    already cancelled when [await] is called, the [`Cancelled] error is
+    returned even when [future] has already completed; that completed result
+    remains observable through {!Future.await} or {!Future.peek}. Errors from
+    the future itself pass through unchanged. The future must belong to the
+    same workflow execution as the scope. *)
 val await :
   t ->
   ('value, Error.t) Future.t ->

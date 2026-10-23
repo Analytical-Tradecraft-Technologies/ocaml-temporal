@@ -109,7 +109,7 @@ jobs:
       - name: Test matrix selection and artifact failure cases
         run: make test-ci-artifacts
       - name: Install pinned quality tools
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-deny@0.20.2,cargo-machete@0.9.2,typos@1.48.0
           fallback: none
@@ -127,23 +127,25 @@ jobs:
         uses: actions/checkout@v7
       - name: Audit dependency licenses
         run: make license-check OCAML_VERSION=5.2
+      - name: Test dependency inventory drift detection
+        run: make test-dependency-inventory-contract
       - name: Test Cargo license policy
         run: |
           docker run --rm --network none \
             --volume "$PWD:/workspace:ro" \
             --workdir /workspace \
-            python:3.14-slim-bookworm@sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9 \
+            python:3.15-slim-bookworm@sha256:122756f3fe72c4f5d3d71897888204ee85774bc79de952555b8a474e1d0a5d53 \
             sh test/smoke/test_cargo_license_policy.sh
       - name: Audit locked Cargo dependency licenses
         shell: bash
         run: |
           set -o pipefail
-          OCAML_IMAGE=ocaml/opam:debian-12-ocaml-5.2 \
+          OCAML_VERSION=5.2 \
             make --silent cargo-metadata \
             | docker run --rm --interactive --network none \
                 --volume "$PWD:/workspace:ro" \
                 --workdir /workspace \
-                python:3.14-slim-bookworm@sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9 \
+                python:3.15-slim-bookworm@sha256:122756f3fe72c4f5d3d71897888204ee85774bc79de952555b8a474e1d0a5d53 \
                 python3 scripts/check-cargo-licenses.py --metadata -
 
   temporal-integration:
@@ -155,7 +157,12 @@ jobs:
     # Independent live controllers run sequentially while reusing the
     # checked-out source and build cache. Parent/child recovery includes a
     # deliberate 120-second timer and two complete worker generations.
-    timeout-minutes: 45
+    # Every step has its own timeout and the job timeout is at least their
+    # sum, so a hung scenario step is stopped by its own timeout and the
+    # always() evidence uploads after it still run before the job is killed
+    # (test/smoke/test_temporal_compose_config.sh checks this). A normal run
+    # takes about 25 minutes.
+    timeout-minutes: 93
     env:
       # Keep this as one explicit compatibility lane because it starts the
       # complete PostgreSQL/Temporal stack and two OCaml processes.
@@ -165,17 +172,24 @@ jobs:
       # Always make failure-reporting scripts available, even if a producer
       # failed and the dependency gate below stops the live test steps.
       - name: Check out repository
+        timeout-minutes: 3
         uses: actions/checkout@v7
       - name: Require successful OCaml builds
+        timeout-minutes: 1
         env:
           OCAML_RESULT: ${{ needs.verify.result }}
         run: test "$OCAML_RESULT" = success
       - name: Download compiled smoke executables
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        # The statically linked smoke bundle is about 1.8 GB. Downloads
+        # normally take under three minutes, but slow artifact storage has
+        # stalled them past that, so leave headroom rather than fail the lane.
+        timeout-minutes: 10
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: temporal-smoke-linux-amd64-ocaml-5.5.1
           path: _build/smoke-artifact
       - name: Verify and unpack the exact tested executables
+        timeout-minutes: 3
         run: python3 scripts/smoke-artifact.py unpack --directory _build/smoke-artifact --commit "$GITHUB_SHA" --ocaml "$OCAML_VERSION"
       - name: Reclaim disposable GitHub-hosted runner disk
         # The smoke lane downloads executables that statically link Rust.
@@ -183,6 +197,9 @@ jobs:
         # preinstalled SDKs before the first Compose build so a valid native
         # link cannot fail because the disposable runner ran out of space.
         if: runner.environment == 'github-hosted'
+        # Measured at 37 s to 3 min 47 s on hosted runners; a 4 minute bound
+        # timed out before any test ran.
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
@@ -191,6 +208,7 @@ jobs:
           docker system prune --all --force --volumes
           df -h /
       - name: Verify workflow start metadata and exact-history worker replacement
+        timeout-minutes: 10
         env:
           TEMPORAL_COMPOSE_PROJECT: ocaml-temporal-metadata-ci
         run: |
@@ -198,7 +216,8 @@ jobs:
           make test-temporal-start-metadata-live
       - name: Retain synthetic workflow start metadata evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        timeout-minutes: 2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: workflow-start-metadata-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -211,10 +230,12 @@ jobs:
       - name: Recover the same workflow runs after task failures
         # Independent of the seven existing controllers; any failed
         # assertion fails this job after retaining this gate's evidence.
+        timeout-minutes: 5
         run: make test-temporal-task-failure-live
       - name: Retain exact-run task failure recovery evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        timeout-minutes: 2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: workflow-task-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: _build/task-failure-live/
@@ -222,23 +243,44 @@ jobs:
           retention-days: 14
 
       - name: Run the live two-OCaml-binary Temporal Compose smoke
-        # Leave time for always() upload after a scenario step times out.
+        # The job timeout reserves time for the always() uploads below after
+        # this step times out.
         timeout-minutes: 40
         env:
           TEMPORAL_DIAGNOSTICS_DIR: ${{ github.workspace }}/_build/live-diagnostics
         run: make test-temporal-live-ci
       - name: Upload bounded live diagnostic bundles
         if: always()
+        timeout-minutes: 2
         id: live-artifacts
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: live-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: _build/live-diagnostics/
           retention-days: 7
           if-no-files-found: warn
+      - name: Upload live regression suite logs
+        # run-live-regressions.sh writes one log per suite, the official-SDK
+        # interop evidence and the activity worker crash suite's histories and
+        # worker logs under _build/live-regressions (#504, #519). The
+        # copied admin-tools CLI binary in that directory is deliberately
+        # excluded. Upload failure is reported here, not as a scenario failure.
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: live-regressions-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            _build/live-regressions/*.log
+            _build/live-regressions/activity_worker_crash/
+            _build/live-regressions/sdk_interop/
+          retention-days: 7
+          if-no-files-found: warn
       - name: Link live diagnostics and collection status
         if: always()
+        timeout-minutes: 1
         env:
           LIVE_ARTIFACT_URL: ${{ steps.live-artifacts.outputs.artifact-url }}
           LIVE_UPLOAD_OUTCOME: ${{ steps.live-artifacts.outcome }}
@@ -270,7 +312,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
       - name: Download the verified platform bridge
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: rust-bridge-linux-${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}
           path: _build/rust-bridge
@@ -292,12 +334,39 @@ jobs:
         env:
           OCAML_VERSION: ${{ matrix.ocaml }}
         run: make verify
+      - name: Build API documentation with odoc warnings as errors
+        # Rendered documentation is compiler-independent, so one lane present
+        # in every tier checks it. The docs image extends this lane's cached
+        # development image with the exact CI-only odoc closure.
+        if: matrix.ocaml == '5.2.1' && matrix.runner == 'ubuntu-24.04'
+        env:
+          OCAML_VERSION: ${{ matrix.ocaml }}
+        run: make docs
+      # `make verify` already enforces the replay history corpus on every
+      # matrix leg through `dune runtest`. One leg reruns the same offline
+      # runner (seconds, reusing the build) to retain the machine-readable
+      # report that Core pin and Dependabot Cargo PRs cite as upgrade
+      # evidence; it also runs after a failed verify so a mismatch is
+      # recorded per case.
+      - name: Write the replay history corpus upgrade report
+        if: ${{ !cancelled() && matrix.runner == 'ubuntu-24.04' && matrix.ocaml == '5.5.1' }}
+        env:
+          OCAML_VERSION: ${{ matrix.ocaml }}
+        run: make test-history-corpus-upgrade HISTORY_CORPUS_SDK_COMMIT="$GITHUB_SHA"
+      - name: Upload the replay history corpus upgrade report
+        if: ${{ !cancelled() && matrix.runner == 'ubuntu-24.04' && matrix.ocaml == '5.5.1' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: history-corpus-report-linux-amd64-ocaml-${{ matrix.ocaml }}
+          path: _build/history-corpus/report.json
+          if-no-files-found: warn
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
       - name: Package and consume the compiled OCaml library
         env:
           OCAML_VERSION: ${{ matrix.ocaml }}
         run: make library-artifact
       - name: Upload the verified OCaml library
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ocaml-sdk-linux-${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}-ocaml-${{ matrix.ocaml }}
           path: _build/ocaml-library-artifact/
@@ -313,7 +382,7 @@ jobs:
           python3 scripts/smoke-artifact.py pack --directory _build/smoke-artifact --commit "$GITHUB_SHA" --ocaml "$OCAML_VERSION"
       - name: Upload compiled smoke executables
         if: matrix.runner == 'ubuntu-24.04' && matrix.ocaml == '5.5.1'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: temporal-smoke-linux-amd64-ocaml-5.5.1
           path: _build/smoke-artifact/
@@ -332,11 +401,11 @@ jobs:
       matrix: ${{ fromJSON(needs.changes.outputs.native) }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
-      RUSTUP_TOOLCHAIN: 1.98.1-aarch64-apple-darwin
+      RUSTUP_TOOLCHAIN: 1.99.1-aarch64-apple-darwin
       NATIVE_OCAML_VERSION: ${{ matrix.ocaml }}
       OCAML_ARTIFACT_COMMIT: ${{ github.sha }}
       RUST_BRIDGE_PROFILE: ${{ inputs.bridge-profile || 'ci' }}
-      NATIVE_RUST_VERSION: 1.98.1
+      NATIVE_RUST_VERSION: 1.99.1
       NATIVE_ARCH: arm64
       NATIVE_RUST_HOST: aarch64-apple-darwin
       TEMPORAL_RUST_BRIDGE_DIR: ${{ github.workspace }}/_build/rust-bridge
@@ -360,10 +429,13 @@ jobs:
           --component clippy --component rustfmt
       - name: Install Protocol Buffers compiler on macOS
         run: brew install protobuf
-      - name: Install OCaml dependencies
-        run: opam install . --deps-only --with-test --assume-depexts --yes
+      - name: Install and verify locked OCaml dependencies
+        # Exact temporal-sdk.opam.locked versions (compiler packages excepted);
+        # fails if the switch drifts from the audited lock.
+        shell: bash
+        run: sh scripts/opam-locked-deps.sh install --assume-depexts
       - name: Download the verified platform bridge
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: rust-bridge-macos-arm64
           path: _build/rust-bridge
@@ -377,7 +449,7 @@ jobs:
         shell: bash
         run: make native-library-artifact OCAML_ARTIFACT_PLATFORM=macos-arm64 PYTHON=python3
       - name: Upload the verified OCaml library
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ocaml-sdk-macos-arm64-ocaml-${{ matrix.ocaml }}
           path: _build/ocaml-library-artifact/
@@ -396,11 +468,11 @@ jobs:
       matrix: ${{ fromJSON(needs.changes.outputs.native) }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/_build/rust
-      RUSTUP_TOOLCHAIN: 1.98.1-x86_64-pc-windows-gnu
+      RUSTUP_TOOLCHAIN: 1.99.1-x86_64-pc-windows-gnu
       NATIVE_OCAML_VERSION: ${{ matrix.ocaml }}
       OCAML_ARTIFACT_COMMIT: ${{ github.sha }}
       RUST_BRIDGE_PROFILE: ${{ inputs.bridge-profile || 'ci' }}
-      NATIVE_RUST_VERSION: 1.98.1
+      NATIVE_RUST_VERSION: 1.99.1
       NATIVE_ARCH: amd64
       NATIVE_RUST_HOST: x86_64-pc-windows-gnu
       TEMPORAL_RUST_BRIDGE_DIR: ${{ github.workspace }}/_build/rust-bridge
@@ -438,10 +510,13 @@ jobs:
           cygpath -w "$(dirname "$protoc_unix_path")" >> "$GITHUB_PATH"
           echo "PROTOC=$protoc_windows_path" >> "$GITHUB_ENV"
           "$protoc_unix_path" --version
-      - name: Install OCaml dependencies
-        run: opam install . --deps-only --with-test --assume-depexts --yes
+      - name: Install and verify locked OCaml dependencies
+        # Exact temporal-sdk.opam.locked versions (compiler packages excepted);
+        # fails if the switch drifts from the audited lock.
+        shell: bash
+        run: sh scripts/opam-locked-deps.sh install --assume-depexts
       - name: Download the verified platform bridge
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: rust-bridge-windows-amd64
           path: _build/rust-bridge
@@ -455,10 +530,62 @@ jobs:
         shell: bash
         run: make native-library-artifact OCAML_ARTIFACT_PLATFORM=windows-amd64 PYTHON=python
       - name: Upload the verified OCaml library
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ocaml-sdk-windows-amd64-ocaml-${{ matrix.ocaml }}
           path: _build/ocaml-library-artifact/
           if-no-files-found: error
           retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
           compression-level: 0
+
+  # Builds the release source archive exactly as opam would install it: inside
+  # a network-denying opam build sandbox, from the vendored Rust sources only
+  # (#778). It needs a full optimized Rust build, so it runs on master builds
+  # as an early warning rather than on every pull request. Releases do not use
+  # it: release.yml's source-archive-check job builds the exact archive it
+  # publishes. scripts/check-opam-source-archive.sh uses opam's own build
+  # wrapper when the switch has sandboxing enabled and otherwise the same
+  # macOS sandbox-exec policy, gives Cargo an empty home, and first proves the
+  # sandbox blocks a network request.
+  opam-source-offline:
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' && inputs.tier == 'master' }}
+    needs: changes
+    name: Sandboxed opam build from the source archive / macOS ARM64
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.1-aarch64-apple-darwin
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up the exact OCaml compiler
+        uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
+        with:
+          ocaml-compiler: "5.5.1"
+      - name: Set up pinned Rust toolchain
+        shell: bash
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Install Protocol Buffers compiler on macOS
+        run: brew install protobuf
+      - name: Install and verify locked OCaml dependencies
+        shell: bash
+        run: sh scripts/opam-locked-deps.sh install --assume-depexts
+      - name: Create the release source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version: "\(.*\)"$/\1/p' temporal-sdk.opam)
+          test -n "$version"
+          # The archive prefix uses the release tag spelling (hyphen for "~").
+          sh scripts/create-source-archive.sh . "v${version//\~/-}" \
+            "$RUNNER_TEMP/ocaml-temporal-source.tar.gz"
+      - name: Build the archive inside the opam build sandbox
+        shell: bash
+        run: >-
+          opam exec -- sh scripts/check-opam-source-archive.sh
+          "$RUNNER_TEMP/ocaml-temporal-source.tar.gz" "$RUNNER_TEMP/opam-source-check"
+      # Installs that build into a fresh prefix and builds the installed-package
+      # consumer fixture from the archive against it, outside the checkout.
+      - name: Build a consumer against the package installed from the archive
+        shell: bash
+        run: opam exec -- sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"

@@ -80,9 +80,12 @@ type ('input, 'output) t
 (** Creates the in-memory state but does not call the workflow function yet.
     The function starts only after [activate] receives [Start_workflow].
     [task_queue] is captured in the execution context and is used by activity
-    commands when a workflow does not supply an explicit queue. *)
+    commands when a workflow does not supply an explicit queue. [namespace]
+    is the worker namespace reported by [Temporal.Workflow.info]. Both
+    default to ["default"]. *)
 val start :
   ?task_queue:string ->
+  ?namespace:string ->
   ?randomness_seed:string ->
   ?signal_handlers:signal_handler list ->
   ?query_handlers:query_handler list ->
@@ -117,6 +120,15 @@ val set_activation_deployment_version :
     dispatched. The native adapter calls this before patch notifications and
     workflow fibers are processed. *)
 val set_activation_is_replaying : ('input, 'output) t -> bool -> unit
+
+(** Installs Core's task-local history facts for the activation currently
+    being dispatched. *)
+val set_activation_history :
+  ('input, 'output) t -> Workflow_context_store.activation_history -> unit
+
+(** Installs the run identity from the initialization activation. *)
+val set_run_info :
+  ('input, 'output) t -> Workflow_context_store.run_info option -> unit
 
 (** Releases paused fibers and pending operation tables for this execution.
     Idempotent. Call when removing a run from a worker registry if a terminal

@@ -29,6 +29,11 @@ type application_failure_category = Workflow.application_failure_category =
   | Application_category_unspecified
   | Application_category_benign
 
+type nexus_handler_retry_behavior = Workflow.nexus_handler_retry_behavior =
+  | Nexus_retry_unspecified
+  | Nexus_retry_retryable
+  | Nexus_retry_non_retryable
+
 type failure_info = Workflow.failure_info =
   | Application of {
       type_name : string;
@@ -60,6 +65,21 @@ type failure_info = Workflow.failure_info =
       timeout_type : timeout_type;
       last_heartbeat_details : payload list;
     }
+  | Server of { non_retryable : bool }
+  | Reset_workflow of { last_heartbeat_details : payload list }
+  | Nexus_operation of {
+      scheduled_event_id : int64;
+      endpoint : string;
+      service : string;
+      operation : string;
+      operation_id : string;
+      operation_token : string;
+    }
+  | Nexus_handler of {
+      type_name : string;
+      retry_behavior : nexus_handler_retry_behavior;
+    }
+  | Absent
 
 type failure = Workflow.failure = {
   message : string;
@@ -122,7 +142,7 @@ type task_variant = Start of activity_start | Cancel of activity_cancel
 type task = { task_token : bytes; variant : task_variant }
 
 type completion_result =
-  | Completed of payload option
+  | Completed of payload
   | Failed of failure
   | Cancelled of failure
   | Will_complete_async
@@ -132,6 +152,18 @@ type completion = { task_token : bytes; result : completion_result }
 (** Progress details submitted for one currently leased activity token. Rust
     converts the opaque token back to the official Core protobuf. *)
 type heartbeat = { task_token : bytes; details : payload list }
+
+(** An async-handle heartbeat with its attempt's heartbeat timeout (#1025);
+    see the interface. *)
+type async_heartbeat = { heartbeat : heartbeat; heartbeat_timeout : duration option }
+
+(** The closed set of submitted async-heartbeat outcomes; see the
+    interface. *)
+type async_heartbeat_response =
+  | Heartbeat_recorded
+  | Heartbeat_cancel_requested
+  | Heartbeat_paused
+  | Heartbeat_reset
 type error = Workflow.error
 type error_view = Workflow.error_view = { code : string; path : string; message : string }
 
@@ -194,16 +226,19 @@ let payload_map path = function
   | _ -> Error (Shared.invalid path "expected JSON object")
 
 (** Encodes a payload map while rejecting keys that are invalid or repeated in
-    OCaml's association-list representation. *)
+    OCaml's association-list representation. The duplicate check is linear in
+    the number of entries. *)
 let payload_map_json path values =
+  let seen = Hashtbl.create ~random:true (List.length values) in
   let rec loop encoded = function
     | [] -> Ok (`Assoc encoded)
     | (key, value) :: rest ->
         let* _ = Shared.identifier (path ^ ".<key>") (`String key) in
-        if List.exists (fun (existing, _) -> String.equal existing key) encoded then
+        if Hashtbl.mem seen key then
           Error (Shared.invalid path "duplicate payload-map key")
         else
           let* value = Shared.payload_json value in
+          Hashtbl.add seen key ();
           loop ((key, value) :: encoded) rest
   in
   loop [] values
@@ -349,7 +384,12 @@ let activity_start path json =
   let* retry_json = get "retry_policy" in
   let* retry_policy = Shared.nullable (path ^ ".retry_policy") retry_policy retry_json in
   let* priority_json = get "priority" in
-  let* priority = Shared.nullable (path ^ ".priority") Shared.workflow_priority priority_json in
+  (* A task's priority was accepted by the server, which clamps rather than
+     rejects fairness weights, so it is decoded with the inbound rule that the
+     Rust activity decoder also applies (#1016). *)
+  let* priority =
+    Shared.nullable (path ^ ".priority") Shared.inbound_workflow_priority priority_json
+  in
   let* standalone_json = get "standalone_run_id" in
   let* standalone_run_id = Shared.string (path ^ ".standalone_run_id") standalone_json in
   Ok
@@ -543,8 +583,9 @@ let decode_task input =
   | Error error -> Error (of_control_error error)
   | Ok json -> task_from_json json
 
-(** Encodes and reparses a task so typed outgoing values obey every receiver
-    invariant before crossing the native boundary. *)
+(** Encodes a task and applies the decoder's semantic rules so typed outgoing
+    values obey every receiver invariant before crossing the native boundary.
+*)
 let encode_task (value : task) =
   let* token = task_token_json "$.task_token" value.task_token in
   let* variant = task_variant_json value.variant in
@@ -552,7 +593,9 @@ let encode_task (value : task) =
   match Control.encode_payload_object json with
   | Error error -> Error (of_control_error error)
   | Ok output ->
-      let* _ = decode_task output in
+      (* The validated tree receives the decoder's semantic rules directly;
+         parsing [output] again would only repeat the payload passes. *)
+      let* _ = task_from_json json in
       Ok output
 
 (** Decodes one closed activity completion result. *)
@@ -568,7 +611,7 @@ let completion_result path json =
   | "completed" ->
       let* entries = Shared.exact_object path [ "kind"; "result" ] json in
       let* result_json = required path "result" entries in
-      let* result = Shared.nullable (path ^ ".result") Shared.payload result_json in
+      let* result = Shared.payload (path ^ ".result") result_json in
       Ok (Completed result)
   | "failed" | "cancelled" ->
       let* entries = Shared.exact_object path [ "kind"; "failure" ] json in
@@ -585,9 +628,7 @@ let completion_result path json =
     failure codec as appropriate. *)
 let completion_result_json = function
   | Completed result ->
-      let* result =
-        match result with None -> Ok `Null | Some value -> Shared.payload_json value
-      in
+      let* result = Shared.payload_json result in
       Ok (`Assoc [ ("kind", `String "completed"); ("result", result) ])
   | Failed failure ->
       let* failure = Shared.failure_json failure in
@@ -612,7 +653,8 @@ let decode_completion input =
   | Error error -> Error (of_control_error error)
   | Ok json -> completion_from_json json
 
-(** Encodes and reparses a completion before it can be submitted to Core. *)
+(** Encodes a completion and applies the decoder's semantic rules before it
+    can be submitted to Core. *)
 let encode_completion (value : completion) =
   let* token = task_token_json "$.task_token" value.task_token in
   let* result = completion_result_json value.result in
@@ -620,7 +662,9 @@ let encode_completion (value : completion) =
   match Control.encode_payload_object json with
   | Error error -> Error (of_control_error error)
   | Ok output ->
-      let* _ = decode_completion output in
+      (* The validated tree receives the decoder's semantic rules directly;
+         parsing [output] again would only repeat the payload passes. *)
+      let* _ = completion_from_json json in
       Ok output
 
 (** Decodes a heartbeat object after closing its exact two-member shape. *)
@@ -638,8 +682,8 @@ let decode_heartbeat input =
   | Error error -> Error (of_control_error error)
   | Ok json -> heartbeat_from_json json
 
-(** Encodes and reparses a heartbeat before sending it across the native
-    boundary, so malformed metadata cannot reach Core. *)
+(** Encodes a heartbeat and applies the decoder's semantic rules before sending
+    it across the native boundary, so malformed metadata cannot reach Core. *)
 let encode_heartbeat (value : heartbeat) =
   let* token = task_token_json "$.task_token" value.task_token in
   let* details = payloads_json value.details in
@@ -647,5 +691,56 @@ let encode_heartbeat (value : heartbeat) =
   match Control.encode_payload_object json with
   | Error error -> Error (of_control_error error)
   | Ok output ->
-      let* _ = decode_heartbeat output in
+      (* The validated tree receives the decoder's semantic rules directly;
+         parsing [output] again would only repeat the payload passes. *)
+      let* _ = heartbeat_from_json json in
       Ok output
+
+(** Decodes an async heartbeat object after closing its exact three-member
+    shape; the heartbeat members follow the plain heartbeat's rules. *)
+let async_heartbeat_from_json json =
+  let* entries =
+    Shared.exact_object "$" [ "task_token"; "details"; "heartbeat_timeout" ] json
+  in
+  let* token_json = required "$" "task_token" entries in
+  let* task_token = task_token "$.task_token" token_json in
+  let* details_json = required "$" "details" entries in
+  let* details = Shared.list "$.details" Shared.payload details_json in
+  let* timeout_json = required "$" "heartbeat_timeout" entries in
+  let* heartbeat_timeout =
+    Shared.nullable "$.heartbeat_timeout" Shared.duration timeout_json
+  in
+  Ok { heartbeat = { task_token; details }; heartbeat_timeout }
+
+(** Strictly decodes one async-activity heartbeat JSON document. *)
+let decode_async_heartbeat input =
+  match Control.decode_payload_object input with
+  | Error error -> Error (of_control_error error)
+  | Ok json -> async_heartbeat_from_json json
+
+(** Encodes an async heartbeat and applies the decoder's semantic rules
+    before sending it across the native boundary. *)
+let encode_async_heartbeat (value : async_heartbeat) =
+  let* token = task_token_json "$.task_token" value.heartbeat.task_token in
+  let* details = payloads_json value.heartbeat.details in
+  let json =
+    `Assoc
+      [
+        ("task_token", token);
+        ("details", details);
+        ("heartbeat_timeout", optional_duration value.heartbeat_timeout);
+      ]
+  in
+  match Control.encode_payload_object json with
+  | Error error -> Error (of_control_error error)
+  | Ok output ->
+      let* _ = async_heartbeat_from_json json in
+      Ok output
+
+(** Maps the bridge's fixed outcome words; anything else is [None]. *)
+let async_heartbeat_response_of_string = function
+  | "" -> Some Heartbeat_recorded
+  | "cancel_requested" -> Some Heartbeat_cancel_requested
+  | "paused" -> Some Heartbeat_paused
+  | "reset" -> Some Heartbeat_reset
+  | _ -> None

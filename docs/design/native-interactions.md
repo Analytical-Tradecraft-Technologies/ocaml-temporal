@@ -19,7 +19,7 @@ delivery.
 ## Scope and sources of truth
 
 Temporal Core is pinned by the Rust workspace to commit
-`95e97686a079dcfe6c42e3254b2f3f5e3d97408f` of `temporalio/sdk-core`. The
+`8fe478ee179ed754614d230f39586f3edb57da71` of `temporalio/sdk-core`. The
 authoritative interaction definitions are the pinned Core
 `workflow_activation.proto` and `workflow_commands.proto` files:
 
@@ -57,9 +57,13 @@ Consequently:
 - `SignalWorkflow` is deliverable to a registered OCaml workflow handler,
   including its name, repeated payload list, sender identity, and headers.
   The handler is queued on the execution scheduler. The public handler policy
-  accepts exactly one payload; a missing handler or unsupported arity is logged
-  and completed as a non-retryable workflow failure rather than acknowledged
-  as a no-op.
+  accepts one payload and decodes zero payloads as the canonical `binary/null`
+  unit payload. Delivery is fail-closed (#811): a missing handler, an
+  undecodable payload, or more than one payload fails the workflow task
+  rather than closing the run or being acknowledged as a no-op, so the run
+  stays open until a worker with a matching handler replays it. Only a
+  deliberate application error returned by the handler fails the workflow.
+  See [unknown and undecodable signals](../reference/interactive-workflows.md#unknown-and-undecodable-signals).
 - `QueryWorkflow` is deliverable to a registered output-only or exactly-one-
   input OCaml query handler. Core's repeated arguments and headers remain in
   the private runtime record. Output-only definitions reject non-empty
@@ -67,8 +71,10 @@ Consequently:
   bridge never silently truncates or ignores a payload. Missing handlers and
   handler errors use the same failed-query response and leave the workflow
   execution unchanged.
-- `DoUpdate` is deliverable to a registered OCaml update handler that accepts
-  exactly one input payload. The private runtime retains the full input,
+- `DoUpdate` is deliverable to a registered OCaml update handler. Zero input
+  payloads, which the Temporal CLI and other SDKs send for a no-argument
+  update, decode as the canonical `binary/null` unit payload; one payload is
+  decoded normally; more than one is rejected. The private runtime retains the full input,
   headers, identity, metadata ID, protocol-instance ID, and replay-validation
   flag while the public handler currently exposes only the typed input value.
   Missing handlers and unsupported input arity are rejected as typed
@@ -80,19 +86,19 @@ Consequently:
   validation, duplicate-name rejection, and validator ordering locally.
 - The signal transport tests prove the native activation boundary. The first
   focused typed signal/condition acceptance is recorded in the [PR #266
-  Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247):
+  Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29311239247):
   the driver signals an exact run only after its worker-visible readiness
   marker, and the handler wakes a deterministic condition before returning its
   terminal value. The recorded seventeen-result baseline is also covered by
-  the [PR #289 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368).
-  The [PR #302 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638)
+  the [PR #289 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368).
+  The [PR #302 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29351689638)
   first verifies the later long-backoff extension, and the complete [PR #439
-  Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+  Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29824441578)
   retains both paths in the current 26-start baseline.
-  The [PR #434 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836)
+  The [PR #434 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29684113836)
   proves both query forms against parked exact runs. Typed update
   admission/completion is live-verified by the [PR #428 Actions
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29676120429); the
+  run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29676120429); the
   focused scheduler and bridge tests remain the evidence for suspended update
   continuation behavior.
 
@@ -183,8 +189,13 @@ are preserved; the bridge does not select an arbitrary element or silently
 discard extra payloads.
 
 The current public signal definition accepts one typed input. The native public
-handler therefore requires exactly one payload and returns a typed,
-non-retryable workflow error for zero or multiple payloads. The runtime still
+handler (`Signal.Handler.dispatch_payloads`) decodes one payload normally and
+returns a typed, non-retryable `Codec` error for multiple payloads, which fails
+the workflow task rather than the run (the v1 fail-closed signal policy, #811). Zero
+payloads are decoded as the canonical `binary/null` unit payload, matching
+workflow start input: the Temporal CLI, Web UI, and other SDKs send a
+no-argument signal with no payloads, and rejecting it would let any sender
+with signal permission fail a workflow that registers a unit signal. The runtime still
 retains the complete repeated list so a future repeated-input API can be added
 without changing the transport record.
 
@@ -192,9 +203,9 @@ A signal handler is mutating workflow code but has no result command of its
 own. Its state changes and any ordinary activity, child, or timer commands are
 returned in the completion for the containing activation. The handler observes
 the Core-provided ordering relative to other signal and update jobs. A missing
-handler, invalid arity or payload, or handler exception follows the SDK's typed
-non-retryable workflow-defect path; raw exceptions and payload values never
-cross the bridge. Public `Temporal.Signal.Handler.t` currently receives the
+handler, invalid arity or payload, or handler exception becomes a typed
+non-retryable `Defect` or `Codec` error that fails the workflow task, not the
+run; raw exceptions and payload values never cross the bridge. Public `Temporal.Signal.Handler.t` currently receives the
 single typed payload only. Identity and headers remain validated runtime data
 until a metadata-aware public handler API is designed.
 
@@ -264,7 +275,9 @@ contains the `DoUpdate` job:
 | Validation | `accepted` or `rejected` | Always in the same activation as `DoUpdate`. |
 | Handler | `completed` or `rejected` | In that activation or a later activation after the handler finishes. |
 
-The native implementation decodes one payload with the registered input codec,
+The native implementation decodes its input with the registered input codec
+(zero payloads as the canonical unit payload, one payload normally, more than
+one rejected before validation),
 runs the validator when `run_validator` is true, and emits `accepted` before
 calling the implementation. If the implementation parks on a workflow future,
 the scheduler retains its continuation in an execution-owned map keyed by
@@ -396,8 +409,8 @@ single side accepting a new variant early:
    semantic/runtime slice:** bilateral Core conversion, exact query-ID
    preservation (including Core's `legacy_query` path), output-only and
    exactly-one-input handler dispatch, and rejected extra arguments. Output-only
-   query acceptance is live-verified by [PR #406](https://github.com/mfow/ocaml-temporal/actions/runs/29557704643),
-   and both query forms are live-verified by [PR #434](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836).
+   query acceptance is live-verified by [PR #406](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29557704643),
+   and both query forms are live-verified by [PR #434](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29684113836).
 3. **Implemented bounded milestone:** add `DoUpdate` and `UpdateResponse`
    semantic records, strict JSON/schema validation, pinned-Core conversion,
    immediate and suspended public handler dispatch, replay validator skipping,
@@ -413,9 +426,9 @@ single side accepting a new variant early:
    PostgreSQL to cover suspended update continuations, query deadlines, and
    replay/cache-eviction behavior through the two OCaml binaries. The current
    typed query path is live-verified in the [PR #434 Actions
-   run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836), and
+   run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29684113836), and
    typed update admission/completion is live-verified in [PR
-   #428](https://github.com/mfow/ocaml-temporal/actions/runs/29676120429).
+   #428](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29676120429).
    Record recovery and deadline results separately from the existing
    acceptance evidence.
 

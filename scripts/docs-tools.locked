@@ -1,0 +1,26 @@
+# Exact OPAM closure of the CI-only API documentation tool (`make docs`).
+#
+# Format: <package> <exact version>
+#
+# Dockerfile.dev's `docs` stage installs these packages on top of the locked
+# SDK closure and fails if any installed version differs. They are build tools
+# for rendering documentation only: no package here is a dependency of
+# temporal-sdk, is linked into any SDK library or executable, or is
+# redistributed. Packages already pinned by temporal-sdk.opam.locked (dune,
+# ocamlfind, ocamlbuild, topkg) are reused at their locked versions and are not
+# repeated here. The closure was solved for the OCaml 5.2 image that runs
+# `make docs`; see docs/reference/quality-gates.md for the licence review.
+astring 0.8.5
+camlp-streams 5.0.1
+cmdliner 2.1.1
+cppo 1.8.0
+crunch 4.0.0
+fmt 0.11.0
+fpath 0.7.3
+odoc 3.2.1
+odoc-parser 3.2.1
+ptime 1.2.0
+re 1.14.0
+seq base
+tyxml 4.6.0
+uutf 1.0.4

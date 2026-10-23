@@ -12,6 +12,10 @@ awk '
 mkdir "$fixture/repo"
 cd "$fixture/repo"
 git init -q
+# The fixture is discarded on exit; detached maintenance must not outlive it
+# and race the cleanup trap after these repeated commits.
+git config maintenance.auto false
+git config gc.auto 0
 git config commit.gpgsign false
 git config core.autocrlf false
 git config user.name 'CI fixture'

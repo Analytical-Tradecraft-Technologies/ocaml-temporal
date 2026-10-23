@@ -14,14 +14,25 @@ records the wire-format decision.
 
 ## Retry policy
 
-`Temporal.Activity.Retry_policy.make` constructs one immutable policy. The
+`Temporal.Retry_policy.make` constructs one immutable policy. The
 same policy type is accepted by activity and child-workflow operations:
 
 ```ocaml
+(* An activity marks a business failure with an application error type. The
+   error itself stays retryable; the caller's policy decides. *)
+let validate_order =
+  Temporal.Activity.define ~name:"validate_order"
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun order ->
+      if String.equal order "" then
+        Error
+          (Temporal.Error.make ~error_type:"InvalidInput" ~category:`Activity
+             ~message:"order must not be empty" ())
+      else Ok order)
+
 let run_with_retry activity child input =
   let open Temporal.Result_syntax in
   let* retry_policy =
-    Temporal.Activity.Retry_policy.make
+    Temporal.Retry_policy.make
       ~initial_interval:(Temporal.Duration.of_ms 100L)
       ~backoff_coefficient:2.0
       ~maximum_interval:(Temporal.Duration.of_ms 10_000L)
@@ -47,10 +58,16 @@ The constructor validates before a command is emitted and returns a typed
   positive values include the initial attempt.
 - `non_retryable_error_types` is a copied list of Temporal application error
   type names. A matching application failure is not retried by this policy.
-  Names must satisfy the same strict text constraints as other values crossing
-  the native boundary.
+  Temporal compares each name with the failure's
+  `ApplicationFailureInfo.type` (use the exact spelling; Core's local-activity
+  check ignores case, but do not rely on that): for an OCaml activity that is the
+  `~error_type` given to `Temporal.Error.make` (`"InvalidInput"` in
+  `validate_order` above), or the lowercase category name (`Error.kind`, for
+  example `"activity"`) when no type was set. A category name therefore
+  matches every untyped error of that category. Names must satisfy the same
+  strict text constraints as other values crossing the native boundary.
 
-`Retry_policy.create` is an alias for `make`. The accessor functions return
+The accessor functions return
 copies or immutable scalar values, so changing a caller-owned list after
 construction cannot change a command already selected by workflow code.
 Passing no `~retry_policy` leaves the option absent; it does not create an
@@ -131,9 +148,19 @@ server to leave an accepted child running when its parent closes. `Terminate`
 and `Request_cancel` select the other explicit policies; omission retains the
 server default. Parent-close policy is independent of `~cancellation_type`,
 which controls an explicit cancellation request made through a child handle or
-scope. These options do not expose a child-start acknowledgement: callers that
-close a parent immediately after scheduling must not assume the child has
-already been accepted by the server.
+scope.
+
+Temporal Server does not start a child whose parent has already closed, even
+under `Abandon`: the start-child transfer task finds the parent closed and
+drops the child. A parent that schedules a child and completes in the same
+workflow task therefore loses it silently. `Child_workflow.started` exposes
+Core's child-start acknowledgement (`ResolveChildWorkflowExecutionStart`) as a
+future of the child's run ID, so a parent awaits it before returning when the
+child must outlive it. A start failure or a cancellation before the start
+settles it with the same typed error as the result future. This matches the
+official SDKs: Go's `GetChildWorkflowExecution().Get` and Java's
+`Workflow.getWorkflowExecution(child).get()` wait for the start, and the
+Python and TypeScript `start_child` calls return only once the child started.
 
 The deterministic runtime and bilateral bridge tests cover all three policies,
 queue validation, default compatibility, and lossless Core conversion. This

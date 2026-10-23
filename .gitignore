@@ -11,3 +11,4 @@ __pycache__/
 test/integration/temporal/.cancellation-ready
 test/integration/temporal/.worker-stopped
 test/integration/temporal/.patch-replay-*
+.history-corpus-capture/

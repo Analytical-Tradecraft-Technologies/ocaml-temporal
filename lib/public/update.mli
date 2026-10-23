@@ -34,8 +34,10 @@ module Handler : sig
   type t
 
   (** Builds an update handler. [validator] runs first when supplied. A
-      validator may reject with a typed [Error.t]; in that case [run] is not
-      called and no update-side state change can occur. *)
+      validator may reject with a typed [Error.t] of any category, including
+      [Error.defect]; an exception it raises also rejects the update. In both
+      cases [run] is not called, no update-side state change can occur, and
+      the workflow task is unaffected. *)
   val make :
     ?validator:('input -> (unit, Error.t) result) ->
     ('input, 'output) definition ->
@@ -65,4 +67,16 @@ module Handler : sig
     ?run_validator:bool ->
     ?on_validated:(unit -> unit) ->
     t -> Payload.t -> (Payload.t, Error.t) result
+
+  (** Dispatches Temporal's repeated update input list. This is the worker
+      adapter boundary. Zero payloads, which the Temporal CLI, Web UI, other
+      SDKs, and this SDK's client send for a no-argument update, are decoded
+      as the canonical [binary/null] unit payload; one payload is passed to
+      [dispatch] with the same optional arguments; more than one is a
+      non-retryable workflow error returned before decoding, validation, or
+      [on_validated]. *)
+  val dispatch_payloads :
+    ?run_validator:bool ->
+    ?on_validated:(unit -> unit) ->
+    t -> Payload.t list -> (Payload.t, Error.t) result
 end

@@ -22,7 +22,7 @@ ledger validates the run ID or opaque task token before Core sees a completion.
 
 ## Startup compatibility
 
-ABI version `2` guards the C layout and operations. The bridge checks it once
+ABI version `4` guards the C layout and operations. The bridge checks it once
 before creating an SDK runtime. It is absent from messages because OCaml and
 Rust are compiled and shipped together. Direct JSON documents are strictly
 validated and evolve with those paired sources; CI identifies prebuilt Rust
@@ -269,22 +269,27 @@ the sequence from the original start command. The OCaml runtime accepts that
 sequence twice only for this start/terminal pair; duplicate events and
 cross-kind collisions are invalid. A terminal job before a successful start is
 rejected by the runtime so a parent cannot observe a child that Core has not
-started.
+started, with one exception: when the workflow cancels a `Try_cancel` or
+`Abandon` child after start initiation but before
+`ChildWorkflowExecutionStarted`, Core resolves it directly as cancelled, and
+that cancelled terminal job is accepted only after the handle emitted
+`Cancel_child_workflow` (see
+[runtime invariants](runtime-invariants.md)).
 
 Both language decoders validate the complete child-resolution object before an
 activation reaches the runtime. Required identifiers must be nonempty and
 within the UTF-8 safety ceiling; outcome discriminators, start causes, nullable
 payloads, and recursive failure objects are closed and type-checked; child
-failure event IDs cannot be negative. One Temporal Core edge state is explicit:
-when cancellation is reported before `ChildWorkflowExecutionStarted`, Core
-does not know a child run ID and sends `run_id: ""` with
-`started_event_id: 0`. The bilateral validators preserve that empty value only
-for this pre-start state; a child failure after start must carry a nonempty run
-ID. A malformed document returns the typed `invalid_message` protocol error and
+failure event IDs cannot be negative. When cancellation is reported before
+`ChildWorkflowExecutionStarted`, Core does not know a child run ID and sends
+`run_id: ""` with `started_event_id: 0`. The identifiers inside a child
+failure's wrapper are SDK-written copies, so the bilateral validators carry
+them, including that empty run ID, as bounded text in every state (#1050). A
+malformed document returns the typed `invalid_message` protocol error and
 has no lifecycle side effect. Runtime ordering checks happen only after this
-parse boundary: a terminal-before-start, duplicate start, duplicate terminal,
-or unknown sequence returns a typed bridge defect and leaves the existing
-resolver state unchanged.
+parse boundary: a terminal-before-start (other than the cancellation case
+above), duplicate start, duplicate terminal, or unknown sequence returns a
+typed bridge defect and leaves the existing resolver state unchanged.
 
 A completion is a closed object sent from OCaml to Rust. Optional
 `task_failure` distinguishes a failed workflow task from successful commands.
@@ -326,6 +331,12 @@ authoritative for duplicate members and UTF-8 byte limits. A terminal workflow
 command may occur at most once and must be last.
 When acknowledging an eviction, the completion command list must be empty and
 the run ID must match the activation.
+An eviction-only activation is never answered with a failure, even when the
+bridge or OCaml rejects its delivery: Core owes no workflow task for it and
+accepts only an empty acknowledgement, so the private rejection path sends
+that acknowledgement instead (issue #814). Core's eviction `message` is a
+Debug dump of the preceding failure and can exceed the string limit; it is
+truncated like other inbound free text (see the degradation table below).
 
 ### External workflow operations
 
@@ -452,17 +463,44 @@ semantics. The successor run is not followed by the bridge or by
 
 Temporal identifiers must be nonempty but use the protocol's 65,536-byte text
 safety ceiling rather than an invented 255-byte server policy; the server's
-identifier policy is configurable. The one intentional exception is the
-pre-start child failure `run_id` described above. Application failure `type` is
-bounded text and may be empty. Activity failure event IDs are nonnegative and
-worker identity is bounded text. Durations use nonnegative seconds plus 0
-through 999,999,999 nanoseconds;
+identifier policy is configurable. Fields that an SDK copies into a failure
+wrapper (activity type and ID; child namespace, workflow ID, run ID, and
+workflow type) are not server-bounded identifiers: another SDK may leave them
+empty (the Java SDK reports a child cancelled before its start command with
+namespace `""`), so both validators treat them as bounded text, and an absent
+Core activity type, child execution, or child type converts to empty text
+(#1050). Application failure `type` is bounded text and may be empty. Activity failure event IDs are nonnegative and
+worker identity is bounded text. Durations use nonnegative seconds no greater
+than protobuf's 315,576,000,000-second (10,000-year) maximum plus 0 through
+999,999,999 nanoseconds; both the OCaml decoder and the Rust validator reject
+larger seconds, and an activity command's explicit schedule-to-close or
+start-to-close timeout must be nonzero because Temporal treats zero as unset;
 timestamps allow signed seconds with the same nanosecond range. Payload metadata
 and initialization header maps normalize keys lexicographically on both sides.
 Payload values preserve opaque data and metadata bytes using the canonical
-base64 wrapper. Supported structured failures are application, cancellation,
-termination, activity, child-workflow, and timeout failures, including recursive causes,
-child execution identity, event IDs, and retry state. A timeout failure keeps
+base64 wrapper. Structured failures cover every `failure_info` arm of the
+pinned Core schema: application, cancellation, termination, activity,
+child-workflow, timeout, server, reset-workflow, Nexus-operation, and
+Nexus-handler failures, including recursive causes, child execution identity,
+event IDs, and retry state. A Core failure with no `failure_info` becomes
+`{"kind":"absent"}`; prost also decodes a kind added by a newer server this
+way. The message, source, stack trace, encoded attributes, and cause chain are
+kept for every kind, so a failure's kind alone never rejects an activation.
+Before this, a server-generated cause such as an oversized activity result
+failed every workflow task on that history and stuck the workflow.
+`{"kind":"server","non_retryable":...}` keeps the server's retry decision.
+`reset_workflow` keeps `last_heartbeat_details`. `nexus_operation` keeps
+`scheduled_event_id` (nonnegative), `endpoint`, `service`, `operation`,
+`operation_token`, and the deprecated `operation_id`; all text there is bounded
+and may be empty. `nexus_handler` keeps the Nexus error `type` and
+`retry_behavior` (`unspecified`, `retryable`, or `non_retryable`). Public
+retryability uses `server.non_retryable` and an explicit handler retry
+behavior. An unspecified handler behavior follows the Nexus specification's
+default for the handler `type`: `BAD_REQUEST`, `UNAUTHENTICATED`,
+`UNAUTHORIZED`, `NOT_FOUND`, `NOT_IMPLEMENTED`, and `CONFLICT` are not
+retried, and every other type is. For reset-workflow, Nexus-operation, and
+absent kinds it uses the nested cause, like an activity wrapper whose retry
+policy is unset. A timeout failure keeps
 Core's exact `timeout_type` (`unspecified`, `start_to_close`,
 `schedule_to_start`, `schedule_to_close`, or `heartbeat`) and the ordered
 `last_heartbeat_details` payload list. A termination cause uses
@@ -472,18 +510,60 @@ through nested child failures so the parent receives a typed child-workflow
 error instead of a bridge rejection. Application failures retain Core's
 `category` (`unspecified` or `benign`) and exact nonnegative
 `next_retry_delay` seconds/nanoseconds in nested activity, child, continuation,
-and client outcomes. The default category and absent delay are omitted from
+and client outcomes; an inbound negative delay is carried as absent (#1049). The default category and absent delay are omitted from
 the canonical JSON to preserve existing documents. These Core-only options
 are included in the bounded public error diagnostic.
 
-An activation with a future unsupported category or invalid delay is failed
-to Core and its lease retired. After Core accepts that rejection, the native
+### Inbound degradation of server-valid activations
+
+Temporal Server accepts history that exceeds the bridge's safety limits: a
+failure message or stack trace longer than 65,536 bytes, a cause chain deeper
+than the 128-level JSON nesting allows, a client-supplied header or memo key
+that is empty or contains NUL, or a sender identity containing NUL. History
+is immutable, so rejecting such an activation would fail the same workflow
+task on every replay. The Rust Core-to-semantic conversion
+(`activation_from_core`, and `failure_from_core` for client outcomes) instead
+applies these deterministic rules, so every replay of the same history
+produces the same semantic activation:
+
+| Inbound value | Rule |
+|---|---|
+| Free text over 65,536 bytes: failure `message`, `source`, `stack_trace`, failure-info identities, application/Nexus-handler `type`, Nexus-operation text, cancellation `reason`, eviction `message`, initialization `identity`, signal/update identity, `last_sdk_version`, `deployment_name` | Cut at the last UTF-8 character boundary that leaves room for `\n[truncated by ocaml-temporal: original length N bytes]`; the result is at most 65,536 bytes. Shorter text is unchanged. |
+| Failure chain longer than 100 layers (`MAX_INBOUND_FAILURE_LAYERS`) | The first 99 layers are kept exactly; the remainder becomes one final layer whose message is `[truncated by ocaml-temporal: N deeper failure causes omitted beyond 100 layers]`. Its kind preserves the omitted tail's retryability decision (the same rule as `failure_non_retryable`): `{"kind":"server","non_retryable":true}` when the tail is non-retryable, otherwise `{"kind":"absent"}`. |
+| NUL in a signal or update sender identity | Each NUL becomes U+FFFD before the length rule. |
+| Signal, query, update, or initialization header key, or memo key, that is empty, contains NUL, or exceeds 65,536 bytes | The entry is dropped. No OCaml API can name such a key, and escaping it could collide with a real key. |
+| Negative application `next_retry_delay` (the Go SDK sends `time.Until(retryAt)` after `retryAt` has passed) | Becomes absent ("no override"), in activations, client wait results, and update outcomes (#1049). |
+| Unknown enum number for a retry state, timeout type, application category, Nexus handler retry behavior, continuation initiator, or continue-as-new suggestion reason | Becomes `unspecified` (#1017). The adapter omits an unspecified suggestion reason from `Workflow.Info.continue_as_new_reasons`; `continue_as_new_suggested` is unchanged. |
+| Payload `external_payloads` size details, or a payload metadata entry with an empty key | Dropped; the payload's data and remaining metadata are kept (#1050). |
+| Start-event priority outside the outbound rules (fairness weight outside `{0} ∪ [0.001, 1000]`, non-finite, NUL in the fairness key, any priority key) | Carried with its exact bits; only the 64-byte fairness-key bound applies, as for activity tasks (#1016). |
+| Start-event retry policy that the outbound rules reject (recorded with `maximum_attempts = 1`, which the server does not validate) | Carried as recorded, with an absent or negative interval normalized to zero; `Workflow.Info.retry_policy` reports a policy the public type cannot represent as `None` (#1016). |
+| Schedule-started run carrying `last_completion_result` or `continued_failure` with no previous run ID | Represented as a continuation whose `continued_from_execution_run_id` is empty; `Workflow.Info.continued_from_run_id` is `None` (#1015). |
+
+The 100-layer cap matches prost's default 100-level decode recursion limit,
+so any chain Core can receive over gRPC converts unchanged; from the deepest
+activation location (`continued_failure`, depth 6) a capped chain whose last
+layer carries detail payload metadata reaches depth 110, leaving room for a
+completion that rethrows it inside its own failure. Payload bytes, payload
+metadata, and identifiers that Temporal Server itself bounds (workflow,
+activity, run, and update IDs, type names, signal names, search-attribute
+names) are never rewritten and keep their strict checks. The OCaml decoder
+applies the matching inbound rules for start-event priority and retry policy,
+activity-task priority, failure-wrapper fields, and an empty continuation run
+ID; every other degraded value satisfies its existing limits.
+Outbound semantic documents (completions, and any activation passed to
+`encode_activation` or `decode_activation`) remain strictly validated; the
+degradation exists only in the Core-to-semantic conversion.
+
+An activation that still fails conversion (for example a non-normalized
+duration) is failed to Core and its lease retired. After Core accepts that rejection, the native
 poll returns `not_ready` so `Worker.run` can process other tasks; a fixed,
 internal 100 ms delay bounds immediate redelivery churn and warning volume.
 A failed Core rejection remains a fatal worker error. The rejection reason is
 static and contains no run ID or payload. Unknown
-protobuf oneofs, enum values, external payload references, unsupported failure
-variants, or omitted Core fields with non-default values fail conversion.
+protobuf oneofs, enum values outside the advisory enums listed above, or
+omitted Core fields with non-default values fail conversion. Failure kinds are not part of this list.
+Every pinned `failure_info` kind has a variant, and an absent or future kind
+is `absent`.
 
 The Rust conversion functions are the only protobuf boundary. They convert
 official pinned Core activations to semantic values and semantic completions

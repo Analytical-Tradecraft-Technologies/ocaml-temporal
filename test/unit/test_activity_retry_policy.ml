@@ -1,4 +1,4 @@
-module Retry_policy = Temporal.Activity.Retry_policy
+module Retry_policy = Temporal.Retry_policy
 
 (** Builds a valid policy shared by the accessor and boundary tests. *)
 let valid_policy () =
@@ -70,7 +70,7 @@ let () =
   in
   assert (Retry_policy.maximum_attempts maximum_policy = maximum_attempts);
   expect_invalid "zero initial interval"
-    (Retry_policy.create
+    (Retry_policy.make
        ~initial_interval:(Temporal.Duration.of_ms 0L)
        ~backoff_coefficient:1.0
        ~maximum_interval:(Temporal.Duration.of_ms 1L) ~maximum_attempts:0 ());

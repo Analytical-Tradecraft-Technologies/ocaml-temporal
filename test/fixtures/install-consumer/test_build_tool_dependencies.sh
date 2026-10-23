@@ -59,7 +59,7 @@ require_lf_attribute() {
 
 for lf_pattern in \
   '.gitattributes' 'Dockerfile*' dune-project '*.opam' '*.opam.locked' \
-  '.github/workflows/*.yml'; do
+  '.github/workflows/*.yml' scripts/opam-lock-overrides.txt; do
   require_lf_attribute "$lf_pattern"
 done
 
@@ -68,15 +68,24 @@ done
 # that clone, so refresh it in the same layer that resolves dependencies. The
 # image installs protoc through apt and copies the pinned Rust toolchain from
 # the official Rust image, so opam must validate the conf packages without
-# attempting or solving their distribution-level depexts.
+# attempting or solving their distribution-level depexts. Release artifacts
+# must be compiled against the audited lock, so the layer installs and checks
+# the exact locked closure rather than re-solving temporal-sdk.opam.
 if ! awk '
   before_previous == "RUN opam repository set-url default https://opam.ocaml.org \\" &&
     previous == "    && opam update \\" &&
-    $0 == "    && opam install --deps-only --with-test --no-depexts -y ." { found = 1 }
+    $0 == "    && sh scripts/opam-locked-deps.sh install --no-depexts" { found = 1 }
   { before_previous = previous; previous = $0 }
   END { exit !found }
 ' "$root/Dockerfile.dev"; then
-  fail "Dockerfile.dev does not use the current HTTPS opam repository before installing dependencies"
+  fail "Dockerfile.dev does not install the locked closure from the current HTTPS opam repository"
+fi
+
+if ! grep -Fx 'COPY --chown=opam:opam temporal-sdk.opam temporal-sdk.opam.locked dune-project ./' \
+    "$root/Dockerfile.dev" >/dev/null ||
+  ! grep -Fx 'COPY --chown=opam:opam scripts/opam-locked-deps.sh scripts/opam-lock-overrides.txt ./scripts/' \
+    "$root/Dockerfile.dev" >/dev/null; then
+  fail "Dockerfile.dev does not copy the lock and its installer into the dependency layer"
 fi
 
 if ! grep -F 'protobuf-compiler \' "$root/Dockerfile.dev" >/dev/null ||
@@ -85,10 +94,66 @@ if ! grep -F 'protobuf-compiler \' "$root/Dockerfile.dev" >/dev/null ||
   fail "Dockerfile.dev does not install the native tools required by its conf packages"
 fi
 
+# Every compiler series in the CI matrix must build from its own ocaml/opam
+# image pinned to an immutable manifest digest. The pin is the single FROM line
+# of docker/ocaml-<series>/Dockerfile (#1027), each tracked by its own
+# Dependabot docker entry whose `versions` ignore range starts at the next
+# series, so Dependabot refreshes the digest but never retargets the tag.
+# Dockerfile.dev must not name ocaml/opam itself: a second copy of a pin would
+# be invisible to that per-series tracking.
+compilers=$(tr -d '\r' <"$root/scripts/ci-matrix.py" |
+  sed -n 's/^COMPILERS = (\(.*\))$/\1/p' | tr -d '",')
+[ -n "$compilers" ] || fail "could not read compiler series from scripts/ci-matrix.py"
+tr -d '\r' <"$root/.github/dependabot.yml" >"$metadata_dir/dependabot.yml"
+expected_series=
+for compiler in $compilers; do
+  series=${compiler%.*}
+  expected_series="$expected_series ocaml-$series"
+  pin="$root/docker/ocaml-$series/Dockerfile"
+  [ -f "$pin" ] || fail "docker/ocaml-$series/Dockerfile is missing"
+  tr -d '\r' <"$pin" | grep '^FROM ' >"$metadata_dir/from" || true
+  if [ "$(wc -l <"$metadata_dir/from" | tr -d ' ')" != 1 ] ||
+    ! grep -E "^FROM ocaml/opam:debian-12-ocaml-$series@sha256:[0-9a-f]{64}\$" \
+      "$metadata_dir/from" >/dev/null; then
+    fail "docker/ocaml-$series/Dockerfile must have exactly one FROM line, pinning ocaml/opam:debian-12-ocaml-$series by digest"
+  fi
+  # The next series is the lower bound of the ignore range: 5.2 -> '>= 5.3'.
+  next="${series%.*}.$((${series#*.} + 1))"
+  if ! awk -v dir="/docker/ocaml-$series" -v range="'>= $next'" '
+      /^- package-ecosystem: / { docker = ($3 == "docker"); matched = 0; dep = ""; next }
+      docker && $1 == "directory:" { matched = ($2 == dir); next }
+      matched && $1 == "-" && $2 == "dependency-name:" { dep = $3; next }
+      matched && dep == "ocaml/opam" && $1 == "-" && ($2 " " $3) == range { found = 1 }
+      END { exit !found }
+    ' "$metadata_dir/dependabot.yml"; then
+    fail ".github/dependabot.yml has no docker entry for /docker/ocaml-$series ignoring ocaml/opam '>= $next'"
+  fi
+done
+actual_series=$(cd "$root/docker" && ls -d ocaml-* 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')
+wanted_series=$(printf '%s\n' $expected_series | LC_ALL=C sort | tr '\n' ' ')
+[ "$actual_series" = "$wanted_series" ] ||
+  fail "docker/ocaml-* directories ($actual_series) differ from scripts/ci-matrix.py ($wanted_series)"
+if grep -v '^#' "$root/Dockerfile.dev" | grep -F 'ocaml/opam' >/dev/null; then
+  fail "Dockerfile.dev must take its ocaml/opam base image from docker/ocaml-<series>/Dockerfile"
+fi
+
 for workflow in "$root/.github/workflows/build.yml" "$root/.github/workflows/build-pr.yml"; do
-  if grep -E 'opam install .*--deps-only.*--with-test' "$workflow" |
+  if grep -E 'opam install .*--deps-only' "$workflow" >/dev/null; then
+    fail "$(basename "$workflow") installs unlocked OCaml dependencies"
+  fi
+  if grep -F 'opam-locked-deps.sh install' "$workflow" |
     grep -v -- '--assume-depexts' >/dev/null; then
     fail "$(basename "$workflow") allows conf packages to replace the pinned native toolchain"
+  fi
+done
+# Each native test lane must install the locked closure itself. The check is
+# per job, so another macOS job that also installs it (the master-tier opam
+# source-archive lane, #778) cannot stand in for a lane that dropped it.
+for native_lane in native-macos native-windows; do
+  if ! sed -n "/^  $native_lane:\$/,/^  [a-z][a-z0-9-]*:\$/p" \
+      "$root/.github/workflows/build-pr.yml" |
+    grep -Fx '        run: sh scripts/opam-locked-deps.sh install --assume-depexts' >/dev/null; then
+    fail "build-pr.yml native macOS/Windows lanes do not install the locked closure"
   fi
 done
 

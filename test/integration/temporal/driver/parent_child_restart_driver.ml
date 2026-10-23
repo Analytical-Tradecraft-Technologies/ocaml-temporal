@@ -96,7 +96,7 @@ let fixture () :
     successor run for the expected post-restart resolution. *)
 let require_completed expected_label expected_result :
     string Client.terminal_result -> (unit, Error.t) result = function
-  | Client.Completed value when String.equal value expected_result ->
+  | Client.Completed { output = value; _ } when String.equal value expected_result ->
       Ok ()
   | Client.Completed _ ->
     Error
@@ -184,7 +184,7 @@ let run () : (unit, Error.t) result =
               (Printf.sprintf
                  "workflow_id=%s\nrun_id=%s\nchild_workflow_id=%s\n"
                  (Client.workflow_id handle)
-                 (Client.run_id handle) child_workflow_id)
+                 (Option.get (Client.run_id handle)) child_workflow_id)
           in
           let* outcome = Client.wait handle in
           let* () = require_completed expected_label expected_result outcome in

@@ -25,6 +25,15 @@ first introduction of smaller slices and must not be called the current suite.
 | Native build/test matrix | OCaml 5.5 on Windows x64 and macOS ARM64 | Native package/bridge/runtime validation, without the Compose server suite |
 | Pins | [Compose images][compose] include immutable image digests; [Cargo manifest][cargo] pins Temporal Core to `95e97686a079dcfe6c42e3254b2f3f5e3d97408f`; the [workflow][workflow] identifies the executed lanes | A successful snapshot does not qualify later image, Core, toolchain, or source changes |
 
+The audited run therefore qualifies Core `95e97686` only. The Temporal Core
+v1.1.0 upgrade to `8fe478ee179ed754614d230f39586f3edb57da71` (#989) has
+separate live evidence: the [October 12 Build run][core-upgrade-build] at the
+upgrade commit [`acbda8dad9a3`][core-upgrade-commit] passed the same
+[Temporal/PostgreSQL integration job][core-upgrade-live-job], including the
+`two-binary driver assertions passed` marker. That run has not been re-audited
+controller by controller as this record was; it is evidence that the existing
+live suite passes on the new Core pin, not a replacement for this audit.
+
 The workflow and Makefile must be read at the tested commit. In particular,
 the audited Rust toolchain file selects 1.98 while the native workflow/Makefile
 still request 1.94.1; the successful job is evidence for what actually ran, not
@@ -47,10 +56,85 @@ All live controllers use a real Temporal Server and own fixture cleanup.
 | `test-temporal-parent-child-restart` | Exact parent and child histories, linkage, nonterminal prefixes after removal, both generation-two replay observations, then successful completion | [parent/child controller][parent-controller], [parent/child contract][parent-contract] |
 | `test-temporal-parent-child-failure-replay` | Both runs replay before the child fails non-retryably; child and parent failure events retain exact linkage; parent returns `SMOKE:PARENT:CHILD:FAILURE_RECOVERED` | [failure controller][failure-controller], [failure contract][failure-contract], [definitions][definitions] |
 
+Three live controllers were added to the Build workflow after the audited
+baseline, so the successful runs above do not cover them. Their assertion
+boundaries are defined by their own references, and the
+[generated inventory](live-acceptance-inventory.md) tracks their membership:
+
+| Make target | Assertion boundary | Reference |
+| --- | --- | --- |
+| `test-temporal-start-metadata-live` | Five exact active runs carry memo, search-attribute, combined, continued and official-CLI start metadata; workflow snapshots match before and after worker replacement. Three more runs on a one-slot-cache worker are each evicted with reason `cache_full` and replayed; snapshots, exact expirations and results match | [start metadata](workflow-start-metadata.md) |
+| `test-temporal-task-failure-live` | Body, encoder and missing-registration defects leave exact runs with durable workflow-task failures; a corrected worker replays and completes them, and typed business failures keep their retryability flags | [workflow failures](workflow-failures.md) |
+| `test-temporal-live-regressions` | Each fixed-bug regression executable in `LIVE_REGRESSION_EXECUTABLES` runs once, bounded, against a fresh stack: cooperative activity cancellation and the worker-shutdown signal (#494), bounded shutdown of a worker whose activity never heartbeats, with the attempt retried on a second worker (#495), detection, task failure and bounded shutdown of a worker whose workflow code stops yielding, with the run recovered on a corrected worker (#493), client request IDs (#545), update admission outcomes (#546), completed-workflow queries (#548), local activity retry cancellation (#567), split workflow/activity workers (#805), query and suspended-update recovery after sticky-cache eviction and worker replacement (#530), and official-SDK interoperability (#517), where the pinned official Python SDK client and activity worker drive an OCaml workflow and both clients decode the same exact runs. The run fails if any suite fails; a Docker-free contract requires every `test/integration/*/regression.exe` to be in the smoke artifact and run by CI (#795) | Each suite's `README.md` or module comment under `test/integration/` |
+
 The [child-failure acceptance reference](child-failure-replay-acceptance.md)
 records the original PR #361 evidence. Its status is live-tested, not pending a
 first run. Broader child failure, cache-pressure, repeated restart, and recovery
 combinations still need dedicated cases.
+
+## Worker crash, restart, shutdown and eviction inventory
+
+Issue [#519][issue-519] names three boundaries. The existing suites below
+already cover part of each; this table records which part, so new cases extend
+them rather than duplicate them. Every suite asserts a durable server outcome
+for exact runs, not just a process exit, and each runs in the Build workflow's
+Temporal/PostgreSQL job through `make test-temporal-live-ci`.
+
+| Boundary | Suite | What it removes or forces, and when | Durable outcome asserted |
+| --- | --- | --- | --- |
+| Worker removal during pending work | `test-temporal-worker-crash-recovery` | `docker kill --signal KILL` on generation one once the exact run's history shows its pending timer; exit 137, no graceful-stop marker | Generation two replays (`is_replaying=true`) and the same run completes |
+| Worker removal during pending work | `test-temporal-parent-child-restart` | Graceful `Worker.shutdown` of generation one while a parent and its long-running child are both suspended | Both exact runs replay on generation two and complete with exact parent/child linkage |
+| Worker removal during a running activity callback | `activity_worker_crash` (#519) | `SIGKILL` to the worker process (hosting the workflow and the activity) after the callback's marker file and `workflow describe` both show attempt 1 started and heartbeating on it; the process must die of that signal | With no worker polling, the server alone fails attempt 1 on its three-second heartbeat timeout and schedules attempt 2. A replacement process completes attempt 2 (`Activity.Info.attempt`), reads attempt 1's last heartbeat detail, and the run returns the exact expected result; history has one scheduled, started (attempt 2, replacement identity, heartbeat-timeout last failure) and completed activity event and no activity failure or timeout |
+| Worker removal during pending work | `interaction_recovery` (#530) | `SIGTERM` to the worker process that accepted a suspended update | The replacement answers queries from replayed state; history has one acceptance and one completion of the original update ID, attributed to the original and replacement workers |
+| Shutdown with outstanding work | `bounded_shutdown` (#495) | `Worker.shutdown_with_report` with a two-second grace period while an activity callback ignores cancellation and the shutdown flag | Shutdown returns within its bound and reports one abandoned callback; Temporal retries the attempt and a second worker completes attempt 2 |
+| Eviction followed by continued progress | `test-temporal-worker-cache-eviction` | One-slot cache; a second parked run forces Core `RemoveFromCache` (`cache_full`) of the first | Empty eviction acknowledgement; evicted run A resumes on its signal and completes, then B is cancelled with a typed terminal outcome (see the [#519 matrix](#issue-519-worker-recovery-regression-matrix)) |
+| Eviction followed by continued progress | `interaction_recovery` (#530) | One-entry sticky cache; a filler run evicts the target while an update handler is suspended | A query answers from replayed state, the release signal resumes the handler from history, and the run's durable events equal the control run's |
+
+Reproduce each against the pinned Compose stack (Docker required). The first
+three targets each own a fresh Temporal/PostgreSQL lifecycle:
+
+```sh
+make test-temporal-worker-crash-recovery
+make test-temporal-worker-cache-eviction
+make test-temporal-parent-child-restart
+# All LIVE_REGRESSION_EXECUTABLES, including interaction_recovery,
+# bounded_shutdown and activity_worker_crash, against one fresh stack; logs
+# land in _build/live-regressions/.
+make test-temporal-live-regressions
+```
+
+To run one regression suite against an already running disposable server, use
+its focused target. `interaction_recovery` and `activity_worker_crash` need a
+`default` namespace and the official Temporal CLI; `bounded_shutdown` defaults
+to `temporal-sdk-test`:
+
+```sh
+make test-interaction-recovery-live RUN='opam exec --' \
+  TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233 \
+  TEMPORAL_TEST_CLI=/absolute/path/to/temporal
+make test-activity-worker-crash-live RUN='opam exec --' \
+  TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233 \
+  TEMPORAL_TEST_CLI=/absolute/path/to/temporal \
+  ACTIVITY_WORKER_CRASH_EVIDENCE=$PWD/_build/activity-worker-crash
+make test-bounded-shutdown-live RUN='opam exec --' \
+  TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233
+```
+
+In CI, the controllers' bundles are in the `live-diagnostics-<run>-<attempt>`
+artifact ([live diagnostic artifacts](live-diagnostic-artifacts.md)), and each
+regression suite's log, plus the official-SDK interoperability evidence, is in
+`live-regressions-<run>-<attempt>`. That artifact also holds
+`activity_worker_crash/`: the suite's `describe` snapshots before and after the
+kill, the raw exact-run history, and each worker generation's log (the logs are
+copied into the suite log too). Both artifacts are uploaded even when the step
+fails and kept for seven days.
+
+The `activity_worker_crash` suite covers the case the other suites leave open:
+an abrupt process death while an activity callback is running. The crash
+controller kills its worker while the run is parked on a timer, and
+`bounded_shutdown` abandons a running callback through the graceful path in a
+process that stays alive. Here recovery rests on Temporal's heartbeat timeout
+and retry policy alone, the documented at-least-once contract.
 
 ## Issue #519 worker recovery regression matrix
 
@@ -116,7 +200,7 @@ have different totals; none is a substitute for the named evidence below.
 | `smoke.signal_condition` | Separate direct-client signal, external signal, and update targets; output-only and typed-input queries; missing-handler and locally invalid-input rejection | Readiness does not prove that a condition was already parked; FIFO wake-up and teardown rely on focused runtime tests |
 | `smoke.external_signal_parent`, `smoke.external_signal_completed_parent` | Delivery to the retained exact target; rejection when signaling a confirmed completed run | Missing targets and external-operation replay/retry combinations remain unqualified |
 | `smoke.external_cancellation_parent`, `smoke.external_cancellation_wrong_run_parent` | Exact-run external cancellation and rejection of mismatched run identity before acknowledgement | Wrong-run rejection is a retryable workflow error (`non_retryable=false`); this does not cover cancellation of every missing/completed target |
-| Typed update on `smoke.signal_condition` | Unknown handler is rejected; registered update is admitted, polled to typed completion, and changes workflow-local state | Suspended updates, validator rejection, replay/eviction, retry and deadline behavior need additional live cases |
+| Typed update on `smoke.signal_condition` | Unknown handler is rejected; registered update is admitted, polled to typed completion, and changes workflow-local state | Suspended-update recovery across eviction and worker replacement, and validator rejection, are covered by the `interaction_recovery` (#530) and `update_outcomes` (#546) regressions, and the typed caller result when the run closes before an update finishes by `update_run_close` (#520); retry and deadline behavior need additional live cases |
 
 ## Cancellation and non-live evidence
 
@@ -130,17 +214,28 @@ The live suite does not directly qualify the `~scope` path. See
 
 Cancelling observation, buffering a Core cancellation command, receiving an
 activity cancellation task, stopping an OCaml callback, and shutting down a
-worker are distinct events. The serialized callback adapter has no public
-cooperative cancellation probe; a Core cancellation task cannot preempt an
-already running OCaml callback. Worker shutdown drains owned work through its
-lifecycle path. The stop-marker checks and focused lifecycle tests do not prove
-a bound on application callback duration or Kubernetes termination behavior.
+worker are distinct events. A Core cancellation task cannot preempt an
+already running OCaml callback; it reaches the callback cooperatively at its
+next heartbeat, and the `activity_cancellation` regression (#494) is the live
+evidence for that path and for the worker-shutdown flag. Worker shutdown
+drains owned work through its lifecycle path, and the `bounded_shutdown`
+regression (#495) is the live evidence that shutdown returns within its bound
+while a callback ignores it. That bound applies to `Worker.shutdown`, not to
+the abandoned callback, which keeps running; the stop-marker checks and
+focused lifecycle tests do not prove Kubernetes termination behavior.
+The `non_yielding_workflow` regression (#493) is the matching evidence for
+workflow code: the watchdog fails the stuck task within the deadline plus one
+tick, shutdown reports the abandoned activation within its bound, and
+Temporal's retry completes the same run on a corrected worker.
 
-Reset, bounded visibility listing, worker deployment routing, memo/search
-attributes and priority metadata have implemented/focused-tested surfaces but
-no dedicated live qualification in this inventory. The private replay feeder
-is not a public history replay tool. Authentication configuration, cross-version
-history corpora, release delivery and operational/load qualification remain
+Reset, bounded visibility listing, worker deployment routing, search-attribute
+upserts and priority metadata have implemented/focused-tested surfaces but no
+dedicated live qualification. Start memo/search attributes have the post-baseline
+start-metadata controller described above. The private replay feeder
+is not a public history replay tool. The seeded
+[history corpus](history-corpus.md) is replayed offline in every `dune runtest`;
+it is not live acceptance. Authentication configuration, running that corpus
+across versions (#524), release delivery and operational/load qualification remain
 tracked work; consult [feature coverage](feature-coverage.md) and the
 [roadmap](../implementation-roadmap.md).
 
@@ -176,6 +271,9 @@ make verify
 [baseline]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/beae10d0a58e58fb8e076734cd38113d7a2b4466
 [build]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35469570419
 [live-job]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35469570419/job/105967951226
+[core-upgrade-build]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/38186805228
+[core-upgrade-commit]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/acbda8dad9a356cb2cc3ba47f9c4adeb146a5bee
+[core-upgrade-live-job]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/38186805228/job/114616750679
 [previous-build]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35278812252
 [previous-baseline]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/a4581f7c97e83498d4910dadc3ad811389a80f82
 [policy]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/489
@@ -202,3 +300,4 @@ make verify
 [child-source]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/lib/public/child_workflow.ml
 [scope-tests]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/runtime/test_scope.ml
 [activation-tests]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/runtime/test_activation.ml
+[issue-519]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/519

@@ -76,6 +76,7 @@ fn client_temporal_response() -> client_protocol::StartWorkflowResponse {
             workflow_id: "workflow".to_owned(),
             run_id: "run".to_owned(),
         },
+        started: true,
     }
 }
 
@@ -90,7 +91,7 @@ fn nonblocking_close_joins_aborted_start_tasks_before_core_drop() {
         .expect("default Temporal Core runtime options");
     let core = CoreRuntime::new(options, TokioRuntimeBuilder::default())
         .expect("default Temporal Core runtime");
-    let mut runtime = Runtime::new(core).expect("runtime cleanup thread starts");
+    let mut runtime = Runtime::with_owned_core(core).expect("runtime cleanup thread starts");
 
     let dropped = Arc::new(AtomicBool::new(false));
     let task = runtime
@@ -112,6 +113,13 @@ fn nonblocking_close_joins_aborted_start_tasks_before_core_drop() {
                 input: Vec::new(),
                 memo: Vec::new(),
                 search_attributes: Vec::new(),
+                id_conflict_policy: client_protocol::IdConflictPolicy::Fail,
+                id_reuse_policy: client_protocol::IdReusePolicy::AllowDuplicate,
+                execution_timeout_ms: None,
+                run_timeout_ms: None,
+                task_timeout_ms: None,
+                retry_policy: None,
+                rpc_timeout_ms: None,
             }),
             receiver,
             task,
@@ -142,7 +150,7 @@ fn nonblocking_close_joins_after_terminal_result_publication() {
         .expect("default Temporal Core runtime options");
     let core = CoreRuntime::new(options, TokioRuntimeBuilder::default())
         .expect("default Temporal Core runtime");
-    let mut runtime = Runtime::new(core).expect("runtime cleanup thread starts");
+    let mut runtime = Runtime::with_owned_core(core).expect("runtime cleanup thread starts");
 
     let published = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicBool::new(false));
@@ -169,6 +177,13 @@ fn nonblocking_close_joins_after_terminal_result_publication() {
                 input: Vec::new(),
                 memo: Vec::new(),
                 search_attributes: Vec::new(),
+                id_conflict_policy: client_protocol::IdConflictPolicy::Fail,
+                id_reuse_policy: client_protocol::IdReusePolicy::AllowDuplicate,
+                execution_timeout_ms: None,
+                run_timeout_ms: None,
+                task_timeout_ms: None,
+                retry_policy: None,
+                rpc_timeout_ms: None,
             }),
             receiver,
             task,

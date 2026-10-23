@@ -12,10 +12,60 @@ type failure = Workflow_protocol.failure
 (** Structured Temporal failure shared with workflow activations. *)
 
 type execution = { namespace : string; workflow_id : string; run_id : string }
-(** The exact Temporal execution identified by namespace, workflow ID, and run. *)
+(** A Temporal execution identified by namespace, workflow ID, and run. In a
+    request sent after start, an empty [run_id] selects the workflow's current
+    run, which Temporal resolves when it handles the RPC (#791); every
+    execution returned by Temporal names a concrete run, except the echo in
+    {!type-wait_response}. *)
 
 type metadata_field = { key : string; value : payload }
 (** One named payload attached to a workflow start memo or search attribute. *)
+
+type id_conflict_policy = Fail | Use_existing | Terminate_existing
+(** Temporal's [WorkflowIdConflictPolicy] for a start whose workflow ID has
+    an open run, without its [UNSPECIFIED] value: the encoder always sends an
+    explicit policy. The wire names are ["fail"], ["use_existing"], and
+    ["terminate_existing"]. *)
+
+type id_reuse_policy = Allow_duplicate | Allow_duplicate_failed_only | Reject_duplicate
+(** Temporal's [WorkflowIdReusePolicy] for a start whose workflow ID's latest
+    run is closed, without [UNSPECIFIED] (the encoder always sends a value)
+    and without the deprecated [TERMINATE_IF_RUNNING]. The wire names are
+    ["allow_duplicate"], ["allow_duplicate_failed_only"], and
+    ["reject_duplicate"]. *)
+
+val max_rpc_timeout_ms : int64
+(** Largest caller-selected RPC timeout, 60,000 ms. Rust enforces the same
+    bound because control RPCs run on the supervisor's owner Domain. *)
+
+type rpc_deadline = { timeout_ms : int64; expires_at_ns : int64 }
+(** A caller's RPC deadline (#499). [expires_at_ns] is absolute on the
+    process's monotonic clock and is fixed when the public client call
+    begins; [timeout_ms] is the budget sent to Rust as [rpc_timeout_ms]. The
+    supervisor replaces [timeout_ms] with the budget remaining when the owner
+    Domain dispatches the request (see {!remaining_rpc_deadline}), so time
+    spent queued behind earlier calls counts against the caller's bound.
+    [expires_at_ns] never crosses the bridge, so the ABI is unchanged. *)
+
+val rpc_deadline : now_ns:int64 -> timeout_ms:int64 -> rpc_deadline
+(** [rpc_deadline ~now_ns ~timeout_ms] is a deadline expiring [timeout_ms]
+    after the monotonic reading [now_ns]. The timeout is validated by the
+    encoder, not here. *)
+
+val remaining_rpc_deadline :
+  now_ns:int64 -> rpc_deadline -> rpc_deadline option
+(** Returns the deadline with [timeout_ms] lowered to the whole milliseconds
+    remaining at [now_ns] (rounded up, so a live deadline sends at least
+    1 ms and never more than the original budget), or [None] when the
+    deadline has already expired and the request must not be sent. *)
+
+val max_workflow_task_timeout_ms : int64
+(** Largest workflow task timeout, 120,000 ms: Temporal silently lowers a
+    larger value, so the protocol rejects it instead. *)
+
+val max_workflow_timeout_ms : int64
+(** Largest workflow execution or run timeout: the protobuf [Duration]
+    maximum, 315,576,000,000,999 ms. *)
 
 type start_request = {
   request_id : string;
@@ -26,14 +76,36 @@ type start_request = {
   input : payload list;
   memo : metadata_field list;
   search_attributes : metadata_field list;
+  id_conflict_policy : id_conflict_policy;
+  id_reuse_policy : id_reuse_policy;
+  execution_timeout_ms : int64 option;
+  run_timeout_ms : int64 option;
+  task_timeout_ms : int64 option;
+  retry_policy : Workflow_protocol.retry_policy option;
+  rpc_deadline : rpc_deadline option;
 }
 (** Dynamic workflow-start request sent to the Rust client adapter. [request_id]
     is stable across retries and is passed unchanged to Temporal, so a caller
     can reconcile an uncertain asynchronous start without issuing a second
-    logical operation. *)
+    logical operation.
 
-type start_response = { execution : execution }
-(** Server-assigned execution returned by a successful start. *)
+    The workflow timeouts (milliseconds) and [retry_policy] are server-side
+    execution policies; [None] omits the member so Temporal applies its
+    default. Each timeout must be positive, the task timeout at most
+    {!max_workflow_task_timeout_ms}, a run timeout no larger than an
+    execution timeout, and a task timeout no larger than the run timeout (or
+    the execution timeout when there is no run timeout). Every combination
+    of the reuse and conflict policies is valid.
+    [rpc_deadline] bounds only this client call (default ten seconds) and
+    never the workflow; its [timeout_ms] is sent as [rpc_timeout_ms] and must
+    be between 1 and {!max_rpc_timeout_ms}. Every other request below that
+    carries [rpc_deadline] applies the same bound in place of its own
+    default. *)
+
+type start_response = { execution : execution; started : bool }
+(** Execution returned by a successful start. [started] is [false] only when
+    [Use_existing] returned a run created by another start request; the
+    execution then names that existing run. *)
 
 type start_ticket
 (** Opaque capability for one admitted asynchronous start. The ticket retains
@@ -41,14 +113,16 @@ type start_ticket
     with the caller's requested workflow identity before they are exposed. *)
 
 type wait_request = execution
-(** Exact run selected by a wait; continued-as-new successors are not followed. *)
+(** Run selected by a wait (empty [run_id]: the current run when Temporal
+    handles the poll); successors are never followed by the bridge. *)
 
 type cancel_request = {
   execution : execution;
   request_id : string;
   reason : string;
+  rpc_deadline : rpc_deadline option;
 }
-(** Exact run and idempotency metadata for a client cancellation request. *)
+(** Run selector and idempotency metadata for a client cancellation request. *)
 
 type cancel_response = { acknowledged : bool }
 (** Positive acknowledgement returned after Temporal accepts the cancellation RPC. *)
@@ -58,14 +132,20 @@ type reset_request = {
   request_id : string;
   reason : string;
   workflow_task_finish_event_id : int64;
+  rpc_deadline : rpc_deadline option;
 }
-(** Exact run and workflow-task event used as the reset point. *)
+(** Run selector and workflow-task event used as the reset point. *)
 
 type reset_response = { execution : execution }
 (** New run identity returned by Temporal after a successful reset. *)
 
-type terminate_request = { execution : execution; reason : string }
-(** Exact-run termination request. [reason] is bounded operator context. *)
+type terminate_request = {
+  execution : execution;
+  reason : string;
+  rpc_deadline : rpc_deadline option;
+}
+(** Termination request for one run selector. [reason] is bounded operator
+    context. *)
 
 type terminate_response = { acknowledged : bool }
 (** Positive acknowledgement returned after Temporal accepts termination. *)
@@ -75,8 +155,9 @@ type signal_request = {
   signal_name : string;
   request_id : string;
   input : payload list;
+  rpc_deadline : rpc_deadline option;
 }
-(** Exact workflow/run identity and typed payloads for one signal delivery.
+(** Workflow/run selector and typed payloads for one signal delivery.
 
     [request_id] is the Temporal idempotency key for this logical control
     operation. The signal name and payload list are encoded in the same closed
@@ -89,8 +170,9 @@ type query_request = {
   execution : execution;
   query_type : string;
   input : payload list;
+  rpc_deadline : rpc_deadline option;
 }
-(** Exact execution identity and output-only query name sent to Temporal. The
+(** Execution selector and output-only query name sent to Temporal. The
     input list is currently required to be empty by the public client API but
     remains explicit in the closed protocol for future typed query arguments. *)
 
@@ -102,15 +184,31 @@ type visibility_request = {
   query : string;
   page_size : int;
   next_page_token : string option;
+  rpc_deadline : rpc_deadline option;
 }
 (** One explicitly bounded visibility page request. The token is opaque base64. *)
+
+type visibility_status =
+  [ `Running
+  | `Completed
+  | `Failed
+  | `Canceled
+  | `Terminated
+  | `Continued_as_new
+  | `Timed_out
+  | `Paused
+  | `Unknown of int ]
+(** Temporal [WorkflowExecutionStatus] decoded from its Rust name. A value
+    the SDK does not name (a newer server's addition, or the legacy
+    [unspecified] name, which is wire value [0]) is [`Unknown n] with its
+    wire value. *)
 
 type visibility_execution = {
   workflow_id : string;
   run_id : string;
   workflow_type : string;
   task_queue : string;
-  status : string;
+  status : visibility_status;
 }
 (** Stable subset of Temporal visibility metadata exposed by this SDK. *)
 
@@ -125,6 +223,7 @@ type update_request = {
   update_id : string;
   update_name : string;
   input : payload list;
+  rpc_deadline : rpc_deadline option;
 }
 (** Request to admit one named workflow update. *)
 
@@ -153,16 +252,24 @@ type outcome =
   | Terminated of { details : payload list }
   | Timed_out of { successor : execution option }
   | Continued_as_new of { successor : execution }
-(** Terminal outcome returned by Temporal for one exact run. *)
+(** Terminal outcome returned by Temporal for one run. Every successor names
+    a concrete run of the same workflow, including the successor a completed
+    cron or retry run links to. *)
 
 type wait_response = { execution : execution; outcome : outcome }
-(** Exact execution and its terminal result returned by the native adapter. *)
+(** The waited execution, echoed exactly as requested (so its [run_id] is
+    empty for a current-run wait), and the observed run's terminal result. *)
 
 type client_error =
   | Already_started of { workflow_id : string; existing_run_id : string option }
   | Rpc of { code : string }
+  | Query_failed of { message : string }
   | Protocol of { code : string }
-(** Closed error body returned by a native client operation. *)
+(** Closed error body returned by a native client operation. [Rpc] carries a
+    gRPC status code name and never server text. [Query_failed] is returned
+    only by a query whose workflow handler failed (or whose query name the
+    worker did not know); [message] is the handler's message, at most 4,096
+    bytes, valid UTF-8, NUL-free, and possibly empty. *)
 
 type start_outcome =
   | Accepted of start_response
@@ -210,35 +317,37 @@ val decode_start_response : request:start_request -> string -> (start_response, 
     returned namespace and workflow ID belong to the requested start. *)
 
 val encode_wait_request : wait_request -> (string, error) result
-(** Validates and serializes one exact-run wait request. *)
+(** Validates and serializes one wait request; an empty run ID is allowed. *)
 
 val encode_cancel_request : cancel_request -> (string, error) result
-(** Validates and serializes one exact-run cancellation request. *)
+(** Validates and serializes one cancellation request; an empty run ID is
+    allowed. *)
 
 val decode_cancel_response : string -> (cancel_response, error) result
 (** Strictly decodes the positive native cancellation acknowledgement. *)
 
 val encode_reset_request : reset_request -> (string, error) result
-(** Validates and serializes one exact-run reset request whose workflow-task
-    finish event ID is greater than 1. *)
+(** Validates and serializes one reset request whose workflow-task finish
+    event ID is greater than 1; an empty run ID is allowed. *)
 
 val decode_reset_response : request:reset_request -> string -> (reset_response, error) result
 (** Strictly decodes and correlates the new run returned after reset. *)
 
 val encode_terminate_request : terminate_request -> (string, error) result
-(** Validates and serializes one exact-run termination request. *)
+(** Validates and serializes one termination request; an empty run ID is
+    allowed. *)
 
 val decode_terminate_response : string -> (terminate_response, error) result
 (** Strictly decodes the positive native termination acknowledgement. *)
 
 val encode_signal_request : signal_request -> (string, error) result
-(** Validates and serializes one exact-run signal request. *)
+(** Validates and serializes one signal request; an empty run ID is allowed. *)
 
 val decode_signal_response : string -> (signal_response, error) result
 (** Strictly decodes the positive native signal acknowledgement. *)
 
 val encode_query_request : query_request -> (string, error) result
-(** Validates and serializes one exact-run, output-only query request. *)
+(** Validates and serializes one query request; an empty run ID is allowed. *)
 
 val decode_query_response : string -> (query_response, error) result
 (** Strictly decodes one successful query result payload list. *)
@@ -250,20 +359,24 @@ val decode_visibility_response : string -> (visibility_page, error) result
 (** Strictly decodes one visibility page returned by Rust. *)
 
 val encode_update_request : update_request -> (string, error) result
-(** Validates and serializes one update admission request. *)
+(** Validates and serializes one update admission request; an empty run ID
+    is allowed. *)
 
 val encode_poll_update_request : poll_update_request -> (string, error) result
-(** Validates and serializes one update completion poll request. *)
+(** Validates and serializes one update completion poll request; an empty
+    run ID is allowed. *)
 
 val decode_update_response : request:update_request -> string -> (update_response, error) result
-(** Decodes and correlates one update admission response. *)
+(** Decodes and correlates one update admission response. The response must
+    name a concrete run: the requested one, or for a current-run request the
+    run Temporal resolved. *)
 
 val decode_poll_update_response : string -> (poll_update_response, error) result
 (** Strictly decodes one bounded update poll response. *)
 
 val decode_wait_response : request:wait_request -> string -> (wait_response, error) result
-(** Strictly decodes one terminal exact-run response and verifies that the
-    returned execution is exactly the requested run. *)
+(** Strictly decodes one terminal wait response and verifies that the
+    returned execution echoes the requested run selector exactly. *)
 
 val decode_client_error : string -> (client_error, error) result
 (** Strictly decodes the structured error body returned by the native ABI. *)
@@ -292,4 +405,8 @@ val decode_signal_error : string -> (client_error, error) result
 
 val decode_query_error : string -> (client_error, error) result
 (** Decodes a query error and rejects the start-only [already_started]
-    category. *)
+    category. This is the only decoder that accepts [Query_failed]. *)
+
+val decode_update_error : string -> (client_error, error) result
+(** Decodes an update admission or poll error, rejecting the start-only
+    [already_started] and query-only [query_failed] categories. *)

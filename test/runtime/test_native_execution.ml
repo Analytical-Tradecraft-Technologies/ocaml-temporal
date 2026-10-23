@@ -46,6 +46,7 @@ let public_payload (payload : Temporal_base.Codec.payload) : Temporal.Payload.t 
 let base_error (error : Temporal.Error.t) : Temporal_base.Error.t =
   let view = Temporal.Error.view error in
   Temporal_base.Error.make ~non_retryable:view.non_retryable
+    ?error_type:view.error_type
     ~details:(List.map base_payload view.details) ~category:view.category
     ~message:view.message ()
 
@@ -419,8 +420,207 @@ let test_activity_failure_details_are_preserved () =
       begin match view.details with
       | [ payload ] when Bytes.to_string payload.data = "failure-details" -> ()
       | _ -> failwith "wrapped activity failure details were discarded"
-      end
+      end;
+      (* The application type nested under the activity wrapper is the one
+         workflow code can branch on, not the wrapper's activity type. *)
+      if view.error_type <> Some "mock_failure" then
+        failwith "wrapped activity application type was not preserved"
   | _ -> failwith "activity failure did not become a typed runtime error"
+
+(** Payload metadata values are arbitrary bytes in Temporal's protocol, and
+    another SDK's codec may store a raw nonce or key ID there (#1048). Before
+    the fix every inbound copy of such a payload failed translation, which on
+    a live worker failed every workflow task of the run. An activity result, a
+    signal input and header, and a failure detail must all carry the bytes
+    unchanged. *)
+let test_binary_metadata_is_lossless () =
+  let binary text : Protocol.payload =
+    {
+      Protocol.metadata =
+        [
+          ("encoding", Bytes.of_string "binary/plain");
+          ("nonce", Bytes.of_string "\xff\x00");
+        ];
+      data = Bytes.of_string text;
+    }
+  in
+  let expected text : Temporal_base.Codec.payload =
+    {
+      Temporal_base.Payload.metadata =
+        [ ("encoding", "binary/plain"); ("nonce", "\xff\x00") ];
+      data = Bytes.of_string text;
+    }
+  in
+  let failure : Protocol.failure =
+    {
+      message = "failed";
+      source = "GoSDK";
+      stack_trace = "";
+      encoded_attributes = None;
+      cause = None;
+      info =
+        Protocol.Application
+          {
+            type_name = "Rejected";
+            non_retryable = true;
+            details = [ binary "detail" ];
+            category = Protocol.Application_category_unspecified;
+            next_retry_delay = None;
+          };
+    }
+  in
+  let translated =
+    unwrap "binary metadata translation"
+      (Native_execution.translate_activation
+         (activation
+            [
+              Protocol.Resolve_activity
+                { seq = 1L; result = Protocol.Completed (Some (binary "result")) };
+              Protocol.Resolve_activity { seq = 2L; result = Failed failure };
+              Protocol.Signal_workflow
+                {
+                  signal_name = "binary";
+                  input = [ binary "signal" ];
+                  identity = "go";
+                  headers = [ ("trace", binary "header") ];
+                };
+            ]))
+  in
+  begin match translated.jobs with
+  | [
+   Activation.Resolve_activity { seq = 1L; result = Ok result };
+   Activation.Resolve_activity { seq = 2L; result = Error error };
+   Activation.Signal_workflow
+     { input = [ input ]; headers = [ ("trace", header) ]; _ };
+  ] ->
+      if result <> expected "result" then
+        failwith "activity result metadata was not carried losslessly";
+      if (Temporal_base.Error.view error).details <> [ expected "detail" ] then
+        failwith "failure detail metadata was not carried losslessly";
+      if input <> expected "signal" || header <> expected "header" then
+        failwith "signal metadata was not carried losslessly"
+  | _ -> failwith "binary metadata changed the translated jobs"
+  end
+
+(** Confirms a child-workflow failure exposes the type of the application
+    failure nested under Core's child-workflow wrapper, and that a failure with
+    no application layer leaves the type absent instead of inventing one. *)
+let test_child_failure_application_type () =
+  let application_failure : Protocol.failure =
+    {
+      message = "child business failure";
+      source = "GoSDK";
+      stack_trace = "";
+      encoded_attributes = None;
+      cause = None;
+      info =
+        Protocol.Application
+          {
+            type_name = "OrderRejected";
+            non_retryable = true;
+            details = [];
+            category = Protocol.Application_category_unspecified;
+            next_retry_delay = None;
+          };
+    }
+  in
+  let child_wrapper cause : Protocol.failure =
+    {
+      message = "child workflow failed";
+      source = "core";
+      stack_trace = "";
+      encoded_attributes = None;
+      cause;
+      info =
+        Protocol.Child_workflow
+          {
+            namespace = "default";
+            workflow_id = "child";
+            run_id = "child-run";
+            workflow_type = "child_type";
+            initiated_event_id = 1L;
+            started_event_id = 2L;
+            retry_state = Protocol.Non_retryable_failure;
+          };
+    }
+  in
+  let resolve seq failure =
+    let translated =
+      unwrap "child failure translation"
+        (Native_execution.translate_activation
+           (activation
+              [
+                Protocol.Resolve_child_workflow
+                  { seq; result = Protocol.Child_failed failure };
+              ]))
+    in
+    match translated.jobs with
+    | [ Activation.Resolve_child_workflow { result = Error error; _ } ] ->
+        Temporal_base.Error.view error
+    | _ -> failwith "child failure did not become a typed runtime error"
+  in
+  let typed = resolve 9L (child_wrapper (Some application_failure)) in
+  if typed.category <> `Child_workflow then
+    failwith "child failure category changed";
+  if typed.error_type <> Some "OrderRejected" then
+    failwith "nested child application type was not preserved";
+  let untyped = resolve 10L (child_wrapper None) in
+  if untyped.error_type <> None then
+    failwith "child failure without an application layer invented a type"
+
+(** Runs a workflow that returns [error] and returns the single
+    [Fail_workflow] failure it produces. *)
+let fail_workflow_failure ~label error =
+  let workflow =
+    Temporal_base.Definition.make ~name:label ~input:Temporal_base.Codec.unit
+      ~output:Temporal_base.Codec.unit
+      ~implementation:(Some (fun () -> Error error))
+  in
+  let execution = Execution.start workflow () in
+  let completion =
+    unwrap label
+      (Native_execution.activate execution
+         (activation
+            [
+              Protocol.Initialize_workflow
+                {
+                  workflow_id = label;
+                  workflow_type = label;
+                  arguments = [];
+                  randomness_seed = "1";
+                  attempt = 1;
+                  context = None;
+                };
+            ]))
+  in
+  Execution.shutdown execution;
+  match completion.commands with
+  | [ Protocol.Fail_workflow { failure } ] -> failure
+  | _ -> failwith (label ^ " did not fail the workflow")
+
+(** Confirms a workflow failure carries the error's explicit application type
+    as [ApplicationFailureInfo.type], falls back to the category label when the
+    error is untyped, and uses the SDK-wide failure source. *)
+let test_workflow_failure_application_type () =
+  let typed =
+    fail_workflow_failure ~label:"typed_failure"
+      (Temporal_base.Error.make ~error_type:"InvalidInput" ~non_retryable:true
+         ~category:`Workflow ~message:"bad input" ())
+  in
+  (match typed.info with
+  | Protocol.Application { type_name = "InvalidInput"; non_retryable = true; _ }
+    ->
+      ()
+  | _ -> failwith "workflow failure did not carry its explicit type");
+  if typed.source <> "ocaml-temporal" then
+    failwith "workflow failure used an unexpected source";
+  let untyped =
+    fail_workflow_failure ~label:"untyped_failure"
+      (Temporal_base.Error.make ~category:`Workflow ~message:"failed" ())
+  in
+  match untyped.info with
+  | Protocol.Application { type_name = "workflow"; _ } -> ()
+  | _ -> failwith "untyped workflow failure did not fall back to its category"
 
 (** Confirms child start and terminal resolutions remain distinct jobs while
     sharing one Core sequence number. A repeated start or repeated terminal
@@ -544,7 +744,8 @@ let test_signal_workflow_translation_and_activation () =
   in
   begin match completion.commands, completion.task_failure with
   | [], Some { message; _ }
-    when String.equal message "unhandled workflow signal: order_updated" -> ()
+    when String.starts_with ~prefix:"unhandled workflow signal: order_updated "
+           message -> ()
   | _ -> failwith "unhandled signal did not fail only the workflow task"
   end
 
@@ -674,11 +875,20 @@ let test_query_workflow_translation_and_activation () =
        })
 
 (** A query can inspect the owning live scope without draining a paused fiber.
-    Mutation and cross-Domain reads remain disallowed, and the retained handle
-    becomes stale after workflow completion. *)
+    Both state reads work before and after cancellation; mutation, scoped
+    command starts, and cross-Domain reads remain disallowed, and the retained
+    handle becomes stale after workflow completion. *)
 let test_query_reads_live_scope_status () =
   let scope_ref = ref None in
   let resumes = ref 0 in
+  let activity =
+    Temporal.Activity.remote ~name:"query-scope-activity"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+  in
+  let child =
+    Temporal.Workflow.remote ~name:"query-scope-child"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+  in
   let workflow =
     Temporal.Workflow.define ~name:"query_scope_status"
       ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
@@ -706,18 +916,47 @@ let test_query_reads_live_scope_status () =
         | Ok cancelled -> Ok (runtime_payload (string_of_bool cancelled))
         | Error error -> Error (base_error error))
   in
+  let check_handler =
+    Execution.make_query_handler ~name:"scope-check" ~dispatch:(fun _ ->
+        match Temporal.Scope.check (scope ()) with
+        | Ok () -> Ok (runtime_payload "active")
+        | Error error when (Temporal.Error.view error).category = `Cancelled ->
+            Ok (runtime_payload "cancelled")
+        | Error error -> Error (base_error error))
+  in
   let read_only_handler =
     Execution.make_query_handler ~name:"scope-read-only" ~dispatch:(fun _ ->
         let scope = scope () in
         let mutation_rejected =
           match Temporal.Scope.cancel scope with Error _ -> true | Ok () -> false
         in
+        let scoped_activity_rejected =
+          match Temporal.Future.peek (Temporal.Activity.start ~scope activity ()) with
+          | Some (Error error) ->
+              (Temporal.Error.view error).category = `Defect
+          | Some (Ok ()) | None -> false
+        in
+        let scoped_child_rejected =
+          match
+            Temporal.Future.peek
+              (Temporal.Child_workflow.start ~scope ~id:"query-scope-child" child ())
+          with
+          | Some (Error error) ->
+              (Temporal.Error.view error).category = `Defect
+          | Some (Ok ()) | None -> false
+        in
         let foreign_read_rejected =
           match Domain.join (Domain.spawn (fun () -> Temporal.Scope.is_cancelled scope)) with
           | Error _ -> true
           | Ok _ -> false
         in
-        if mutation_rejected && foreign_read_rejected then
+        let foreign_check_rejected =
+          match Domain.join (Domain.spawn (fun () -> Temporal.Scope.check scope)) with
+          | Error _ -> true
+          | Ok () -> false
+        in
+        if mutation_rejected && scoped_activity_rejected && scoped_child_rejected
+           && foreign_read_rejected && foreign_check_rejected then
           Ok (runtime_payload "rejected")
         else
           Error
@@ -725,7 +964,7 @@ let test_query_reads_live_scope_status () =
                ~message:"query bypassed scope ownership"))
   in
   let execution =
-    Execution.start ~query_handlers:[ status_handler; read_only_handler ]
+    Execution.start ~query_handlers:[ status_handler; check_handler; read_only_handler ]
       (base_workflow workflow) ()
   in
   let activate jobs =
@@ -764,6 +1003,7 @@ let test_query_reads_live_scope_status () =
              } ])
   in
   expect_query "scope-before-cancel" "false" "scope-status";
+  expect_query "scope-check-before-cancel" "active" "scope-check";
   expect_query "scope-ownership" "rejected" "scope-read-only";
   if !resumes <> 0 then failwith "query resumed the paused workflow fiber";
   let second_timer =
@@ -772,6 +1012,7 @@ let test_query_reads_live_scope_status () =
   in
   if !resumes <> 1 then failwith "timer did not resume the workflow once";
   expect_query "scope-after-cancel" "true" "scope-status";
+  expect_query "scope-check-after-cancel" "cancelled" "scope-check";
   if !resumes <> 1 then failwith "query resumed the cancelled workflow fiber";
   let finished = activate [ Protocol.Fire_timer { seq = second_timer } ] in
   (match (finished.commands, finished.task_failure) with
@@ -787,6 +1028,16 @@ let test_query_reads_live_scope_status () =
   | [ Protocol.Query_result
         { query_id = "scope-stale"; result = Query_failed _ } ], None -> ()
   | _ -> failwith "query accepted a stale scope after workflow completion");
+  let stale_check =
+    activate
+      [ Protocol.Query_workflow
+          { query_id = "scope-check-stale"; query_type = "scope-check";
+            arguments = []; headers = [] } ]
+  in
+  (match (stale_check.commands, stale_check.task_failure) with
+  | [ Protocol.Query_result
+        { query_id = "scope-check-stale"; result = Query_failed _ } ], None -> ()
+  | _ -> failwith "query accepted a stale scope check after workflow completion");
   Execution.shutdown execution
 
 (** Proves a native update is translated with its Core correlation fields and
@@ -1551,19 +1802,47 @@ let test_command_order_and_validation () =
        (Activation.Cancel_timer { seq = 4_294_967_296L }))
 
   ;
-  let continue_input = runtime_unit_payload () in
   let continue_completion =
     unwrap "continue-as-new command conversion"
       (Native_execution.completion_of_commands ~run_id:"run-native-translation"
+         [ Activation.Continue_as_new { workflow_type = "native"; input = [] } ])
+  in
+  (* A unit continue-as-new input arrives as zero arguments (#819), matching
+     other SDKs; the next run's start decodes [[]] back to unit. *)
+  (match continue_completion.commands with
+  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [] } ] ->
+      ()
+  | _ -> failwith "continue-as-new command was not translated as terminal");
+  (* A non-unit argument whose bytes are [binary/null], such as an option's
+     [None], is forwarded as one payload rather than collapsed (#1012). *)
+  (match
+     (unwrap "continue-as-new command with a null argument"
+        (Native_execution.completion_of_commands
+           ~run_id:"run-native-translation"
+           [
+             Activation.Continue_as_new
+               { workflow_type = "native"; input = [ runtime_unit_payload () ] };
+           ]))
+       .commands
+   with
+  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ null ] } ]
+    when null.Protocol.metadata = [ ("encoding", Bytes.of_string "binary/null") ]
+         && Bytes.length null.data = 0 ->
+      ()
+  | _ -> failwith "continue-as-new collapsed a null argument");
+  let continue_completion =
+    unwrap "continue-as-new command with input"
+      (Native_execution.completion_of_commands ~run_id:"run-native-translation"
          [
            Activation.Continue_as_new
-             { workflow_type = "native"; input = continue_input };
+             { workflow_type = "native"; input = [ runtime_payload "next" ] };
          ])
   in
   match continue_completion.commands with
-  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ _ ] } ] ->
+  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ next ] } ]
+    when next = protocol_payload "next" ->
       ()
-  | _ -> failwith "continue-as-new command was not translated as terminal"
+  | _ -> failwith "continue-as-new command did not keep its non-unit input"
 
 (** Activity commands retain every Core-required field through translation, and
     malformed timeout/identity options fail before a completion is returned. *)
@@ -1715,7 +1994,7 @@ let test_activity_command_translation_and_validation () =
               seq = 2L;
               id = "child/1";
               name = "child";
-              input;
+              input = [];
               retry_policy = None;
               cancellation_type = Activation.Child_abandon;
             }))
@@ -1725,17 +2004,31 @@ let test_activity_command_translation_and_validation () =
         seq = 2L;
         workflow_id = "child/1";
         workflow_type = "child";
-        input = [ child_input ];
+        (* A unit child input is sent as zero payloads (#819). *)
+        input = [];
         retry_policy = None;
         cancellation_type = Protocol.Child_abandon;
-      }
-    when child_input =
-      {
-        Protocol.metadata = [ ("encoding", Bytes.of_string "binary/null") ];
-        data = Bytes.empty;
       } ->
       ()
   | _ -> failwith "child command fields were not preserved"
+  end;
+  begin match
+    unwrap "child command translation with input"
+      (Native_execution.command_to_protocol
+         (Activation.Start_child_workflow
+            { task_queue = None; parent_close_policy = None;
+              seq = 3L;
+              id = "child/2";
+              name = "child";
+              input = [ runtime_payload "argument" ];
+              retry_policy = None;
+              cancellation_type = Activation.Child_abandon;
+            }))
+  with
+  | Protocol.Start_child_workflow { input = [ child_input ]; _ }
+    when child_input = protocol_payload "argument" ->
+      ()
+  | _ -> failwith "child command did not keep its non-unit input"
   end;
   begin match
     unwrap "child cancellation translation"
@@ -1749,15 +2042,53 @@ let test_activity_command_translation_and_validation () =
   expect_error_code "empty child cancellation reason" "invalid_message"
     (Native_execution.command_to_protocol
        (Activation.Cancel_child_workflow { seq = 2L; reason = "" }));
-  let invalid_metadata : Temporal_base.Codec.payload =
+  (* Metadata values are arbitrary bytes (#1048): a payload received with a
+     binary value can be returned unchanged, while keys keep the outbound
+     identifier rule. *)
+  let binary_metadata : Temporal_base.Codec.payload =
     {
-      Temporal_base.Payload.metadata = [ ("encoding", "\255") ];
+      Temporal_base.Payload.metadata =
+        [ ("encoding", "binary/plain"); ("nonce", "\255\000") ];
       data = Bytes.empty;
     }
   in
-  expect_error_code "binary metadata" "invalid_message"
+  begin match
+    unwrap "binary metadata completion"
+      (Native_execution.command_to_protocol
+         (Activation.Complete_workflow binary_metadata))
+  with
+  | Protocol.Complete_workflow { result = Some { metadata; _ } }
+    when List.assoc_opt "nonce" metadata = Some (Bytes.of_string "\255\000") ->
+      ()
+  | _ -> failwith "binary metadata value was not sent losslessly"
+  end;
+  (* A NUL in a key satisfies the bridge protocol's key rule, so a payload
+     received from another SDK can be returned unchanged (#1048). *)
+  let nul_metadata_key : Temporal_base.Codec.payload =
+    {
+      Temporal_base.Payload.metadata = [ ("nul\000key", "value") ];
+      data = Bytes.empty;
+    }
+  in
+  begin match
+    unwrap "NUL metadata key completion"
+      (Native_execution.command_to_protocol
+         (Activation.Complete_workflow nul_metadata_key))
+  with
+  | Protocol.Complete_workflow { result = Some { metadata; _ } }
+    when List.assoc_opt "nul\000key" metadata = Some (Bytes.of_string "value") ->
+      ()
+  | _ -> failwith "metadata key with NUL was not sent unchanged"
+  end;
+  let invalid_metadata_key : Temporal_base.Codec.payload =
+    {
+      Temporal_base.Payload.metadata = [ ("bad\255key", "value") ];
+      data = Bytes.empty;
+    }
+  in
+  expect_error_code "metadata key that is not UTF-8" "invalid_message"
     (Native_execution.command_to_protocol
-       (Activation.Complete_workflow invalid_metadata));
+       (Activation.Complete_workflow invalid_metadata_key));
   let duplicate_metadata : Temporal_base.Codec.payload =
     {
       Temporal_base.Payload.metadata =
@@ -1800,12 +2131,86 @@ let test_unknown_sequence_becomes_failure () =
       ()
   | _ -> failwith "unknown sequence did not become a protocol failure"
 
+(** Issue #846: [activate_translated] consumes one translation and encodes its
+    completion once, returning those canonical bytes. The bytes must equal what
+    [Workflow_protocol.encode_completion] produces for the typed completion
+    (the document the supervisor used to build by encoding a second time), the
+    [activate] convenience path must agree with it, and the bytes must be a
+    snapshot that later mutation of the typed completion's payload buffers
+    cannot change. *)
+let test_activate_translated_encodes_once () =
+  (* Every byte value, so the canonical base64 output covers padding and the
+     full alphabet rather than only ASCII text. *)
+  let output = Bytes.init (64 * 1024 + 1) (fun index -> Char.chr (index land 0xff)) in
+  let workflow =
+    Temporal_base.Definition.make ~name:"native_single_encode"
+      ~input:Temporal_base.Codec.unit ~output:Temporal_base.Codec.bytes
+      ~implementation:(Some (fun () -> Ok (Bytes.copy output)))
+  in
+  let start =
+    activation
+      [
+        Protocol.Initialize_workflow
+          {
+            workflow_id = "workflow-single-encode";
+            workflow_type = "native_single_encode";
+            arguments = [];
+            randomness_seed = "1";
+            attempt = 1;
+            context = None;
+          };
+      ]
+  in
+  let translated =
+    unwrap "single-encode translation" (Native_execution.translate_activation start)
+  in
+  if translated.source != start then
+    failwith "translation did not retain its source activation by reference";
+  let checked =
+    unwrap "single-encode activation"
+      (Native_execution.activate_translated (Execution.start workflow ()) translated)
+  in
+  let submitted =
+    Temporal_protocol.Encoded_workflow_completion.to_string checked.encoded
+  in
+  (match Protocol.encode_completion checked.completion with
+  | Ok expected when String.equal expected submitted -> ()
+  | Ok _ -> failwith "retained completion bytes differ from the canonical encoder"
+  | Error _ -> failwith "checked completion no longer encodes");
+  (* The convenience path translates and activates once more on a fresh
+     execution; it must produce the same completion, hence the same bytes. *)
+  let typed =
+    unwrap "convenience activation" (Native_execution.activate (Execution.start workflow ()) start)
+  in
+  if typed <> checked.completion then
+    failwith "activate and activate_translated produced different completions";
+  (match checked.completion.commands with
+  | [ Protocol.Complete_workflow { result = Some payload } ] ->
+      if not (Bytes.equal payload.data output) then
+        failwith "completion payload changed during translation";
+      Bytes.fill payload.data 0 (Bytes.length payload.data) 'Z'
+  | _ -> failwith "single-encode workflow did not complete with its payload");
+  if
+    not
+      (String.equal submitted
+         (Temporal_protocol.Encoded_workflow_completion.to_string checked.encoded))
+  then failwith "mutating a typed payload changed the retained completion bytes";
+  match Protocol.decode_completion submitted with
+  | Ok
+      { commands = [ Protocol.Complete_workflow { result = Some payload } ]; _ }
+    when Bytes.equal payload.data output ->
+      ()
+  | _ -> failwith "retained completion bytes do not decode to the original payload"
+
 (** Runs every native-execution translation assertion. *)
 let () =
+  test_binary_metadata_is_lossless ();
   test_start_metadata_snapshot ();
   test_activation_metadata_and_order ();
   test_retained_payloads_are_copied ();
   test_activity_failure_details_are_preserved ();
+  test_child_failure_application_type ();
+  test_workflow_failure_application_type ();
   test_child_resolution_translation ();
   test_local_activity_backoff_translation ();
   test_signal_workflow_translation_and_activation ();
@@ -1827,4 +2232,5 @@ let () =
   test_command_order_and_validation ();
   test_activity_command_translation_and_validation ();
   test_duplicate_sequence_rejected ();
-  test_unknown_sequence_becomes_failure ()
+  test_unknown_sequence_becomes_failure ();
+  test_activate_translated_encodes_once ()

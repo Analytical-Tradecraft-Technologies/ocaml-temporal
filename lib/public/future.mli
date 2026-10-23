@@ -1,3 +1,9 @@
+(** Deterministic workflow futures and combinators for awaiting them.
+
+    Futures are produced by activities, child workflows, timers, and other
+    workflow operations. Awaiting one suspends only the current workflow
+    fiber until a later Temporal activation resolves it. *)
+
 (** A result that may become available in a later Temporal activation. A future
     belongs to one workflow execution. It is not a general-purpose promise for
     coordinating operating-system threads. Its internal type identity is

@@ -29,10 +29,16 @@ type ('value, 'error) waiter =
   (('value, 'error) result, unit) Effect.Deep.continuation
 
 (** Holds paused fibers and mapping callbacks while a result is unavailable.
-    Lists are reversed so adding a new entry is constant time. *)
+    [waiters] is reversed so adding a paused fiber is constant time; waiters
+    are never removed individually.  [observers] are kept in an ordered
+    registry because a subscription may be cancelled before the result
+    arrives (for example the losing side of a race against a long-lived
+    future); the registry makes that unsubscription O(1) while delivery still
+    follows registration order. *)
 type ('value, 'error) pending = {
   mutable waiters : ('value, 'error) waiter list;
-  mutable observers : (('value, 'error) result -> unit) option ref list;
+  observers :
+    (('value, 'error) result -> unit) option ref Temporal_base.Ordered_registry.t;
 }
 
 (** [Closed] means the workflow ended before this future received a result and
@@ -59,25 +65,28 @@ type ('left, 'right) race = Left of 'left | Right of 'right
 type _ Effect.t +=
   | Await : ('value, 'error) t -> ('value, 'error) result Effect.t
 
-(** Domain-local id of the scheduler fiber currently running on this Domain.
+(** Id of the scheduler whose drain the calling system thread is running.
     [await] requires this to match the future's owner so a fiber cannot park on
     another workflow's pending future merely because that other scheduler is
-    running somewhere else. *)
-let current_owner_id_key = Domain.DLS.new_key (fun () -> (None : int option))
+    running somewhere else. The binding is keyed per system thread, not per
+    Domain, because workers hosted on sibling threads of one Domain may
+    interleave their drains (#765). *)
+let current_owner_id = Thread_binding.create ()
 
-(** Publishes or clears the active owner id for the duration of one fiber. *)
+(** Publishes or clears the active owner id for the duration of one drain on
+    the calling thread, restoring the previous id even if [action] raises. *)
 let with_current_owner_id id action =
-  let previous = Domain.DLS.get current_owner_id_key in
-  Domain.DLS.set current_owner_id_key id;
-  Fun.protect
-    ~finally:(fun () -> Domain.DLS.set current_owner_id_key previous)
-    action
+  Thread_binding.with_value current_owner_id id action
 
-(** True when this Domain is currently running the scheduler with [id]. *)
+(** True when the calling thread is currently running the scheduler with [id]. *)
 let current_owner_matches id =
-  match Domain.DLS.get current_owner_id_key with
+  match Thread_binding.get current_owner_id with
   | Some current -> current = id
   | None -> false
+
+(** Number of threads on the calling Domain with a published owner id; used by
+    tests to prove that drains leave no binding behind. *)
+let bound_owner_count () = Thread_binding.bound_count current_owner_id
 
 (** Internal exception used only to release a paused fiber during shutdown. It
     is caught inside this module and never becomes a workflow error. *)
@@ -94,8 +103,9 @@ let teardown promise () =
       promise.owner.on_settled ();
       let waiters = List.rev pending.waiters in
       pending.waiters <- [];
-      List.iter (fun observer -> observer := None) pending.observers;
-      pending.observers <- [];
+      List.iter
+        (fun observer -> observer := None)
+        (Temporal_base.Ordered_registry.take_all pending.observers);
       List.iter
         (fun continuation ->
           try Effect.Deep.discontinue continuation Scheduler_shutdown
@@ -107,7 +117,13 @@ let teardown promise () =
     the future immediately sees it as ready. *)
 let create ~owner ~outside_error =
   let promise =
-    { owner; outside_error; state = Pending { waiters = []; observers = [] } }
+    {
+      owner;
+      outside_error;
+      state =
+        Pending
+          { waiters = []; observers = Temporal_base.Ordered_registry.create () };
+    }
   in
   owner.on_create ();
   (* Settled futures no longer need a shutdown callback. Removing the
@@ -144,9 +160,8 @@ let create ~owner ~outside_error =
                 observer := None;
                 if owner.callbacks_live () then
                   Option.iter (fun callback -> callback result) callback))
-          (List.rev pending.observers);
-        pending.waiters <- [];
-        pending.observers <- []
+          (Temporal_base.Ordered_registry.take_all pending.observers);
+        pending.waiters <- []
   in
   (promise, resolve)
 
@@ -183,13 +198,13 @@ let enqueue promise = promise.owner.enqueue
 (** Returns a ready result, or pauses only when called from the active fiber of
     the scheduler that owns this future. [is_running] alone is insufficient:
     another Domain may be running a different scheduler whose [is_running] is
-    true while this Domain is not that owner. *)
+    true while this thread is not that owner. *)
 let await promise =
   match promise.state with
   | Ready result -> result
   | Closed -> Error (promise.outside_error ())
   | Pending _ -> (
-      match Domain.DLS.get current_owner_id_key with
+      match Thread_binding.get current_owner_id with
       | Some id
         when id = promise.owner.id && promise.owner.is_running () ->
           Effect.perform (Await promise)
@@ -220,7 +235,8 @@ let add_waiter promise continuation =
     when the owner shuts down become no-ops after runtime teardown. Public
     derived wrappers use the same liveness signal to avoid scheduling work
     from these skipped callbacks. The returned owner-only removal action also
-    unlinks pending list storage and suppresses callbacks already queued. *)
+    unlinks pending registry storage in O(1) and suppresses callbacks already
+    queued. *)
 let subscribe promise observer =
   let token = ref (Some observer) in
   let deliver result () =
@@ -229,16 +245,21 @@ let subscribe promise observer =
     if promise.owner.callbacks_live () then
       Option.iter (fun callback -> callback result) callback
   in
-  (match promise.state with
-  | Pending pending -> pending.observers <- token :: pending.observers
-  | Ready result -> promise.owner.enqueue (deliver result)
-  | Closed -> promise.owner.enqueue (deliver (Error (promise.outside_error ()))));
-  fun () ->
-    token := None;
+  let registration =
     match promise.state with
     | Pending pending ->
-        pending.observers <- List.filter (fun current -> current != token) pending.observers
-    | Ready _ | Closed -> ()
+        Some (Temporal_base.Ordered_registry.add pending.observers token)
+    | Ready result ->
+        promise.owner.enqueue (deliver result);
+        None
+    | Closed ->
+        promise.owner.enqueue (deliver (Error (promise.outside_error ())));
+        None
+  in
+  fun () ->
+    token := None;
+    (* A no-op once resolution or teardown has drained the registry. *)
+    Option.iter Temporal_base.Ordered_registry.remove registration
 
 (** Registers an observer whose lifetime ends at delivery or owner teardown. *)
 let observe promise observer =

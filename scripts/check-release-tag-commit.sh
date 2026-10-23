@@ -10,6 +10,14 @@ if [ "$#" -ne 2 ]; then
 fi
 tag=$1
 expected=$2
+# git check-ref-format rejects "~" silently; name the OPAM/Git spelling mix-up
+# so a maintainer who typed the OPAM version knows which tag to use instead.
+case "$tag" in
+  *~*)
+    echo "Release tag $tag cannot contain '~' because Git refnames forbid it; use the hyphen spelling (for example v1.0.0-beta.1)." >&2
+    exit 1
+    ;;
+esac
 git check-ref-format "refs/tags/$tag"
 expected_commit=$(git rev-parse --verify "$expected^{commit}")
 if ! git fetch --no-tags --depth=1 origin "refs/tags/$tag"; then

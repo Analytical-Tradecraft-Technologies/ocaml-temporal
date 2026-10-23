@@ -15,6 +15,7 @@ type status =
   | Already_started
   | Retryable
   | Async_heartbeat_rejected
+  | Resource_exhausted
   | Unknown of int
 
 (** Error data copied into OCaml. It never owns Rust memory. *)
@@ -34,7 +35,7 @@ module Observability = Temporal_base.Observability
 module Control_protocol = Temporal_protocol.Control_protocol
 
 (** Version requested by this binding layer. *)
-let abi_version = 2l
+let abi_version = 4l
 
 (** Private OCaml value implemented in C. It owns a Rust result allocation until
     [decode] frees it or the OCaml garbage collector runs its finalizer. *)
@@ -44,11 +45,25 @@ type response
     SDK supervisor may use or close it; workflow code never sees this type. *)
 type runtime
 
+(** Opaque owner of one Core runtime shared by several [runtime] graphs
+    (#832). Each attached graph holds its own native reference to the shared
+    Core, so closing this value never frees Core under a live graph. *)
+type shared_runtime
+
+(** Optional admission limits of one client connection (#796). [None] keeps
+    the bridge default (64 waits, 64 starts, 4,096 calls). *)
+type client_limits = {
+  max_pending_waits : int option;
+  max_pending_starts : int option;
+  max_in_flight_calls : int option;
+}
+
 (** Validated client connection settings. The concrete JSON representation is
     private so callers cannot bypass sender-side checks. *)
 type client_config = {
   target_url : string;
   identity : string;
+  limits : client_limits;
 }
 
 (** Selects whether Core should use no worker versioning or its legacy build-ID
@@ -70,6 +85,33 @@ type worker_versioning =
 
 let ( let* ) = Result.bind
 
+(** Autoscaling bounds for Core's workflow-task pollers (#498). *)
+type poller_autoscaling = { minimum : int; maximum : int; initial : int }
+
+(** Optional Core worker settings added after the original worker document
+    (#498). [None] leaves Core's own default in force, and an all-[None]
+    value is not serialized at all, so default workers keep sending the
+    exact document that older bridge archives accept. *)
+type worker_tuning = {
+  workflow_task_poller_autoscaling : poller_autoscaling option;
+  sticky_queue_schedule_to_start_timeout_ms : int64 option;
+  max_heartbeat_throttle_interval_ms : int64 option;
+  default_heartbeat_throttle_interval_ms : int64 option;
+  max_worker_activities_per_second : float option;
+  max_task_queue_activities_per_second : float option;
+}
+
+(** Leaves every tuning setting at Core's default. *)
+let default_worker_tuning =
+  {
+    workflow_task_poller_autoscaling = None;
+    sticky_queue_schedule_to_start_timeout_ms = None;
+    max_heartbeat_throttle_interval_ms = None;
+    default_heartbeat_throttle_interval_ms = None;
+    max_worker_activities_per_second = None;
+    max_task_queue_activities_per_second = None;
+  }
+
 (** Validated workflow-only worker settings retained as ordinary OCaml data
     until the supervisor serializes worker construction. *)
 type worker_config = {
@@ -81,6 +123,14 @@ type worker_config = {
   max_outstanding_workflow_tasks : int;
   max_concurrent_workflow_task_polls : int;
   graceful_shutdown_timeout_ms : int64;
+  tuning : worker_tuning;
+      (** Optional Core settings; see {!worker_tuning}. *)
+  workflow_tasks : bool;
+      (** Poll workflow tasks. False only when no workflow is registered. *)
+  activity_tasks : bool;
+      (** Poll remote activity tasks. False only when no activity is
+          registered, so the worker never takes an activity that a sibling
+          worker on the same task queue could execute (#805). *)
 }
 
 (** Private transport-safety ceiling mirrored and revalidated by Rust. This is
@@ -99,6 +149,33 @@ let min_cached_workflow_polls = 2
 (** Maximum accepted graceful shutdown period in milliseconds. *)
 let max_graceful_shutdown_timeout_ms = 86_400_000L
 
+(** Maximum accepted sticky-queue timeout and heartbeat throttle interval in
+    milliseconds (one day), mirrored by the Rust bridge. A longer value is far
+    more likely to be a unit mistake than a deliberate policy, and the bound
+    keeps every value representable as a protobuf duration. *)
+let max_worker_tuning_duration_ms = 86_400_000L
+
+(** Largest explicit Tokio worker-thread count for one runtime. Mirrors
+    [MAX_RUNTIME_WORKER_THREADS] in the Rust bridge, which rejects larger
+    values again; validating here keeps an invalid count from allocating the
+    OCaml runtime owner at all. *)
+let max_runtime_worker_threads = 256
+
+(** Validates an explicit runtime worker-thread count; [None] selects the
+    bridge default and is always accepted. *)
+let validate_runtime_worker_threads = function
+  | None -> Ok ()
+  | Some count when count >= 1 && count <= max_runtime_worker_threads -> Ok ()
+  | Some count ->
+      Error
+        {
+          status = Invalid_argument;
+          message =
+            Printf.sprintf
+              "runtime worker thread count must be between 1 and %d, got %d"
+              max_runtime_worker_threads count;
+        }
+
 external check_abi_version_raw : int32 -> response
   = "ocaml_temporal_check_abi_version"
 
@@ -107,14 +184,35 @@ external echo_raw : bytes -> response = "ocaml_temporal_echo"
 external conformance_wait_ms_raw : int -> response
   = "ocaml_temporal_conformance_wait_ms"
 
+(** Reads the process-local monotonic clock in nanoseconds; see the
+    interface. Implemented in C, not Rust, so the bridge ABI is unchanged. *)
+external monotonic_now_ns : unit -> int64 = "ocaml_temporal_monotonic_now_ns"
+
+(** Sleeps with the runtime lock released, through the bridge's
+    high-resolution pacing sleep; see the interface (#1008). *)
+external pacing_sleep : float -> unit = "ocaml_temporal_pacing_sleep"
+
 external response_status : response -> int = "ocaml_temporal_response_status"
 external response_value : response -> bytes = "ocaml_temporal_response_value"
 external response_error : response -> string = "ocaml_temporal_response_error"
 external response_free : response -> unit = "ocaml_temporal_response_free"
-external runtime_create_raw : unit -> runtime * response
+external runtime_create_raw : int -> runtime * response
   = "ocaml_temporal_runtime_create"
 
 external runtime_close_raw : runtime -> int = "ocaml_temporal_runtime_close"
+
+external shared_runtime_create_raw : int -> shared_runtime * response
+  = "ocaml_temporal_shared_runtime_create"
+
+external shared_runtime_create_with_telemetry_raw :
+  int -> string -> shared_runtime * response
+  = "ocaml_temporal_shared_runtime_create_with_telemetry"
+
+external runtime_attach_raw : shared_runtime -> runtime * response
+  = "ocaml_temporal_runtime_attach"
+
+external shared_runtime_close_raw : shared_runtime -> int
+  = "ocaml_temporal_shared_runtime_close"
 
 external client_connect_raw : runtime -> bytes -> response
   = "ocaml_temporal_client_connect"
@@ -157,6 +255,15 @@ external client_wait_start_workflow_json_raw : runtime -> bytes -> response
 
 external client_wait_workflow_json_raw : runtime -> bytes -> response
   = "ocaml_temporal_client_wait_workflow_json"
+
+external client_submit_json_raw : runtime -> int -> bytes -> response
+  = "ocaml_temporal_client_submit_json"
+
+external client_await_call_raw : int -> int -> int -> response
+  = "ocaml_temporal_client_await_call"
+
+external client_release_call_raw : int -> int -> response
+  = "ocaml_temporal_client_release_call"
 
 external client_complete_async_activity_json_raw : runtime -> bytes -> response
   = "ocaml_temporal_client_complete_async_activity_json"
@@ -212,6 +319,9 @@ external worker_try_poll_activity_raw : runtime -> response
 external worker_wait_activity_raw : runtime -> response
   = "ocaml_temporal_worker_wait_activity"
 
+external worker_wait_any_raw : runtime -> response
+  = "ocaml_temporal_worker_wait_any"
+
 external worker_wait_activity_completion_retry_backoff_raw : runtime -> response
   = "ocaml_temporal_worker_wait_activity_completion_retry_backoff"
 
@@ -223,6 +333,9 @@ external worker_record_activity_heartbeat_json_raw : runtime -> bytes -> respons
 
 external worker_reject_activity_json_raw : runtime -> bytes -> response
   = "ocaml_temporal_worker_reject_activity_json"
+
+external worker_initiate_shutdown_raw : runtime -> response
+  = "ocaml_temporal_worker_initiate_shutdown"
 
 external worker_shutdown_raw : runtime -> response
   = "ocaml_temporal_worker_shutdown"
@@ -246,6 +359,7 @@ let status = function
   | 12 -> Already_started
   | 13 -> Retryable
   | 14 -> Async_heartbeat_rejected
+  | 15 -> Resource_exhausted
   | code -> Unknown code
 
 (** Converts a bridge status to a bounded stable tag value without exposing the
@@ -265,6 +379,7 @@ let status_name = function
   | Already_started -> "already_started"
   | Retryable -> "retryable"
   | Async_heartbeat_rejected -> "async_heartbeat_rejected"
+  | Resource_exhausted -> "resource_exhausted"
   | Unknown _ -> "unknown"
 
 (** Constructs a local configuration failure without entering native code. *)
@@ -317,22 +432,163 @@ let validate_count ~allow_zero name value =
          max_worker_count)
   else Ok ()
 
+(** Leaves every client limit at the bridge default. *)
+let default_client_limits =
+  { max_pending_waits = None; max_pending_starts = None; max_in_flight_calls = None }
+
+(** Largest accepted [max_pending_waits], mirroring
+    [MAX_CONFIGURABLE_PENDING_WAITS] in the Rust bridge. Each distinct waited
+    run holds one open history long poll, so far larger values are much more
+    likely to be a mistake than a deliberate setting. *)
+let max_configurable_pending_waits = 4_096
+
+(** Largest accepted [max_pending_starts], mirroring
+    [MAX_CONFIGURABLE_PENDING_STARTS] in the Rust bridge. *)
+let max_configurable_pending_starts = 4_096
+
+(** Largest accepted [max_in_flight_calls], mirroring
+    [MAX_CONFIGURABLE_IN_FLIGHT_CALLS] in the Rust bridge. *)
+let max_configurable_in_flight_calls = 65_536
+
+(** Checks one optional limit against [1..maximum]. The message names the
+    field and the accepted range, matching the Rust bridge's wording. *)
+let validate_limit name maximum = function
+  | None -> Ok ()
+  | Some value when value >= 1 && value <= maximum -> Ok ()
+  | Some _ ->
+      configuration_error
+        (Printf.sprintf "client %s must be between 1 and %d" name maximum)
+
+(** Validates every explicit client limit; the Rust bridge checks the same
+    ranges again when it decodes the connect document. *)
+let validate_client_limits
+    { max_pending_waits; max_pending_starts; max_in_flight_calls } =
+  let* () =
+    validate_limit "max_pending_waits" max_configurable_pending_waits
+      max_pending_waits
+  in
+  let* () =
+    validate_limit "max_pending_starts" max_configurable_pending_starts
+      max_pending_starts
+  in
+  validate_limit "max_in_flight_calls" max_configurable_in_flight_calls
+    max_in_flight_calls
+
 (** Creates client settings only after all sender-side invariants hold. *)
-let client_config ~target_url ~identity =
-  match validate_target_url target_url with
-  | Error _ as error -> error
-  | Ok () ->
-      Result.map
-        (fun () -> { target_url; identity })
-        (validate_identifier "identity" identity)
+let client_config ?(limits = default_client_limits) ~target_url ~identity () =
+  let* () = validate_target_url target_url in
+  let* () = validate_identifier "identity" identity in
+  let* () = validate_client_limits limits in
+  Ok { target_url; identity; limits }
+
+(** Checks one optional positive tuning duration against
+    [max_worker_tuning_duration_ms]. *)
+let validate_tuning_duration name = function
+  | None -> Ok ()
+  | Some value
+    when Int64.compare value 0L > 0
+         && Int64.compare value max_worker_tuning_duration_ms <= 0 ->
+      Ok ()
+  | Some _ ->
+      configuration_error
+        (Printf.sprintf "%s must be between 1 and %Ld" name
+           max_worker_tuning_duration_ms)
+
+(** Checks one optional rate: Core rejects zero, negative, NaN, infinite and
+    subnormal worker rates, and the task-queue rate is held to the same rule
+    because the server treats it as a positive dispatch limit. *)
+let validate_rate name = function
+  | None -> Ok ()
+  | Some value when Float.classify_float value = FP_normal && value > 0.0 ->
+      Ok ()
+  | Some _ -> configuration_error (name ^ " must be a positive finite number")
+
+(** Smallest accepted per-worker activity rate: one poll per day. *)
+let min_worker_rate = 1.0 /. 86_400.0
+
+(** Checks the per-worker rate. Core computes its poll interval as
+    [Duration::from_secs_f64 (1 / rate)], which panics inside worker
+    construction when the reciprocal overflows, so the reciprocal is bounded
+    to one day. The task-queue rate is only forwarded to the server. *)
+let validate_worker_rate name value =
+  let* () = validate_rate name value in
+  match value with
+  | Some rate when rate < min_worker_rate ->
+      configuration_error (name ^ " must be at least one per day (1/86400)")
+  | _ -> Ok ()
+
+(** Validates the optional settings together with the poller maximum they
+    must agree with. An autoscaling poller's maximum is carried in
+    [max_concurrent_workflow_task_polls], so the two can never disagree. *)
+let validate_tuning ~max_concurrent_workflow_task_polls tuning =
+  let* () =
+    match tuning.workflow_task_poller_autoscaling with
+    | None -> Ok ()
+    | Some { minimum; maximum; initial } ->
+        let* () =
+          validate_count ~allow_zero:false
+            "workflow_task_poller_autoscaling.minimum" minimum
+        in
+        let* () =
+          validate_count ~allow_zero:false
+            "workflow_task_poller_autoscaling.maximum" maximum
+        in
+        if maximum < minimum then
+          configuration_error
+            "workflow_task_poller_autoscaling.maximum must be at least minimum"
+        else if initial < minimum || initial > maximum then
+          configuration_error
+            "workflow_task_poller_autoscaling.initial must be between minimum \
+             and maximum"
+        else if maximum <> max_concurrent_workflow_task_polls then
+          configuration_error
+            "workflow_task_poller_autoscaling.maximum must equal \
+             max_concurrent_workflow_task_polls"
+        else Ok ()
+  in
+  let* () =
+    validate_tuning_duration "sticky_queue_schedule_to_start_timeout_ms"
+      tuning.sticky_queue_schedule_to_start_timeout_ms
+  in
+  let* () =
+    validate_tuning_duration "max_heartbeat_throttle_interval_ms"
+      tuning.max_heartbeat_throttle_interval_ms
+  in
+  let* () =
+    validate_tuning_duration "default_heartbeat_throttle_interval_ms"
+      tuning.default_heartbeat_throttle_interval_ms
+  in
+  let* () =
+    (* Core silently clips the default interval to the maximum; reject the
+       explicit contradiction instead of hiding it. *)
+    match
+      ( tuning.default_heartbeat_throttle_interval_ms,
+        tuning.max_heartbeat_throttle_interval_ms )
+    with
+    | Some default, Some maximum when Int64.compare default maximum > 0 ->
+        configuration_error
+          "default_heartbeat_throttle_interval_ms must not exceed \
+           max_heartbeat_throttle_interval_ms"
+    | _ -> Ok ()
+  in
+  let* () =
+    validate_worker_rate "max_worker_activities_per_second"
+      tuning.max_worker_activities_per_second
+  in
+  validate_rate "max_task_queue_activities_per_second"
+    tuning.max_task_queue_activities_per_second
 
 (** Creates workflow-only worker settings after validating every field. *)
 let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
     ~max_cached_workflows
     ~max_outstanding_workflow_tasks ~max_concurrent_workflow_task_polls
-    ~graceful_shutdown_timeout_ms () =
+    ~graceful_shutdown_timeout_ms ?(tuning = default_worker_tuning)
+    ?(workflow_tasks = true) ?(activity_tasks = true) () =
   let validations =
     [
+      (if workflow_tasks || activity_tasks then Ok ()
+       else
+         configuration_error "task_types must enable workflows or activities");
       validate_identifier "namespace" namespace;
       validate_identifier "task_queue" task_queue;
       validate_identifier "build_id" build_id;
@@ -357,24 +613,31 @@ let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
             if String.equal build_id deployment_build_id then Ok ()
             else configuration_error "versioning.build_id must match build_id"
           in
-          if use_worker_versioning then
-            (match default_versioning_behavior with
-            | None -> Ok ()
-            | Some (Auto_upgrade | Pinned) -> Ok ())
-          else
-            match default_versioning_behavior with
-            | None -> Ok ()
-            | Some _ ->
-                configuration_error
-                  "versioning.default_versioning_behavior requires use_worker_versioning");
+          (* Mirrors the Rust validator: completions never carry a
+             per-workflow behavior, so a versioned worker must configure the
+             default Core substitutes for UNSPECIFIED (issue #817). *)
+          (match (use_worker_versioning, default_versioning_behavior) with
+          | true, Some (Auto_upgrade | Pinned) | false, None -> Ok ()
+          | true, None ->
+              configuration_error
+                "versioning.use_worker_versioning requires \
+                 default_versioning_behavior"
+          | false, Some _ ->
+              configuration_error
+                "versioning.default_versioning_behavior requires \
+                 use_worker_versioning"));
       validate_count ~allow_zero:true "max_cached_workflows"
         max_cached_workflows;
       validate_count ~allow_zero:false "max_outstanding_workflow_tasks"
         max_outstanding_workflow_tasks;
       validate_count ~allow_zero:false "max_concurrent_workflow_task_polls"
         max_concurrent_workflow_task_polls;
+      (* Core splits only a fixed poller count between the sticky and normal
+         queues; autoscaling bounds apply to each queue, so the two-poller
+         rule does not apply to them. *)
       (if
          max_cached_workflows > 0
+         && Option.is_none tuning.workflow_task_poller_autoscaling
          && max_concurrent_workflow_task_polls < min_cached_workflow_polls
        then
          configuration_error
@@ -389,6 +652,7 @@ let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
        else
          configuration_error
            "graceful_shutdown_timeout_ms must be between 0 and 86400000");
+      validate_tuning ~max_concurrent_workflow_task_polls tuning;
     ]
   in
   match List.find_opt Result.is_error validations with
@@ -405,21 +669,73 @@ let worker_config ~namespace ~task_queue ~build_id ?(versioning = No_versioning)
           max_outstanding_workflow_tasks;
           max_concurrent_workflow_task_polls;
           graceful_shutdown_timeout_ms;
+          tuning;
+          workflow_tasks;
+          activity_tasks;
         }
 
-(** Encodes the exact strict client document accepted by the Rust adapter. *)
-let encode_client_config config =
+(** Renders the exact strict client document accepted by the Rust adapter.
+    Each explicit limit is appended after [identity] in a fixed order; an
+    omitted one is not serialized, so a client with default limits sends the
+    document byte-for-byte as before #796. *)
+let client_config_document config =
+  let limit name = Option.map (fun value -> (name, `Int value)) in
+  let { max_pending_waits; max_pending_starts; max_in_flight_calls } =
+    config.limits
+  in
   `Assoc
-    [
-      ("target_url", `String config.target_url);
-      ("identity", `String config.identity);
-    ]
-  |> Yojson.Safe.to_string |> Bytes.of_string
+    ([
+       ("target_url", `String config.target_url);
+       ("identity", `String config.identity);
+     ]
+    @ List.filter_map Fun.id
+        [
+          limit "max_pending_waits" max_pending_waits;
+          limit "max_pending_starts" max_pending_starts;
+          limit "max_in_flight_calls" max_in_flight_calls;
+        ])
+  |> Yojson.Safe.to_string
+
+(** Encodes {!client_config_document} as the bytes sent to Rust. *)
+let encode_client_config config = Bytes.of_string (client_config_document config)
+
+(** Encodes the optional [tuning] member, listing only explicit settings.
+    Returns [None] for an all-default value so the member is omitted and the
+    document stays byte-for-byte identical to the pre-#498 encoding. *)
+let encode_worker_tuning tuning =
+  let duration name = Option.map (fun ms -> (name, `Intlit (Int64.to_string ms))) in
+  let rate name = Option.map (fun value -> (name, `Float value)) in
+  let fields =
+    List.filter_map Fun.id
+      [
+        Option.map
+          (fun { minimum; maximum; initial } ->
+            ( "workflow_task_poller_autoscaling",
+              `Assoc
+                [
+                  ("minimum", `Int minimum);
+                  ("maximum", `Int maximum);
+                  ("initial", `Int initial);
+                ] ))
+          tuning.workflow_task_poller_autoscaling;
+        duration "sticky_queue_schedule_to_start_timeout_ms"
+          tuning.sticky_queue_schedule_to_start_timeout_ms;
+        duration "max_heartbeat_throttle_interval_ms"
+          tuning.max_heartbeat_throttle_interval_ms;
+        duration "default_heartbeat_throttle_interval_ms"
+          tuning.default_heartbeat_throttle_interval_ms;
+        rate "max_worker_activities_per_second"
+          tuning.max_worker_activities_per_second;
+        rate "max_task_queue_activities_per_second"
+          tuning.max_task_queue_activities_per_second;
+      ]
+  in
+  match fields with [] -> None | fields -> Some ("tuning", `Assoc fields)
 
 (** Encodes the exact strict workflow-worker document accepted by Rust. *)
-let encode_worker_config config =
+let worker_config_document config =
   `Assoc
-    [
+    ([
       ("namespace", `String config.namespace);
       ("task_queue", `String config.task_queue);
       ("build_id", `String config.build_id);
@@ -454,8 +770,18 @@ let encode_worker_config config =
         `Int config.max_concurrent_workflow_task_polls );
       ( "graceful_shutdown_timeout_ms",
         `Intlit (Int64.to_string config.graceful_shutdown_timeout_ms) );
+      ( "task_types",
+        `Assoc
+          [
+            ("workflows", `Bool config.workflow_tasks);
+            ("activities", `Bool config.activity_tasks);
+          ] );
     ]
-  |> Yojson.Safe.to_string |> Bytes.of_string
+    @ Option.to_list (encode_worker_tuning config.tuning))
+  |> Yojson.Safe.to_string
+
+(** The worker document as the bytes handed to the C stub. *)
+let encode_worker_config config = Bytes.of_string (worker_config_document config)
 
 (** Returns one closed protocol error for malformed replay input. The Rust
     side repeats the complete checks; this sender-side copy rejects bad JSON
@@ -484,10 +810,7 @@ let validate_replay_history input =
         when String.length workflow_id > 0
              && String.length workflow_id <= max_transport_string_bytes
              && not (String.contains workflow_id '\000') -> (
-          match
-            Control_protocol.decode_payload
-              (Yojson.Safe.to_string history_json)
-          with
+          match Control_protocol.decode_payload_json history_json with
           | Ok _ -> Ok ()
           | Error _ -> invalid ())
       | _ -> invalid ())
@@ -514,8 +837,9 @@ let bridge_error_log_level = function
          operator. *)
       (Logs.Debug, "bridge operation not ready")
   | Outstanding_tasks ->
-      (* Shutdown can be retried after the language side finishes its leased
-         work. Keep this visible without classifying it as a bridge failure. *)
+      (* Live worker shutdown force-completed a lease the language side never
+         completed and still released the worker; replay reports undrained
+         input. Keep this visible without classifying it as a bridge failure. *)
       (Logs.Warning, "bridge operation waiting for outstanding tasks")
   | _ ->
       (* Protocol, lifecycle, configuration, and native failures all indicate
@@ -634,6 +958,98 @@ let client_wait_start_workflow_json runtime input =
 let client_wait_workflow_json runtime input =
   bridge_call "client_wait_workflow_json" (fun () ->
       decode (client_wait_workflow_json_raw runtime input))
+
+(** Selects the client operation a submitted call performs (#807). *)
+type client_call_kind =
+  | Call_start
+  | Call_wait
+  | Call_cancel
+  | Call_terminate
+  | Call_reset
+  | Call_signal
+  | Call_query
+  | Call_update
+  | Call_poll_update
+  | Call_visibility
+  | Call_async_activity_completion
+  | Call_async_activity_heartbeat
+
+(** Handle of one submitted call: the random identity of the runtime graph
+    that submitted it and the call identifier, both issued by Rust and
+    positive. Rust serves an await only when both match, so the handle is
+    the capability to collect the outcome. *)
+type client_call = { owner : int; call : int }
+
+(** The closed numeric selector of [kind] in ABI version 4; it must match
+    [OCAML_TEMPORAL_CORE_CLIENT_CALL_*] in the C header. *)
+let client_call_selector = function
+  | Call_start -> 1
+  | Call_wait -> 2
+  | Call_cancel -> 3
+  | Call_terminate -> 4
+  | Call_reset -> 5
+  | Call_signal -> 6
+  | Call_query -> 7
+  | Call_update -> 8
+  | Call_poll_update -> 9
+  | Call_visibility -> 10
+  | Call_async_activity_completion -> 11
+  | Call_async_activity_heartbeat -> 12
+
+(** Longest single native wait accepted by Rust for one await. *)
+let max_client_await_ms = 60_000
+
+(** Parses the [<owner>.<call>] handle Rust returns; both parts must be
+    positive decimal integers. [int_of_string_opt] alone also accepts a sign,
+    [_] separators, and [0x]/[0o]/[0b]/[0u] prefixes, which would let several
+    spellings alias one handle, so each part must first be nonempty ASCII
+    decimal digits (#506 decoder fuzz). *)
+let parse_client_call text =
+  let decimal part =
+    part <> "" && String.for_all (function '0' .. '9' -> true | _ -> false) part
+  in
+  match String.split_on_char '.' text with
+  | [ owner; call ] when decimal owner && decimal call -> (
+      match (int_of_string_opt owner, int_of_string_opt call) with
+      | Some owner, Some call when owner > 0 && call > 0 -> Some { owner; call }
+      | _ -> None)
+  | _ -> None
+
+(** Submits one client RPC through the runtime owner and parses the call
+    handle Rust returns. A malformed handle is a bridge protocol defect
+    reported as [Protocol]; it cannot be awaited. *)
+let client_submit_json runtime kind input =
+  bridge_call "client_submit_json" (fun () ->
+      match decode (client_submit_json_raw runtime (client_call_selector kind) input) with
+      | Error _ as error -> error
+      | Ok bytes -> (
+          match parse_client_call (Bytes.to_string bytes) with
+          | Some handle -> Ok handle
+          | None ->
+              Error
+                {
+                  status = Protocol;
+                  message = "client call submission returned an invalid handle";
+                }))
+
+(** Waits at most [timeout_ms] for one submitted call's outcome. The C stub
+    borrows no runtime and releases the OCaml lock for the whole wait, so it
+    may run on any Domain or thread. An elapsed interval ([Not_ready]) is
+    ordinary pending state and is logged at debug level only. An invalid
+    [timeout_ms] is a programmer error. *)
+let client_await_call { owner; call } ~timeout_ms =
+  if timeout_ms < 0 || timeout_ms > max_client_await_ms then
+    invalid_arg "Native_bridge.client_await_call: timeout out of range";
+  bridge_call "client_await_call" (fun () ->
+      decode (client_await_call_raw owner call timeout_ms))
+
+(** Abandons one submitted call without reading it, freeing its slot in the
+    runtime's call ceiling and dropping any published outcome. Releasing a
+    call that was already read, released, or closed is a no-op. Like
+    {!client_await_call} it borrows no runtime and may run on any thread. *)
+let client_release_call { owner; call } =
+  bridge_call "client_release_call" (fun () ->
+      Result.map ignore (decode (client_release_call_raw owner call)))
 
 (** Completes an admitted asynchronous activity through Rust's official
     namespace-bound client. The input is strict activity-completion JSON and is
@@ -766,6 +1182,14 @@ let worker_wait_activity runtime =
   bridge_call "worker_wait_activity" (fun () ->
       Result.map (fun _ -> ()) (decode (worker_wait_activity_raw runtime)))
 
+(** Waits for readiness on either worker lane under the same bounded,
+    runtime-lock-free contract as [worker_wait_workflow]. A queued task on
+    either lane ends the wait without being consumed; drain it with the
+    matching [worker_try_poll_*] call. *)
+let worker_wait_any runtime =
+  bridge_call "worker_wait_any" (fun () ->
+      Result.map (fun _ -> ()) (decode (worker_wait_any_raw runtime)))
+
 (** Applies the fixed native delay used only after Rust explicitly reports a
     retryable activity-completion transport outcome. The C stub releases the
     OCaml runtime lock while Rust sleeps on the supervisor owner Domain. *)
@@ -787,7 +1211,10 @@ let worker_complete_activity_json runtime input =
     it, because terminal completion remains a separate operation. The result is
     deliberately an acknowledgement only: pinned Temporal Core reports
     cancellation, pause, and reset flags asynchronously in a later Cancel task
-    rather than fabricating synchronous status here. *)
+    rather than fabricating synchronous status here. Since Core v1.0, a
+    heartbeat whose details exceed the namespace payload limit makes Core fail
+    the activity itself and queue that Cancel task; the later OCaml completion
+    is then accepted and discarded by Core. *)
 let worker_record_activity_heartbeat_json runtime input =
   bridge_call "worker_record_activity_heartbeat_json" (fun () ->
       Result.map (fun _ -> ())
@@ -800,6 +1227,12 @@ let worker_reject_activity_json runtime input =
   bridge_call "worker_reject_activity_json" (fun () ->
       Result.map (fun _ -> ())
         (decode (worker_reject_activity_json_raw runtime input)))
+
+(** Stops the worker taking new tasks without releasing it (#1028). Rust
+    treats repetition, and an absent worker, as success. *)
+let worker_initiate_shutdown runtime =
+  bridge_call "worker_initiate_shutdown" (fun () ->
+      Result.map (fun _ -> ()) (decode (worker_initiate_shutdown_raw runtime)))
 
 (** Gracefully closes the worker. Rust treats repetition as success. *)
 let worker_shutdown runtime =
@@ -839,20 +1272,27 @@ let runtime_close runtime =
   result
 
 (** Checks the linked bridge contract once, then creates the native runtime.
-    If creation fails after allocating the OCaml owner, cleanup remains safe
-    because its native pointer is either null or explicitly closed here. *)
-let runtime_create () =
+    An invalid [worker_threads] is rejected before any allocation. If creation
+    fails after allocating the OCaml owner, cleanup remains safe because its
+    native pointer is either null or explicitly closed here. The C ABI encodes
+    the bridge default as [0]. *)
+let runtime_create ?worker_threads () =
   let result =
     bridge_call "runtime_create" (fun () ->
+        match validate_runtime_worker_threads worker_threads with
+        | Error _ as error -> error
+        | Ok () -> (
         match check_abi_version abi_version with
         | Error _ as error -> error
         | Ok () ->
-            let runtime, response = runtime_create_raw () in
+            let runtime, response =
+              runtime_create_raw (Option.value worker_threads ~default:0)
+            in
             (match decode response with
             | Ok _ -> Ok runtime
             | Error error ->
                 ignore (runtime_close runtime);
-                Error error))
+                Error error)))
   in
   let level, message, bridge_status =
     match result with
@@ -865,3 +1305,164 @@ let runtime_create () =
   in
   Observability.report ~src:Observability.Source.lifecycle level ~tags message;
   result
+
+(** Reports one shared-runtime lifecycle transition on the lifecycle source,
+    mirroring [runtime_create] and [runtime_close]. *)
+let report_shared_lifecycle ~operation ~ok_message ~error_message result =
+  let level, message, bridge_status =
+    match result with
+    | Ok _ -> (Logs.Info, ok_message, None)
+    | Error error -> (Logs.Error, error_message, Some (status_name error.status))
+  in
+  let tags = Observability.tags ~operation ?bridge_status () in
+  Observability.report ~src:Observability.Source.lifecycle level ~tags message;
+  result
+
+(** Releases the shared handle's Core reference. Repeating it is safe; Core
+    is destroyed before this returns only when no attached graph remains. *)
+let shared_runtime_close shared =
+  bridge_call "shared_runtime_close" (fun () ->
+      match shared_runtime_close_raw shared with
+      | 0 -> Ok ()
+      | code ->
+          Error
+            {
+              status = status code;
+              message = "Temporal Core shared runtime close failed";
+            })
+  |> report_shared_lifecycle ~operation:"shared_runtime_close"
+       ~ok_message:"shared runtime closed"
+       ~error_message:"shared runtime shutdown failed"
+
+(** Checks the bridge contract, then creates one shareable Core runtime. The
+    thread-count contract and failure cleanup match [runtime_create]. *)
+let shared_runtime_create ?worker_threads () =
+  bridge_call "shared_runtime_create" (fun () ->
+      match validate_runtime_worker_threads worker_threads with
+      | Error _ as error -> error
+      | Ok () -> (
+          match check_abi_version abi_version with
+          | Error _ as error -> error
+          | Ok () -> (
+              let shared, response =
+                shared_runtime_create_raw (Option.value worker_threads ~default:0)
+              in
+              match decode response with
+              | Ok _ -> Ok shared
+              | Error error ->
+                  ignore (shared_runtime_close shared);
+                  Error error)))
+  |> report_shared_lifecycle ~operation:"shared_runtime_create"
+       ~ok_message:"shared runtime initialized"
+       ~error_message:"shared runtime initialization failed"
+
+(** As [shared_runtime_create], but passes the strict telemetry document
+    [telemetry] to Rust (#500) and returns the bound metrics address, which
+    is empty when the document configures no exporter. Rust validates the
+    document and binds the endpoint before publishing the handle, so a
+    failure leaves nothing running; the empty owner is still closed. *)
+let shared_runtime_create_with_telemetry ?worker_threads ~telemetry () =
+  bridge_call "shared_runtime_create" (fun () ->
+      match validate_runtime_worker_threads worker_threads with
+      | Error _ as error -> error
+      | Ok () -> (
+          match check_abi_version abi_version with
+          | Error _ as error -> error
+          | Ok () -> (
+              let shared, response =
+                shared_runtime_create_with_telemetry_raw
+                  (Option.value worker_threads ~default:0)
+                  telemetry
+              in
+              match decode response with
+              | Ok address -> Ok (shared, Bytes.to_string address)
+              | Error error ->
+                  ignore (shared_runtime_close shared);
+                  Error error)))
+  |> report_shared_lifecycle ~operation:"shared_runtime_create"
+       ~ok_message:"shared runtime initialized"
+       ~error_message:"shared runtime initialization failed"
+
+(** Creates one graph on [shared]'s Core. A failed attach closes the
+    (necessarily empty) graph owner before returning. *)
+let runtime_attach shared =
+  bridge_call "runtime_attach" (fun () ->
+      let runtime, response = runtime_attach_raw shared in
+      match decode response with
+      | Ok _ -> Ok runtime
+      | Error error ->
+          ignore (runtime_close runtime);
+          Error error)
+  |> report_shared_lifecycle ~operation:"runtime_attach"
+       ~ok_message:"runtime attached to shared runtime"
+       ~error_message:"runtime attach failed"
+
+(** SDK metrics recorder of a shared runtime (#500); see the interface. The
+    C payload is the Rust handle, or NULL when the runtime has no exporter;
+    only the GC finalizer releases it. *)
+type metric_meter
+
+(** Kind of one SDK metric series; fixed per metric name. *)
+type metric_kind =
+  | Counter
+  | Up_down_counter
+  | Gauge
+  | Histogram
+  | Duration_histogram
+
+external shared_runtime_metric_meter_raw :
+  shared_runtime -> metric_meter * response
+  = "ocaml_temporal_shared_runtime_metric_meter"
+
+external metric_meter_enabled : metric_meter -> bool
+  = "ocaml_temporal_metric_meter_enabled"
+[@@noalloc]
+
+external metric_register_raw : metric_meter -> string -> int * response
+  = "ocaml_temporal_metric_meter_register"
+
+(** The hot recording path: allocation-free on both sides of the boundary,
+    and it never releases the runtime lock (Rust takes only a read lock and
+    performs no I/O). Returns the bridge status code. *)
+external metric_record_raw : metric_meter -> int -> int -> int
+  = "ocaml_temporal_metric_meter_record"
+[@@noalloc]
+
+let shared_runtime_metric_meter shared =
+  let meter, response = shared_runtime_metric_meter_raw shared in
+  match decode response with
+  | Ok _ -> Ok (if metric_meter_enabled meter then Some meter else None)
+  | Error _ as error -> error
+
+(** The registration document's [kind] member. *)
+let metric_kind_name = function
+  | Counter -> "counter"
+  | Up_down_counter -> "up_down_counter"
+  | Gauge -> "gauge"
+  | Histogram -> "histogram"
+  | Duration_histogram -> "duration_histogram"
+
+let metric_register meter ~kind ~name ~description ~labels =
+  let document =
+    `Assoc
+      [
+        ("kind", `String (metric_kind_name kind));
+        ("name", `String name);
+        ("description", `String description);
+        ( "labels",
+          `List
+            (List.map
+               (fun (label, value) ->
+                 `Assoc [ ("name", `String label); ("value", `String value) ])
+               labels) );
+      ]
+  in
+  let id, response = metric_register_raw meter (Yojson.Safe.to_string document) in
+  match decode response with
+  | Ok _ when id >= 0 -> Ok id
+  | Ok _ ->
+      Error
+        { status = Internal; message = "metric registration returned no identifier" }
+  | Error _ as error -> error
+
+let metric_record meter id value = metric_record_raw meter id value = 0

@@ -173,14 +173,43 @@ pub struct ActivityHeartbeat {
     pub details: Vec<Payload>,
 }
 
+/// Progress details for an activity handed off with `WillCompleteAsync`,
+/// together with the attempt's heartbeat timeout (#1025).
+///
+/// The bridge throttles these heartbeats per task token as Core throttles a
+/// running activity's heartbeats. Core derives the throttle interval from the
+/// heartbeat timeout of the task it still tracks; the async client path has
+/// no such task, so the OCaml adapter, which copied the timeout from the
+/// attempt's start task, supplies it here. `None` (and a zero duration, which
+/// the server uses for an unset timeout) selects the worker's default
+/// throttle interval.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncActivityHeartbeat {
+    /// Opaque canonical-base64 token copied from the handed-off task.
+    pub task_token: String,
+    /// Ordered details retained by Temporal for the next retry attempt.
+    pub details: Vec<Payload>,
+    /// Heartbeat timeout of the attempt, copied from its start task.
+    #[serde(deserialize_with = "workflow_protocol::required_nullable")]
+    pub heartbeat_timeout: Option<Duration>,
+}
+
 /// Supported activity completion outcomes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActivityCompletionResult {
+    /// Activity code returned successfully.
     Completed {
-        /// Optional Temporal payload returned by the activity.
-        #[serde(deserialize_with = "workflow_protocol::required_nullable")]
-        result: Option<Payload>,
+        /// Temporal payload returned by the activity.
+        ///
+        /// The payload is required and not nullable. Core's
+        /// `validate_activity_completion` rejects `Success { result: None }`
+        /// as malformed (issue #954), so a void result is an encoded payload
+        /// whose data may be empty, as in the official SDKs. Refusing `null`
+        /// at decode keeps the failure ahead of any Core call, while the
+        /// lease is still held and the existing reject path can retire it.
+        result: Payload,
     },
     /// Activity code failed with structured Temporal failure information.
     Failed {
@@ -198,9 +227,10 @@ pub enum ActivityCompletionResult {
 
 /// Decodes and validates one strict activity-task document.
 pub fn decode_task(input: &str) -> Result<ActivityTask, ProtocolError> {
-    let value = protocol::decode_payload_object(input)?;
-    let task: ActivityTask = serde_json::from_value(to_serde(value))
-        .map_err(|_| ProtocolError::invalid("$", "invalid activity task semantics"))?;
+    let task: ActivityTask = protocol::semantic_from_value(
+        protocol::decode_payload_object(input)?,
+        "invalid activity task semantics",
+    )?;
     validate_task(&task)?;
     Ok(task)
 }
@@ -208,9 +238,7 @@ pub fn decode_task(input: &str) -> Result<ActivityTask, ProtocolError> {
 /// Validates, normalizes, and reparses one outgoing activity task.
 pub fn encode_task(value: &ActivityTask) -> Result<String, ProtocolError> {
     validate_task(value)?;
-    let json = serde_json::to_value(value)
-        .map_err(|_| ProtocolError::invalid("$", "could not encode activity task"))?;
-    let output = protocol::encode_payload_object(&from_serde(json)?)?;
+    let output = protocol::encode_semantic(value, "could not encode activity task")?;
     decode_task(&output)?;
     Ok(output)
 }
@@ -218,27 +246,60 @@ pub fn encode_task(value: &ActivityTask) -> Result<String, ProtocolError> {
 /// Decodes and validates one strict activity-completion document.
 pub fn decode_completion(input: &str) -> Result<ActivityCompletion, ProtocolError> {
     let value = protocol::decode_payload_object(input)?;
-    let completion: ActivityCompletion = serde_json::from_value(to_serde(value))
-        .map_err(|_| ProtocolError::invalid("$", "invalid activity completion semantics"))?;
+    reject_null_completed_payload(&value)?;
+    let completion: ActivityCompletion =
+        protocol::semantic_from_value(value, "invalid activity completion semantics")?;
     validate_completion(&completion)?;
     Ok(completion)
+}
+
+/// Gives an explicit `null` success payload a precise diagnostic path.
+///
+/// Serde would also refuse `null` for the required [`Payload`], but only with
+/// the generic `$` path. Naming `$.result.result` tells a protocol author
+/// which member Core requires (issue #954). Every other shape is left to the
+/// typed decoder, which remains the single source of acceptance.
+fn reject_null_completed_payload(value: &protocol::JsonValue) -> Result<(), ProtocolError> {
+    /// Finds one member of a decoded object; duplicates were already refused.
+    fn member<'a>(value: &'a protocol::JsonValue, name: &str) -> Option<&'a protocol::JsonValue> {
+        match value {
+            protocol::JsonValue::Object(entries) => entries
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, member)| member),
+            _ => None,
+        }
+    }
+    let Some(result) = member(value, "result") else {
+        return Ok(());
+    };
+    let completed = matches!(
+        member(result, "kind"),
+        Some(protocol::JsonValue::String(kind)) if kind == "completed"
+    );
+    if completed && matches!(member(result, "result"), Some(protocol::JsonValue::Null)) {
+        return Err(ProtocolError::invalid(
+            "$.result.result",
+            "completed activity result requires a payload",
+        ));
+    }
+    Ok(())
 }
 
 /// Validates, normalizes, and reparses one outgoing activity completion.
 pub fn encode_completion(value: &ActivityCompletion) -> Result<String, ProtocolError> {
     validate_completion(value)?;
-    let json = serde_json::to_value(value)
-        .map_err(|_| ProtocolError::invalid("$", "could not encode activity completion"))?;
-    let output = protocol::encode_payload_object(&from_serde(json)?)?;
+    let output = protocol::encode_semantic(value, "could not encode activity completion")?;
     decode_completion(&output)?;
     Ok(output)
 }
 
 /// Decodes and validates one strict activity-heartbeat document.
 pub fn decode_heartbeat(input: &str) -> Result<ActivityHeartbeat, ProtocolError> {
-    let value = protocol::decode_payload_object(input)?;
-    let heartbeat: ActivityHeartbeat = serde_json::from_value(to_serde(value))
-        .map_err(|_| ProtocolError::invalid("$", "invalid activity heartbeat semantics"))?;
+    let heartbeat: ActivityHeartbeat = protocol::semantic_from_value(
+        protocol::decode_payload_object(input)?,
+        "invalid activity heartbeat semantics",
+    )?;
     validate_heartbeat(&heartbeat)?;
     Ok(heartbeat)
 }
@@ -246,10 +307,26 @@ pub fn decode_heartbeat(input: &str) -> Result<ActivityHeartbeat, ProtocolError>
 /// Validates, normalizes, and reparses one outgoing activity heartbeat.
 pub fn encode_heartbeat(value: &ActivityHeartbeat) -> Result<String, ProtocolError> {
     validate_heartbeat(value)?;
-    let json = serde_json::to_value(value)
-        .map_err(|_| ProtocolError::invalid("$", "could not encode activity heartbeat"))?;
-    let output = protocol::encode_payload_object(&from_serde(json)?)?;
+    let output = protocol::encode_semantic(value, "could not encode activity heartbeat")?;
     decode_heartbeat(&output)?;
+    Ok(output)
+}
+
+/// Decodes and validates one strict async-activity heartbeat document.
+pub fn decode_async_heartbeat(input: &str) -> Result<AsyncActivityHeartbeat, ProtocolError> {
+    let heartbeat: AsyncActivityHeartbeat = protocol::semantic_from_value(
+        protocol::decode_payload_object(input)?,
+        "invalid async activity heartbeat semantics",
+    )?;
+    validate_async_heartbeat(&heartbeat)?;
+    Ok(heartbeat)
+}
+
+/// Validates, normalizes, and reparses one outgoing async-activity heartbeat.
+pub fn encode_async_heartbeat(value: &AsyncActivityHeartbeat) -> Result<String, ProtocolError> {
+    validate_async_heartbeat(value)?;
+    let output = protocol::encode_semantic(value, "could not encode async activity heartbeat")?;
+    decode_async_heartbeat(&output)?;
     Ok(output)
 }
 
@@ -402,11 +479,16 @@ fn validate_uint64_decimal(value: &str, path: &str) -> Result<(), ProtocolError>
 fn validate_completion(value: &ActivityCompletion) -> Result<(), ProtocolError> {
     decode_token(&value.task_token)?;
     match &value.result {
+        ActivityCompletionResult::Completed { result } => {
+            workflow_protocol::validate_payload_limits(result).map_err(|_| {
+                ProtocolError::invalid("$.result.result", "result payload violates protocol limits")
+            })?;
+        }
         ActivityCompletionResult::Failed { failure }
         | ActivityCompletionResult::Cancelled { failure } => {
             workflow_protocol::validate_failure(failure, "$.result.failure")?
         }
-        _ => {}
+        ActivityCompletionResult::WillCompleteAsync => {}
     }
     Ok(())
 }
@@ -416,9 +498,29 @@ fn validate_completion(value: &ActivityCompletion) -> Result<(), ProtocolError> 
 fn validate_heartbeat(value: &ActivityHeartbeat) -> Result<(), ProtocolError> {
     decode_token(&value.task_token)?;
     for payload in &value.details {
-        workflow_protocol::payload_to_core(payload).map_err(|_| {
+        workflow_protocol::validate_payload_limits(payload).map_err(|_| {
             ProtocolError::invalid("$.details", "heartbeat payload violates protocol limits")
         })?;
+    }
+    Ok(())
+}
+
+/// Applies the heartbeat rules to an async heartbeat and checks that its
+/// heartbeat timeout is an exact nonnegative protobuf duration.
+fn validate_async_heartbeat(value: &AsyncActivityHeartbeat) -> Result<(), ProtocolError> {
+    decode_token(&value.task_token)?;
+    for payload in &value.details {
+        workflow_protocol::validate_payload_limits(payload).map_err(|_| {
+            ProtocolError::invalid("$.details", "heartbeat payload violates protocol limits")
+        })?;
+    }
+    if let Some(timeout) = value.heartbeat_timeout {
+        workflow_protocol::validate_time(
+            timeout.seconds,
+            timeout.nanoseconds,
+            true,
+            "$.heartbeat_timeout",
+        )?;
     }
     Ok(())
 }
@@ -555,14 +657,15 @@ pub fn completion_to_core(
     let status = match &value.result {
         ActivityCompletionResult::Completed { result } => {
             Status::Completed(activity_result::Success {
-                result: result
-                    .as_ref()
-                    .map(workflow_protocol::payload_to_core)
-                    .transpose()?,
+                result: Some(workflow_protocol::payload_to_core(result)?),
             })
         }
         ActivityCompletionResult::Failed { failure } => Status::Failed(activity_result::Failure {
             failure: Some(workflow_protocol::failure_to_core(failure)?),
+            // Core 1.x uses the cause only as a bounded metric label for
+            // worker-detected size or storage failures. An application
+            // failure reported by OCaml has no such cause.
+            cause: activity_result::ActivityTaskFailedCause::Unspecified.into(),
         }),
         ActivityCompletionResult::Cancelled { failure } => {
             Status::Cancelled(activity_result::Cancellation {
@@ -626,47 +729,4 @@ fn cancel_reason_from_core(value: i32) -> Result<ActivityCancelReason, CoreConve
             Core::Reset => ActivityCancelReason::Reset,
         },
     )
-}
-
-/// Converts the duplicate-aware protocol tree into Serde's value tree.
-fn to_serde(value: protocol::JsonValue) -> serde_json::Value {
-    match value {
-        protocol::JsonValue::Null => serde_json::Value::Null,
-        protocol::JsonValue::Bool(value) => serde_json::Value::Bool(value),
-        protocol::JsonValue::Signed(value) => value.into(),
-        protocol::JsonValue::Unsigned(value) => value.into(),
-        protocol::JsonValue::String(value) => serde_json::Value::String(value),
-        protocol::JsonValue::Array(values) => {
-            serde_json::Value::Array(values.into_iter().map(to_serde).collect())
-        }
-        protocol::JsonValue::Object(fields) => {
-            serde_json::Value::Object(fields.into_iter().map(|(k, v)| (k, to_serde(v))).collect())
-        }
-    }
-}
-
-/// Converts a Serde value into the normalized protocol tree.
-fn from_serde(value: serde_json::Value) -> Result<protocol::JsonValue, ProtocolError> {
-    Ok(match value {
-        serde_json::Value::Null => protocol::JsonValue::Null,
-        serde_json::Value::Bool(value) => protocol::JsonValue::Bool(value),
-        serde_json::Value::Number(value) => value
-            .as_i64()
-            .map(protocol::JsonValue::Signed)
-            .or_else(|| value.as_u64().map(protocol::JsonValue::Unsigned))
-            .ok_or_else(|| ProtocolError::invalid("$", "number is not integral"))?,
-        serde_json::Value::String(value) => protocol::JsonValue::String(value),
-        serde_json::Value::Array(values) => protocol::JsonValue::Array(
-            values
-                .into_iter()
-                .map(from_serde)
-                .collect::<Result<_, _>>()?,
-        ),
-        serde_json::Value::Object(fields) => protocol::JsonValue::Object(
-            fields
-                .into_iter()
-                .map(|(k, v)| Ok((k, from_serde(v)?)))
-                .collect::<Result<_, ProtocolError>>()?,
-        ),
-    })
 }

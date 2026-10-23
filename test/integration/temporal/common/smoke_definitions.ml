@@ -22,7 +22,9 @@ let mock_transform =
 
 (** Supplies invalid application failure details through the public activity
     API. Each case must become a valid, non-retryable task failure rather than
-    stopping the worker or poisoning its completion retry queue. *)
+    stopping the worker or poisoning its completion retry queue. Metadata
+    values are arbitrary bytes (#1048), so the malformed-UTF-8 case puts the
+    bad bytes in a key, which must still be valid UTF-8. *)
 let invalid_failure_details_activity =
   Temporal.Activity.define ~name:"smoke.invalid_failure_details_activity"
     ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun case ->
@@ -30,7 +32,7 @@ let invalid_failure_details_activity =
         match case with
         | "duplicate" -> [ ("encoding", "one"); ("encoding", "two") ]
         | "oversized" -> [ (String.make 65_537 'k', "value") ]
-        | _ -> [ ("encoding", "\255") ]
+        | _ -> [ ("\255", "value") ]
       in
       let detail =
         Temporal.Codec.{ metadata; data = Bytes.of_string "invalid detail" }
@@ -362,7 +364,7 @@ let external_signal_parent =
       | [ workflow_id; run_id ] ->
           let* () =
             Temporal.Workflow.signal_external_workflow ~workflow_id ~run_id
-              ~signal:signal_value ~input:"external"
+              ~signal:signal_value ~input:"external" ()
             |> Temporal.Future.await
           in
           Ok "SMOKE:EXTERNAL:SIGNAL:ACK"
@@ -383,7 +385,7 @@ let external_cancellation_wrong_run_parent =
       | [ workflow_id; wrong_run_id ] -> (
           match
             Temporal.Workflow.cancel_external_workflow ~workflow_id
-              ~run_id:wrong_run_id ~reason:"external acceptance mismatched run ID"
+              ~run_id:wrong_run_id ~reason:"external acceptance mismatched run ID" ()
             |> Temporal.Future.await
           with
           | Error error ->
@@ -436,7 +438,7 @@ let external_signal_completed_parent =
       | [ workflow_id; run_id ] -> (
           match
             Temporal.Workflow.signal_external_workflow ~workflow_id ~run_id
-              ~signal:signal_value ~input:"after-completion"
+              ~signal:signal_value ~input:"after-completion" ()
             |> Temporal.Future.await
           with
           | Error error ->
@@ -473,7 +475,7 @@ let external_cancellation_parent =
       | [ workflow_id; run_id ] ->
           let* () =
             Temporal.Workflow.cancel_external_workflow ~workflow_id ~run_id
-              ~reason:"external acceptance requested cancellation"
+              ~reason:"external acceptance requested cancellation" ()
             |> Temporal.Future.await
           in
           Ok "SMOKE:EXTERNAL:CANCEL:ACK"
@@ -488,7 +490,7 @@ let external_cancellation_parent =
     constructor's validation ever changes, instead of hiding a construction
     exception in a module initializer. *)
 let retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 100L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 100L)
@@ -499,7 +501,7 @@ let retry_policy =
     immediate second attempt, while keeping the live acceptance bounded and
     independent of the much slower timeout-triggered scenarios. *)
 let long_backoff_retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 2_000L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 2_000L)
@@ -796,7 +798,7 @@ let timeout_retry_first_attempt_sleep_seconds = 6.0
     coverage for the other activities without hiding the adapter's ordering
     invariant by enlarging their leases. *)
 let timeout_retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 7_000L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 7_000L)
@@ -863,7 +865,7 @@ let heartbeat_timeout_retry_first_attempt_sleep_seconds = 6.0
     local to this scenario so the next task cannot be mistaken for a queue
     timeout caused by the still-running first callback. *)
 let heartbeat_timeout_retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 7_000L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 7_000L)
@@ -932,18 +934,20 @@ let activity_heartbeat_timeout_retry =
             ~retry_policy:policy ~do_not_eagerly_execute:true
             heartbeat_timeout_retry_activity seed)
 
-(** Uses Temporal's [non_retryable_error_types] policy matching against the
-    public activity error kind. The callback returns a retryable typed error on
-    its first attempt and would succeed on a second attempt; the workflow
-    catches the first activity future so the live result proves both that the
-    server stopped retrying and that the runtime preserved the activity category
-    and non-retryable decision. *)
+(** Uses Temporal's [non_retryable_error_types] policy matching against an
+    application-defined error type set with [Error.make ~error_type]. The
+    callback returns a retryable typed error on its first attempt and would
+    succeed on a second attempt; the workflow catches the first activity future
+    so the live result proves that the type reached the server as
+    [ApplicationFailureInfo.type], that the server stopped retrying, and that
+    the runtime preserved the activity category, error type and non-retryable
+    decision. *)
 let non_retryable_activity_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 100L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 100L)
-    ~maximum_attempts:2 ~non_retryable_error_types:[ "activity" ] ()
+    ~maximum_attempts:2 ~non_retryable_error_types:[ "SmokeInvalidInput" ] ()
 
 (** Counts attempts only inside the worker process. A correct policy match
     leaves the second-attempt success branch unreachable; retaining that branch
@@ -968,7 +972,8 @@ let non_retryable_activity =
           | Error error -> Error error
           | Ok detail ->
               Error
-                (Temporal.Error.make ~category:`Activity ~details:[ detail ]
+                (Temporal.Error.make ~error_type:"SmokeInvalidInput"
+                   ~category:`Activity ~details:[ detail ]
                    ~message:"SMOKE:ACTIVITY_NON_RETRYABLE:ATTEMPT:1" ()))
       | 2 -> Ok "SMOKE:ACTIVITY_NON_RETRYABLE:RETRIED"
       | attempt ->
@@ -998,15 +1003,19 @@ let activity_non_retryable_failure =
           with
           | Error error -> (
               let view = Temporal.Error.view error in
-              if view.category <> `Activity || not view.non_retryable then
+              if
+                view.category <> `Activity || not view.non_retryable
+                || view.error_type <> Some "SmokeInvalidInput"
+              then
                 Error
                   (Temporal.Error.defect
                      ~message:
                        (Printf.sprintf
                           "activity non-retryable metadata was not preserved \
-                           (kind=%s, non_retryable=%b)"
+                           (kind=%s, non_retryable=%b, error_type=%s)"
                           (Temporal.Error.kind error)
-                          view.non_retryable))
+                          view.non_retryable
+                          (Option.value view.error_type ~default:"<none>")))
               else
                 match view.details with
                 | [ detail ] -> (
@@ -1046,7 +1055,7 @@ let activity_non_retryable_failure =
     that Temporal retries the child execution rather than merely retrying its
     activity. *)
 let child_activity_no_retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 100L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 100L)
@@ -1105,7 +1114,7 @@ let child_retryable_failure =
     separate from the activity's one-attempt policy makes the ownership of the
     retry state machine visible in the fixture. *)
 let child_retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 100L)
     ~backoff_coefficient:1.0
     ~maximum_interval:(Temporal.Duration.of_ms 100L)

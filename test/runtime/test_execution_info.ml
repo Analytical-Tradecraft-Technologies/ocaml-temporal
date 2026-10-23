@@ -1,0 +1,680 @@
+(** Tests for the read-only execution metadata exposed by
+    [Temporal.Workflow.info], [Temporal.Workflow.is_replaying], and
+    [Temporal.Activity.Context.info], and
+    [Temporal.Activity.Async_context.info] (#792).
+
+    Workflow scenarios drive real protocol activations through
+    [Native_execution.activate], the same adapter the native worker uses, so
+    they check that identity comes from Core's initialization job, that
+    task-local history facts and the replay flag are replaced on every
+    activation, and that live and replayed executions observe the same
+    identity. Activity scenarios exercise the public projection of the private
+    task metadata, including timestamp and timeout conversion and the
+    synthetic-context defects. *)
+
+module Protocol = Temporal_protocol.Workflow_protocol
+module Execution = Temporal_runtime.Execution
+module Native_execution = Temporal_runtime.Native_execution
+
+(** Fails with the stable translation diagnostic when a result was expected. *)
+let unwrap label = function
+  | Ok value -> value
+  | Error error ->
+      let view = Native_execution.error_view error in
+      failwith
+        (Printf.sprintf "%s: %s at %s (%s)" label view.message view.path
+           view.code)
+
+(** Fails with [label] when two values differ. *)
+let expect label expected actual =
+  if expected <> actual then failwith (label ^ " did not match")
+
+(** Builds activation metadata carrying the history facts under test, with
+    [reasons] as Core's continue-as-new suggestion reasons; every other field
+    takes its neutral value. *)
+let metadata ~history_size_bytes ~continue_as_new_suggested ~reasons :
+    Protocol.activation_metadata =
+  {
+    available_internal_flags = [];
+    history_size_bytes;
+    continue_as_new_suggested;
+    deployment_version_for_current_task = None;
+    last_sdk_version = "test";
+    suggest_continue_as_new_reasons = reasons;
+    target_worker_deployment_version_changed = false;
+  }
+
+(** Wraps jobs in an ordinary activation for the fixed test run. *)
+let activation ~is_replaying ~history_length ?metadata jobs : Protocol.activation =
+  {
+    run_id = "run-info";
+    timestamp = Some { seconds = 1L; nanoseconds = 0 };
+    is_replaying;
+    history_length;
+    jobs;
+    metadata;
+  }
+
+(** The initialization job of a child run continued from an earlier run. *)
+let initialize : Protocol.activation_job =
+  let context : Protocol.initialize_context =
+    {
+      headers = [];
+      memo = None;
+      search_attributes = None;
+      workflow_execution_expiration_time = None;
+      first_workflow_task_backoff = None;
+      identity = "client";
+      parent_workflow =
+        Some { namespace = "parents"; workflow_id = "parent-1"; run_id = "parent-run" };
+      workflow_execution_timeout = None;
+      workflow_run_timeout = None;
+      workflow_task_timeout = None;
+      first_execution_run_id = "first-run";
+      start_time = Some { seconds = 1_700_000_000L; nanoseconds = 42 };
+      root_workflow = None;
+      priority = None;
+      retry_policy = None;
+      continuation = None;
+    }
+  in
+  Protocol.Initialize_workflow
+    {
+      workflow_id = "info-1";
+      workflow_type = "info_workflow";
+      arguments = [];
+      randomness_seed = "1";
+      attempt = 3;
+      context = Some context;
+    }
+
+(** Every protocol reason, in a non-sorted order and including Core's
+    unspecified zero value, so tests can check that order is preserved and
+    the placeholder is dropped. *)
+let all_reasons =
+  [
+    Protocol.Too_many_updates;
+    Protocol.Suggest_unspecified;
+    Protocol.History_size_too_large;
+    Protocol.Too_many_history_events;
+  ]
+
+(** One observation taken inside workflow code, kept as plain values so the
+    assertions run after the workflow fiber has returned. *)
+type observation = {
+  identity : string * string * string option * string * string * int;
+  namespace : string;
+  parent : Temporal.Workflow.Info.parent option;
+  start_time : (int64 * int) option;
+  snapshot_replaying : bool;
+  live_replaying : bool;
+  history_length : int;
+  history_size_bytes : int option;
+  continue_as_new_suggested : bool;
+  continue_as_new_reasons : Temporal.Workflow.Info.continue_as_new_reason list;
+}
+
+(** Reads every public accessor for the current activation. *)
+let observe () =
+  match Temporal.Workflow.info () with
+  | Error error -> failwith (Temporal.Error.message error)
+  | Ok info ->
+      let module Info = Temporal.Workflow.Info in
+      {
+        identity =
+          ( Info.workflow_id info,
+            Info.run_id info,
+            Info.first_execution_run_id info,
+            Info.workflow_type info,
+            Info.task_queue info,
+            Info.attempt info );
+        namespace = Info.namespace info;
+        parent = Info.parent info;
+        start_time =
+          Option.map
+            (fun time -> (Temporal.Time.seconds time, Temporal.Time.nanoseconds time))
+            (Info.start_time info);
+        snapshot_replaying = Info.is_replaying info;
+        live_replaying = Temporal.Workflow.is_replaying ();
+        history_length = Info.history_length info;
+        history_size_bytes = Info.history_size_bytes info;
+        continue_as_new_suggested = Info.continue_as_new_suggested info;
+        continue_as_new_reasons = Info.continue_as_new_reasons info;
+      }
+
+(** Runs one execution through a start activation and a timer activation and
+    returns the observations taken before and after the timer. [replaying]
+    selects the replay flag of the first activation and [reasons] the
+    continue-as-new reasons its metadata carries; the second activation is
+    always new progress without metadata, which must clear the first task's
+    history facts and reasons rather than retain them. *)
+let run ?(reasons = all_reasons) ~replaying () =
+  let observations = ref [] in
+  let definition =
+    Temporal_base.Definition.make ~name:"info_workflow"
+      ~input:Temporal_base.Codec.unit ~output:Temporal_base.Codec.unit
+      ~implementation:
+        (Some
+           (fun () ->
+             observations := observe () :: !observations;
+             match Temporal.Workflow.sleep (Temporal.Duration.of_ms 1L) with
+             | Error _ ->
+                 Error
+                   (Temporal_base.Error.make ~category:`Defect
+                      ~message:"timer failed" ())
+             | Ok () ->
+                 observations := observe () :: !observations;
+                 Ok ()))
+  in
+  let execution =
+    Execution.start ~task_queue:"info-queue" ~namespace:"info-namespace"
+      definition ()
+  in
+  let first =
+    unwrap "start"
+      (Native_execution.activate execution
+         (activation ~is_replaying:replaying ~history_length:3L
+            ~metadata:
+              (metadata ~history_size_bytes:"2048" ~continue_as_new_suggested:true
+                 ~reasons)
+            [ initialize ]))
+  in
+  (match first.commands with
+   | [ Protocol.Start_timer _ ] -> ()
+   | _ -> failwith "workflow did not suspend on its timer");
+  let second =
+    unwrap "resume"
+      (Native_execution.activate execution
+         (activation ~is_replaying:false ~history_length:8L
+            [ Protocol.Fire_timer { seq = 1L } ]))
+  in
+  (match second.commands with
+   | [ Protocol.Complete_workflow _ ] -> ()
+   | _ -> failwith "workflow did not complete");
+  Execution.shutdown execution;
+  match List.rev !observations with
+  | [ before; after ] -> (before, after)
+  | _ -> failwith "workflow did not record two observations"
+
+(** Live and replayed executions see the same run identity, while the replay
+    flag and history facts follow each activation. *)
+let test_workflow_info () =
+  let check ~replaying =
+    let before, after = run ~replaying () in
+    let identity =
+      ("info-1", "run-info", Some "first-run", "info_workflow", "info-queue", 3)
+    in
+    expect "identity" identity before.identity;
+    expect "identity after timer" identity after.identity;
+    expect "namespace" "info-namespace" before.namespace;
+    expect "namespace after timer" "info-namespace" after.namespace;
+    expect "parent"
+      (Some
+         { Temporal.Workflow.Info.namespace = "parents"; workflow_id = "parent-1";
+           run_id = "parent-run" })
+      before.parent;
+    expect "start time" (Some (1_700_000_000L, 42)) before.start_time;
+    expect "snapshot replay flag" replaying before.snapshot_replaying;
+    expect "live replay flag" replaying before.live_replaying;
+    expect "history length" 3 before.history_length;
+    expect "history size" (Some 2048) before.history_size_bytes;
+    expect "continue-as-new suggestion" true before.continue_as_new_suggested;
+    expect "continue-as-new reasons"
+      [ `Too_many_updates; `History_size_too_large; `Too_many_history_events ]
+      before.continue_as_new_reasons;
+    expect "later replay flag" false after.snapshot_replaying;
+    expect "later live replay flag" false after.live_replaying;
+    expect "later history length" 8 after.history_length;
+    expect "later history size" None after.history_size_bytes;
+    expect "later continue-as-new suggestion" false
+      after.continue_as_new_suggested;
+    expect "later continue-as-new reasons" [] after.continue_as_new_reasons
+  in
+  check ~replaying:false;
+  check ~replaying:true
+
+(** A suggestion whose only reason is Core's unspecified zero value, or that
+    names no reason at all as older servers do, reports the suggestion with an
+    empty reason list instead of inventing a cause. *)
+let test_unspecified_continue_as_new_reasons () =
+  List.iter
+    (fun reasons ->
+      let before, _after = run ~reasons ~replaying:false () in
+      expect "unnamed suggestion" true before.continue_as_new_suggested;
+      expect "unnamed reasons" [] before.continue_as_new_reasons)
+    [ [ Protocol.Suggest_unspecified ]; [] ]
+
+(** The start policy a client can set, as plain values read inside workflow
+    code: execution, run, and task timeouts in milliseconds, the retry
+    policy's fields, and continuation provenance. *)
+type start_policy = {
+  timeouts : int64 option * int64 option * int64 option;
+  retry : (int64 * float * int64 * int * string list) option;
+  continued_from_run_id : string option;
+  initiator : Temporal.Workflow.Info.continuation_initiator option;
+}
+
+(** Reads every start-policy accessor of the current run. *)
+let observe_start_policy () =
+  match Temporal.Workflow.info () with
+  | Error error -> failwith (Temporal.Error.message error)
+  | Ok info ->
+      let module Info = Temporal.Workflow.Info in
+      let module Policy = Temporal.Retry_policy in
+      let ms = Option.map Temporal.Duration.to_ms in
+      {
+        timeouts =
+          ( ms (Info.execution_timeout info),
+            ms (Info.run_timeout info),
+            ms (Info.task_timeout info) );
+        retry =
+          Option.map
+            (fun policy ->
+              ( Temporal.Duration.to_ms (Policy.initial_interval policy),
+                Policy.backoff_coefficient policy,
+                Temporal.Duration.to_ms (Policy.maximum_interval policy),
+                Policy.maximum_attempts policy,
+                Policy.non_retryable_error_types policy ))
+            (Info.retry_policy info);
+        continued_from_run_id = Info.continued_from_run_id info;
+        initiator = Info.continuation_initiator info;
+      }
+
+(** An initialization job carrying every client start policy: timeouts with
+    sub-millisecond remainders, a retry policy whose coefficient is stored as
+    raw IEEE-754 bits, and the supplied continuation provenance. *)
+let initialize_with_policy ~continuation : Protocol.activation_job =
+  let duration seconds nanoseconds : Protocol.duration = { seconds; nanoseconds } in
+  let context : Protocol.initialize_context =
+    {
+      headers = [];
+      memo = None;
+      search_attributes = None;
+      workflow_execution_expiration_time =
+        Some { seconds = 1_700_000_090L; nanoseconds = 0 };
+      first_workflow_task_backoff = None;
+      identity = "client";
+      parent_workflow = None;
+      workflow_execution_timeout = Some (duration 90L 0);
+      workflow_run_timeout = Some (duration 30L 1);
+      workflow_task_timeout = Some (duration 7L 500_000_000);
+      first_execution_run_id = "first-run";
+      start_time = Some { seconds = 1_700_000_000L; nanoseconds = 0 };
+      root_workflow = None;
+      priority = None;
+      retry_policy =
+        Some
+          {
+            initial_interval = duration 0L 250_000_000;
+            backoff_coefficient_bits = Int64.to_string (Int64.bits_of_float 1.5);
+            maximum_interval = duration 4L 0;
+            maximum_attempts = 3;
+            non_retryable_error_types = [ "Fatal"; "Invalid" ];
+          };
+      continuation;
+    }
+  in
+  Protocol.Initialize_workflow
+    {
+      workflow_id = "policy-1";
+      workflow_type = "policy_workflow";
+      arguments = [];
+      randomness_seed = "1";
+      attempt = 2;
+      context = Some context;
+    }
+
+(** Runs one execution through a start activation and a timer activation,
+    returning the start-policy observations taken before and after the
+    timer. The second observation proves the run-stable values survive a
+    later activation that carries no initialization job. *)
+let run_start_policy ~replaying job =
+  let observations = ref [] in
+  let definition =
+    Temporal_base.Definition.make ~name:"policy_workflow"
+      ~input:Temporal_base.Codec.unit ~output:Temporal_base.Codec.unit
+      ~implementation:
+        (Some
+           (fun () ->
+             observations := observe_start_policy () :: !observations;
+             match Temporal.Workflow.sleep (Temporal.Duration.of_ms 1L) with
+             | Error _ ->
+                 Error
+                   (Temporal_base.Error.make ~category:`Defect
+                      ~message:"timer failed" ())
+             | Ok () ->
+                 observations := observe_start_policy () :: !observations;
+                 Ok ()))
+  in
+  let execution =
+    Execution.start ~task_queue:"info-queue" ~namespace:"info-namespace"
+      definition ()
+  in
+  ignore
+    (unwrap "policy start"
+       (Native_execution.activate execution
+          (activation ~is_replaying:replaying ~history_length:3L [ job ])));
+  ignore
+    (unwrap "policy resume"
+       (Native_execution.activate execution
+          (activation ~is_replaying:false ~history_length:8L
+             [ Protocol.Fire_timer { seq = 1L } ])));
+  Execution.shutdown execution;
+  match List.rev !observations with
+  | [ before; after ] -> (before, after)
+  | _ -> failwith "policy workflow did not record two observations"
+
+(** Workflow code reads back every start policy the client can set, from the
+    initialization job alone, identically live and under replay. Durations
+    round up to whole milliseconds, the coefficient keeps its exact bits, and
+    each Core continuation initiator maps to its public variant, with the
+    unspecified value reported as no reason. A run without policy metadata
+    reports [None] throughout. *)
+let test_workflow_start_policy () =
+  let continuation initiator : Protocol.continuation =
+    {
+      continued_from_execution_run_id = "previous-run";
+      initiator;
+      continued_failure = None;
+      last_completion_result = None;
+    }
+  in
+  let expected_timeouts = (Some 90_000L, Some 30_001L, Some 7_500L) in
+  let expected_retry = Some (250L, 1.5, 4_000L, 3, [ "Fatal"; "Invalid" ]) in
+  List.iter
+    (fun (initiator, expected_initiator) ->
+      List.iter
+        (fun replaying ->
+          let before, after =
+            run_start_policy ~replaying
+              (initialize_with_policy
+                 ~continuation:(Some (continuation initiator)))
+          in
+          List.iter
+            (fun observed ->
+              expect "start timeouts" expected_timeouts observed.timeouts;
+              expect "start retry policy" expected_retry observed.retry;
+              expect "continued from" (Some "previous-run")
+                observed.continued_from_run_id;
+              expect "continuation initiator" expected_initiator
+                observed.initiator)
+            [ before; after ])
+        [ false; true ])
+    [
+      (Protocol.Continue_as_new_retry, Some `Retry);
+      (Protocol.Continue_as_new_workflow, Some `Continue_as_new);
+      (Protocol.Continue_as_new_cron_schedule, Some `Cron_schedule);
+      (Protocol.Continue_as_new_unspecified, None);
+    ];
+  let root, _ =
+    run_start_policy ~replaying:false (initialize_with_policy ~continuation:None)
+  in
+  expect "root continued from" None root.continued_from_run_id;
+  expect "root initiator" None root.initiator;
+  expect "root timeouts" expected_timeouts root.timeouts;
+  let bare, _ = run_start_policy ~replaying:false initialize in
+  expect "absent timeouts" (None, None, None) bare.timeouts;
+  expect "absent retry policy" None bare.retry;
+  expect "absent continuation" None bare.continued_from_run_id
+
+(** The largest protobuf duration clamps to the public maximum instead of
+    raising when workflow code reads it. *)
+let test_workflow_start_policy_clamps () =
+  let maximum : Protocol.duration =
+    { seconds = 315_576_000_000L; nanoseconds = 999_999_999 }
+  in
+  let job =
+    match initialize_with_policy ~continuation:None with
+    | Protocol.Initialize_workflow ({ context = Some context; _ } as init) ->
+        Protocol.Initialize_workflow
+          {
+            init with
+            context =
+              Some { context with workflow_execution_timeout = Some maximum };
+          }
+    | _ -> failwith "unexpected initialization fixture"
+  in
+  let observed, _ = run_start_policy ~replaying:false job in
+  let execution, _, _ = observed.timeouts in
+  expect "clamped execution timeout" (Some 315_576_000_000_999L) execution
+
+(** Start-event shapes the server accepts but the outbound rules reject must
+    reach workflow code without raising. A Temporal Schedule action carries
+    the previous result with an empty predecessor run ID (#1015), which reads
+    as no predecessor. A policy recorded with [maximum_attempts = 1] skips
+    server validation (#1016), so its coefficient may be below 1.0 with an
+    empty non-retryable type and a zero interval; [Info.retry_policy]
+    reports it as [None] instead of raising [Invalid_argument]. *)
+let test_workflow_start_policy_inbound_shapes () =
+  let schedule : Protocol.continuation =
+    {
+      continued_from_execution_run_id = "";
+      initiator = Protocol.Continue_as_new_unspecified;
+      continued_failure = None;
+      last_completion_result =
+        Some [ { Protocol.metadata = []; data = Bytes.of_string "42" } ];
+    }
+  in
+  let job =
+    match initialize_with_policy ~continuation:(Some schedule) with
+    | Protocol.Initialize_workflow ({ context = Some context; _ } as init) ->
+        Protocol.Initialize_workflow
+          {
+            init with
+            context =
+              Some
+                {
+                  context with
+                  (* Clamped, not rejected, by the server (#1016). *)
+                  priority =
+                    Some
+                      {
+                        priority_key = 1;
+                        fairness_key = "nul\000key";
+                        fairness_weight_bits =
+                          Int64.of_int32 (Int32.bits_of_float 5000.);
+                      };
+                  retry_policy =
+                    Some
+                      {
+                        initial_interval = { seconds = 0L; nanoseconds = 0 };
+                        backoff_coefficient_bits =
+                          Int64.to_string (Int64.bits_of_float 0.5);
+                        maximum_interval = { seconds = 0L; nanoseconds = 0 };
+                        maximum_attempts = 1;
+                        non_retryable_error_types = [ "" ];
+                      };
+                };
+          }
+    | _ -> failwith "unexpected initialization fixture"
+  in
+  List.iter
+    (fun replaying ->
+      let before, after = run_start_policy ~replaying job in
+      List.iter
+        (fun observed ->
+          expect "schedule continued from" None observed.continued_from_run_id;
+          expect "schedule initiator" None observed.initiator;
+          expect "unrepresentable retry policy" None observed.retry)
+        [ before; after ])
+    [ false; true ]
+
+(** Detached code has no run: [info] fails closed and nothing is replaying. *)
+let test_workflow_info_outside_workflow () =
+  (match Temporal.Workflow.info () with
+   | Error error -> expect "detached info kind" "defect" (Temporal.Error.kind error)
+   | Ok _ -> failwith "detached info unexpectedly succeeded");
+  expect "detached replay flag" false (Temporal.Workflow.is_replaying ())
+
+(** A context without an initialization activation reports a defect instead
+    of fabricating identity values. *)
+let test_workflow_info_synthetic_context () =
+  let scheduler = Temporal_runtime.Scheduler.create () in
+  let context = Temporal_runtime.Workflow_context_store.create scheduler in
+  let observed =
+    Temporal_runtime.Workflow_context_store.with_context context Temporal.Workflow.info
+  in
+  Temporal_runtime.Workflow_context_store.shutdown context;
+  match observed with
+  | Error error ->
+      expect "synthetic info message"
+        "Temporal.Workflow.info is unavailable for this execution"
+        (Temporal.Error.message error)
+  | Ok _ -> failwith "synthetic info unexpectedly succeeded"
+
+(** Activity metadata, including exact timestamps and the scheduling
+    workflow, is projected unchanged and survives context invalidation. *)
+let test_activity_info () =
+  let base : Temporal_base.Activity_context.info =
+    {
+      namespace = "default";
+      workflow_id = "wf";
+      workflow_run_id = "run";
+      workflow_type = "orders";
+      activity_id = "charge";
+      activity_type = "charge_card";
+      attempt = 4;
+      is_local = true;
+      scheduled_time = Some { seconds = 10L; nanoseconds = 5 };
+      current_attempt_scheduled_time = Some { seconds = 20L; nanoseconds = 0 };
+      started_time = None;
+      schedule_to_close_timeout = Some (Temporal_base.Duration.of_ms 90_000L);
+      start_to_close_timeout = Some (Temporal_base.Duration.of_ms 30_001L);
+      task_heartbeat_timeout = None;
+    }
+  in
+  let make info =
+    Temporal_base.Activity_context.create_with_info ~info
+      ~heartbeat:(fun _ -> Ok ()) ~details:[] ~heartbeat_timeout:None
+  in
+  let context = make base in
+  Temporal_base.Activity_context.invalidate context;
+  let module Info = Temporal.Activity.Info in
+  let seconds time = Option.map Temporal.Time.seconds time in
+  (match Temporal.Activity.Context.info context with
+   | Error error -> failwith (Temporal.Error.message error)
+   | Ok info ->
+       expect "activity namespace" "default" (Info.namespace info);
+       expect "activity workflow"
+         { Info.workflow_id = "wf"; run_id = "run"; workflow_type = "orders" }
+         (Info.workflow info);
+       expect "activity id" "charge" (Info.activity_id info);
+       expect "activity type" "charge_card" (Info.activity_type info);
+       expect "activity attempt" 4 (Info.attempt info);
+       expect "activity local" true (Info.is_local info);
+       expect "scheduled seconds" (Some 10L) (seconds (Info.scheduled_time info));
+       expect "scheduled nanoseconds" (Some 5)
+         (Option.map Temporal.Time.nanoseconds (Info.scheduled_time info));
+       expect "attempt scheduled seconds" (Some 20L)
+         (seconds (Info.current_attempt_scheduled_time info));
+       expect "started time" None (seconds (Info.started_time info));
+       let ms = Option.map Temporal.Duration.to_ms in
+       expect "schedule-to-close timeout" (Some 90_000L)
+         (ms (Info.schedule_to_close_timeout info));
+       expect "start-to-close timeout" (Some 30_001L)
+         (ms (Info.start_to_close_timeout info));
+       expect "heartbeat timeout" None (ms (Info.heartbeat_timeout info)));
+  match
+    Temporal.Activity.Context.info
+      (Temporal_base.Activity_context.unavailable ~details:[] ~heartbeat_timeout:None)
+  with
+  | Error error -> expect "synthetic activity kind" "defect" (Temporal.Error.kind error)
+  | Ok _ -> failwith "synthetic activity info unexpectedly succeeded"
+
+(** The public timeout accessors clamp a private value above the public
+    [Duration.t] maximum (here the rounded-up protobuf maximum) instead of
+    raising, so metadata access stays total for every producer of the
+    private record. *)
+let test_activity_info_clamps_timeouts () =
+  let above = Temporal_base.Duration.of_ms 315_576_000_001_000L in
+  let base : Temporal_base.Activity_context.info =
+    {
+      namespace = "default";
+      workflow_id = "wf";
+      workflow_run_id = "run";
+      workflow_type = "orders";
+      activity_id = "charge";
+      activity_type = "charge_card";
+      attempt = 1;
+      is_local = false;
+      scheduled_time = None;
+      current_attempt_scheduled_time = None;
+      started_time = None;
+      schedule_to_close_timeout = Some above;
+      start_to_close_timeout = Some above;
+      task_heartbeat_timeout = Some above;
+    }
+  in
+  let context =
+    Temporal_base.Activity_context.create_with_info ~info:base
+      ~heartbeat:(fun _ -> Ok ()) ~details:[] ~heartbeat_timeout:None
+  in
+  let module Info = Temporal.Activity.Info in
+  let ms = Option.map Temporal.Duration.to_ms in
+  let expected = Some 315_576_000_000_999L in
+  match Temporal.Activity.Context.info context with
+  | Error error -> failwith (Temporal.Error.message error)
+  | Ok info ->
+      expect "clamped schedule-to-close" expected
+        (ms (Info.schedule_to_close_timeout info));
+      expect "clamped start-to-close" expected
+        (ms (Info.start_to_close_timeout info));
+      expect "clamped heartbeat" expected (ms (Info.heartbeat_timeout info))
+
+(** An asynchronous context carries the metadata it was built with, and one
+    built without a Core task reports a defect rather than empty values. The
+    native adapter path is covered by [test_native_async_activity]. *)
+let test_async_context_info () =
+  let handle () =
+    Temporal_base.Async_activity.create
+      ~submit:(fun _ -> Ok ())
+      ~encode_output:(fun () -> Ok (Temporal_base.Payload.unit_null ()))
+  in
+  let info : Temporal_base.Activity_context.info =
+    {
+      namespace = "async-namespace";
+      workflow_id = "wf";
+      workflow_run_id = "run";
+      workflow_type = "orders";
+      activity_id = "ship";
+      activity_type = "ship_order";
+      attempt = 1;
+      is_local = false;
+      scheduled_time = None;
+      current_attempt_scheduled_time = None;
+      started_time = None;
+      schedule_to_close_timeout = None;
+      start_to_close_timeout = None;
+      task_heartbeat_timeout = Some (Temporal_base.Duration.of_ms 2_000L);
+    }
+  in
+  let module Info = Temporal.Activity.Info in
+  (match
+     Temporal.Activity.Async_context.info
+       (Temporal_base.Async_activity.context ~info (handle ()))
+   with
+   | Error error -> failwith (Temporal.Error.message error)
+   | Ok info ->
+       expect "async namespace" "async-namespace" (Info.namespace info);
+       expect "async activity id" "ship" (Info.activity_id info);
+       expect "async heartbeat timeout" (Some 2_000L)
+         (Option.map Temporal.Duration.to_ms (Info.heartbeat_timeout info)));
+  match
+    Temporal.Activity.Async_context.info
+      (Temporal_base.Async_activity.context (handle ()))
+  with
+  | Error error -> expect "synthetic async kind" "defect" (Temporal.Error.kind error)
+  | Ok _ -> failwith "synthetic async info unexpectedly succeeded"
+
+(** Runs every execution-info scenario as one dune test executable. *)
+let () =
+  test_workflow_info ();
+  test_unspecified_continue_as_new_reasons ();
+  test_workflow_start_policy ();
+  test_workflow_start_policy_clamps ();
+  test_workflow_start_policy_inbound_shapes ();
+  test_workflow_info_outside_workflow ();
+  test_workflow_info_synthetic_context ();
+  test_activity_info ();
+  test_activity_info_clamps_timeouts ();
+  test_async_context_info ()

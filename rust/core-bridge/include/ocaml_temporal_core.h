@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define OCAML_TEMPORAL_CORE_ABI_VERSION UINT32_C(2)
+#define OCAML_TEMPORAL_CORE_ABI_VERSION UINT32_C(4)
 
 /* Signed fixed-width status keeps layout identical across supported ABIs. */
 typedef int32_t ocaml_temporal_core_status;
@@ -28,7 +28,10 @@ enum {
   OCAML_TEMPORAL_CORE_STATUS_PROTOCOL = 11,
   OCAML_TEMPORAL_CORE_STATUS_ALREADY_STARTED = 12,
   OCAML_TEMPORAL_CORE_STATUS_RETRYABLE = 13,
-  OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED = 14
+  OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED = 14,
+  /* A bounded client-operation registry is full; the request was not admitted
+     and may be retried after another in-flight operation finishes. */
+  OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED = 15
 };
 
 /* Rust-owned byte allocation. `{ NULL, 0 }` is the sole empty representation. */
@@ -45,8 +48,14 @@ typedef struct ocaml_temporal_core_result {
   ocaml_temporal_core_buffer error;
 } ocaml_temporal_core_result;
 
-/* Opaque handle types reserved by ABI v2 for the worker implementation. */
+/* Opaque handle types reserved by ABI v3 for the worker implementation. */
 typedef struct ocaml_temporal_core_runtime ocaml_temporal_core_runtime;
+/* A Core runtime (Tokio executor) shared by several runtime graphs (#832). */
+typedef struct ocaml_temporal_core_shared_runtime
+    ocaml_temporal_core_shared_runtime;
+/* SDK-side metrics recorder over a shared runtime's Core meter (#500). */
+typedef struct ocaml_temporal_core_metric_meter
+    ocaml_temporal_core_metric_meter;
 typedef struct ocaml_temporal_core_client ocaml_temporal_core_client;
 typedef struct ocaml_temporal_core_worker ocaml_temporal_core_worker;
 
@@ -56,14 +65,14 @@ typedef struct ocaml_temporal_core_worker ocaml_temporal_core_worker;
  * A zero-length buffer is represented canonically as { NULL, 0 }.
  *
  * The caller must release every initialized result with
- * ocaml_temporal_core_v2_result_free. Releasing the same result object twice
+ * ocaml_temporal_core_v4_result_free. Releasing the same result object twice
  * is safe because the first call resets it. Copying a live result and freeing
  * both copies is invalid. Callers must not modify owned pointer/length fields.
  */
-ocaml_temporal_core_status ocaml_temporal_core_v2_check_abi_version(
+ocaml_temporal_core_status ocaml_temporal_core_v4_check_abi_version(
     uint32_t requested_version, ocaml_temporal_core_result *output);
 
-ocaml_temporal_core_status ocaml_temporal_core_v2_echo(
+ocaml_temporal_core_status ocaml_temporal_core_v4_echo(
     const uint8_t *input, size_t input_len,
     ocaml_temporal_core_result *output);
 
@@ -71,57 +80,128 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_echo(
  * Bounded native wait used only to verify that bindings release their runtime
  * lock. This is not a Temporal workflow timer.
  */
-ocaml_temporal_core_status ocaml_temporal_core_v2_conformance_wait_ms(
+ocaml_temporal_core_status ocaml_temporal_core_v4_conformance_wait_ms(
     uint32_t milliseconds, ocaml_temporal_core_result *output);
+
+/* Longest sleep performed by ocaml_temporal_core_v4_pacing_sleep_ns. */
+#define OCAML_TEMPORAL_CORE_MAX_PACING_SLEEP_NS UINT64_C(1000000000)
+
+/*
+ * Sleep the calling thread for `nanoseconds`, clamped to
+ * OCAML_TEMPORAL_CORE_MAX_PACING_SLEEP_NS, for worker idle pacing (#1008).
+ * On Windows this uses a per-timer high-resolution waitable timer where the
+ * OS provides one, so sub-tick sleeps do not round up to the 15.6 ms system
+ * timer tick, and no process- or system-wide timer resolution is changed.
+ * Zero returns at once. Safe from any thread; callers should release their
+ * language runtime lock. Takes no result object: returns
+ * OCAML_TEMPORAL_CORE_STATUS_OK, or OCAML_TEMPORAL_CORE_STATUS_PANIC if a
+ * Rust panic was contained. This is not a Temporal workflow timer.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_pacing_sleep_ns(
+    uint64_t nanoseconds);
 
 /*
  * Create the sole native runtime owner for one SDK instance. On success,
  * `runtime` receives an opaque handle and `output` is an empty success.
+ * Equivalent to ocaml_temporal_core_v4_runtime_new_with_worker_threads with a
+ * worker_threads value of 0 (the bridge default).
  */
-ocaml_temporal_core_status ocaml_temporal_core_v2_runtime_new(
+ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_new(
     ocaml_temporal_core_runtime **runtime,
     ocaml_temporal_core_result *output);
+
+/* Largest explicit Tokio worker-thread count accepted by runtime creation. */
+#define OCAML_TEMPORAL_CORE_MAX_RUNTIME_WORKER_THREADS UINT32_C(256)
+
+/*
+ * Create the runtime owner with a bounded Tokio worker pool. A worker_threads
+ * value of 0 selects the bridge default (the host's available parallelism,
+ * capped at 4); 1 through OCAML_TEMPORAL_CORE_MAX_RUNTIME_WORKER_THREADS is
+ * used unchanged; a larger value returns
+ * OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT and leaves `*runtime` NULL.
+ * Ownership of a created handle is identical to ocaml_temporal_core_v4_runtime_new.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_new_with_worker_threads(
+    uint32_t worker_threads, ocaml_temporal_core_runtime **runtime,
+    ocaml_temporal_core_result *output);
+
+/*
+ * Create a Core runtime that several runtime graphs can share (#832).
+ * worker_threads has the contract of runtime_new_with_worker_threads. On
+ * success `*shared` receives an owned handle carrying no client or worker;
+ * release it with ocaml_temporal_core_v4_shared_runtime_free.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_new(
+    uint32_t worker_threads, ocaml_temporal_core_shared_runtime **shared,
+    ocaml_temporal_core_result *output);
+
+/*
+ * shared_runtime_new plus an opt-in telemetry document (#500). `input` is a
+ * strict UTF-8 JSON object of at most 16 KiB; `{}` configures no exporter and
+ * `{"prometheus":{"bind_address":"127.0.0.1:9464",...}}` serves Core's
+ * metrics for scraping until Core is destroyed. Invalid input or an unusable
+ * address returns OCAML_TEMPORAL_CORE_STATUS_CONFIGURATION and leaves
+ * `*shared` NULL. On success the result value is the bound socket address as
+ * UTF-8 text (empty without an exporter).
+ */
+ocaml_temporal_core_status
+ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(
+    uint32_t worker_threads, const uint8_t *input, size_t input_len,
+    ocaml_temporal_core_shared_runtime **shared,
+    ocaml_temporal_core_result *output);
+
+/*
+ * Create a runtime graph that runs on `shared`'s Core instead of its own.
+ * The graph is used and released exactly like one from runtime_new. It holds
+ * its own reference to the shared Core, so Core outlives the graph even if
+ * `shared` is released first. A released `shared` fails with
+ * OCAML_TEMPORAL_CORE_STATUS_INVALID_STATE and leaves `*runtime` NULL.
+ * Concurrent attaches on one live handle are permitted.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_new_attached(
+    const ocaml_temporal_core_shared_runtime *shared,
+    ocaml_temporal_core_runtime **runtime, ocaml_temporal_core_result *output);
 
 /*
  * Strictly decode one UTF-8 JSON client configuration, connect through the
  * official Temporal client, and retain it beneath `runtime`. No client is
  * retained on failure. The input is borrowed only for this blocking call.
  */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_connect_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_connect_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Start one dynamically named workflow using strict JSON. The successful
  * value is an execution reference. An AlreadyStarted failure has status 12
  * and a closed JSON body in `error` containing workflow_id and existing_run_id. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_start_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_start_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Request cancellation of one exact workflow run. The successful value is a
  * strict {"acknowledged":true} document; the request and response are copied
  * across the private JSON boundary and Temporal protobuf remains Rust-owned. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_cancel_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_cancel_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Terminate one exact workflow run. The successful value is a strict
  * {"acknowledged":true} document; termination is immediate. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_terminate_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_terminate_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Reset one exact workflow run to a workflow-task event boundary. The
  * successful value is the new run identity; callers must use it for later
  * exact-run waits rather than assuming the old run ID remains current. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_reset_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_reset_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Send one signal to one exact workflow run. The successful value is a strict
  * {"acknowledged":true} document; the Rust client owns Temporal protobuf and
  * network state while this ABI exposes only copied JSON. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_signal_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_signal_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
@@ -129,25 +209,25 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_client_signal_workflow_json(
  * successful value is a strict {"result": [...]} document; query rejection
  * and RPC failures use the same structured JSON error body as other client
  * control operations. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_query_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_query_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* List one bounded visibility page. The page token is opaque base64 in the
  * JSON boundary and protobuf visibility values remain owned by Rust. */
 ocaml_temporal_core_status
-ocaml_temporal_core_v2_client_list_visibility_json(
+ocaml_temporal_core_v4_client_list_visibility_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Admit one workflow update and return its strict JSON response. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_update_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_update_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Poll one admitted workflow update and return a pending or terminal JSON
  * response. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_poll_update_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_poll_update_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
@@ -155,21 +235,21 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_client_poll_update_workflow_js
  * is an opaque JSON ticket. The caller must later poll or wait that ticket;
  * the Rust owner keeps its Core connection and Tokio task alive until one
  * terminal result is observed or the runtime is closed. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_begin_start_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_begin_start_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Poll one asynchronous start ticket without waiting. STATUS_NOT_READY means
  * the RPC remains in flight. A terminal success value is a closed JSON object
  * with kind accepted, rejected, or unknown; the ticket is then retired. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_poll_start_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_poll_start_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Wait for one asynchronous start ticket for a bounded interval. The C stub
  * must release the OCaml runtime lock. A timeout is STATUS_NOT_READY so the
  * supervisor can service its mailbox and retry. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_wait_start_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_wait_start_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
@@ -179,21 +259,89 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_client_wait_start_workflow_jso
  * the single supervisor owner responsive to lifecycle messages. A
  * continued-as-new close is returned as a terminal outcome with successor
  * metadata; the bridge never follows it implicitly. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_wait_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_wait_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
+
+/* Closed selectors for ocaml_temporal_core_v4_client_submit_json (#807). Each
+ * takes the request document of the matching synchronous operation, except
+ * ASYNC_ACTIVITY_HEARTBEAT. ASYNC_ACTIVITY_COMPLETION (#1025) takes the
+ * document of ocaml_temporal_core_v4_client_complete_async_activity_json.
+ * ASYNC_ACTIVITY_HEARTBEAT takes the heartbeat document of
+ * ocaml_temporal_core_v4_client_record_async_activity_heartbeat_json plus a
+ * required, nullable "heartbeat_timeout" duration copied from the attempt's
+ * start task; the bridge throttles these heartbeats per task token as Core
+ * throttles a running activity's heartbeats, so a call may record its
+ * details for a later send instead of sending them. Both outcomes are an
+ * empty value on success, or the fixed value "not_found" where the
+ * synchronous symbol would return STATUS_INVALID_STATE (the server no longer
+ * knows the task token), because an awaited call reports
+ * STATUS_INVALID_STATE only when the call itself was closed. A heartbeat's
+ * outcome may instead be the fixed value "cancel_requested", "reset", or
+ * "paused" (in that precedence) when the latest send reported that state. */
+enum {
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_START = 1,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_WAIT = 2,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_CANCEL = 3,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_TERMINATE = 4,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_RESET = 5,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_SIGNAL = 6,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_QUERY = 7,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_UPDATE = 8,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_POLL_UPDATE = 9,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_VISIBILITY = 10,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_COMPLETION = 11,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_HEARTBEAT = 12
+};
+
+/* Submit one client RPC without waiting for Temporal (#807). Only the
+ * runtime's owner thread may call this. A call counts against the ceiling
+ * until it is read, released, or its runtime closes. On success the value is
+ * the call
+ * handle "<owner>.<call>" in ASCII decimal: the submitting graph's random
+ * owner identity and the call identifier. The RPC runs on a Rust task. Starts and waits
+ * keep their 64-entry limits and every call shares a 4,096-entry ceiling;
+ * admission beyond a limit returns RESOURCE_EXHAUSTED (status 15). */
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_submit_json(
+    ocaml_temporal_core_runtime *runtime, uint32_t kind, const uint8_t *input,
+    size_t input_len, ocaml_temporal_core_result *output);
+
+/* Wait at most timeout_ms (up to 60000) for a submitted call's outcome.
+ * owner and call come from the submission handle; a call is reachable only
+ * through the owner that submitted it. Any thread may call this; it takes no
+ * runtime. The first terminal result retires the call and is the
+ * operation's own value or failure (a start yields the
+ * accepted/rejected/unknown outcome document). NOT_READY (status 10) means
+ * the interval elapsed. INVALID_STATE (status 5) means the call can no longer
+ * complete because its runtime disconnected or closed, the identifier is
+ * unknown, or owner does not match; these cases are indistinguishable and a
+ * mismatched owner leaves the call untouched. Bindings must release their
+ * runtime lock. */
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_await_call(
+    uint64_t owner, uint64_t call, uint32_t timeout_ms,
+    ocaml_temporal_core_result *output);
+
+/* Abandon a submitted call without reading it, freeing its slot in the
+ * 4,096-call ceiling (an unread completed call keeps counting until it is
+ * read, released, or its runtime closes). Any published outcome is dropped
+ * and a still-running task is aborted, so the call stops holding its wait,
+ * start, and in-flight slots at once. Takes no runtime; a mismatched owner,
+ * retired call, or unknown identifier is a successful no-op. */
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_release_call(
+    uint64_t owner, uint64_t call, ocaml_temporal_core_result *output);
 
 /* Complete an activity after WillCompleteAsync through the namespace-bound
  * client. The worker task-token ledger is intentionally not consulted. */
 ocaml_temporal_core_status
-ocaml_temporal_core_v2_client_complete_async_activity_json(
+ocaml_temporal_core_v4_client_complete_async_activity_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Record a heartbeat for an admitted asynchronous activity through the
- * namespace-bound client. */
+ * namespace-bound client. Every call is one blocking, unthrottled RPC; the
+ * OCaml worker submits ASYNC_ACTIVITY_HEARTBEAT instead. */
 ocaml_temporal_core_status
-ocaml_temporal_core_v2_client_record_async_activity_heartbeat_json(
+ocaml_temporal_core_v4_client_record_async_activity_heartbeat_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
@@ -202,7 +350,7 @@ ocaml_temporal_core_v2_client_record_async_activity_heartbeat_json(
  * Core worker, and validate its namespace before returning success. A failed
  * temporary worker is cleaned before this operation returns.
  */
-ocaml_temporal_core_status ocaml_temporal_core_v2_worker_start_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_start_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
@@ -210,7 +358,7 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_worker_start_json(
  * the bounded JSON feeder below, so no Temporal client is required. Replay
  * and live workers are mutually exclusive within one runtime graph. */
 ocaml_temporal_core_status
-ocaml_temporal_core_v2_replay_worker_start_json(
+ocaml_temporal_core_v4_replay_worker_start_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
@@ -218,55 +366,55 @@ ocaml_temporal_core_v2_replay_worker_start_json(
  * queued history at a time and applies backpressure rather than growing an
  * unbounded native allocation. */
 ocaml_temporal_core_status
-ocaml_temporal_core_v2_replay_worker_feed_history_json(
+ocaml_temporal_core_v4_replay_worker_feed_history_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Close replay input. Core reaches natural shutdown only after the queued
  * histories and their activations have been completed. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_replay_worker_finish_input(
+ocaml_temporal_core_status ocaml_temporal_core_v4_replay_worker_finish_input(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
 /* Non-blocking replay activation handoff. */
 ocaml_temporal_core_status
-ocaml_temporal_core_v2_replay_worker_try_poll_workflow(
+ocaml_temporal_core_v4_replay_worker_try_poll_workflow(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
 /* Bounded replay readiness wait. The binding must release the OCaml runtime
  * lock while waiting; success is a wake signal and does not consume a task. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_replay_worker_wait_workflow(
+ocaml_temporal_core_status ocaml_temporal_core_v4_replay_worker_wait_workflow(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
 /* Complete one replay activation previously handed to OCaml. */
 ocaml_temporal_core_status
-ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+ocaml_temporal_core_v4_replay_worker_complete_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Retire one replay activation whose semantic JSON could not be decoded. */
 ocaml_temporal_core_status
-ocaml_temporal_core_v2_replay_worker_reject_workflow_json(
+ocaml_temporal_core_v4_replay_worker_reject_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Finalize only after feeder closure and natural Core shutdown. A failure
  * retains the replay worker for another owner-serialized attempt. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_replay_worker_finalize(
+ocaml_temporal_core_status ocaml_temporal_core_v4_replay_worker_finalize(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
 /* Explicitly abandon replay and force-complete native debts. A terminal Core
  * failure retains the worker instead of silently dropping its ownership graph. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_replay_worker_dispose(
+ocaml_temporal_core_status ocaml_temporal_core_v4_replay_worker_dispose(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
 /* Non-blocking Rust-owned task handoff. `NOT_READY` is an expected empty-lane
  * result; success owns one strictly validated semantic JSON document. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_worker_try_poll_workflow(
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_try_poll_workflow(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
@@ -274,30 +422,37 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_worker_try_poll_workflow(
  * this with the OCaml runtime lock released; `NOT_READY` means the bounded
  * wait elapsed and the owner supervisor should service its mailbox and retry.
  * Success does not consume a task; callers drain it with try_poll_workflow. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_worker_wait_workflow(
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_wait_workflow(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
 /* Complete exactly one previously handed-off workflow activation. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_worker_complete_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_complete_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Reparse and reject the exact Rust-produced activation document when the
  * OCaml semantic decoder cannot accept it after lease handoff. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_worker_reject_workflow_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_reject_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Non-blocking task handoff for the independently guarded remote-activity
  * lane. Local activities and Nexus are disabled by worker configuration. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_worker_try_poll_activity(
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_try_poll_activity(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
 /* Bounded readiness wait for the remote-activity lane. It has the same lock,
  * timeout, and non-consuming semantics as the workflow readiness operation. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_worker_wait_activity(
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_wait_activity(
+    ocaml_temporal_core_runtime *runtime,
+    ocaml_temporal_core_result *output);
+
+/* Bounded readiness wait for either live-worker lane. Any queued workflow
+ * activation or activity task ends it; otherwise it has the same lock,
+ * timeout, and non-consuming semantics as the lane-specific waits. */
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_wait_any(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
@@ -305,34 +460,43 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_worker_wait_activity(
  * that an activity completion was not consumed. The C binding must release
  * the OCaml runtime lock while this bounded timer runs. */
 ocaml_temporal_core_status
-ocaml_temporal_core_v2_worker_wait_activity_completion_retry_backoff(
+ocaml_temporal_core_v4_worker_wait_activity_completion_retry_backoff(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
 /* Complete exactly one previously handed-off remote activity task. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_worker_complete_activity_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_complete_activity_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Record progress for one currently leased remote activity task. */
 ocaml_temporal_core_status
-ocaml_temporal_core_v2_worker_record_activity_heartbeat_json(
+ocaml_temporal_core_v4_worker_record_activity_heartbeat_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
 /* Reparse and reject the exact Rust-produced activity-task document when the
  * OCaml semantic decoder cannot accept it after lease handoff. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_worker_reject_activity_json(
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_reject_activity_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
+/* Stop the worker from taking new tasks without releasing it (#1028): close
+ * admission and readiness and ask Core to stop polling the server. Tasks
+ * already leased to OCaml may still be completed or heartbeated until
+ * ocaml_temporal_core_v4_worker_shutdown. Never blocks on Core or the
+ * network. Repeating it, or calling it without a worker, is a success. */
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_initiate_shutdown(
+    ocaml_temporal_core_runtime *runtime,
+    ocaml_temporal_core_result *output);
+
 /* Gracefully stop the worker. Repeating this operation is safe. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_worker_shutdown(
+ocaml_temporal_core_status ocaml_temporal_core_v4_worker_shutdown(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
 /* Drop the client after its worker is absent. Repeating this operation is safe. */
-ocaml_temporal_core_status ocaml_temporal_core_v2_client_disconnect(
+ocaml_temporal_core_status ocaml_temporal_core_v4_client_disconnect(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);
 
@@ -341,17 +505,73 @@ ocaml_temporal_core_status ocaml_temporal_core_v2_client_disconnect(
  * same now-null slot is safe. The runtime defensively finalizes a remaining
  * worker and drops its client in reverse ownership order before Core.
  */
-ocaml_temporal_core_status ocaml_temporal_core_v2_runtime_free(
+ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_free(
     ocaml_temporal_core_runtime **runtime);
 
 /*
  * GC fallback that transfers runtime destruction to its Rust cleanup thread
  * without waiting. SDK supervisors use runtime_free for explicit shutdown.
  */
-ocaml_temporal_core_status ocaml_temporal_core_v2_runtime_dispose(
+ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_dispose(
     ocaml_temporal_core_runtime **runtime);
 
-ocaml_temporal_core_status ocaml_temporal_core_v2_result_free(
+/*
+ * Release a shared-runtime handle, clear the slot, and wait until its Core
+ * reference is dropped. Core is destroyed here only if no attached graph
+ * remains; otherwise the last graph's release destroys it. Calling again
+ * with the now-null slot is safe.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_free(
+    ocaml_temporal_core_shared_runtime **shared);
+
+/*
+ * GC fallback that transfers a shared-runtime handle's reference to its
+ * Rust cleanup thread without waiting.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_dispose(
+    ocaml_temporal_core_shared_runtime **shared);
+
+/*
+ * Create an SDK metrics recorder over `shared`'s Core meter (#500). On
+ * success `*meter` receives an owned handle, or stays NULL when the runtime
+ * has no metrics exporter. The handle references Core's meter, not Core, so
+ * it may outlive `shared`; release it once with metric_meter_free. A
+ * released `shared` fails with OCAML_TEMPORAL_CORE_STATUS_INVALID_STATE.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_metric_meter(
+    const ocaml_temporal_core_shared_runtime *shared,
+    ocaml_temporal_core_metric_meter **meter,
+    ocaml_temporal_core_result *output);
+
+/*
+ * Register one SDK metric series from a strict UTF-8 JSON document of at
+ * most 8 KiB and store its identifier in `*id` (UINT32_MAX on failure).
+ * Registering an identical series again returns the same identifier.
+ * Concurrent calls on one live handle are permitted.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_metric_meter_register_json(
+    const ocaml_temporal_core_metric_meter *meter, const uint8_t *input,
+    size_t input_len, uint32_t *id, ocaml_temporal_core_result *output);
+
+/*
+ * Record `value` into series `id`. Allocates no result and never blocks on
+ * I/O, so it may be called with the OCaml runtime lock held, from any
+ * thread. Unsigned instruments reject a negative value with
+ * OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT; a duration histogram reads
+ * microseconds.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_metric_meter_record(
+    const ocaml_temporal_core_metric_meter *meter, uint32_t id, int64_t value);
+
+/*
+ * Release an SDK metrics recorder and clear the slot. Touches only memory,
+ * so it is safe from a GC finalizer. Calling again with the now-null slot is
+ * safe.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_metric_meter_free(
+    ocaml_temporal_core_metric_meter **meter);
+
+ocaml_temporal_core_status ocaml_temporal_core_v4_result_free(
     ocaml_temporal_core_result *result);
 
 #ifdef __cplusplus
@@ -390,6 +610,8 @@ static_assert(OCAML_TEMPORAL_CORE_STATUS_ALREADY_STARTED == 12,
 static_assert(OCAML_TEMPORAL_CORE_STATUS_RETRYABLE == 13,
               "status numbering is part of the ABI");
 static_assert(OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED == 14,
+              "status numbering is part of the ABI");
+static_assert(OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED == 15,
               "status numbering is part of the ABI");
 static_assert(offsetof(ocaml_temporal_core_buffer, ptr) == 0,
               "buffer pointer must be the first field");
@@ -439,6 +661,8 @@ _Static_assert(OCAML_TEMPORAL_CORE_STATUS_ALREADY_STARTED == 12,
 _Static_assert(OCAML_TEMPORAL_CORE_STATUS_RETRYABLE == 13,
                "status numbering is part of the ABI");
 _Static_assert(OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED == 14,
+               "status numbering is part of the ABI");
+_Static_assert(OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED == 15,
                "status numbering is part of the ABI");
 _Static_assert(offsetof(ocaml_temporal_core_buffer, ptr) == 0,
                "buffer pointer must be the first field");

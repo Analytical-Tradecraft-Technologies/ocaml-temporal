@@ -11,15 +11,27 @@ type _ Effect.t += Abort_workflow : 'value Effect.t
     try/with wrappers; the deep handler treats it like shutdown. *)
 exception Workflow_aborted
 
-(** State for one workflow scheduler. [pending] counts futures without results,
-    and [teardowns] stores one removable cleanup token for each pending future.
-    Settling a future removes its token so completed values are not retained by
-    a long-lived workflow scheduler. *)
+(** One pending future's shutdown cleanup.  [removed] is set exactly once,
+    either when the future settles or when shutdown runs [action], so a token
+    drained by shutdown can no longer run after its future settled during an
+    earlier teardown action. *)
 type teardown_token = {
   mutable removed : bool;
   action : unit -> unit;
 }
 
+(** State for one workflow scheduler. [pending] counts futures without results,
+    and [teardowns] stores one removable cleanup token for each pending future
+    in creation order.  Settling a future unlinks its token in O(1), so
+    completed values are not retained by a long-lived workflow scheduler and
+    settling [n] futures costs O(n) rather than O(n{^ 2}).
+
+    [failures] holds exceptions that escaped workflow fibers while the
+    scheduler was active; they invalidate the activation. [teardown_failures]
+    holds exceptions that escaped only after {!shutdown} deactivated the
+    scheduler, that is from cleanup code ([Fun.protect ~finally], exception
+    handlers) of fibers being discontinued. Teardown cannot be retried and the
+    run's outcome was already chosen, so those are diagnostics only (#1021). *)
 type t = {
   id : int;
   queue : runnable Queue.t;
@@ -28,7 +40,8 @@ type t = {
   mutable active : bool;
   mutable pending : int;
   mutable failures : exn list;
-  mutable teardowns : teardown_token list;
+  mutable teardown_failures : exn list;
+  teardowns : teardown_token Temporal_base.Ordered_registry.t;
   mutable abort_requested : bool;
 }
 
@@ -48,12 +61,13 @@ let create () =
     active = true;
     pending = 0;
     failures = [];
-    teardowns = [];
+    teardown_failures = [];
+    teardowns = Temporal_base.Ordered_registry.create ();
     abort_requested = false;
   }
 
 (** Returns the stable identity assigned to this workflow scheduler.  Runtime
-    stores use it with the Domain-local owner marker to reject cross-workflow
+    stores use it with the thread-local owner marker to reject cross-workflow
     waits before they retain a continuation. *)
 let id scheduler = scheduler.id
 
@@ -82,15 +96,42 @@ let owner scheduler =
     ~on_settled:(fun () -> scheduler.pending <- scheduler.pending - 1)
     ~register_teardown:(fun teardown ->
       let token = { removed = false; action = teardown } in
-      scheduler.teardowns <- token :: scheduler.teardowns;
-      (* Physical identity is safe here because every registration allocates a
-         fresh token. The linear scan keeps shutdown order explicit while
-         releasing the completed future's closure immediately. *)
+      let handle =
+        Temporal_base.Ordered_registry.add scheduler.teardowns token
+      in
+      (* Unlinking the registry node is O(1) and drops the registry's
+         reference to the completed future's closure immediately, while the
+         registry keeps shutdown order equal to creation order. *)
       fun () ->
         if not token.removed then (
           token.removed <- true;
-          scheduler.teardowns <-
-            List.filter (fun current -> current != token) scheduler.teardowns))
+          Temporal_base.Ordered_registry.remove handle))
+
+(** Records an exception that escaped a workflow fiber. While the scheduler is
+    active the exception is an activation defect reported by {!run}. Two
+    windows instead keep it apart for {!take_teardown_failures}, because the
+    only code that can run in them is cleanup of a fiber being unwound after
+    the run's outcome was chosen, and it must not invalidate the terminal
+    command or eviction that caused the teardown (#1021):
+    - after {!shutdown} has deactivated the scheduler (terminal command
+      emitted through the execution, eviction, adapter shutdown);
+    - after a terminal operation performed [Abort_workflow] in this drain
+      (continue-as-new or [terminate]): the terminal command is already
+      buffered, and the drain loop runs no other fiber once
+      [abort_requested] is set, so only the aborted fiber's own cleanup
+      handlers can raise. *)
+let record_failure scheduler exception_ =
+  if scheduler.active && not scheduler.abort_requested then
+    scheduler.failures <- exception_ :: scheduler.failures
+  else
+    scheduler.teardown_failures <- exception_ :: scheduler.teardown_failures
+
+(** Returns, oldest first, and forgets the exceptions recorded from cleanup
+    code of fibers discontinued after shutdown. *)
+let take_teardown_failures scheduler =
+  let failures = List.rev scheduler.teardown_failures in
+  scheduler.teardown_failures <- [];
+  failures
 
 (** Rejects new future allocation after shutdown, when no continuation could be
     safely resumed. *)
@@ -100,7 +141,7 @@ let promise scheduler ~outside_error =
 
 (** Handles the private [Await] effect by saving the paused workflow fiber on
     its future. Effects not owned by this scheduler continue to an outer
-    handler. The Domain-local owner id is published by [run] for the whole
+    handler. The thread-local owner id is published by [run] for the whole
     drain so resumed fibers still see the correct owner after an await. *)
 let handle scheduler thunk =
   Effect.Deep.match_with thunk ()
@@ -112,7 +153,7 @@ let handle scheduler thunk =
              is control flow, not a workflow defect. *)
           match exception_ with
           | Future_store.Scheduler_shutdown | Workflow_aborted -> ()
-          | _ -> scheduler.failures <- exception_ :: scheduler.failures);
+          | _ -> record_failure scheduler exception_);
       effc =
         (fun (type result) (operation : result Effect.t) ->
           match operation with
@@ -147,7 +188,7 @@ let spawn scheduler thunk =
 
 (** Runs queued work until the queue is empty, including fibers added by future
     completions during the run. An uncaught exception is reported before
-    [Blocked] or [Complete]. Publishes this scheduler as the Domain-local owner
+    [Blocked] or [Complete]. Publishes this scheduler as the thread-local owner
     for the entire drain so [Future_store.await] accepts parking only on this
     execution's futures, including after a fiber resumes from a prior await.
     [on_idle] checks synchronous predicates after all runnable work, while the
@@ -169,8 +210,7 @@ let run ?(on_idle = fun () -> ()) scheduler =
           let invoke thunk =
             try thunk () with
             | Future_store.Scheduler_shutdown | Workflow_aborted -> ()
-            | exception_ ->
-                scheduler.failures <- exception_ :: scheduler.failures
+            | exception_ -> record_failure scheduler exception_
           in
           (* Alternate FIFO drains and idle checks until no new work is queued. *)
           let rec drain () =
@@ -210,19 +250,23 @@ let run_label scheduler =
 let shutdown scheduler =
   if scheduler.active then (
     scheduler.active <- false;
+    (* Snapshot in creation order, as before: a teardown action may settle a
+       later future (through a discontinued fiber's cleanup), which marks its
+       token removed so it is skipped here. Registrations made during this
+       loop are dropped without running, matching the previous ledger reset. *)
     List.iter
       (fun token ->
         if not token.removed then (
           token.removed <- true;
           token.action ()))
-      (List.rev scheduler.teardowns);
-    scheduler.teardowns <- [];
+      (Temporal_base.Ordered_registry.take_all scheduler.teardowns);
+    Temporal_base.Ordered_registry.clear scheduler.teardowns;
     if not scheduler.running then
       while not (Queue.is_empty scheduler.queue) do
         let (Runnable (_, thunk)) = Queue.pop scheduler.queue in
         try thunk () with
         | Future_store.Scheduler_shutdown | Workflow_aborted -> ()
-        | exception_ -> scheduler.failures <- exception_ :: scheduler.failures
+        | exception_ -> record_failure scheduler exception_
       done)
 
 (** Performs the scheduler's private terminal control effect. *)

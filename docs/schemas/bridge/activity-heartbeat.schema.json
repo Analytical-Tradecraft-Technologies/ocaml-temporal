@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/activity-heartbeat.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/activity-heartbeat.schema.json",
   "title": "Remote activity heartbeat",
   "description": "A non-terminal progress record sent from the private OCaml activity runner to the Rust Temporal Core bridge for a currently leased activity task.",
   "type": "object",

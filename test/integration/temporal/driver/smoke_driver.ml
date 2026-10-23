@@ -218,8 +218,8 @@ let require_live_gate () =
 
 (** Requires a completed terminal outcome with the expected typed payload. *)
 let require_completed operation expected = function
-  | Ok (Client.Completed actual) when String.equal actual expected -> Ok ()
-  | Ok (Client.Completed actual) ->
+  | Ok (Client.Completed { output = actual; _ }) when String.equal actual expected -> Ok ()
+  | Ok (Client.Completed { output = actual; _ }) ->
       Error
         (Error.defect
            ~message:
@@ -370,30 +370,29 @@ let cancel_workflow handle =
   let operation = "cancel:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   match
     Client.cancel ~request_id:"two-binary-cancel-long-running-1"
       ~reason:"live acceptance requested cancellation" handle
   with
   | Ok () ->
       phase ~operation ~status:"acknowledged"
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Ok ()
   | Error error ->
       phase ~operation ~status:("error:" ^ Error.kind error)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Error error
 
-(** Identifies the one public bridge diagnostic for which the termination
-    acknowledgement is deliberately uncertain. The public client contract says
-    that the server may have accepted this request, so the caller must reconcile
-    it through [wait] rather than retrying a non-idempotent command. *)
+(** Identifies the one public bridge classification for which the
+    termination acknowledgement is deliberately uncertain. The public client
+    contract says that the server may have accepted this request, so the
+    caller must reconcile it through [wait] rather than retrying a
+    non-idempotent command. *)
 let is_uncertain_termination error =
-  String.equal (Error.kind error) "bridge"
-  && String.equal (Error.message error)
-       "Temporal client RPC failed: termination_outcome_uncertain"
+  Client.rpc_status error = Some `Termination_outcome_uncertain
 
 (** Sends an exact-run termination request and records its acknowledgement
     metadata. A documented uncertain bridge response is accepted here because
@@ -403,23 +402,23 @@ let terminate_workflow handle =
   let operation = "terminate:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   match
     Client.terminate ~reason:"live acceptance requested termination" handle
   with
   | Ok () ->
       phase ~operation ~status:"acknowledged"
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Ok ()
   | Error error when is_uncertain_termination error ->
       phase ~operation ~status:"uncertain"
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Ok ()
   | Error error ->
       phase ~operation ~status:("error:" ^ Error.kind error)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Error error
 
@@ -432,15 +431,15 @@ let query_signal_condition_workflow handle =
   let operation = "query:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   match Client.query handle ~query:Definitions.signal_condition_status with
   | Ok value ->
       phase ~operation ~status:"answered" ~workflow_id:(Client.workflow_id handle)
-        ~run_id:(Client.run_id handle) ~duration_ms:(elapsed_ms started) ();
+        ~run_id:(Option.get (Client.run_id handle)) ~duration_ms:(elapsed_ms started) ();
       Ok value
   | Error error ->
       phase ~operation ~status:("error:" ^ Error.kind error)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Error error
 
@@ -451,18 +450,18 @@ let query_signal_value_echo handle input =
   let operation = "query_typed:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   match
     Client.query_with_input handle ~query:Definitions.signal_value_echo ~input
   with
   | Ok value ->
       phase ~operation ~status:"answered"
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Ok value
   | Error error ->
       phase ~operation ~status:("error:" ^ Error.kind error)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Error error
 
@@ -474,14 +473,14 @@ let update_signal_condition_workflow handle input =
   let operation = "update:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   match
     Client.start_update ~update_id:"two-binary-update-1" handle
       ~update:Definitions.signal_value_update ~input ()
   with
   | Error error ->
       phase ~operation ~status:("error:" ^ Error.kind error)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       Error error
   | Ok update_handle -> (
@@ -489,12 +488,12 @@ let update_signal_condition_workflow handle input =
       | Ok value ->
           phase ~operation ~status:"completed"
             ~workflow_id:(Client.workflow_id handle)
-            ~run_id:(Client.run_id handle) ~duration_ms:(elapsed_ms started) ();
+            ~run_id:(Option.get (Client.run_id handle)) ~duration_ms:(elapsed_ms started) ();
           Ok value
       | Error error ->
           phase ~operation ~status:("error:" ^ Error.kind error)
             ~workflow_id:(Client.workflow_id handle)
-            ~run_id:(Client.run_id handle) ~duration_ms:(elapsed_ms started) ();
+            ~run_id:(Option.get (Client.run_id handle)) ~duration_ms:(elapsed_ms started) ();
           Error error)
 
 (** Confirms the live server rejects an update whose name is absent from the
@@ -506,10 +505,10 @@ let update_missing_handler handle =
   let operation = "update_missing:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   let rejected () =
     phase ~operation ~status:"rejected"
-      ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+      ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
       ~duration_ms:(elapsed_ms started) ();
     Ok ()
   in
@@ -541,8 +540,9 @@ let update_missing_handler handle =
         (Error.defect
            ~message:"unknown update was reported as accepted")
 
-(** Confirms the live server rejects an unknown query handler with the
-    documented invalid-argument boundary. Accepting any error here would let a
+(** Confirms the live server reports an unknown query handler as the typed,
+    non-retryable query handler failure (issue #823) rather than a generic
+    invalid-argument RPC error. Accepting any error here would let a
     connection, timeout, or protocol failure masquerade as a correct handler
     rejection. *)
 let query_missing_handler handle =
@@ -550,9 +550,10 @@ let query_missing_handler handle =
   | Error error ->
       let view = Error.view error in
       if
-        String.equal (Error.kind error) "bridge"
-        && String.equal view.message
-             "Temporal client RPC failed: invalid_argument"
+        Client.is_query_failed error
+        && view.category = `Workflow
+        && Client.rpc_status error = None
+        && not (String.equal view.message "")
       then Ok ()
       else
         Error
@@ -606,7 +607,7 @@ let start_workflow client ~workflow ~task_queue ~id ~input =
   with
   | Ok handle as result ->
       phase ~operation ~status:"accepted" ~workflow_id:(Client.workflow_id handle)
-        ~run_id:(Client.run_id handle) ~duration_ms:(elapsed_ms started) ();
+        ~run_id:(Option.get (Client.run_id handle)) ~duration_ms:(elapsed_ms started) ();
       result
   | Error error as result ->
       phase ~operation ~status:("error:" ^ Error.kind error) ~workflow_id:id
@@ -620,16 +621,16 @@ let wait_workflow handle =
   let operation = "wait:" ^ Client.workflow_id handle in
   let started = Unix.gettimeofday () in
   phase ~operation ~status:"begin" ~workflow_id:(Client.workflow_id handle)
-    ~run_id:(Client.run_id handle) ();
+    ~run_id:(Option.get (Client.run_id handle)) ();
   match Client.wait handle with
   | Ok outcome as result ->
       phase ~operation ~status:(terminal_kind outcome)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       result
   | Error error as result ->
       phase ~operation ~status:("error:" ^ Error.kind error)
-        ~workflow_id:(Client.workflow_id handle) ~run_id:(Client.run_id handle)
+        ~workflow_id:(Client.workflow_id handle) ~run_id:(Option.get (Client.run_id handle))
         ~duration_ms:(elapsed_ms started) ();
       result
 
@@ -794,8 +795,9 @@ let run () =
            accepted in one activation before this exact run is cancelled; the
            timer keeps the execution outstanding. The child-start-failure
            parent is started only after that top-level cancellation run is
-           submitted, so its duplicate child ID must be rejected by Temporal
-           rather than succeeding as an ordinary child. The heartbeat workflow is also already outstanding here, so its retry
+           submitted, and its result is awaited before the run is cancelled,
+           so its duplicate child ID must be rejected by Temporal rather than
+           succeeding as an ordinary child. The heartbeat workflow is also already outstanding here, so its retry
            runs concurrently with the other live server work instead of being
            mistaken for a sequential local callback. The timeout workflow is
            deliberately started only after the heartbeat workflow has reached
@@ -885,7 +887,7 @@ let run () =
            parked behind its readiness marker, so the parent can only complete
            after Temporal has delivered the signal to that exact run. *)
         let external_signal_target =
-          Client.workflow_id signal_handle ^ "\n" ^ Client.run_id signal_handle
+          Client.workflow_id signal_handle ^ "\n" ^ Option.get (Client.run_id signal_handle)
         in
         let* external_signal_parent_handle =
           start_workflow client ~workflow:Definitions.external_signal_parent
@@ -941,6 +943,20 @@ let run () =
         let* () =
           wait_for_cancellation_ready cancellation_ready_file cancellation_token
         in
+        (* The duplicate child ID is only held while the cancellation run is
+           open, so the parent must have observed Temporal's start rejection
+           before that run is cancelled. Waiting here removes the race in
+           which the cancellation completes before the parent's first
+           workflow task issues StartChildWorkflowExecution, letting the
+           "duplicate" child start normally. The parent completes as soon as
+           the start fails, so this wait never depends on the cancellation. *)
+        let* child_start_failure_result =
+          wait_workflow child_start_failure_handle
+        in
+        let* () =
+          require_completed "smoke.parent_observes_child_start_failure"
+            "SMOKE:CHILD:START_FAILED" (Ok child_start_failure_result)
+        in
         let* () = cancel_workflow cancellation_handle in
         (* Reuse the marker file for a distinct direct-termination target only
            after the cancellation acknowledgement is observed. This readiness
@@ -979,7 +995,7 @@ let run () =
            fail. *)
         let external_cancellation_wrong_run_target =
           Client.workflow_id external_cancellation_handle ^ "\n"
-          ^ Client.run_id signal_handle
+          ^ Option.get (Client.run_id signal_handle)
         in
         let* external_cancellation_wrong_run_parent_handle =
           start_workflow client
@@ -998,7 +1014,7 @@ let run () =
         in
         let external_cancellation_target =
           Client.workflow_id external_cancellation_handle ^ "\n"
-          ^ Client.run_id external_cancellation_handle
+          ^ Option.get (Client.run_id external_cancellation_handle)
         in
         let* external_cancellation_parent_handle =
           start_workflow client ~workflow:Definitions.external_cancellation_parent
@@ -1107,13 +1123,6 @@ let run () =
           require_completed "smoke.parent_retries_child"
             "SMOKE:CHILD_RETRY:ATTEMPT:2" (Ok child_retry_result)
         in
-        let* child_start_failure_result =
-          wait_workflow child_start_failure_handle
-        in
-        let* () =
-          require_completed "smoke.parent_observes_child_start_failure"
-            "SMOKE:CHILD:START_FAILED" (Ok child_start_failure_result)
-        in
         let* parent_result = wait_workflow parent_handle in
         let* () =
           require_completed "smoke.parent_awaits_child" "SMOKE:CHILD"
@@ -1175,7 +1184,7 @@ let run () =
            an exact-run external signal does not silently succeed after completion. *)
         let completed_signal_target =
           Client.workflow_id signal_handle ^ "
-" ^ Client.run_id signal_handle
+" ^ Option.get (Client.run_id signal_handle)
         in
         let* external_signal_completed_parent_handle =
           start_workflow client

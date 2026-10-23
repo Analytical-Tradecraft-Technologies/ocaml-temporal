@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/workflow-completion.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/workflow-completion.schema.json",
   "title": "Workflow completion",
   "description": "A closed successful command batch or a failed workflow task sent from the private OCaml workflow runtime to the Rust Temporal Core bridge.",
   "type": "object",
@@ -234,7 +234,7 @@
         {
           "type": "object", "additionalProperties": false,
           "required": ["kind", "workflow_type", "input"],
-          "description": "Ends the current run and starts a fresh run of the named workflow type. The current SDK emits one input payload; the array mirrors Core's repeated argument field.",
+          "description": "Ends the current run and starts a fresh run of the named workflow type. The current SDK emits zero payloads for a Codec.unit input and exactly one otherwise, decided by the codec rather than the payload bytes; the array mirrors Core's repeated argument field.",
           "properties": {
             "kind": {"const": "continue_as_new"},
             "workflow_type": {"$ref": "#/$defs/identifier"},

@@ -8,6 +8,8 @@
     Server. *)
 
 module Protocol = Temporal_protocol.Activity_protocol
+module Encoded = Temporal_protocol.Encoded_activity_completion
+module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
 module Raw_adapter = Temporal_runtime.Native_activity_execution
 
 (** Copies a public payload into the base payload representation expected by the
@@ -23,6 +25,7 @@ let base_payload (payload : Temporal.Payload.t) : Temporal_base.Payload.t =
 let base_error (error : Temporal.Error.t) : Temporal_base.Error.t =
   let view = Temporal.Error.view error in
   Temporal_base.Error.make ~non_retryable:view.non_retryable
+    ?error_type:view.error_type
     ~details:(List.map base_payload view.details) ~category:view.category
     ~message:view.message ()
 
@@ -111,6 +114,10 @@ type fake_supervisor = {
   completions : Protocol.completion list ref;
   (* Validated submissions, including attempts whose acknowledgement fails. *)
   completion_attempts : Protocol.completion list ref;
+  (* The exact canonical documents handed to [complete_activity], newest
+     first, retained without copying so a test can prove that a retry
+     resubmits the physically identical single-encode string (issue #995). *)
+  submitted_documents : string list ref;
   (* Heartbeats accepted while their corresponding token remains leased. *)
   heartbeats : Protocol.heartbeat list ref;
   (* One-shot transport rejection used to verify completion retry without a
@@ -119,8 +126,20 @@ type fake_supervisor = {
   (* One-shot transient exception used to prove raised completion failures
      retain the same lease and are classified through the source boundary. *)
   raise_next_completion : bool ref;
+  (* One-shot non-retryable rejection. It models a failure after which Core
+     may already have consumed the lease, so the adapter must never resubmit
+     the retained completion (issue #843). *)
+  reject_next_completion_permanently : bool ref;
+  (* One-shot exception that is not classified retryable: an uncertain
+     acknowledgement that must also fail closed. *)
+  raise_next_completion_uncertain : bool ref;
   (* Optional source poll failure, modelling a lower-layer typed rejection. *)
   poll_error : source_error option ref;
+  (* Runs at the start of every heartbeat record, before the adapter's
+     delivery sweep. A test uses it to hold a heartbeat from another Domain
+     while the callback returns, forcing a cross-Domain interleaving
+     deterministically. *)
+  heartbeat_hook : (unit -> unit) ref;
 }
 (** Mutable fake-supervisor state. The adapter itself serializes access to all
     fields through its poll mutex; assertions inspect them only after a poll
@@ -133,32 +152,41 @@ let fake_supervisor () =
     leased = ref [];
     completions = ref [];
     completion_attempts = ref [];
+    submitted_documents = ref [];
     heartbeats = ref [];
     reject_next_completion = ref false;
     raise_next_completion = ref false;
+    reject_next_completion_permanently = ref false;
+    raise_next_completion_uncertain = ref false;
     poll_error = ref None;
+    heartbeat_hook = ref ignore;
   }
 
-(** Copies a validated completion by traversing the same strict JSON semantic
-    codec used at the Rust boundary. The fake therefore never retains a mutable
-    token or payload buffer owned by the adapter. *)
-let copy_completion completion =
-  match Protocol.encode_completion completion with
+(** Strictly decodes the canonical bytes the adapter submitted, as the Rust
+    bridge does, and checks that they are exactly the canonical encoding of
+    the decoded value. The fake therefore owns fresh token and payload storage
+    and never encodes a submission itself. *)
+let copy_completion encoded =
+  let json = Encoded.to_string encoded in
+  match Protocol.decode_completion json with
   | Error _ -> failwith "adapter submitted an invalid completion to fake source"
-  | Ok json -> (
-      match Protocol.decode_completion json with
-      | Ok value -> value
-      | Error _ -> failwith "fake source could not reparse its own completion")
+  | Ok value ->
+      if Protocol.encode_completion value <> Ok json then
+        failwith "adapter submitted non-canonical completion bytes";
+      value
 
-(** Copies a heartbeat through the strict protocol codec so the fake source
-    cannot accidentally retain mutable buffers owned by an activity context. *)
-let copy_heartbeat heartbeat =
-  match Protocol.encode_heartbeat heartbeat with
+(** Strictly decodes the adapter's single-encode heartbeat bytes, as the
+    Rust bridge does, and checks that they are canonical. Decoding gives the
+    fake fresh storage, so it cannot retain mutable buffers owned by an
+    activity context, and it never encodes a submission itself (#1001). *)
+let copy_heartbeat encoded =
+  let json = Encoded_heartbeat.to_string encoded in
+  match Protocol.decode_heartbeat json with
   | Error _ -> failwith "adapter submitted an invalid heartbeat to fake source"
-  | Ok json -> (
-      match Protocol.decode_heartbeat json with
-      | Ok value -> value
-      | Error _ -> failwith "fake source could not reparse its own heartbeat")
+  | Ok value ->
+      if Protocol.encode_heartbeat value <> Ok json then
+        failwith "adapter submitted non-canonical heartbeat bytes";
+      value
 
 (** Removes one exact opaque token from a list and reports whether it was found.
     [Bytes.equal] is intentional: tokens are binary correlation data, not text.
@@ -187,16 +215,28 @@ module Fake_supervisor = struct
         if Queue.is_empty supervisor.queue then Ok None
         else
           let task = Queue.take supervisor.queue in
-          supervisor.leased :=
-            Bytes.copy task.task_token :: !(supervisor.leased);
+          (* Like the Rust ledger, a cancellation is an update to its start's
+             single completion debt: it adds a lease only for a token that is
+             not already leased (a bare cancellation in these fixtures). *)
+          let already_leased =
+            List.exists (Bytes.equal task.task_token) !(supervisor.leased)
+          in
+          (match task.variant with
+          | Protocol.Cancel _ when already_leased -> ()
+          | Protocol.Start _ | Protocol.Cancel _ ->
+              supervisor.leased :=
+                Bytes.copy task.task_token :: !(supervisor.leased));
           Ok (Some task)
 
   (** Accepts a completion only for a currently leased exact token. An injected
       rejection leaves the native lease untouched so the adapter must retry the
       same completion without invoking the OCaml implementation again. *)
-  let complete_activity supervisor (completion : Protocol.completion) =
+  let complete_activity supervisor encoded =
+    supervisor.submitted_documents :=
+      Encoded.to_string encoded :: !(supervisor.submitted_documents);
+    let completion = copy_completion encoded in
     supervisor.completion_attempts :=
-      copy_completion completion :: !(supervisor.completion_attempts);
+      completion :: !(supervisor.completion_attempts);
     if !(supervisor.raise_next_completion) then begin
       supervisor.raise_next_completion := false;
       raise Transient_completion_failure
@@ -208,6 +248,17 @@ module Fake_supervisor = struct
           message = "completion transport unavailable";
           retryable = true;
         }
+    end else if !(supervisor.reject_next_completion_permanently) then begin
+      supervisor.reject_next_completion_permanently := false;
+      Error
+        {
+          code = "core_rejected";
+          message = "completion lease may already be consumed";
+          retryable = false;
+        }
+    end else if !(supervisor.raise_next_completion_uncertain) then begin
+      supervisor.raise_next_completion_uncertain := false;
+      failwith "injected uncertain completion exception"
     end
     else
       let found, remaining =
@@ -223,21 +274,22 @@ module Fake_supervisor = struct
       else begin
         supervisor.leased := remaining;
         supervisor.completions :=
-          copy_completion completion :: !(supervisor.completions);
+          completion :: !(supervisor.completions);
         Ok ()
       end
 
   (** Accepts progress only while the activity token is leased. The focused
       dispatch tests do not retain heartbeat bodies; the lease check still
       verifies that the adapter never sends a heartbeat after completion. *)
-  let record_activity_heartbeat supervisor (heartbeat : Protocol.heartbeat) =
+  let record_activity_heartbeat supervisor encoded =
+    !(supervisor.heartbeat_hook) ();
+    let heartbeat = copy_heartbeat encoded in
     if
       List.exists
         (fun token -> Bytes.equal token heartbeat.Protocol.task_token)
         !(supervisor.leased)
     then begin
-      supervisor.heartbeats :=
-        copy_heartbeat heartbeat :: !(supervisor.heartbeats);
+      supervisor.heartbeats := heartbeat :: !(supervisor.heartbeats);
       Ok ()
     end
     else
@@ -250,7 +302,7 @@ module Fake_supervisor = struct
 
   (** The legacy activity fake does not model a namespace-bound client; making
       this explicit keeps tests honest when the adapter contract grows. *)
-  let complete_async_activity _supervisor (_completion : Protocol.completion) =
+  let complete_async_activity _supervisor (_encoded : Encoded.t) =
     Error
       {
         code = "unsupported";
@@ -259,7 +311,7 @@ module Fake_supervisor = struct
       }
 
   let record_async_activity_heartbeat _supervisor
-      (_heartbeat : Protocol.heartbeat) =
+      (_encoded : Temporal_protocol.Encoded_async_activity_heartbeat.t) =
     Error
       {
         code = "unsupported";
@@ -277,9 +329,9 @@ module Fake_supervisor = struct
       protocol failures and must remain fatal. *)
   let error_is_retryable error = error.retryable
 
-  (** This fake does not submit async heartbeats; preserve its explicit source
+  (** This fake does not submit async operations; preserve its explicit source
       classification to satisfy the operation-specific adapter contract. *)
-  let async_heartbeat_error_disposition error =
+  let async_operation_error_disposition error =
     if error.retryable then Temporal_runtime.Native_worker_policy.Retry_exact
     else Temporal_runtime.Native_worker_policy.Retired
 
@@ -399,9 +451,13 @@ let cancel_task token : Protocol.task =
 (** Adds a task in producer order to the fake supervisor queue. *)
 let enqueue supervisor task = Queue.add task supervisor.queue
 
-(** Creates a worker and turns configuration failures into a test diagnostic. *)
-let worker supervisor activities =
-  match Worker.create ~supervisor ~activities with
+(** Creates a worker whose shutdown probe reads [shutting_down], and turns
+    configuration failures into a test diagnostic. *)
+let worker ?(shutting_down = Atomic.make false) supervisor activities =
+  match
+    Worker.create ~supervisor ~activities
+      ~worker_shutting_down:(fun () -> Atomic.get shutting_down)
+  with
   | Ok worker -> worker
   | Error (error : Adapter.error_view) ->
       failwith
@@ -453,7 +509,7 @@ let test_successful_dispatch () =
   if not (Bytes.equal completion.Protocol.task_token token) then
     failwith "completion did not preserve the exact opaque task token";
   begin match completion.Protocol.result with
-  | Protocol.Completed (Some payload) ->
+  | Protocol.Completed payload ->
       if decode_output Temporal.Codec.string payload <> "HELLO" then
         failwith "activity output was not decoded from the completion payload"
   | _ -> failwith "successful activity used a non-completed result variant"
@@ -462,6 +518,37 @@ let test_successful_dispatch () =
   | Ok Adapter.Not_ready -> ()
   | _ -> failwith "empty activity queue did not report Not_ready"
   end
+
+(** Payload metadata values are arbitrary bytes (#1048). A task whose input
+    carries a binary metadata value, as a Go or Java codec may write beside
+    the encoding, used to be failed non-retryably before the activity ran even
+    though the codec ignores that entry. It must now run and succeed. *)
+let test_binary_metadata_input () =
+  let supervisor = fake_supervisor () in
+  let received = ref None in
+  let activity =
+    Temporal.Activity.define ~name:"native_activity_binary_metadata"
+      ~input:Temporal.Codec.bytes ~output:Temporal.Codec.bytes (fun input ->
+        received := Some (Bytes.to_string input);
+        Ok input)
+  in
+  let input : Protocol.payload =
+    {
+      Protocol.metadata =
+        [
+          ("encoding", Bytes.of_string "binary/plain");
+          ("nonce", Bytes.of_string "\xff\x00");
+        ];
+      data = Bytes.of_string "body";
+    }
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "binary-metadata-token")
+       ~activity_type:"native_activity_binary_metadata" ~input:[ input ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  if !received <> Some "body" then
+    failwith "activity with binary input metadata did not run"
 
 (** A typed [Error.t] from an activity becomes a structured application failure,
     preserves retryability and application detail payloads, and is acknowledged
@@ -513,7 +600,49 @@ let test_typed_failure () =
   | _ ->
       failwith
         "typed activity failure did not preserve retryability or details"
+  end;
+  (* Without an explicit application type the category label remains the wire
+     type, preserving the pre-existing behaviour for untyped errors. *)
+  begin match (latest_completion supervisor).Protocol.result with
+  | Protocol.Failed
+      { info = Protocol.Application { type_name = "activity"; _ }; source; _ }
+    when String.equal source "ocaml-temporal" ->
+      ()
+  | _ -> failwith "untyped activity failure changed its wire type or source"
   end
+
+(** An explicit [~error_type] becomes [ApplicationFailureInfo.type] on the
+    activity completion. This is the field Temporal Server and Core match
+    against a retry policy's [non_retryable_error_types], so it must be the
+    user's type rather than the category label. *)
+let test_typed_failure_error_type () =
+  let supervisor = fake_supervisor () in
+  let activity =
+    Temporal.Activity.define ~name:"native_activity_typed_failure"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        Error
+          (Temporal.Error.make ~error_type:"InvalidInput" ~category:`Activity
+             ~message:"rejected input" ()))
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "typed-failure-token")
+       ~activity_type:"native_activity_typed_failure"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  begin match Worker.poll worker with
+  | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+  | _ -> failwith "typed activity failure was not retired"
+  end;
+  match (latest_completion supervisor).Protocol.result with
+  | Protocol.Failed
+      {
+        info =
+          Protocol.Application
+            { type_name = "InvalidInput"; non_retryable = false; _ };
+        _;
+      } ->
+      ()
+  | _ -> failwith "activity failure did not carry its explicit error type"
 
 (** Malformed application details must fail only their own activity. Each case
     queues unrelated work behind the rejected task to detect a poisoned retry
@@ -523,9 +652,9 @@ let test_invalid_failure_details_allow_next_activity () =
     [ ("duplicate", [ ("encoding", "binary/plain"); ("encoding", "binary/plain") ]);
       ("oversized", [ (String.make 65_537 'k', "value") ]);
       ("empty", [ ("", "value") ]);
-      ("nul", [ ("bad\000key", "value") ]);
-      ("invalid-key", [ ("\255", "value") ]);
-      ("invalid-value", [ ("encoding", "\255") ]) ]
+      (* A binary metadata value and a NUL in a key are valid Temporal data
+         (#1048), so only keys outside the protocol's key rule remain. *)
+      ("invalid-key", [ ("\255", "value") ]) ]
   in
   List.iter
     (fun (label, metadata) ->
@@ -610,14 +739,15 @@ let test_invalid_failure_completion_retry () =
   if !calls <> 1 || !(supervisor.leased) <> [] || Queue.length supervisor.queue <> 1 then
     failwith "replacement retry reran the activity, retained its lease, or polled later work"
 
-(** Wire-valid context values which the runtime cannot represent must fail only
-    their own task. Exercise both callback styles, immediate acknowledgement,
-    and transport retry through poll and drain before running unrelated work. *)
+(** Wire-valid task values which the runtime cannot represent (here a second
+    input value) must fail only their own task. Exercise both callback
+    styles, immediate acknowledgement, and transport retry through poll and
+    drain before running unrelated work. A sub-millisecond heartbeat timeout
+    is representable since #1032 (it rounds up); see
+    [test_task_timeouts_zero_is_unset]. *)
 let test_unrepresentable_context_retires_lease () =
   List.iter
     (fun async ->
-      List.iter
-        (fun binary_metadata ->
           List.iter
             (fun retry ->
               let supervisor = fake_supervisor () in
@@ -644,19 +774,18 @@ let test_unrepresentable_context_retires_lease () =
                     ignore (Atomic.fetch_and_add good_calls 1);
                     Ok ())
               in
-              let heartbeat_details, heartbeat_timeout, path =
-                if binary_metadata then
-                  ([ Protocol.{ metadata = [ ("opaque", Bytes.of_string "\255") ];
-                       data = Bytes.of_string "private-heartbeat" } ],
-                   None, "$.variant.heartbeat_details[0].metadata.opaque")
-                else
-                  ([], Some Protocol.{ seconds = 1L; nanoseconds = 1 },
-                   "$.variant.heartbeat_timeout.nanoseconds")
-              in
+              (* Binary heartbeat metadata is representable since #1048, so
+                 the remaining unrepresentable shape is a second input value,
+                 which the single-input definition cannot accept. A remote
+                 attempt with undecodable input fails retryably so the retry
+                 policy can reach an updated worker (#1031). *)
+              let unit_input = encode_input Temporal.Codec.unit () in
+              let path = "$.variant.input" in
               let token = Bytes.of_string "\000bad-context\255" in
               let task =
-                start_task_with_heartbeat ~heartbeat_details ~heartbeat_timeout
-                  ~token ~activity_type:"bad-context" ~input:[]
+                start_task_with_heartbeat ~heartbeat_details:[]
+                  ~heartbeat_timeout:None ~token ~activity_type:"bad-context"
+                  ~input:[ unit_input; unit_input ]
               in
               (* These are valid native tasks, not malformed wire envelopes. *)
               let task =
@@ -691,7 +820,7 @@ let test_unrepresentable_context_retires_lease () =
               let completion = latest_completion supervisor in
               (match completion.result with
               | Protocol.Failed { message; info = Protocol.Application
-                  { non_retryable = true; details = []; _ }; _ }
+                  { non_retryable = false; details = []; _ }; _ }
                 when String.length message <= 1_024 -> ()
               | _ -> failwith "context failure did not produce a bounded rejection");
               if not (Bytes.equal completion.task_token token)
@@ -713,7 +842,7 @@ let test_unrepresentable_context_retires_lease () =
                 | Error error -> Error error
                 | _ -> failwith "queued activity did not make progress"
               in
-              (match Loop.run ~closed:(fun () -> Atomic.get good_calls = 1)
+              (match Loop.run ~activity_lane:true ~lane_unavailable:raise ~detach:None ~closed:(fun () -> Atomic.get good_calls = 1)
                  ~poll_workflow:(fun () -> Ok Loop.Not_ready) ~poll_activity
                  ~wait_for_lane:(fun ~workflow_lane ~native_wait:_ ->
                    if not workflow_lane then failwith "unexpected activity wait";
@@ -734,32 +863,169 @@ let test_unrepresentable_context_retires_lease () =
               | Ok () when !(supervisor.leased) = [] && Atomic.get good_calls = 1 -> ()
               | _ -> failwith "context rejection left unaccounted completion debt")
             [ false; true ])
-        [ true; false ])
     [ false; true ]
 
-(** An unknown activity type is acknowledged with a typed non-retryable failure,
-    preventing a leased task from being silently abandoned. *)
+(** Temporal reports an unset timeout as a zero duration: Core fills a local
+    activity's absent schedule-to-close with zero and the server reports an
+    unset heartbeat timeout as zero. Both [Info] and
+    [Context.heartbeat_timeout] must read those as [None], matching
+    [Temporal.Testing], while a positive timeout stays [Some]. A
+    sub-millisecond heartbeat interval from another SDK rounds up instead of
+    rejecting a synchronous task (#1032). *)
+let test_task_timeouts_zero_is_unset () =
+  let zero = Some Protocol.{ seconds = 0L; nanoseconds = 0 } in
+  let ms value = Option.map Temporal.Duration.to_ms value in
+  let run ~is_local ~schedule_to_close ~start_to_close ~heartbeat =
+    let supervisor = fake_supervisor () in
+    let observed = ref None in
+    let activity =
+      Temporal.Activity.define_with_context ~name:"timeouts"
+        ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+        (fun context () ->
+          let module Info = Temporal.Activity.Info in
+          match Temporal.Activity.Context.info context with
+          | Error error -> Error error
+          | Ok info ->
+              observed :=
+                Some
+                  ( ms (Info.schedule_to_close_timeout info),
+                    ms (Info.start_to_close_timeout info),
+                    ms (Info.heartbeat_timeout info),
+                    ms (Temporal.Activity.Context.heartbeat_timeout context) );
+              Ok ())
+    in
+    let task =
+      match
+        start_task ~token:(Bytes.of_string "timeouts-token")
+          ~activity_type:"timeouts"
+          ~input:[ encode_input Temporal.Codec.unit () ]
+      with
+      | { Protocol.variant = Protocol.Start start; _ } as task ->
+          {
+            task with
+            variant =
+              Protocol.Start
+                {
+                  start with
+                  is_local;
+                  schedule_to_close_timeout = schedule_to_close;
+                  start_to_close_timeout = start_to_close;
+                  heartbeat_timeout = heartbeat;
+                };
+          }
+      | _ -> failwith "start fixture was not a start task"
+    in
+    (* Round-trip through the strict wire codec so the fixture is a task the
+       bridge could really deliver. *)
+    let task =
+      match Result.bind (Protocol.encode_task task) Protocol.decode_task with
+      | Ok task -> task
+      | Error _ -> failwith "timeout fixture is not wire-valid"
+    in
+    enqueue supervisor task;
+    let worker = worker supervisor [ Adapter.register activity ] in
+    expect_completed Adapter.Succeeded (Worker.poll worker);
+    match !observed with
+    | Some timeouts -> timeouts
+    | None -> failwith "timeout activity did not run"
+  in
+  (* A local activity scheduled without schedule-to-close. *)
+  if
+    run ~is_local:true ~schedule_to_close:zero
+      ~start_to_close:(Some Protocol.{ seconds = 5L; nanoseconds = 0 })
+      ~heartbeat:None
+    <> (None, Some 5_000L, None, None)
+  then failwith "local activity reported an unset schedule-to-close as zero";
+  (* A remote activity with the server's zero heartbeat timeout and a zero
+     schedule-to-close inherited from a workflow without a run timeout. *)
+  if
+    run ~is_local:false ~schedule_to_close:zero
+      ~start_to_close:(Some Protocol.{ seconds = 60L; nanoseconds = 0 })
+      ~heartbeat:zero
+    <> (None, Some 60_000L, None, None)
+  then failwith "remote activity reported unset timeouts as zero";
+  (* A sub-millisecond heartbeat interval rounds up in both views. *)
+  if
+    run ~is_local:false ~schedule_to_close:None ~start_to_close:None
+      ~heartbeat:(Some Protocol.{ seconds = 1L; nanoseconds = 1 })
+    <> (None, None, Some 1_001L, Some 1_001L)
+  then failwith "sub-millisecond heartbeat timeout was not rounded up"
+
+(** Returns the application failure type, retryability, and message of the
+    latest completion, failing when it is not an application failure. *)
+let latest_application_failure supervisor =
+  match (latest_completion supervisor).Protocol.result with
+  | Protocol.Failed
+      {
+        message;
+        info = Protocol.Application { type_name; non_retryable; _ };
+        _;
+      } ->
+      (type_name, non_retryable, message)
+  | _ -> failwith "expected the latest completion to be an application failure"
+
+(** Reports whether [part] occurs in [text]; used for diagnostic messages. *)
+let contains text part =
+  let text_length = String.length text and part_length = String.length part in
+  let rec loop index =
+    index + part_length <= text_length
+    && (String.equal (String.sub text index part_length) part || loop (index + 1))
+  in
+  loop 0
+
+(** Builds a start task for [activity_type] with an explicit locality. *)
+let start_task_local ~is_local ~token ~activity_type ~input : Protocol.task =
+  match start_task ~token ~activity_type ~input with
+  | { variant = Protocol.Start start; _ } as task ->
+      { task with variant = Protocol.Start { start with is_local } }
+  | _ -> assert false
+
+(** An unknown activity type is acknowledged rather than silently abandoned.
+    For a remote activity the failure is a retryable ["NotFoundError"] naming
+    the registered types, as in the other Temporal SDKs, so the retry policy
+    can route a later attempt to a worker that has the type (#1031); a local
+    activity always runs on this worker, so it stays non-retryable. *)
 let test_unknown_activity_retires_lease () =
-  let supervisor = fake_supervisor () in
-  let token = Bytes.of_string "unknown-token" in
-  enqueue supervisor
-    (start_task ~token ~activity_type:"missing_activity" ~input:[]);
-  let worker = worker supervisor [] in
-  begin match Worker.poll worker with
-  | Ok
-      (Adapter.Rejected
-         {
-           activity_type = Some "missing_activity";
-           lease_retired = true;
-           error;
-           _;
-         })
-    when String.equal error.code "unknown_activity_type" ->
-      ()
-  | _ -> failwith "unknown activity was not rejected with a retired lease"
-  end;
-  if !(supervisor.leased) <> [] then
-    failwith "unknown activity lease remained active"
+  let registered =
+    Temporal.Activity.define ~name:"present_activity"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () -> Ok ())
+  in
+  List.iter
+    (fun is_local ->
+      let supervisor = fake_supervisor () in
+      let token = Bytes.of_string "unknown-token" in
+      enqueue supervisor
+        (start_task_local ~is_local ~token ~activity_type:"missing_activity"
+           ~input:[]);
+      let worker = worker supervisor [ Adapter.register registered ] in
+      begin match Worker.poll worker with
+      | Ok
+          (Adapter.Rejected
+             {
+               activity_type = Some "missing_activity";
+               lease_retired = true;
+               error;
+               _;
+             })
+        when String.equal error.code "unknown_activity_type" ->
+          ()
+      | _ -> failwith "unknown activity was not rejected with a retired lease"
+      end;
+      if !(supervisor.leased) <> [] then
+        failwith "unknown activity lease remained active";
+      let type_name, non_retryable, message =
+        latest_application_failure supervisor
+      in
+      if type_name <> "NotFoundError" then
+        failwith ("unknown activity used failure type " ^ type_name);
+      if non_retryable <> is_local then
+        failwith
+          (if is_local then "unknown local activity was retryable"
+           else "unknown remote activity bypassed the retry policy");
+      if not (contains message "missing_activity"
+              && contains message "[present_activity]")
+      then failwith ("unknown activity message lacked the types: " ^ message))
+    [ false; true ]
 
 (** Cancellation is represented as a canceled Temporal failure and preserves the
     same opaque token even when no activity implementation is registered. *)
@@ -837,6 +1103,46 @@ let test_completion_retry_does_not_redo_activity () =
   if !(supervisor.leased) <> [] then
     failwith "retried completion left lease active"
 
+(** Each completion is encoded exactly once (issue #995). The adapter's single
+    encoder pass yields the immutable document that every submission sends:
+    a typed rejection retried by [poll] and a transient exception retried by
+    [drain] both resubmit the physically identical string, so neither a retry
+    nor the supervisor re-encodes the completion. The document is also
+    byte-for-byte the canonical encoding of the accepted completion, so the
+    JSON protocol is unchanged. *)
+let test_completion_is_encoded_once () =
+  let supervisor = fake_supervisor () in
+  let activity =
+    Temporal.Activity.define ~name:"native_activity_single_encode"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+        Ok "encoded once")
+  in
+  let token = Bytes.of_string "\000single-encode\255" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"native_activity_single_encode"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  supervisor.reject_next_completion := true;
+  let worker = worker supervisor [ Adapter.register activity ] in
+  (match Worker.poll worker with
+  | Error { code = "completion_failed"; retryable = true; _ } -> ()
+  | _ -> failwith "single-encode: first submission was not rejected");
+  supervisor.raise_next_completion := true;
+  (match Worker.poll worker with
+  | Error { code = "completion_failed"; retryable = true; _ } -> ()
+  | _ -> failwith "single-encode: second submission did not raise");
+  (match Worker.drain worker with
+  | Ok () -> ()
+  | Error _ -> failwith "single-encode: drain did not submit the retained lease");
+  match !(supervisor.submitted_documents), !(supervisor.completions) with
+  | [ third; second; first ], [ accepted ] ->
+      if not (first == second && second == third) then
+        failwith "single-encode: a retry submitted a re-encoded document";
+      if Protocol.encode_completion accepted <> Ok first then
+        failwith "single-encode: submitted bytes are not the canonical encoding";
+      if not (Bytes.equal accepted.Protocol.task_token token) then
+        failwith "single-encode: submitted token changed"
+  | _ -> failwith "single-encode: unexpected number of submissions"
+
 (** A completion exception follows the same ownership rule as a typed
     rejection when the supervisor explicitly marks that exception transient.
     The second poll retries the copied completion and never re-enters the
@@ -874,6 +1180,63 @@ let test_transient_completion_exception_does_not_redo_activity () =
   if !(supervisor.leased) <> [] then
     failwith "raised completion retry left lease active"
 
+(** A completion failure that is not explicitly retryable is fail-closed
+    (issue #843): the retained completion is never submitted again, neither by
+    a later poll nor by a shutdown drain, and it keeps blocking new tasks until
+    terminal [discard]. Both a typed rejection and an unclassified exception
+    must follow this rule. *)
+let test_non_retryable_completion_is_never_resubmitted () =
+  List.iter
+    (fun (label, inject) ->
+      let supervisor = fake_supervisor () in
+      let calls = ref 0 in
+      let name = "native_activity_fail_closed_" ^ label in
+      let activity =
+        Temporal.Activity.define ~name ~input:Temporal.Codec.unit
+          ~output:Temporal.Codec.string (fun () ->
+            incr calls;
+            Ok "once")
+      in
+      let start token =
+        start_task ~token:(Bytes.of_string token) ~activity_type:name
+          ~input:[ encode_input Temporal.Codec.unit () ]
+      in
+      enqueue supervisor (start (label ^ "-token"));
+      inject supervisor;
+      let worker = worker supervisor [ Adapter.register activity ] in
+      (* Matches the fail-closed error and returns it for later comparison. *)
+      let expect_refusal context (result : (_, Adapter.error_view) result) =
+        match result with
+        | Error ({ code = "completion_failed"; retryable = false; _ } as error) ->
+            error
+        | Error error ->
+            failwith
+              (Printf.sprintf "%s %s returned the wrong error: %s" label context
+                 error.code)
+        | Ok _ ->
+            failwith (Printf.sprintf "%s %s acknowledged a refused lease" label context)
+      in
+      let first = expect_refusal "poll" (Worker.poll worker) in
+      (* A queued task must not be polled while the refused lease is retained. *)
+      enqueue supervisor (start (label ^ "-next-token"));
+      let again = expect_refusal "second poll" (Worker.poll worker) in
+      let drained = expect_refusal "drain" (Worker.drain worker) in
+      if again <> first || drained <> first then
+        failwith (label ^ " refusal changed its recorded diagnostic");
+      if List.length !(supervisor.completion_attempts) <> 1 then
+        failwith (label ^ " retained completion was submitted more than once");
+      if !calls <> 1 || Queue.length supervisor.queue <> 1 then
+        failwith (label ^ " refused lease allowed further activity execution");
+      Worker.discard worker;
+      match Worker.drain worker with
+      | Ok () -> ()
+      | Error error ->
+          failwith (label ^ " discard left a retained lease: " ^ error.code))
+    [ ("rejected", fun supervisor ->
+        supervisor.reject_next_completion_permanently := true);
+      ("raised", fun supervisor ->
+        supervisor.raise_next_completion_uncertain := true) ]
+
 (** A contextual activity receives the previous attempt's heartbeat details,
     reports a typed progress value through the supervisor, and cannot submit a
     second heartbeat after terminal completion invalidates its context. *)
@@ -897,10 +1260,39 @@ let test_contextual_heartbeat_lifecycle () =
           | Some timeout when Temporal.Duration.to_ms timeout = 2_000L -> ()
           | _ -> failwith "activity heartbeat timeout was not converted exactly"
         end;
+        (* #792: the native adapter must forward the task's identity so
+           activities can build idempotency keys. *)
+        begin
+          match Temporal.Activity.Context.info context with
+          | Error error -> failwith (Temporal.Error.message error)
+          | Ok info ->
+              let module Info = Temporal.Activity.Info in
+              if Info.namespace info <> "default"
+                 || Info.workflow info
+                    <> { Info.workflow_id = "workflow-1"; run_id = "run-1";
+                         workflow_type = "test_workflow" }
+                 || Info.activity_id info <> "activity-1"
+                 || Info.activity_type info <> "native_activity_heartbeat"
+                 || Info.attempt info <> 1 || Info.is_local info
+                 || Option.is_some (Info.scheduled_time info)
+              then failwith "activity info did not mirror the start task"
+        end;
         match Temporal.Activity.Context.heartbeat context Temporal.Codec.string
                 "progress" with
-        | Ok () -> Ok "done"
-        | Error error -> Error error)
+        | Error error -> Error error
+        | Ok () -> (
+            (* Regression for #767: this attempt's own heartbeat is recorded
+               for the next attempt and must not replace the previous
+               attempt's details, which stay stable for the whole attempt. *)
+            match Temporal.Activity.Context.details context with
+            | [ payload ]
+              when decode_output Temporal.Codec.string
+                     (protocol_payload payload)
+                   = "prior" ->
+                Ok "done"
+            | _ ->
+                failwith
+                  "heartbeat replaced the previous attempt's details"))
   in
   (* The native adapter only receives the package-private base definition.
      This assertion protects the conversion that must retain a contextual
@@ -947,10 +1339,50 @@ let test_contextual_heartbeat_lifecycle () =
         | Ok () -> failwith "heartbeat succeeded after activity completion")
   end
 
+(** A synchronous heartbeat is encoded once by the adapter, which also
+    validates it (#1001): details the strict encoder rejects (here duplicate
+    metadata keys, which payload conversion alone cannot detect) fail as a
+    typed codec error without any supervisor call, and a valid heartbeat
+    from the same attempt still reaches the supervisor exactly once. *)
+let test_heartbeat_encoder_rejection_stays_local () =
+  let supervisor = fake_supervisor () in
+  let supervisor_calls = ref 0 in
+  supervisor.heartbeat_hook := (fun () -> incr supervisor_calls);
+  let activity =
+    Temporal.Activity.define_with_context ~name:"native_heartbeat_rejected"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        let duplicate : Temporal.Payload.t =
+          { metadata = [ ("opaque", "one"); ("opaque", "two") ];
+            data = Bytes.of_string "invalid" }
+        in
+        (match Temporal.Activity.Context.heartbeat_payloads context [ duplicate ] with
+        | Error error when (Temporal.Error.view error).category = `Codec -> ()
+        | Error _ -> failwith "encoder-rejected heartbeat was not a codec error"
+        | Ok () -> failwith "encoder-rejected heartbeat was accepted");
+        if !supervisor_calls <> 0 then
+          failwith "encoder-rejected heartbeat reached the supervisor";
+        Result.map
+          (fun () -> "done")
+          (Temporal.Activity.Context.heartbeat context Temporal.Codec.string
+             "valid"))
+  in
+  let token = Bytes.of_string "heartbeat-rejected-token" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"native_heartbeat_rejected"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  supervisor.heartbeat_hook := ignore;
+  match !supervisor_calls, !(supervisor.heartbeats) with
+  | 1, [ heartbeat ] when Bytes.equal heartbeat.Protocol.task_token token -> ()
+  | _ -> failwith "valid heartbeat was not submitted exactly once"
+
 (** The public context view must never expose mutable payload storage owned by
     the adapter. This test mutates the source details, a getter result, the
     heartbeat argument, and the callback's retained view in turn; every later
-    observation must still contain the original bytes and ordering. The
+    observation must still contain the original bytes and ordering. A
+    successful heartbeat must not replace the previous attempt's details. The
     timeout is checked through the public conversion as well, because a
     context's timing contract is part of the activity API rather than an
     implementation-only field. *)
@@ -1021,16 +1453,15 @@ let test_context_payloads_are_copied () =
   | [ payload ] when Bytes.equal payload.data expected_heartbeat -> ()
   | _ -> failwith "heartbeat callback retained caller-owned payload bytes"
   end;
-  (* The context stores a separate copy after a successful callback, so even
-     the callback's retained view cannot mutate the next-attempt details. *)
+  (* Neither the successful heartbeat nor mutation of the callback's retained
+     view may change the previous attempt's details (#767): they are fixed
+     for the whole attempt. *)
   begin match !callback_payloads with
   | [ payload ] -> Bytes.set payload.data 0 'Q'
   | _ -> failwith "heartbeat callback received an unexpected detail shape"
   end;
-  begin match Temporal.Activity.Context.details context with
-  | [ payload ] when Bytes.equal payload.data expected_heartbeat -> ()
-  | _ -> failwith "activity context retained mutable callback payload bytes"
-  end
+  expect_source (Temporal.Activity.Context.details context)
+    "successful heartbeat replaced the previous attempt's details"
 
 (** Heartbeat callback failures and stale contexts are ordinary typed results.
     In particular, an invalidated context must reject before entering its
@@ -1089,30 +1520,54 @@ let test_context_callback_exception_and_invalidation () =
     failwith "invalidated activity context entered its heartbeat callback"
 
 (** More than one input payload is rejected explicitly rather than silently
-    dropping later values. *)
+    dropping later values. Like an input the codec cannot decode, the failure
+    of a remote activity is retryable, because a newer caller's input may
+    decode on an updated worker sharing the queue, while a local activity's
+    stays non-retryable (#1031). The callback never runs. *)
 let test_extra_input_is_rejected () =
-  let supervisor = fake_supervisor () in
+  let calls = ref 0 in
   let activity =
     Temporal.Activity.define ~name:"native_activity_one_input"
       ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun input ->
+        incr calls;
         Ok input)
   in
-  enqueue supervisor
-    (start_task
-       ~token:(Bytes.of_string "extra-input")
-       ~activity_type:"native_activity_one_input"
-       ~input:
-         [
-           encode_input Temporal.Codec.string "first";
-           encode_input Temporal.Codec.string "second";
-         ]);
-  let worker = worker supervisor [ Adapter.register activity ] in
-  begin match Worker.poll worker with
-  | Ok (Adapter.Rejected { lease_retired = true; error; _ })
-    when String.equal error.code "unsupported" ->
-      ()
-  | _ -> failwith "extra activity inputs were not rejected"
-  end
+  let cases =
+    [
+      ( "unsupported",
+        [
+          encode_input Temporal.Codec.string "first";
+          encode_input Temporal.Codec.string "second";
+        ] );
+      ("codec", [ encode_input Temporal.Codec.int 7 ]);
+    ]
+  in
+  List.iter
+    (fun (expected_code, input) ->
+      List.iter
+        (fun is_local ->
+          let supervisor = fake_supervisor () in
+          enqueue supervisor
+            (start_task_local ~is_local
+               ~token:(Bytes.of_string "extra-input")
+               ~activity_type:"native_activity_one_input" ~input);
+          let worker = worker supervisor [ Adapter.register activity ] in
+          begin match Worker.poll worker with
+          | Ok (Adapter.Rejected { lease_retired = true; error; _ })
+            when String.equal error.code expected_code ->
+              ()
+          | Ok (Adapter.Rejected { error; _ }) ->
+              failwith ("undecodable input used diagnostic " ^ error.code)
+          | _ -> failwith "undecodable activity input was not rejected"
+          end;
+          let _, non_retryable, _ = latest_application_failure supervisor in
+          if non_retryable <> is_local then
+            failwith
+              (if is_local then "undecodable local input was retryable"
+               else "undecodable remote input bypassed the retry policy"))
+        [ false; true ])
+    cases;
+  if !calls <> 0 then failwith "an undecodable input reached the callback"
 
 (** Duplicate and remote registrations are rejected before any native task is
     polled, keeping the registry unambiguous. *)
@@ -1126,6 +1581,7 @@ let test_registration_validation () =
     Worker.create ~supervisor
       ~activities:
         [ Adapter.register (definition ()); Adapter.register (definition ()) ]
+      ~worker_shutting_down:(fun () -> false)
   with
   | Error { code = "duplicate_activity"; _ } -> ()
   | _ -> failwith "duplicate activity registration was accepted"
@@ -1136,14 +1592,22 @@ let test_registration_validation () =
   in
   begin match
     Worker.create ~supervisor ~activities:[ Adapter.register remote ]
+      ~worker_shutting_down:(fun () -> false)
   with
   | Error { code = "not_executable"; _ } -> ()
   | _ -> failwith "remote activity registration was accepted as executable"
   end
 
 (** Exceptions from application activity code are converted into a typed,
-    retired non-retryable failure instead of escaping the worker loop. *)
+    retired failure instead of escaping the worker loop. Exceptions are
+    programmer defects, so the failure stays non-retryable, but it is
+    identifiable as [ocaml_exception] and carries the backtrace when recording
+    is enabled (#822). *)
 let test_implementation_exception_is_retired () =
+  let recording = Printexc.backtrace_status () in
+  Printexc.record_backtrace true;
+  Fun.protect ~finally:(fun () -> Printexc.record_backtrace recording)
+  @@ fun () ->
   let supervisor = fake_supervisor () in
   let activity =
     Temporal.Activity.define ~name:"native_activity_exception"
@@ -1161,7 +1625,20 @@ let test_implementation_exception_is_retired () =
     when String.equal error.code "ocaml_exception" ->
       ()
   | _ -> failwith "activity exception did not retire its task lease"
-  end
+  end;
+  match (latest_completion supervisor).Protocol.result with
+  | Protocol.Failed
+      { message; stack_trace;
+        info = Protocol.Application { type_name; non_retryable; _ }; _ } ->
+      if not (String.equal type_name "ocaml_exception") then
+        failwith "activity exception used the wrong failure type";
+      if not non_retryable then
+        failwith "activity exception would retry a programmer defect";
+      if not (String.equal message "Failure(\"defect in activity\")") then
+        failwith "activity exception lost its message";
+      if String.equal stack_trace "" then
+        failwith "activity exception lost its recorded backtrace"
+  | _ -> failwith "activity exception did not submit an application failure"
 
 (** A source-side poll failure remains a typed adapter error because no task
     token was available to acknowledge. *)
@@ -1184,21 +1661,891 @@ let test_poll_error_is_typed () =
   | Ok _ -> failwith "poll error unexpectedly produced an activity outcome"
   end
 
+(** The private context cell: the first published cancellation wins and stays
+    fixed, a heartbeat after publication still submits its details but returns
+    the [`Cancelled] error, and invalidation takes precedence over both while
+    leaving the observed value readable. *)
+let test_context_cancellation_signal () =
+  let module Context = Temporal_base.Activity_context in
+  let signal = Context.cancellation_signal () in
+  let submitted = ref 0 in
+  let info : Context.info =
+    {
+      namespace = "default"; workflow_id = "w"; workflow_run_id = "r";
+      workflow_type = "t"; activity_id = "a"; activity_type = "x"; attempt = 1;
+      is_local = false; scheduled_time = None;
+      current_attempt_scheduled_time = None; started_time = None;
+      schedule_to_close_timeout = None; start_to_close_timeout = None;
+      task_heartbeat_timeout = None;
+    }
+  in
+  let context =
+    Context.create_for_task ~cancellation:signal
+      ~worker_shutting_down:(fun () -> false) ~info
+      ~heartbeat:(fun _ -> incr submitted; Ok ())
+      ~details:[] ~heartbeat_timeout:None
+  in
+  if Context.heartbeat context [] <> Ok () then
+    failwith "an uncancelled heartbeat failed";
+  let first = { Context.reason = Context.Timed_out; reasons = [ Context.Timed_out ] } in
+  if not (Context.signal_cancellation signal first) then
+    failwith "the first cancellation was not published";
+  if Context.signal_cancellation signal
+       { reason = Context.Requested; reasons = [ Context.Requested ] }
+  then failwith "a second cancellation replaced the first";
+  if Context.cancellation context <> Some first then
+    failwith "the context did not read its cell";
+  begin match Context.heartbeat context [] with
+  | Error error
+    when (Temporal_base.Error.view error).category = `Cancelled
+         && (Temporal_base.Error.view error).non_retryable ->
+      ()
+  | _ -> failwith "a heartbeat after cancellation did not report it"
+  end;
+  if !submitted <> 2 then failwith "a cancelled heartbeat was not submitted";
+  Context.invalidate context;
+  begin match Context.heartbeat context [] with
+  | Error error when (Temporal_base.Error.view error).category = `Bridge -> ()
+  | _ -> failwith "an invalidated context accepted a heartbeat"
+  end;
+  if !submitted <> 2 || Context.cancellation context <> Some first then
+    failwith "invalidation changed the submitted or observed state"
+
+(** Builds a cancellation task with an explicit Core reason and detail flags,
+    for the cooperative-cancellation tests (#494). *)
+let cancel_task_with ~reason ?details token : Protocol.task =
+  {
+    Protocol.task_token = Bytes.copy token;
+    variant = Cancel { reason; details };
+  }
+
+(** A contextual activity that heartbeats [beats] times, recording what its
+    context reports, and then hands its outcome to [finish]. Each heartbeat
+    result is kept so tests can assert the exact cancellation boundary. *)
+let heartbeating_activity ~name ~beats ~calls ~results ~finish =
+  Temporal.Activity.define_with_context ~name ~input:Temporal.Codec.unit
+    ~output:Temporal.Codec.string (fun context () ->
+      incr calls;
+      if Option.is_some (Temporal.Activity.Context.cancellation context) then
+        failwith "a fresh attempt context was already cancelled";
+      for index = 1 to beats do
+        results :=
+          Temporal.Activity.Context.heartbeat context Temporal.Codec.int index
+          :: !results
+      done;
+      finish context)
+
+(** Asserts that a heartbeat result is the cooperative cancellation error. *)
+let expect_cancelled_heartbeat = function
+  | Error error when (Temporal.Error.view error).category = `Cancelled -> ()
+  | Error error ->
+      failwith ("heartbeat returned a non-cancellation error: " ^ Temporal.Error.message error)
+  | Ok () -> failwith "heartbeat did not report the delivered cancellation"
+
+(** A cancellation queued behind a running attempt is delivered to that
+    attempt's context by its next heartbeat, with Core's reason and flags; the
+    callback acknowledges it by returning the heartbeat error, and the adapter
+    submits exactly one cancelled completion carrying the callback's details
+    while keeping Core's details as outcome metadata. *)
+let test_cancellation_delivered_through_heartbeat () =
+  let supervisor = fake_supervisor () in
+  let token = Bytes.of_string "\000running\255" in
+  let calls = ref 0 in
+  let results = ref [] in
+  let observed = ref None in
+  let detail : Temporal.Payload.t =
+    { metadata = [ ("encoding", "binary/plain") ]; data = Bytes.of_string "cleaned up" }
+  in
+  let activity =
+    heartbeating_activity ~name:"cooperative_cancel" ~beats:2 ~calls ~results
+      ~finish:(fun context ->
+        observed := Temporal.Activity.Context.cancellation context;
+        match !results with
+        | Error error :: _ ->
+            let view = Temporal.Error.view error in
+            Error
+              (Temporal.Error.make ~non_retryable:true ~details:[ detail ]
+                 ~category:view.category ~message:view.message ())
+        | _ -> Ok "ignored")
+  in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"cooperative_cancel"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  enqueue supervisor
+    (cancel_task_with ~reason:Protocol.Cancellation_requested
+       ~details:
+         {
+           Protocol.is_not_found = false;
+           is_cancelled = true;
+           is_paused = true;
+           is_timed_out = false;
+           is_worker_shutdown = false;
+           is_reset = false;
+         }
+       token);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  begin match Worker.poll worker with
+  | Ok
+      (Adapter.Completed
+         { kind = Adapter.Cancelled; cancellation_details = Some details; _ })
+    when details.is_cancelled && details.is_paused ->
+      ()
+  | _ -> failwith "an acknowledged cancellation did not complete as cancelled"
+  end;
+  if !calls <> 1 then failwith "the cancelled callback did not run exactly once";
+  (* The first heartbeat delivers the queued cancellation; both report it. *)
+  List.iter expect_cancelled_heartbeat !results;
+  begin match !observed with
+  | Some cancellation ->
+      let module C = Temporal.Activity.Cancellation in
+      if C.reason cancellation <> C.Requested then
+        failwith "the delivered cancellation lost its primary reason";
+      if C.reasons cancellation <> [ C.Requested; C.Paused ] then
+        failwith "the delivered cancellation lost its independent reasons"
+  | None -> failwith "the context did not expose the delivered cancellation"
+  end;
+  if List.length !(supervisor.heartbeats) <> 2 then
+    failwith "a cancelled heartbeat did not still record its details";
+  if List.length !(supervisor.completions) <> 1 then
+    failwith "cancellation produced more than one completion";
+  begin match (latest_completion supervisor).Protocol.result with
+  | Protocol.Cancelled { info = Protocol.Canceled { details = [ payload ]; _ }; _ }
+    when Bytes.equal payload.data detail.data ->
+      ()
+  | _ -> failwith "the cancelled completion lost the callback's details"
+  end;
+  if not (Queue.is_empty supervisor.queue) then
+    failwith "the cancellation task was left for a second completion";
+  match Worker.poll worker with
+  | Ok Adapter.Not_ready -> ()
+  | _ -> failwith "a delivered cancellation was processed a second time"
+
+(** A callback may ignore a delivered cancellation: returning [Ok] completes
+    the attempt successfully, and a [`Cancelled] error without any delivered
+    cancellation is an ordinary failure, never a fabricated cancellation. *)
+let test_cancellation_outcome_precedence () =
+  let supervisor = fake_supervisor () in
+  let ignored = Bytes.of_string "ignored" in
+  let calls = ref 0 in
+  let results = ref [] in
+  let ignoring =
+    heartbeating_activity ~name:"ignores_cancel" ~beats:1 ~calls ~results
+      ~finish:(fun _ -> Ok "finished anyway")
+  in
+  let claiming =
+    Temporal.Activity.define_with_context ~name:"claims_cancel"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun _ () ->
+        Error
+          (Temporal.Error.make ~category:`Cancelled
+             ~message:"not actually requested" ()))
+  in
+  enqueue supervisor
+    (start_task ~token:ignored ~activity_type:"ignores_cancel"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  enqueue supervisor
+    (cancel_task_with ~reason:Protocol.Cancellation_timed_out ignored);
+  let worker =
+    worker supervisor [ Adapter.register ignoring; Adapter.register claiming ]
+  in
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  List.iter expect_cancelled_heartbeat !results;
+  begin match (latest_completion supervisor).Protocol.result with
+  | Protocol.Completed _ -> ()
+  | _ -> failwith "an ignored cancellation changed a successful result"
+  end;
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "claims") ~activity_type:"claims_cancel"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  begin match Worker.poll worker with
+  | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+  | _ -> failwith "an unrequested cancellation error was not a failure"
+  end;
+  match (latest_completion supervisor).Protocol.result with
+  | Protocol.Failed { info = Protocol.Application { type_name = "cancelled"; _ }; _ } -> ()
+  | _ -> failwith "an unrequested cancellation error became a cancellation"
+
+(** Work that a heartbeat sweep takes but does not own is deferred in order: a
+    start whose cancellation arrived before the start was admitted completes
+    as cancelled without running its callback, and an uncancelled start runs
+    normally afterwards. *)
+let test_cancellation_before_admission () =
+  let supervisor = fake_supervisor () in
+  let calls = ref 0 in
+  let results = ref [] in
+  let skipped_calls = ref 0 in
+  let later_calls = ref 0 in
+  let running =
+    heartbeating_activity ~name:"sweeps" ~beats:1 ~calls ~results
+      ~finish:(fun _ -> Ok "ran")
+  in
+  let skipped =
+    Temporal.Activity.define ~name:"skipped" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () -> incr skipped_calls; Ok ())
+  in
+  let later =
+    Temporal.Activity.define ~name:"later" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () -> incr later_calls; Ok ())
+  in
+  let unit_input = [ encode_input Temporal.Codec.unit () ] in
+  let skipped_token = Bytes.of_string "skipped" in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "sweeps") ~activity_type:"sweeps"
+       ~input:unit_input);
+  enqueue supervisor
+    (start_task ~token:skipped_token ~activity_type:"skipped" ~input:unit_input);
+  enqueue supervisor
+    (cancel_task_with ~reason:Protocol.Cancellation_requested skipped_token);
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "later") ~activity_type:"later"
+       ~input:unit_input);
+  let worker =
+    worker supervisor
+      [
+        Adapter.register running;
+        Adapter.register skipped;
+        Adapter.register later;
+      ]
+  in
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  (match !results with
+  | [ Ok () ] -> ()
+  | _ -> failwith "an unrelated cancellation reached the running attempt");
+  if not (Queue.is_empty supervisor.queue) then
+    failwith "the heartbeat sweep did not take every ready task";
+  begin match Worker.poll worker with
+  | Ok (Adapter.Completed { kind = Adapter.Cancelled; activity_type; _ })
+    when activity_type = Some "skipped" ->
+      ()
+  | _ -> failwith "a start cancelled before admission was not cancelled"
+  end;
+  if !skipped_calls <> 0 then
+    failwith "a start cancelled before admission still ran its callback";
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  if !later_calls <> 1 then failwith "a deferred start did not run in order";
+  begin match Worker.poll worker with
+  | Ok Adapter.Not_ready -> ()
+  | _ -> failwith "deferred work was processed twice"
+  end;
+  if !(supervisor.leased) <> [] then
+    failwith "deferred work left an activity lease outstanding"
+
+(** Builds Core's detail flags for a pause or reset without a cancellation
+    request, as pinned Core reports them. *)
+let interruption_details reason : Protocol.cancellation_details =
+  {
+    is_not_found = false;
+    is_cancelled = false;
+    is_paused = reason = Protocol.Cancellation_paused;
+    is_timed_out = false;
+    is_worker_shutdown = false;
+    is_reset = reason = Protocol.Cancellation_reset;
+  }
+
+(** An operator pause or reset reaches the running attempt as a cancellation,
+    but the server rejects a cancelled completion without a cancellation
+    request, which would leave the attempt open until it timed out (#1022).
+    A callback that acknowledges it by returning the heartbeat's
+    [`Cancelled] error therefore completes with one retryable application
+    failure of type ["ActivityPause"] or ["ActivityReset"], carrying the
+    callback's details and keeping Core's flags as outcome metadata. A start
+    cancelled for the same reasons before admission, and a bare cancellation
+    task, are completed the same way without running a callback. *)
+let test_pause_and_reset_fail_retryably () =
+  let detail : Temporal.Payload.t =
+    { metadata = [ ("encoding", "binary/plain") ]; data = Bytes.of_string "partial" }
+  in
+  let expect_interruption supervisor ~type_name ~with_detail outcome =
+    (match outcome with
+    | Ok
+        (Adapter.Completed
+           { kind = Adapter.Failed; cancellation_details = Some details; _ })
+      when not details.Protocol.is_cancelled ->
+        ()
+    | _ -> failwith (type_name ^ " did not complete as a failure"));
+    match (latest_completion supervisor).Protocol.result with
+    | Protocol.Failed
+        {
+          info =
+            Protocol.Application
+              { type_name = actual; non_retryable = false; details; _ };
+          _;
+        }
+      when String.equal actual type_name ->
+        let expected = if with_detail then [ detail.data ] else [] in
+        if List.map (fun (payload : Protocol.payload) -> payload.data) details
+           <> expected
+        then failwith (type_name ^ " failure lost the callback's details")
+    | Protocol.Cancelled _ ->
+        failwith (type_name ^ " was completed as cancelled")
+    | _ -> failwith (type_name ^ " used the wrong failure")
+  in
+  List.iter
+    (fun (reason, type_name) ->
+      (* A running attempt acknowledges the interruption. *)
+      let supervisor = fake_supervisor () in
+      let token = Bytes.of_string "\000interrupted\255" in
+      let calls = ref 0 and results = ref [] in
+      let activity =
+        heartbeating_activity ~name:"interrupted" ~beats:1 ~calls ~results
+          ~finish:(fun _ ->
+            match !results with
+            | Error error :: _ ->
+                let view = Temporal.Error.view error in
+                Error
+                  (Temporal.Error.make ~non_retryable:true ~details:[ detail ]
+                     ~category:view.category ~message:view.message ())
+            | _ -> Ok "ignored")
+      in
+      enqueue supervisor
+        (start_task ~token ~activity_type:"interrupted"
+           ~input:[ encode_input Temporal.Codec.unit () ]);
+      enqueue supervisor
+        (cancel_task_with ~reason ~details:(interruption_details reason) token);
+      let running = worker supervisor [ Adapter.register activity ] in
+      expect_interruption supervisor ~type_name ~with_detail:true
+        (Worker.poll running);
+      List.iter expect_cancelled_heartbeat !results;
+      if List.length !(supervisor.completions) <> 1 then
+        failwith (type_name ^ " produced more than one completion");
+      if !(supervisor.leased) <> [] then
+        failwith (type_name ^ " left the activity lease outstanding");
+      (* A bare interruption task for a token this adapter never started. *)
+      let bare = Bytes.of_string "bare-interruption" in
+      enqueue supervisor
+        (cancel_task_with ~reason ~details:(interruption_details reason) bare);
+      expect_interruption supervisor ~type_name ~with_detail:false
+        (Worker.poll running);
+      (* A start interrupted before admission never runs its callback. *)
+      let skipped_calls = ref 0 in
+      let sweeping =
+        heartbeating_activity ~name:"sweeping" ~beats:1 ~calls:(ref 0)
+          ~results:(ref []) ~finish:(fun _ -> Ok "ran")
+      in
+      let skipped =
+        Temporal.Activity.define ~name:"skipped" ~input:Temporal.Codec.unit
+          ~output:Temporal.Codec.unit (fun () -> incr skipped_calls; Ok ())
+      in
+      let supervisor = fake_supervisor () in
+      let skipped_token = Bytes.of_string "skipped" in
+      let unit_input = [ encode_input Temporal.Codec.unit () ] in
+      enqueue supervisor
+        (start_task ~token:(Bytes.of_string "sweeping") ~activity_type:"sweeping"
+           ~input:unit_input);
+      enqueue supervisor
+        (start_task ~token:skipped_token ~activity_type:"skipped"
+           ~input:unit_input);
+      enqueue supervisor
+        (cancel_task_with ~reason ~details:(interruption_details reason)
+           skipped_token);
+      let deferring =
+        worker supervisor [ Adapter.register sweeping; Adapter.register skipped ]
+      in
+      expect_completed Adapter.Succeeded (Worker.poll deferring);
+      expect_interruption supervisor ~type_name ~with_detail:false
+        (Worker.poll deferring);
+      if !skipped_calls <> 0 then
+        failwith (type_name ^ " before admission still ran the callback"))
+    [
+      (Protocol.Cancellation_paused, "ActivityPause");
+      (Protocol.Cancellation_reset, "ActivityReset");
+    ]
+
+(** A context retained past its attempt neither sweeps nor reports a later
+    cancellation: the attempt's outcome is already owned by its completion, so
+    a cancellation that arrives afterwards stays with the source, which in
+    production discards it as stale. *)
+let test_cancellation_after_completion () =
+  let supervisor = fake_supervisor () in
+  let token = Bytes.of_string "finished" in
+  let retained = ref None in
+  let activity =
+    Temporal.Activity.define_with_context ~name:"finishes"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun context () ->
+        retained := Some context;
+        Temporal.Activity.Context.heartbeat context Temporal.Codec.int 1)
+  in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"finishes"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  enqueue supervisor (cancel_task_with ~reason:Protocol.Cancellation_requested token);
+  let context = Option.get !retained in
+  begin match Temporal.Activity.Context.heartbeat context Temporal.Codec.int 2 with
+  | Error error when (Temporal.Error.view error).category = `Bridge -> ()
+  | _ -> failwith "a retained context accepted a heartbeat after completion"
+  end;
+  if Option.is_some (Temporal.Activity.Context.cancellation context) then
+    failwith "a late cancellation reached a completed attempt";
+  if Queue.length supervisor.queue <> 1 then
+    failwith "a retained context swept the source after completion"
+
+(** The shutdown probe supplied to the adapter is what the context reports,
+    read live while the callback runs. *)
+let test_worker_shutdown_signal () =
+  let supervisor = fake_supervisor () in
+  let shutting_down = Atomic.make false in
+  let seen = ref [] in
+  let activity =
+    Temporal.Activity.define_with_context ~name:"watches_shutdown"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun context () ->
+        seen := Temporal.Activity.Context.is_worker_shutting_down context :: !seen;
+        Atomic.set shutting_down true;
+        seen := Temporal.Activity.Context.is_worker_shutting_down context :: !seen;
+        Ok ())
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "shutdown") ~activity_type:"watches_shutdown"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker ~shutting_down supervisor [ Adapter.register activity ] in
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  if !seen <> [ true; false ] then
+    failwith "the context did not report the worker shutdown flag live";
+  let synthetic =
+    Temporal_base.Activity_context.unavailable ~details:[] ~heartbeat_timeout:None
+  in
+  if Temporal.Activity.Context.is_worker_shutting_down synthetic
+     || Option.is_some (Temporal.Activity.Context.cancellation synthetic)
+  then failwith "a synthetic context reported a stop signal"
+
+(** Shutdown drain never runs deferred user code: a deferred start is failed
+    retryably (or cancelled when its cancellation was deferred too), so no
+    lease outlives the worker; a later poll then has nothing to dispatch. *)
+let test_drain_retires_deferred_starts () =
+  let supervisor = fake_supervisor () in
+  let calls = ref 0 in
+  let results = ref [] in
+  let deferred_calls = ref 0 in
+  let running =
+    heartbeating_activity ~name:"drain_sweeps" ~beats:1 ~calls ~results
+      ~finish:(fun _ -> Ok "ran")
+  in
+  let deferred =
+    Temporal.Activity.define ~name:"never_dispatched" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () -> incr deferred_calls; Ok ())
+  in
+  let unit_input = [ encode_input Temporal.Codec.unit () ] in
+  let failed_token = Bytes.of_string "failed" in
+  let cancelled_token = Bytes.of_string "cancelled" in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "drain") ~activity_type:"drain_sweeps"
+       ~input:unit_input);
+  enqueue supervisor
+    (start_task ~token:failed_token ~activity_type:"never_dispatched"
+       ~input:unit_input);
+  enqueue supervisor
+    (start_task ~token:cancelled_token ~activity_type:"never_dispatched"
+       ~input:unit_input);
+  enqueue supervisor
+    (cancel_task_with ~reason:Protocol.Cancellation_worker_shutdown
+       cancelled_token);
+  let worker =
+    worker supervisor [ Adapter.register running; Adapter.register deferred ]
+  in
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  begin match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("drain failed: " ^ error.message)
+  end;
+  if !deferred_calls <> 0 then failwith "drain ran a deferred callback";
+  if !(supervisor.leased) <> [] then
+    failwith "drain left a deferred start leased";
+  let result_for token =
+    (List.find
+       (fun (completion : Protocol.completion) ->
+         Bytes.equal completion.task_token token)
+       !(supervisor.completions))
+      .result
+  in
+  begin match result_for failed_token with
+  | Protocol.Failed
+      {
+        info =
+          Protocol.Application
+            { type_name = "ocaml_temporal_worker_shutdown"; non_retryable = false; _ };
+        _;
+      } ->
+      ()
+  | _ -> failwith "an undispatched start was not failed retryably"
+  end;
+  begin match result_for cancelled_token with
+  | Protocol.Cancelled _ -> ()
+  | _ -> failwith "a deferred start with a deferred cancellation was not cancelled"
+  end;
+  match Worker.poll worker with
+  | Ok Adapter.Not_ready -> ()
+  | _ -> failwith "drained deferred work was dispatched afterwards"
+
+(** A poll error met by a heartbeat sweep is not lost: the heartbeat itself
+    still succeeds, and the next poll reports the deferred error. *)
+let test_sweep_poll_error_is_deferred () =
+  let supervisor = fake_supervisor () in
+  let activity =
+    Temporal.Activity.define_with_context ~name:"sweep_error"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun context () ->
+        supervisor.poll_error :=
+          Some { code = "poll_failed"; message = "sweep poll failed"; retryable = false };
+        let result =
+          Temporal.Activity.Context.heartbeat context Temporal.Codec.int 1
+        in
+        supervisor.poll_error := None;
+        result)
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "sweep-error") ~activity_type:"sweep_error"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  expect_completed Adapter.Succeeded (Worker.poll worker);
+  match Worker.poll worker with
+  | Error (error : Adapter.error_view) when error.code = "poll_failed" -> ()
+  | _ -> failwith "a sweep poll error was not reported by the next poll"
+
+(** Regression for the review of #494: a heartbeat sent from a Domain the
+    callback spawned can still be in flight, before its delivery sweep, when
+    the callback returns its [`Cancelled] error. The adapter must end the
+    attempt (waiting for that heartbeat) before it classifies the result, so
+    the cancellation that the sweep then delivers still makes the result a
+    cancellation.
+
+    The heartbeat is held inside the source's record call until either the
+    adapter attempts a completion (which only the racy ordering can do while
+    it is held) or 200 ms pass, so the interleaving is forced both ways and
+    the assertion is deterministic. *)
+let test_late_sweep_delivery_is_classified () =
+  let supervisor = fake_supervisor () in
+  let token = Bytes.of_string "late-sweep" in
+  let in_heartbeat = Atomic.make false in
+  let gate = Atomic.make false in
+  (* Holds only the first heartbeat record, the spawned Domain's. *)
+  let hold_first_heartbeat () =
+    if not (Atomic.get in_heartbeat) then begin
+      Atomic.set in_heartbeat true;
+      while not (Atomic.get gate) do
+        Unix.sleepf 0.001
+      done
+    end
+  in
+  let heartbeater = ref None in
+  let activity =
+    Temporal.Activity.define_with_context ~name:"late_sweep"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun context () ->
+        supervisor.heartbeat_hook := hold_first_heartbeat;
+        heartbeater :=
+          Some
+            (Domain.spawn (fun () ->
+                 Temporal.Activity.Context.heartbeat context Temporal.Codec.int 1));
+        while not (Atomic.get in_heartbeat) do
+          Unix.sleepf 0.001
+        done;
+        (* The heartbeat is now held before its sweep can deliver. *)
+        Error
+          (Temporal.Error.make ~non_retryable:true ~category:`Cancelled
+             ~message:"stopping" ()))
+  in
+  let releaser =
+    Domain.spawn (fun () ->
+        while not (Atomic.get in_heartbeat) do
+          Unix.sleepf 0.001
+        done;
+        let deadline = Unix.gettimeofday () +. 0.2 in
+        while
+          !(supervisor.completion_attempts) = []
+          && Unix.gettimeofday () < deadline
+        do
+          Unix.sleepf 0.001
+        done;
+        Atomic.set gate true)
+  in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"late_sweep"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  enqueue supervisor
+    (cancel_task_with ~reason:Protocol.Cancellation_requested token);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  let outcome = Worker.poll worker in
+  Domain.join releaser;
+  let heartbeat = Domain.join (Option.get !heartbeater) in
+  supervisor.heartbeat_hook := ignore;
+  expect_cancelled_heartbeat heartbeat;
+  begin match outcome with
+  | Ok (Adapter.Completed { kind = Adapter.Cancelled; _ }) -> ()
+  | _ ->
+      failwith
+        "a cancellation delivered after the callback returned was not \
+         classified as a cancellation"
+  end;
+  match (latest_completion supervisor).Protocol.result with
+  | Protocol.Cancelled _ -> ()
+  | _ -> failwith "a late-delivered cancellation was submitted as a failure"
+
 (** Runs every adapter assertion with a stable test-process failure. *)
+module Observability = Temporal_base.Observability
+
+(** One SDK log record observed by [with_captured_logs]: its level, its
+    operation tag, and the full tag set for correlation assertions. *)
+type captured_record = {
+  level : Logs.level;
+  operation : string option;
+  tags : Logs.Tag.set;
+}
+
+(** Runs [f] with a reporter that records every lifecycle-source record at
+    [Debug], then restores the previous reporter and source level even when
+    [f] raises. Returns the records in emission order. The adapter is driven
+    synchronously on this Domain, so a plain list reference is sufficient. *)
+let with_captured_logs f =
+  let records = ref [] in
+  let source = Observability.Source.lifecycle in
+  let previous_reporter = Logs.reporter () in
+  let previous_level = Logs.Src.level source in
+  let report src level ~over continuation messagef =
+    if Logs.Src.equal src source then
+      messagef (fun ?header:_ ?(tags = Logs.Tag.empty) format ->
+          Format.ikfprintf
+            (fun _ ->
+              records :=
+                {
+                  level;
+                  operation = Logs.Tag.find Observability.Tag.operation tags;
+                  tags;
+                }
+                :: !records;
+              over ();
+              continuation ())
+            Format.str_formatter format)
+    else (
+      over ();
+      continuation ())
+  in
+  Logs.set_reporter { Logs.report };
+  Logs.Src.set_level source (Some Logs.Debug);
+  Fun.protect
+    ~finally:(fun () ->
+      Logs.set_reporter previous_reporter;
+      Logs.Src.set_level source previous_level)
+    f;
+  List.rev !records
+
+(** Returns the only captured record for [operation], failing otherwise. *)
+let single_record records operation =
+  match
+    List.filter
+      (fun record -> record.operation = Some operation)
+      records
+  with
+  | [ record ] -> record.tags
+  | found ->
+      failwith
+        (Printf.sprintf "expected one %s record, found %d" operation
+           (List.length found))
+
+(** Requires the tag set to name the attempt built by [start_task_fields]:
+    workflow-1/run-1 of test_workflow, activity-1 of [activity_type], attempt
+    1 (#500). *)
+let expect_attempt_identity ~activity_type tags =
+  let check definition expected label =
+    if Logs.Tag.find definition tags <> Some expected then
+      failwith ("activity record lacked its correlated " ^ label)
+  in
+  check Observability.Tag.workflow_id "workflow-1" "workflow ID";
+  check Observability.Tag.run_id "run-1" "run ID";
+  check Observability.Tag.workflow_type "test_workflow" "workflow type";
+  check Observability.Tag.activity_id "activity-1" "activity ID";
+  check Observability.Tag.activity_type activity_type "activity type";
+  check Observability.Tag.attempt 1 "attempt"
+
+(** The started and completed lease records of one attempt carry its full
+    identity, and the started record precedes any log the callback writes, so
+    application logs can be joined to the attempt between the two (#500). *)
+let test_lease_records_carry_activity_identity () =
+  let supervisor = fake_supervisor () in
+  let activity =
+    Temporal.Activity.define ~name:"correlated" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () ->
+        (* Emitted through the lifecycle source only so the capture can
+           prove ordering; real callbacks log to their own sources. *)
+        Observability.report ~src:Observability.Source.lifecycle Logs.Debug
+          ~tags:(Observability.tags ~operation:"test_callback_ran" ())
+          "callback ran";
+        Ok ())
+  in
+  let token = Bytes.of_string "correlated-token" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"correlated"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  let records =
+    with_captured_logs (fun () ->
+        expect_completed Adapter.Succeeded (Worker.poll worker))
+  in
+  expect_attempt_identity ~activity_type:"correlated"
+    (single_record records "activity_task_started");
+  expect_attempt_identity ~activity_type:"correlated"
+    (single_record records "activity_task_completed");
+  let operations = List.filter_map (fun record -> record.operation) records in
+  let index name =
+    let rec loop position = function
+      | [] -> failwith ("missing record " ^ name)
+      | current :: _ when String.equal current name -> position
+      | _ :: rest -> loop (position + 1) rest
+    in
+    loop 0 operations
+  in
+  if
+    not
+      (index "activity_task_started" < index "test_callback_ran"
+      && index "test_callback_ran" < index "activity_task_completed")
+  then failwith "activity lease records did not bracket the callback";
+  (* The opaque token is a correlation credential, never a log value. *)
+  List.iter
+    (fun record ->
+      let rendered = Format.asprintf "%a" Logs.Tag.pp_set record.tags in
+      let contains needle =
+        let needle_length = String.length needle in
+        let rec scan offset =
+          offset + needle_length <= String.length rendered
+          && (String.sub rendered offset needle_length = needle
+             || scan (offset + 1))
+        in
+        scan 0
+      in
+      if contains "correlated-token" then
+        failwith "an activity record exposed the task token")
+    records
+
+(** A task-level rejection (here an unregistered type) is correlated with the
+    attempt it retired, alongside its stable error kind. *)
+let test_rejection_record_carries_activity_identity () =
+  let supervisor = fake_supervisor () in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "missing") ~activity_type:"missing"
+       ~input:[]);
+  let worker = worker supervisor [] in
+  let records =
+    with_captured_logs (fun () ->
+        match Worker.poll worker with
+        | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+        | _ -> failwith "unknown activity was not rejected")
+  in
+  let tags = single_record records "activity_task_rejected" in
+  expect_attempt_identity ~activity_type:"missing" tags;
+  if
+    Logs.Tag.find Observability.Tag.error_kind tags
+    <> Some "unknown_activity_type"
+  then failwith "rejection record lost its error kind"
+
+(** An ordinary application [Error] is expected Temporal behaviour, not an SDK
+    rejection: the attempt yields exactly one correlated [activity_task_failed]
+    record at [Info] and no [activity_task_rejected] warning (#1024). *)
+let test_application_failure_logs_one_record () =
+  let supervisor = fake_supervisor () in
+  let activity =
+    Temporal.Activity.define ~name:"failing" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () ->
+        Error
+          (Temporal.Error.make ~category:`Activity ~message:"business failure"
+             ()))
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "failing-token")
+       ~activity_type:"failing"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  let records =
+    with_captured_logs (fun () ->
+        match Worker.poll worker with
+        | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+        | _ -> failwith "application failure was not retired")
+  in
+  let failed =
+    List.filter
+      (fun record -> record.operation = Some "activity_task_failed")
+      records
+  in
+  (match failed with
+  | [ { level = Logs.Info; _ } ] -> ()
+  | [ _ ] -> failwith "application failure was not logged at Info"
+  | _ -> failwith "expected exactly one activity_task_failed record");
+  let tags = single_record records "activity_task_failed" in
+  expect_attempt_identity ~activity_type:"failing" tags;
+  if Logs.Tag.find Observability.Tag.error_kind tags <> Some "activity" then
+    failwith "failure record lost its error kind";
+  if
+    List.exists
+      (fun record ->
+        record.operation = Some "activity_task_rejected"
+        || record.level = Logs.Warning)
+      records
+  then failwith "an application failure was logged as an SDK rejection"
+
+(** A cancellation delivered to a running attempt through a heartbeat sweep
+    names that attempt, and a bare cancellation whose start this adapter never
+    saw carries no fabricated identity. *)
+let test_cancellation_records_correlation () =
+  let supervisor = fake_supervisor () in
+  let token = Bytes.of_string "cancel-running" in
+  let calls = ref 0 in
+  let results = ref [] in
+  let activity =
+    heartbeating_activity ~name:"cancel_correlated" ~beats:1 ~calls ~results
+      ~finish:(fun _ -> Ok "done")
+  in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"cancel_correlated"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  enqueue supervisor
+    (cancel_task_with ~reason:Protocol.Cancellation_requested token);
+  let worker = worker supervisor [ Adapter.register activity ] in
+  let delivered =
+    with_captured_logs (fun () -> ignore (Worker.poll worker))
+  in
+  expect_attempt_identity ~activity_type:"cancel_correlated"
+    (single_record delivered "activity_cancellation_delivered");
+  enqueue supervisor (cancel_task (Bytes.of_string "bare-cancel"));
+  let bare =
+    with_captured_logs (fun () ->
+        expect_completed Adapter.Cancelled (Worker.poll worker))
+  in
+  let tags = single_record bare "activity_task_completed" in
+  if
+    Logs.Tag.find Observability.Tag.activity_id tags <> None
+    || Logs.Tag.find Observability.Tag.workflow_id tags <> None
+  then failwith "a bare cancellation record fabricated an activity identity"
+
 let () =
+  test_binary_metadata_input ();
   test_successful_dispatch ();
+  test_application_failure_logs_one_record ();
   test_typed_failure ();
+  test_typed_failure_error_type ();
   test_invalid_failure_details_allow_next_activity ();
   test_invalid_failure_completion_retry ();
   test_unrepresentable_context_retires_lease ();
+  test_task_timeouts_zero_is_unset ();
   test_unknown_activity_retires_lease ();
   test_cancellation ();
   test_completion_retry_does_not_redo_activity ();
   test_transient_completion_exception_does_not_redo_activity ();
+  test_completion_is_encoded_once ();
+  test_non_retryable_completion_is_never_resubmitted ();
   test_contextual_heartbeat_lifecycle ();
+  test_heartbeat_encoder_rejection_stays_local ();
   test_context_payloads_are_copied ();
   test_context_callback_exception_and_invalidation ();
   test_extra_input_is_rejected ();
   test_registration_validation ();
   test_implementation_exception_is_retired ();
-  test_poll_error_is_typed ()
+  test_poll_error_is_typed ();
+  test_context_cancellation_signal ();
+  test_cancellation_delivered_through_heartbeat ();
+  test_cancellation_outcome_precedence ();
+  test_cancellation_before_admission ();
+  test_pause_and_reset_fail_retryably ();
+  test_cancellation_after_completion ();
+  test_worker_shutdown_signal ();
+  test_drain_retires_deferred_starts ();
+  test_sweep_poll_error_is_deferred ();
+  test_late_sweep_delivery_is_classified ();
+  test_lease_records_carry_activity_identity ();
+  test_rejection_record_carries_activity_identity ();
+  test_cancellation_records_correlation ()

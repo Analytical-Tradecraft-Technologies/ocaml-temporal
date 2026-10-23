@@ -2,8 +2,10 @@
 //!
 //! This module deliberately exposes neither `temporalio_client::Client` nor
 //! protobuf values to OCaml.  The bridge accepts small, lossless request
-//! documents for starting a workflow, observing one exact run, and requesting
-//! cancellation and output-only query operations against that same exact run.
+//! documents for starting a workflow, observing one run, and requesting
+//! control, signal, query, and update operations against a run. Every request
+//! after start names either one exact run or, with an empty `run_id`, the
+//! workflow's current run as Temporal resolves it (#791).
 //! A wait never follows a continued-as-new successor: callers can inspect the
 //! successor metadata and decide what to do in OCaml.
 
@@ -11,12 +13,17 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
-use temporalio_client::Connection;
 use temporalio_client::grpc::WorkflowService;
-use temporalio_client::tonic::{Code, IntoRequest, Status};
+use temporalio_client::request_extensions::{NoRetryOnMatching, RetryConfigForCall};
+use temporalio_client::tonic::metadata::MetadataValue;
+use temporalio_client::tonic::{Code, IntoRequest, Request, Status};
+use temporalio_client::{Connection, RetryOptions};
 use temporalio_common::protos::temporal::api::{
     common::v1::{Memo, Payloads, SearchAttributes, WorkflowExecution, WorkflowType},
-    enums::v1::{HistoryEventFilterType, UpdateWorkflowExecutionLifecycleStage},
+    enums::v1::{
+        HistoryEventFilterType, UpdateWorkflowExecutionLifecycleStage, WorkflowIdConflictPolicy,
+        WorkflowIdReusePolicy,
+    },
     history::v1::{HistoryEvent, history_event::Attributes},
     query::v1::WorkflowQuery,
     taskqueue::v1::TaskQueue,
@@ -27,6 +34,7 @@ use temporalio_common::protos::temporal::api::{
         RequestCancelWorkflowExecutionRequest, ResetWorkflowExecutionRequest,
         SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
         TerminateWorkflowExecutionRequest, UpdateWorkflowExecutionRequest,
+        UpdateWorkflowExecutionResponse,
     },
 };
 
@@ -54,6 +62,138 @@ pub struct MetadataField {
     pub key: String,
     /// Payload retained under that key.
     pub value: workflow_protocol::Payload,
+}
+
+/// What Temporal does when a start names a workflow ID whose current run is
+/// still open.
+///
+/// The variants mirror Temporal's `WorkflowIdConflictPolicy` without the
+/// `UNSPECIFIED` value: the bridge always sends an explicit policy so the
+/// behaviour cannot silently depend on a server-side default. The JSON
+/// spelling is the snake-case variant name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdConflictPolicy {
+    /// Reject the start with `WorkflowExecutionAlreadyStarted`, which the
+    /// bridge reports as the closed `already_started` error. This is the
+    /// default when an older request document omits the field.
+    #[default]
+    Fail,
+    /// Return the running execution instead of starting another one. The
+    /// response then names the existing run with `started = false`.
+    UseExisting,
+    /// Terminate the running execution and start a new run.
+    TerminateExisting,
+}
+
+impl IdConflictPolicy {
+    /// Converts the closed bridge value into the protobuf enum number.
+    fn to_core(self) -> i32 {
+        let policy = match self {
+            Self::Fail => WorkflowIdConflictPolicy::Fail,
+            Self::UseExisting => WorkflowIdConflictPolicy::UseExisting,
+            Self::TerminateExisting => WorkflowIdConflictPolicy::TerminateExisting,
+        };
+        i32::from(policy)
+    }
+}
+
+/// What Temporal does when a start names a workflow ID whose most recent run
+/// has already closed.
+///
+/// The variants mirror Temporal's `WorkflowIdReusePolicy` without
+/// `UNSPECIFIED` (the bridge always sends an explicit value) and without the
+/// deprecated `TERMINATE_IF_RUNNING`, whose behaviour belongs to
+/// [`IdConflictPolicy::TerminateExisting`] and which Temporal rejects next to
+/// an explicit conflict policy. The JSON spelling is the snake-case name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdReusePolicy {
+    /// Start a new run whatever the closed run's outcome. This is Temporal's
+    /// default and the value of an omitted field.
+    #[default]
+    AllowDuplicate,
+    /// Start a new run only when the closed run did not complete
+    /// successfully (failed, cancelled, terminated, or timed out).
+    AllowDuplicateFailedOnly,
+    /// Never reuse the workflow ID while Temporal retains the closed run.
+    RejectDuplicate,
+}
+
+impl IdReusePolicy {
+    /// Converts the closed bridge value into the protobuf enum number.
+    fn to_core(self) -> i32 {
+        let policy = match self {
+            Self::AllowDuplicate => WorkflowIdReusePolicy::AllowDuplicate,
+            Self::AllowDuplicateFailedOnly => WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+            Self::RejectDuplicate => WorkflowIdReusePolicy::RejectDuplicate,
+        };
+        i32::from(policy)
+    }
+}
+
+/// Largest caller-selected RPC timeout, in milliseconds (#499).
+///
+/// Control-plane acknowledgements, queries, and update admission run
+/// synchronously on the supervisor's owner Domain, so a caller's timeout is
+/// also how long one call may hold it. One minute keeps that bounded while
+/// still exceeding every built-in default.
+pub const MAX_RPC_TIMEOUT_MS: u64 = 60_000;
+
+/// Largest workflow task timeout accepted by the bridge, in milliseconds.
+///
+/// Temporal silently lowers a larger workflow task timeout to this value; the
+/// bridge rejects it instead so the caller never believes a longer bound is
+/// in force.
+pub const MAX_WORKFLOW_TASK_TIMEOUT_MS: u64 = 120_000;
+
+/// Largest workflow execution or run timeout, in milliseconds: the protobuf
+/// `Duration` maximum of 315,576,000,000 seconds plus 999 milliseconds, which
+/// is also the public `Duration.t` bound.
+pub const MAX_WORKFLOW_TIMEOUT_MS: u64 = 315_576_000_000_999;
+
+/// Converts a validated millisecond count into a protobuf duration.
+///
+/// The bounds above keep every accepted value representable, so the
+/// conversion fails only if a caller skipped validation; that is reported as
+/// a Core conversion error rather than a panic.
+fn milliseconds_to_core(
+    milliseconds: u64,
+) -> Result<prost_wkt_types::Duration, ClientOperationError> {
+    let invalid =
+        || ClientOperationError::Core(workflow_protocol::invalid_core("duration is out of range"));
+    Ok(prost_wkt_types::Duration {
+        seconds: i64::try_from(milliseconds / 1_000).map_err(|_| invalid())?,
+        nanos: i32::try_from((milliseconds % 1_000) * 1_000_000).map_err(|_| invalid())?,
+    })
+}
+
+/// Converts an optional validated millisecond count into an optional
+/// protobuf duration; absent stays absent so Temporal applies its default.
+fn optional_milliseconds_to_core(
+    milliseconds: Option<u64>,
+) -> Result<Option<prost_wkt_types::Duration>, ClientOperationError> {
+    milliseconds.map(milliseconds_to_core).transpose()
+}
+
+/// Returns the total budget of one bounded client RPC: the caller's
+/// validated `rpc_timeout_ms` when present, otherwise the operation default.
+fn rpc_budget(rpc_timeout_ms: Option<u64>, default: Duration) -> Duration {
+    rpc_timeout_ms.map_or(default, Duration::from_millis)
+}
+
+/// Validates an optional caller-selected RPC timeout: it must be between one
+/// millisecond and [`MAX_RPC_TIMEOUT_MS`].
+fn validate_rpc_timeout(value: Option<u64>) -> Result<(), protocol::ProtocolError> {
+    match value {
+        Some(milliseconds) if !(1..=MAX_RPC_TIMEOUT_MS).contains(&milliseconds) => {
+            Err(protocol::ProtocolError::invalid(
+                "$.rpc_timeout_ms",
+                "rpc timeout must be between 1 and 60000 milliseconds",
+            ))
+        }
+        Some(_) | None => Ok(()),
+    }
 }
 
 /// Request to start one workflow execution with raw Temporal payloads.
@@ -84,14 +224,51 @@ pub struct StartWorkflowRequest {
     /// Optional indexed search attributes copied to Temporal's start request.
     #[serde(default)]
     pub search_attributes: Vec<MetadataField>,
+    /// Behaviour when the workflow ID already has an open run. The OCaml
+    /// encoder always sends it; an omitted field means [`IdConflictPolicy::Fail`].
+    /// It participates in request equality, so retrying a pending request ID
+    /// with a different policy is rejected rather than aliased.
+    #[serde(default)]
+    pub id_conflict_policy: IdConflictPolicy,
+    /// Behaviour when the workflow ID's most recent run is closed. The OCaml
+    /// encoder always sends it; an omitted field means
+    /// [`IdReusePolicy::AllowDuplicate`], Temporal's default.
+    #[serde(default)]
+    pub id_reuse_policy: IdReusePolicy,
+    /// Workflow execution timeout in milliseconds, covering the whole chain
+    /// of runs including retries and continue-as-new. Absent means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_timeout_ms: Option<u64>,
+    /// Workflow run timeout in milliseconds, covering one run. Absent means
+    /// the execution timeout (or unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_timeout_ms: Option<u64>,
+    /// Workflow task timeout in milliseconds. Absent means the server default
+    /// of ten seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_timeout_ms: Option<u64>,
+    /// Server-side retry policy for the workflow run. Absent means no retry,
+    /// Temporal's default for workflows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_policy: Option<workflow_protocol::RetryPolicy>,
+    /// Caller-selected total budget of this start RPC in milliseconds,
+    /// replacing [`START_RPC_TIMEOUT`]. It bounds only the client call, never
+    /// the workflow, so it is excluded from [`same_start_request`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_timeout_ms: Option<u64>,
 }
 
 /// Successful result returned by the start operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartWorkflowResponse {
-    /// Execution allocated by Temporal Server.
+    /// Execution allocated by Temporal Server, or the existing open execution
+    /// returned under [`IdConflictPolicy::UseExisting`].
     pub execution: ExecutionRef,
+    /// Temporal's `StartWorkflowExecutionResponse.started`: `true` when this
+    /// request created the run (including a deduplicated retry of the same
+    /// request ID), `false` when `UseExisting` returned another start's run.
+    pub started: bool,
 }
 
 /// Opaque ticket returned while an asynchronous start is still in flight.
@@ -129,11 +306,13 @@ pub(crate) enum StartWorkflowOutcome {
     },
 }
 
-/// Request to wait for one exact workflow run.
+/// Request to wait for one workflow run.
 ///
 /// There is intentionally no `follow_runs` field.  This ABI operation has
 /// fixed `follow_runs = false` semantics, so a continued-as-new event is a
-/// terminal result for the requested run and cannot silently switch identity.
+/// terminal result for the observed run and cannot silently switch identity.
+/// An empty `run_id` observes the run that is current when Temporal handles
+/// the history poll; the OCaml client decides whether to follow successors.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaitWorkflowRequest {
@@ -141,7 +320,8 @@ pub struct WaitWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier to observe without following successors.
+    /// Run identifier to observe without following successors, or empty
+    /// to observe whichever run is current when Temporal handles the poll.
     pub run_id: String,
 }
 
@@ -153,12 +333,16 @@ pub struct CancelWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier; an empty run is never treated as "latest".
+    /// Run identifier, or empty to select the workflow's current run.
     pub run_id: String,
     /// Caller-owned idempotency key for the cancellation RPC.
     pub request_id: String,
     /// Operator-facing reason copied to Temporal. Empty is permitted.
     pub reason: String,
+    /// Caller-selected total budget of this RPC in milliseconds, replacing
+    /// the operation's default budget. Absent keeps the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_timeout_ms: Option<u64>,
 }
 
 /// Positive acknowledgement returned after Temporal accepts the request.
@@ -177,10 +361,14 @@ pub struct TerminateWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier; an empty run is never treated as "latest".
+    /// Run identifier, or empty to select the workflow's current run.
     pub run_id: String,
     /// Operator-facing reason copied to Temporal.
     pub reason: String,
+    /// Caller-selected total budget of this RPC in milliseconds, replacing
+    /// the operation's default budget. Absent keeps the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_timeout_ms: Option<u64>,
 }
 
 /// Positive acknowledgement returned after Temporal accepts termination.
@@ -199,7 +387,8 @@ pub struct ResetWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Run whose workflow-task history supplies the reset point.
+    /// Run whose workflow-task history supplies the reset point, or empty
+    /// to reset the workflow's current run.
     pub run_id: String,
     /// Caller-owned idempotency key for this reset operation.
     pub request_id: String,
@@ -207,6 +396,10 @@ pub struct ResetWorkflowRequest {
     pub reason: String,
     /// Workflow task finish/start event at which the new run should begin.
     pub workflow_task_finish_event_id: i64,
+    /// Caller-selected total budget of this RPC in milliseconds, replacing
+    /// the operation's default budget. Absent keeps the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_timeout_ms: Option<u64>,
 }
 
 /// New exact run identity returned by Temporal after a successful reset.
@@ -225,7 +418,7 @@ pub struct SignalWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier; an empty run is never treated as "latest".
+    /// Run identifier, or empty to select the workflow's current run.
     pub run_id: String,
     /// Registered Temporal signal name.
     pub signal_name: String,
@@ -233,6 +426,10 @@ pub struct SignalWorkflowRequest {
     pub request_id: String,
     /// Ordered signal input payloads.
     pub input: Vec<workflow_protocol::Payload>,
+    /// Caller-selected total budget of this RPC in milliseconds, replacing
+    /// the operation's default budget. Absent keeps the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_timeout_ms: Option<u64>,
 }
 
 /// Positive acknowledgement returned after Temporal accepts a signal RPC.
@@ -254,13 +451,17 @@ pub struct QueryWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier; an empty run is never treated as "latest".
+    /// Run identifier, or empty to select the workflow's current run.
     pub run_id: String,
     /// Registered workflow query name.
     pub query_type: String,
     /// Ordered query argument payloads; currently required to be empty by the
     /// public OCaml API, but validated and forwarded losslessly if populated.
     pub input: Vec<workflow_protocol::Payload>,
+    /// Caller-selected total budget of this RPC in milliseconds, replacing
+    /// the operation's default budget. Absent keeps the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_timeout_ms: Option<u64>,
 }
 
 /// Successful output-only query result returned by Temporal.
@@ -279,7 +480,7 @@ pub struct UpdateWorkflowRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier; an empty run is never treated as latest.
+    /// Run identifier, or empty to select the workflow's current run.
     pub run_id: String,
     /// Caller-owned workflow-scoped update idempotency key.
     pub update_id: String,
@@ -287,6 +488,10 @@ pub struct UpdateWorkflowRequest {
     pub update_name: String,
     /// Ordered update argument payloads.
     pub input: Vec<workflow_protocol::Payload>,
+    /// Caller-selected total budget of this RPC in milliseconds, replacing
+    /// the operation's default budget. Absent keeps the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_timeout_ms: Option<u64>,
 }
 
 /// Request to poll a previously accepted workflow update until completion.
@@ -297,7 +502,8 @@ pub struct PollWorkflowUpdateRequest {
     pub namespace: String,
     /// Stable workflow identifier.
     pub workflow_id: String,
-    /// Concrete run identifier returned by start or retained by the caller.
+    /// Run identifier returned by the acceptance response, or empty to
+    /// select the workflow's current run.
     pub run_id: String,
     /// Workflow-scoped update id returned by the acceptance response.
     pub update_id: String,
@@ -323,7 +529,8 @@ pub enum UpdateOutcome {
 pub struct UpdateWorkflowResponse {
     /// Update id echoed by Temporal's update reference.
     pub update_id: String,
-    /// Exact execution used by the update.
+    /// Execution that accepted the update. When the request selected the
+    /// current run, this is the concrete run Temporal resolved.
     pub execution: ExecutionRef,
     /// Present when the server completed the update before acceptance returned.
     pub outcome: Option<UpdateOutcome>,
@@ -380,6 +587,10 @@ pub struct VisibilityRequest {
     pub page_size: u32,
     /// Opaque base64 token returned by a previous page.
     pub next_page_token: Option<String>,
+    /// Caller-selected total budget of this RPC in milliseconds, replacing
+    /// the ten-second default. Absent keeps the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_timeout_ms: Option<u64>,
 }
 
 /// Metadata for a successor run created by continued-as-new.
@@ -439,11 +650,13 @@ pub enum WorkflowOutcome {
     },
 }
 
-/// Response containing the exact run identity and its terminal outcome.
+/// Response containing the waited run selector and its terminal outcome.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaitWorkflowResponse {
-    /// Run whose close event was observed.
+    /// The request's execution, echoed unchanged. Its run ID is empty when
+    /// the wait selected the current run, because Temporal's history
+    /// response does not name the run it resolved.
     pub execution: ExecutionRef,
     /// Terminal outcome of that run; no successor is followed automatically.
     pub outcome: WorkflowOutcome,
@@ -466,9 +679,26 @@ pub enum ClientOperationError {
         /// Lowercase tonic status code name.
         code: String,
     },
+    /// The workflow's query handler failed, or the worker reported the query
+    /// name as unknown. Temporal answers such a query with `InvalidArgument`
+    /// plus a `QueryFailedFailure` status detail; only that detail
+    /// distinguishes it from a malformed request. Unlike other RPC failures,
+    /// the handler's message is kept, because it is the application's answer
+    /// to its own caller rather than server prose; it is bounded by
+    /// [`bounded_query_failure_message`].
+    QueryFailed {
+        /// Bounded, NUL-free handler failure message; may be empty.
+        message: String,
+    },
     /// Core returned an event or payload outside this closed semantic slice.
     Core(workflow_protocol::CoreConversionError),
 }
+
+/// Largest query handler failure message, in UTF-8 bytes, that crosses the
+/// bridge. A handler controls its own message, so the bound keeps one failed
+/// query from producing an arbitrarily large error buffer; a longer message is
+/// truncated at a character boundary. OCaml enforces the same limit.
+pub(crate) const MAX_QUERY_FAILURE_MESSAGE_BYTES: usize = 4_096;
 
 /// Closed JSON body used when a start call reports `AlreadyStarted`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -486,6 +716,12 @@ pub(crate) enum ClientErrorDocument {
         /// Lowercase tonic status code name.
         code: String,
     },
+    /// Query handler failure with its bounded message; see
+    /// [`ClientOperationError::QueryFailed`].
+    QueryFailed {
+        /// Bounded, NUL-free handler failure message.
+        message: String,
+    },
     /// Stable category for a Core event that cannot cross the semantic bridge.
     Protocol {
         /// Closed Core conversion category.
@@ -500,10 +736,12 @@ pub(crate) enum ClientErrorDocument {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum StartWorkflowOutcomeDocument {
-    /// The server allocated a concrete run.
+    /// The server allocated a concrete run or returned an existing one.
     Accepted {
         /// Exact execution returned by Temporal.
         execution: ExecutionRef,
+        /// Whether this request created the run; see [`StartWorkflowResponse`].
+        started: bool,
     },
     /// The start was rejected with a structured, privacy-safe error body.
     Rejected {
@@ -531,6 +769,9 @@ fn error_document(error: &ClientOperationError) -> ClientErrorDocument {
             existing_run_id: existing_run_id.clone(),
         },
         ClientOperationError::Rpc { code } => ClientErrorDocument::Rpc { code: code.clone() },
+        ClientOperationError::QueryFailed { message } => ClientErrorDocument::QueryFailed {
+            message: message.clone(),
+        },
         ClientOperationError::Core(conversion) => ClientErrorDocument::Protocol {
             code: match conversion.code {
                 workflow_protocol::CoreConversionErrorCode::Unsupported => {
@@ -549,7 +790,7 @@ fn validate_start_outcome_document(
     document: &StartWorkflowOutcomeDocument,
 ) -> Result<(), protocol::ProtocolError> {
     match document {
-        StartWorkflowOutcomeDocument::Accepted { execution } => {
+        StartWorkflowOutcomeDocument::Accepted { execution, .. } => {
             validate_execution(execution, "$.execution")?
         }
         StartWorkflowOutcomeDocument::Rejected { error } => match error {
@@ -564,6 +805,13 @@ fn validate_start_outcome_document(
             }
             ClientErrorDocument::Rpc { code } => validate_identifier(code, "$.error.code")?,
             ClientErrorDocument::Protocol { code } => validate_identifier(code, "$.error.code")?,
+            // A query handler failure can never reject a workflow start.
+            ClientErrorDocument::QueryFailed { .. } => {
+                return Err(protocol::ProtocolError::invalid(
+                    "$.error.kind",
+                    "query_failed is not a valid start rejection",
+                ));
+            }
         },
         StartWorkflowOutcomeDocument::Unknown {
             request_id,
@@ -580,9 +828,10 @@ impl ClientOperationError {
     /// Encodes a privacy-safe structured error body for the ABI error buffer.
     pub(crate) fn to_json(&self) -> String {
         let document = error_document(self);
-        // All variants contain validated identifiers or a bounded tonic code;
-        // serialization cannot fail.  Keep a defensive fallback that cannot
-        // expose a Rust panic through the ABI if a future variant changes.
+        // All variants contain validated identifiers, a bounded tonic code,
+        // or a bounded query failure message; serialization cannot fail.  Keep
+        // a defensive fallback that cannot expose a Rust panic through the ABI
+        // if a future variant changes.
         serde_json::to_string(&document)
             .unwrap_or_else(|_| "{\"kind\":\"rpc\",\"code\":\"internal\"}".to_owned())
     }
@@ -596,7 +845,9 @@ impl ClientOperationError {
     /// the server supplied the conflicting workflow identity.
     pub(crate) fn uncertain_start(&self) -> bool {
         match self {
-            Self::AlreadyStarted { .. } => false,
+            // `QueryFailed` is only produced by the query operation; it is
+            // listed so the match stays exhaustive and terminal.
+            Self::AlreadyStarted { .. } | Self::QueryFailed { .. } => false,
             Self::Core(_) => true,
             Self::Rpc { code } => matches!(
                 code.as_str(),
@@ -623,15 +874,23 @@ pub fn decode_start_request(input: &str) -> Result<StartWorkflowRequest, protoco
 }
 
 /// Compares two validated start requests using every logical field, including
-/// workflow type, task queue, and binary payloads.  The ABI uses this when a
-/// caller retries a pending request ID: only an exact semantic retry may reuse
-/// the existing ticket, while a changed request is rejected as a protocol
-/// error instead of being silently aliased to another start.
+/// workflow type, task queue, binary payloads, and workflow policies.  The ABI
+/// uses this when a caller retries a pending request ID: only an exact
+/// semantic retry may reuse the existing ticket, while a changed request is
+/// rejected as a protocol error instead of being silently aliased to another
+/// start. The caller's RPC timeout is ignored: it bounds one client call, not
+/// the workflow, so a retry may legitimately wait longer or shorter.
 pub(crate) fn same_start_request(
     left: &StartWorkflowRequest,
     right: &StartWorkflowRequest,
 ) -> bool {
-    left == right
+    StartWorkflowRequest {
+        rpc_timeout_ms: None,
+        ..left.clone()
+    } == StartWorkflowRequest {
+        rpc_timeout_ms: None,
+        ..right.clone()
+    }
 }
 
 /// Decodes one opaque start ticket returned by the asynchronous begin call.
@@ -704,19 +963,29 @@ pub fn encode_reset_response(
 }
 
 /// Strictly parses one exact-run signal request.
+///
+/// Like [`decode_start_request`], this uses the payload-aware parser: base64
+/// payload data may use the 128 MiB per-field allowance, while
+/// [`validate_signal_request`] immediately reapplies the 65,536-byte text
+/// limit to every identifier and payload metadata key. Using the generic
+/// object parser here would cap signal input at 49,152 raw bytes (issue #771).
 pub fn decode_signal_request(
     input: &str,
 ) -> Result<SignalWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
+    protocol::decode_payload_object(input)?;
     let request = serde_json::from_str(input)
         .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client signal request"))?;
     validate_signal_request(&request)?;
     Ok(request)
 }
 
-/// Strictly parses one exact-run output-only query request.
+/// Strictly parses one exact-run query request.
+///
+/// Query arguments are payloads, so the payload-aware parser applies the same
+/// per-field and whole-document bounds as start and signal input; the semantic
+/// validator then bounds identifiers and metadata keys as ordinary text.
 pub fn decode_query_request(input: &str) -> Result<QueryWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
+    protocol::decode_payload_object(input)?;
     let request = serde_json::from_str(input)
         .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client query request"))?;
     validate_query_request(&request)?;
@@ -724,10 +993,14 @@ pub fn decode_query_request(input: &str) -> Result<QueryWorkflowRequest, protoco
 }
 
 /// Strictly parses a request that starts one workflow update.
+///
+/// Update arguments use the payload-aware parser for the same reason as
+/// signal input; [`validate_update_request`] keeps every identifier and
+/// metadata key within the ordinary text limit.
 pub fn decode_update_request(
     input: &str,
 ) -> Result<UpdateWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
+    protocol::decode_payload_object(input)?;
     let request = serde_json::from_str(input)
         .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client update request"))?;
     validate_update_request(&request)?;
@@ -838,6 +1111,181 @@ pub fn encode_visibility_response(
     encode_document(response)
 }
 
+/// Maximum transport attempts, including the first, that one exact-run history
+/// long poll may make while Core retries transient failures (#820).
+///
+/// With Core's default backoff (100 ms growing by 1.7x to a 5 s cap, +/-20%
+/// jitter) thirty attempts span roughly two minutes, which covers a routine
+/// Temporal Server restart. The count restarts with every long poll the
+/// server answers, so it bounds one continuous outage rather than the life of
+/// the wait.
+const WAIT_MAX_ATTEMPTS: usize = 30;
+
+/// gRPC metadata key through which a client lists the optional Temporal
+/// protocol features it understands (Temporal Server `headers` package).
+pub const SUPPORTED_FEATURES_HEADER: &str = "supported-features";
+
+/// Temporal feature name declaring that the client follows the
+/// `new_execution_run_id` of a completed, failed, or timed-out close event.
+///
+/// Without it Temporal Server rewrites such a close event, when the history
+/// request filters for the close event only, into a synthetic
+/// `WorkflowExecutionContinuedAsNew` event for compatibility with SDKs from
+/// before 2021 (#971). The rewrite would make a run that a retry policy or
+/// cron schedule chained to a successor indistinguishable from an explicit
+/// continue-as-new and would discard the run's failure. `wait` already maps
+/// every successor-bearing close event, so it always advertises the feature.
+pub const FOLLOWS_NEXT_RUN_ID_FEATURE: &str = "follows-next-run-id";
+
+/// Core retry policy for the exact-run history long poll behind `wait`.
+///
+/// Core measures its elapsed-time limit from the start of the call, and a
+/// healthy long poll can legitimately stay open for most of a minute before
+/// the server fails. Under Core's default ten-second limit such a poll would
+/// therefore not be retried at all when the server goes away mid-poll, which
+/// is exactly the outage `wait` must survive. The wait instead disables the
+/// elapsed-time limit and bounds the outage by [`WAIT_MAX_ATTEMPTS`]. Only
+/// Core's transient status codes are retried; a definitive rejection such as
+/// `not_found` still ends the wait on its first occurrence.
+fn wait_retry_options() -> RetryOptions {
+    RetryOptions::builder()
+        .max_elapsed_time(None)
+        .max_retries(WAIT_MAX_ATTEMPTS)
+        .build()
+}
+
+/// Total budget of one control-plane RPC (signal, cancel, reset, terminate),
+/// including Core's retries (#820).
+///
+/// These acknowledgements run synchronously on the supervisor's owner Domain,
+/// so the budget keeps a stalled or unavailable server from holding it. It is
+/// three seconds rather than one so that the `resource_exhausted` retry Core
+/// performs actually happens: Core waits its throttle backoff of 1 s +/-20%
+/// (at most 1.2 s) before the second attempt, which a one-second budget
+/// usually cut off with `deadline_exceeded`. Three seconds leaves room for
+/// that wait, the re-sent attempt, and several fast `unavailable` retries; a
+/// second consecutive `resource_exhausted` (a further 2 s +/-20% wait) does
+/// not fit and ends in the caller's deadline error.
+const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Wraps one bounded client RPC message for Core's retrying `Connection`.
+///
+/// Every client RPC except the history long poll has a fixed total budget that
+/// keeps the supervisor's synchronous turn finite. Core's default retry window
+/// (ten seconds) is unrelated to those budgets, so it is replaced by Core's
+/// default backoff limited to `budget`: Core stops scheduling retries once the
+/// next backoff would end after the budget and returns the last transport
+/// status (for example `unavailable`) instead of letting the caller's outer
+/// timeout discard it. The same budget is the gRPC deadline of each transport
+/// attempt, so the server also abandons work the client will no longer wait
+/// for. Callers keep their outer `tokio::time::timeout`, which still caps the
+/// call when the budget expires while an attempt is in flight or while Core is
+/// sleeping a `resource_exhausted` throttle delay; that cap yields the
+/// caller's deadline error instead of a transport status.
+///
+/// The throttle delay is not covered by the retry window: the pinned Core
+/// accepts a `resource_exhausted` retry using its ordinary backoff (about
+/// 100 ms at first) and only then lengthens the wait to its separate throttle
+/// backoff (1 s, then 2 s, 4 s, ... up to 10 s, each +/-20%) without
+/// rechecking the window. [`CONTROL_RPC_TIMEOUT`] is sized for that.
+///
+/// Which status codes are retried is Core's decision (`unavailable`,
+/// `resource_exhausted`, `unknown`, `internal`, `aborted`, `out_of_range`,
+/// `data_loss`, and transport-level cancellation); every other status is
+/// returned on its first occurrence. Each retry re-sends the identical
+/// message, so the server's idempotency key (`request_id` or update ID)
+/// deduplicates a retried mutation whose first attempt was applied.
+fn budgeted_request<T>(message: T, budget: Duration) -> Request<T> {
+    let mut request = message.into_request();
+    request.set_timeout(budget);
+    request.extensions_mut().insert(RetryConfigForCall(
+        RetryOptions::builder()
+            .max_elapsed_time(Some(budget))
+            .build(),
+    ));
+    request
+}
+
+/// Wraps a status mapper for one budgeted RPC so that an expired budget is
+/// always reported as the typed `deadline_exceeded` error (#499).
+///
+/// Each attempt carries the remaining budget as its gRPC deadline, and the
+/// transport reports its own expiry of that deadline as `cancelled` (or the
+/// server reports `deadline_exceeded`) when it wins the race with the outer
+/// timeout. Once `budget` has elapsed since `started`, either status means
+/// the caller's deadline expired, so it is reported as `deadline_exceeded`
+/// regardless of which timer fired first. Every other status, and these
+/// statuses before the budget has elapsed, use `map` unchanged.
+fn budget_status<F>(
+    started: tokio::time::Instant,
+    budget: Duration,
+    map: F,
+) -> impl FnOnce(Status) -> ClientOperationError
+where
+    F: FnOnce(Status) -> ClientOperationError,
+{
+    move |status| {
+        if matches!(status.code(), Code::Cancelled | Code::DeadlineExceeded)
+            && started.elapsed() >= budget
+        {
+            ClientOperationError::Rpc {
+                code: "deadline_exceeded".to_owned(),
+            }
+        } else {
+            map(status)
+        }
+    }
+}
+
+/// Reports whether a failed `TerminateWorkflowExecution` attempt must be
+/// returned instead of retried.
+///
+/// Terminate has no idempotency key, so Core may re-send it only after a
+/// status proving that the server did not apply the first attempt:
+/// `resource_exhausted`, which Temporal's rate limiters and admission checks
+/// return before the command is processed. Every other status is returned at
+/// once. In particular `unavailable` is not retried: besides a refused
+/// connection it is also what the transport reports when the connection
+/// drops after the server applied the termination but before the
+/// acknowledgement arrived, and a blind re-send of that applied termination
+/// would report a misleading `not_found` for the already terminated run.
+/// [`terminate_status_error`] reports such an ambiguous status as
+/// `termination_outcome_uncertain`.
+fn terminate_retry_forbidden(status: &Status) -> bool {
+    status.code() != Code::ResourceExhausted
+}
+
+/// Converts a terminate failure into the typed bridge error.
+///
+/// `unavailable`, `deadline_exceeded`, and `cancelled` can be reported after
+/// the server applied the termination (a dropped connection, or the
+/// per-attempt gRPC deadline expiring while the acknowledgement was in
+/// flight), and the RPC has no idempotency key that would make a re-send
+/// equivalent. They therefore become `termination_outcome_uncertain`, the
+/// same result as the outer deadline, which callers reconcile with `wait`.
+/// Every other status keeps its stable gRPC code.
+fn terminate_status_error(status: Status) -> ClientOperationError {
+    match status.code() {
+        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled => ClientOperationError::Rpc {
+            code: "termination_outcome_uncertain".to_owned(),
+        },
+        _ => map_rpc_status(status),
+    }
+}
+
+/// Builds a budgeted terminate request (see [`budgeted_request`]) whose Core
+/// retries are restricted by [`terminate_retry_forbidden`].
+fn terminate_request(
+    message: TerminateWorkflowExecutionRequest,
+    budget: Duration,
+) -> Request<TerminateWorkflowExecutionRequest> {
+    let mut request = budgeted_request(message, budget);
+    request.extensions_mut().insert(NoRetryOnMatching {
+        predicate: terminate_retry_forbidden,
+    });
+    request
+}
+
 /// Lists one visibility page through Temporal's official workflow service.
 /// The opaque page token is copied as bytes only inside Rust and is base64 at
 /// the JSON boundary; no server-owned protobuf or byte buffer is retained.
@@ -846,6 +1294,8 @@ pub async fn list_visibility(
     request: VisibilityRequest,
 ) -> Result<VisibilityPage, ClientOperationError> {
     const VISIBILITY_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+    let budget = rpc_budget(request.rpc_timeout_ms, VISIBILITY_RPC_TIMEOUT);
+    let started = tokio::time::Instant::now();
     let token = request
         .next_page_token
         .as_deref()
@@ -859,22 +1309,24 @@ pub async fn list_visibility(
                 })
         })
         .transpose()?;
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
     let response = match tokio::time::timeout(
-        VISIBILITY_RPC_TIMEOUT,
-        service.list_workflow_executions(
+        budget,
+        service.list_workflow_executions(budgeted_request(
             ListWorkflowExecutionsRequest {
                 namespace: request.namespace,
                 query: request.query,
                 page_size: request.page_size as i32,
                 next_page_token: token.unwrap_or_default(),
-            }
-            .into_request(),
-        ),
+            },
+            budget,
+        )),
     )
     .await
     {
-        Ok(result) => result.map_err(map_rpc_status)?.into_inner(),
+        Ok(result) => result
+            .map_err(budget_status(started, budget, map_rpc_status))?
+            .into_inner(),
         Err(_) => {
             return Err(ClientOperationError::Rpc {
                 code: "deadline_exceeded".to_owned(),
@@ -911,9 +1363,9 @@ pub async fn list_visibility(
     })
 }
 
-/// Requests cancellation of one exact run through Temporal's official
-/// workflow service. The connection is cloned by the owner Domain and no
-/// Tokio task calls back into OCaml.
+/// Requests cancellation of one run (exact, or current for an empty run ID)
+/// through Temporal's official workflow service. The connection is cloned by
+/// the owner Domain and no Tokio task calls back into OCaml.
 pub async fn cancel_workflow(
     connection: Connection,
     request: CancelWorkflowRequest,
@@ -922,8 +1374,9 @@ pub async fn cancel_workflow(
     // wait. Bound it so a stalled server cannot hold the owner Domain mailbox
     // forever; callers can retry the same request ID when the outcome is
     // uncertain.
-    const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(1);
-    let mut service = connection.workflow_service();
+    let budget = rpc_budget(request.rpc_timeout_ms, CONTROL_RPC_TIMEOUT);
+    let started = tokio::time::Instant::now();
+    let mut service = connection.clone();
     let request = RequestCancelWorkflowExecutionRequest {
         namespace: request.namespace,
         workflow_execution: Some(WorkflowExecution {
@@ -936,13 +1389,13 @@ pub async fn cancel_workflow(
         ..Default::default()
     };
     match tokio::time::timeout(
-        CONTROL_RPC_TIMEOUT,
-        service.request_cancel_workflow_execution(request.into_request()),
+        budget,
+        service.request_cancel_workflow_execution(budgeted_request(request, budget)),
     )
     .await
     {
         Ok(result) => {
-            result.map_err(map_rpc_status)?;
+            result.map_err(budget_status(started, budget, map_rpc_status))?;
         }
         Err(_) => {
             return Err(ClientOperationError::Rpc {
@@ -953,20 +1406,22 @@ pub async fn cancel_workflow(
     Ok(CancelWorkflowResponse { acknowledged: true })
 }
 
-/// Resets one exact workflow run through Temporal's official workflow service.
+/// Resets one workflow run (exact, or current for an empty run ID) through
+/// Temporal's official workflow service.
 /// The event ID and request ID are copied into protobuf owned by this RPC; no
 /// OCaml memory is retained after the owner Domain call returns.
 pub async fn reset_workflow(
     connection: Connection,
     request: ResetWorkflowRequest,
 ) -> Result<ResetWorkflowResponse, ClientOperationError> {
-    const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(1);
-    let mut service = connection.workflow_service();
+    let budget = rpc_budget(request.rpc_timeout_ms, CONTROL_RPC_TIMEOUT);
+    let started = tokio::time::Instant::now();
+    let mut service = connection.clone();
     let namespace = request.namespace.clone();
     let workflow_id = request.workflow_id.clone();
     let response = match tokio::time::timeout(
-        CONTROL_RPC_TIMEOUT,
-        service.reset_workflow_execution(
+        budget,
+        service.reset_workflow_execution(budgeted_request(
             ResetWorkflowExecutionRequest {
                 namespace: request.namespace,
                 workflow_execution: Some(WorkflowExecution {
@@ -978,13 +1433,15 @@ pub async fn reset_workflow(
                 request_id: request.request_id,
                 identity: connection.identity().to_owned(),
                 ..Default::default()
-            }
-            .into_request(),
-        ),
+            },
+            budget,
+        )),
     )
     .await
     {
-        Ok(result) => result.map_err(map_rpc_status)?.into_inner(),
+        Ok(result) => result
+            .map_err(budget_status(started, budget, map_rpc_status))?
+            .into_inner(),
         Err(_) => {
             return Err(ClientOperationError::Rpc {
                 code: "deadline_exceeded".to_owned(),
@@ -1016,7 +1473,8 @@ pub async fn reset_workflow(
     Ok(response)
 }
 
-/// Terminates one exact workflow run through Temporal's official service.
+/// Terminates one workflow run (exact, or current for an empty run ID) through
+/// Temporal's official service.
 /// Termination is intentionally separate from cancellation: the server writes
 /// an immutable terminated event immediately and does not wait for workflow
 /// code to observe a cancellation request.
@@ -1024,8 +1482,8 @@ pub async fn terminate_workflow(
     connection: Connection,
     request: TerminateWorkflowRequest,
 ) -> Result<TerminateWorkflowResponse, ClientOperationError> {
-    const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(1);
-    let mut service = connection.workflow_service();
+    let budget = rpc_budget(request.rpc_timeout_ms, CONTROL_RPC_TIMEOUT);
+    let mut service = connection.clone();
     let request = TerminateWorkflowExecutionRequest {
         namespace: request.namespace,
         workflow_execution: Some(WorkflowExecution {
@@ -1037,13 +1495,13 @@ pub async fn terminate_workflow(
         ..Default::default()
     };
     match tokio::time::timeout(
-        CONTROL_RPC_TIMEOUT,
-        service.terminate_workflow_execution(request.into_request()),
+        budget,
+        service.terminate_workflow_execution(terminate_request(request, budget)),
     )
     .await
     {
         Ok(result) => {
-            result.map_err(map_rpc_status)?;
+            result.map_err(terminate_status_error)?;
         }
         Err(_) => {
             return Err(ClientOperationError::Rpc {
@@ -1058,9 +1516,10 @@ pub async fn terminate_workflow(
     Ok(TerminateWorkflowResponse { acknowledged: true })
 }
 
-/// Delivers one signal to one exact workflow run through Temporal's official
-/// workflow service. The request identity and payloads are copied into the
-/// protobuf message; no OCaml memory is retained by the asynchronous RPC.
+/// Delivers one signal to one workflow run (exact, or current for an empty run
+/// ID) through Temporal's official workflow service. The request identity and
+/// payloads are copied into the protobuf message; no OCaml memory is retained
+/// by the asynchronous RPC.
 pub async fn signal_workflow(
     connection: Connection,
     request: SignalWorkflowRequest,
@@ -1069,9 +1528,10 @@ pub async fn signal_workflow(
     // for workflow code to process the message. Keep the owner Domain
     // responsive when the server is unavailable; callers can retry the same
     // request ID after an uncertain timeout.
-    const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(1);
+    let budget = rpc_budget(request.rpc_timeout_ms, CONTROL_RPC_TIMEOUT);
+    let started = tokio::time::Instant::now();
     let payloads = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
     let request = SignalWorkflowExecutionRequest {
         namespace: request.namespace,
         workflow_execution: Some(WorkflowExecution {
@@ -1085,13 +1545,13 @@ pub async fn signal_workflow(
         ..Default::default()
     };
     match tokio::time::timeout(
-        CONTROL_RPC_TIMEOUT,
-        service.signal_workflow_execution(request.into_request()),
+        budget,
+        service.signal_workflow_execution(budgeted_request(request, budget)),
     )
     .await
     {
         Ok(result) => {
-            result.map_err(map_rpc_status)?;
+            result.map_err(budget_status(started, budget, map_rpc_status))?;
         }
         Err(_) => {
             return Err(ClientOperationError::Rpc {
@@ -1114,12 +1574,13 @@ pub async fn query_workflow(
 ) -> Result<QueryWorkflowResponse, ClientOperationError> {
     // Query evaluation may require a workflow task to be scheduled and
     // replayed before Temporal can reply. A one-second control-plane bound
-    // incorrectly rejects healthy slow workers, so use the same bounded
-    // service budget as the rest of this client slice while the public API
-    // does not yet expose a caller-selected deadline.
+    // incorrectly rejects healthy slow workers, so the default is a longer
+    // bounded service budget; a caller may select its own (#499).
     const QUERY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+    let budget = rpc_budget(request.rpc_timeout_ms, QUERY_RPC_TIMEOUT);
+    let started = tokio::time::Instant::now();
     let query_args = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
     let request = QueryWorkflowExecutionRequest {
         namespace: request.namespace,
         execution: Some(WorkflowExecution {
@@ -1137,12 +1598,14 @@ pub async fn query_workflow(
         query_reject_condition: 1,
     };
     let response = match tokio::time::timeout(
-        QUERY_RPC_TIMEOUT,
-        service.query_workflow(request.into_request()),
+        budget,
+        service.query_workflow(budgeted_request(request, budget)),
     )
     .await
     {
-        Ok(result) => result.map_err(map_rpc_status)?.into_inner(),
+        Ok(result) => result
+            .map_err(budget_status(started, budget, map_query_status))?
+            .into_inner(),
         Err(_) => {
             return Err(ClientOperationError::Rpc {
                 code: "deadline_exceeded".to_owned(),
@@ -1160,51 +1623,157 @@ pub async fn query_workflow(
     })
 }
 
+/// Total time `update_workflow` may spend waiting for Temporal to report that
+/// an update was accepted. The bound keeps the supervisor's synchronous client
+/// turn finite; it spans every re-issued `UpdateWorkflowExecution` attempt, not
+/// each attempt separately.
+const UPDATE_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Minimum pause before re-issuing an update whose response reported only the
+/// `Admitted` stage. A conforming server answers `Admitted` only when its own
+/// long poll expires, so the pause adds no latency in practice; it prevents a
+/// misbehaving server that answers immediately from driving a hot RPC loop for
+/// the whole acceptance budget.
+const UPDATE_READMISSION_PAUSE: Duration = Duration::from_millis(100);
+
 /// Starts one update through Temporal's workflow service and waits until the
 /// workflow worker has accepted it. Temporal deliberately does not allow the
 /// asynchronous `Admitted` stage for the public start-update flow; `Accepted`
 /// is the interoperable stage for a handle that will be polled separately.
+///
+/// Temporal answers a `wait_policy = Accepted` request with stage `Admitted`
+/// and no outcome when its long poll expires before a worker processes the
+/// update. An admitted update is not durable and may still be rejected, so
+/// that response must never become a handle. Like the Go and Python SDKs, the
+/// request is re-issued with the same update ID (Temporal deduplicates it)
+/// until the server reports `Accepted`, a terminal outcome (completion or
+/// validator rejection), or the shared [`UPDATE_ACCEPTANCE_TIMEOUT`] expires,
+/// which is reported as the typed `deadline_exceeded` RPC error. A request's
+/// `rpc_timeout_ms` replaces that shared budget.
 pub async fn update_workflow(
     connection: Connection,
     request: UpdateWorkflowRequest,
 ) -> Result<UpdateWorkflowResponse, ClientOperationError> {
+    let budget = rpc_budget(request.rpc_timeout_ms, UPDATE_ACCEPTANCE_TIMEOUT);
+    update_workflow_within(connection, request, budget).await
+}
+
+/// Implements [`update_workflow`] with an explicit total acceptance budget so
+/// tests can observe the deadline path without waiting for the production
+/// bound. Every attempt carries the remaining budget as its gRPC deadline, so
+/// a real server ends its long poll (answering `Admitted`) before the local
+/// timeout fires and the loop can decide whether time remains for a retry.
+pub(crate) async fn update_workflow_within(
+    connection: Connection,
+    request: UpdateWorkflowRequest,
+    budget: Duration,
+) -> Result<UpdateWorkflowResponse, ClientOperationError> {
     let input = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
-    let mut service = connection.workflow_service();
-    let response = tokio::time::timeout(
-        Duration::from_secs(30),
-        service.update_workflow_execution(
-            UpdateWorkflowExecutionRequest {
-                namespace: request.namespace.clone(),
-                workflow_execution: Some(WorkflowExecution {
-                    workflow_id: request.workflow_id.clone(),
-                    run_id: request.run_id.clone(),
-                }),
-                wait_policy: Some(WaitPolicy {
-                    lifecycle_stage: UpdateWorkflowExecutionLifecycleStage::Accepted as i32,
-                }),
-                request: Some(update::v1::Request {
-                    meta: Some(update::v1::Meta {
-                        update_id: request.update_id.clone(),
-                        identity: connection.identity().to_owned(),
-                    }),
-                    input: Some(update::v1::Input {
-                        name: request.update_name,
-                        args: Some(input),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+    let rpc_request = UpdateWorkflowExecutionRequest {
+        namespace: request.namespace.clone(),
+        workflow_execution: Some(WorkflowExecution {
+            workflow_id: request.workflow_id.clone(),
+            run_id: request.run_id.clone(),
+        }),
+        wait_policy: Some(WaitPolicy {
+            lifecycle_stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Accepted),
+        }),
+        request: Some(update::v1::Request {
+            meta: Some(update::v1::Meta {
+                update_id: request.update_id.clone(),
+                identity: connection.identity().to_owned(),
+            }),
+            input: Some(update::v1::Input {
+                name: request.update_name.clone(),
+                args: Some(input),
                 ..Default::default()
-            }
-            .into_request(),
-        ),
-    )
-    .await
-    .map_err(|_| ClientOperationError::Rpc {
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let deadline_exceeded = || ClientOperationError::Rpc {
         code: "deadline_exceeded".to_owned(),
-    })?
-    .map_err(map_rpc_status)?
-    .into_inner();
+    };
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut service = connection.clone();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(deadline_exceeded());
+        }
+        // Core may retry a transient transport failure inside this attempt;
+        // both its retry window and every transport attempt's deadline are
+        // limited to what remains of the shared acceptance budget.
+        let attempt = budgeted_request(rpc_request.clone(), remaining);
+        let attempt_started = tokio::time::Instant::now();
+        let response =
+            tokio::time::timeout_at(deadline, service.update_workflow_execution(attempt))
+                .await
+                .map_err(|_| deadline_exceeded())?
+                .map_err(budget_status(attempt_started, remaining, map_rpc_status))?
+                .into_inner();
+        // Validate identity on every attempt, including admitted-only ones, so
+        // a server answering for another update fails closed immediately.
+        let response_stage = response.stage;
+        let converted = update_response_from_core(&request, response)?;
+        if converted.outcome.is_some() {
+            // An outcome is final whatever stage accompanies it: the server
+            // only attaches one once the update completed or was rejected, so
+            // a stage this bridge does not know (a newer server's) cannot
+            // change its meaning (#1078).
+            return Ok(converted);
+        }
+        if update_stage_is_accepted(response_stage)? {
+            return Ok(converted);
+        }
+        // Admitted, an older server's unspecified stage, or a stage this
+        // bridge does not know, without an outcome: the update is not known
+        // to be durable. Re-issue it if the budget still allows one more
+        // attempt.
+        let pause_until = tokio::time::Instant::now() + UPDATE_READMISSION_PAUSE;
+        if pause_until >= deadline {
+            return Err(deadline_exceeded());
+        }
+        tokio::time::sleep_until(pause_until).await;
+    }
+}
+
+/// Classifies the lifecycle stage of an update response that carried no
+/// outcome. Returns `true` once the update is at least accepted, `false` for
+/// `Admitted` and `Unspecified` (both mean "not yet accepted" and are retried,
+/// matching the official SDKs' `stage < Accepted` loop), and a Core conversion
+/// error for `Completed` without an outcome, which no conforming server sends.
+///
+/// A numeric stage this bridge does not know, as a newer server might add,
+/// is also classified as "not yet accepted" (#1078). That is the conservative
+/// reading: re-issuing the update under the same update ID is deduplicated
+/// by Temporal, so the loop either observes a known stage or ends with the
+/// typed `deadline_exceeded` error, and an update whose durability is not
+/// established never becomes a handle.
+fn update_stage_is_accepted(stage: i32) -> Result<bool, ClientOperationError> {
+    match UpdateWorkflowExecutionLifecycleStage::try_from(stage) {
+        Ok(UpdateWorkflowExecutionLifecycleStage::Accepted) => Ok(true),
+        Ok(UpdateWorkflowExecutionLifecycleStage::Completed) => Err(ClientOperationError::Core(
+            workflow_protocol::invalid_core("Temporal completed update omitted its outcome"),
+        )),
+        Ok(
+            UpdateWorkflowExecutionLifecycleStage::Unspecified
+            | UpdateWorkflowExecutionLifecycleStage::Admitted,
+        )
+        | Err(_) => Ok(false),
+    }
+}
+
+/// Converts one `UpdateWorkflowExecution` response into the closed bridge
+/// response after checking that it names the requested update and run (or,
+/// for a current-run request, a concrete run of the requested workflow).
+/// The stage is interpreted by the caller; this function only validates
+/// identity and converts an optional outcome.
+fn update_response_from_core(
+    request: &UpdateWorkflowRequest,
+    response: UpdateWorkflowExecutionResponse,
+) -> Result<UpdateWorkflowResponse, ClientOperationError> {
     let update_ref = response.update_ref.ok_or_else(|| {
         ClientOperationError::Core(workflow_protocol::invalid_core(
             "Temporal update admission omitted update_ref",
@@ -1221,7 +1790,7 @@ pub async fn update_workflow(
         )));
     }
     let execution = ExecutionRef {
-        namespace: request.namespace,
+        namespace: request.namespace.clone(),
         workflow_id: execution.workflow_id,
         run_id: if execution.run_id.is_empty() {
             request.run_id.clone()
@@ -1229,9 +1798,20 @@ pub async fn update_workflow(
             execution.run_id
         },
     };
-    if execution.workflow_id != request.workflow_id || execution.run_id != request.run_id {
+    // An exact request must be answered for that run. A current-run request
+    // (empty run ID) adopts the run Temporal resolved, so later polls of the
+    // update stay on the run that accepted it even if the workflow continues
+    // as new; Temporal always reports that run, and a response without one
+    // fails closed rather than producing a handle with no run identity.
+    let changed_run = !request.run_id.is_empty() && execution.run_id != request.run_id;
+    if execution.workflow_id != request.workflow_id || changed_run {
         return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
             "Temporal update response changed workflow execution",
+        )));
+    }
+    if execution.run_id.is_empty() {
+        return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
+            "Temporal update response omitted the run that accepted it",
         )));
     }
     let outcome = response
@@ -1247,16 +1827,21 @@ pub async fn update_workflow(
     })
 }
 
+/// Total time one `poll_workflow_update` call may spend, including Core's
+/// retries of transient transport failures, before it reports the update as
+/// still pending.
+const UPDATE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Polls one update until completion, bounded so the supervisor remains
 /// responsive to shutdown and unrelated client requests.
 pub async fn poll_workflow_update(
     connection: Connection,
     request: PollWorkflowUpdateRequest,
 ) -> Result<PollWorkflowUpdateResponse, ClientOperationError> {
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
     let response = match tokio::time::timeout(
-        Duration::from_secs(30),
-        service.poll_workflow_execution_update(
+        UPDATE_POLL_TIMEOUT,
+        service.poll_workflow_execution_update(budgeted_request(
             PollWorkflowExecutionUpdateRequest {
                 namespace: request.namespace,
                 update_ref: Some(update::v1::UpdateRef {
@@ -1268,11 +1853,11 @@ pub async fn poll_workflow_update(
                 }),
                 identity: connection.identity().to_owned(),
                 wait_policy: Some(WaitPolicy {
-                    lifecycle_stage: UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+                    lifecycle_stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Completed),
                 }),
-            }
-            .into_request(),
-        ),
+            },
+            UPDATE_POLL_TIMEOUT,
+        )),
     )
     .await
     {
@@ -1323,6 +1908,7 @@ pub(crate) fn encode_start_outcome(
     let document = match outcome {
         StartWorkflowOutcome::Accepted(response) => StartWorkflowOutcomeDocument::Accepted {
             execution: response.execution.clone(),
+            started: response.started,
         },
         StartWorkflowOutcome::Rejected(error) => StartWorkflowOutcomeDocument::Rejected {
             error: error_document(error),
@@ -1358,6 +1944,10 @@ const START_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Starts one workflow through Core's retrying connection, retaining the same
 /// request and idempotency key across transport attempts within one deadline.
+///
+/// The deadline is the request's `rpc_timeout_ms` or [`START_RPC_TIMEOUT`].
+/// It bounds only this client call; the workflow timeouts and retry policy
+/// are separate server-side execution policies copied into the request.
 pub async fn start_workflow(
     connection: Connection,
     request: StartWorkflowRequest,
@@ -1366,12 +1956,22 @@ pub async fn start_workflow(
     let memo = metadata_to_memo(&request.memo).map_err(ClientOperationError::Core)?;
     let search_attributes = metadata_to_search_attributes(&request.search_attributes)
         .map_err(ClientOperationError::Core)?;
+    let retry_policy = request
+        .retry_policy
+        .as_ref()
+        .map(workflow_protocol::retry_policy_to_core)
+        .transpose()
+        .map_err(ClientOperationError::Core)?;
+    let workflow_execution_timeout = optional_milliseconds_to_core(request.execution_timeout_ms)?;
+    let workflow_run_timeout = optional_milliseconds_to_core(request.run_timeout_ms)?;
+    let workflow_task_timeout = optional_milliseconds_to_core(request.task_timeout_ms)?;
+    let budget = rpc_budget(request.rpc_timeout_ms, START_RPC_TIMEOUT);
     let workflow_id = request.workflow_id.clone();
     // Connection owns Core's retry policy; its underlying workflow service
     // skips that policy and gives up on the first transient transport error.
     let mut service = connection.clone();
     let response = match tokio::time::timeout(
-        START_RPC_TIMEOUT,
+        budget,
         service.start_workflow_execution(
             StartWorkflowExecutionRequest {
                 namespace: request.namespace.clone(),
@@ -1389,8 +1989,18 @@ pub async fn start_workflow(
                 search_attributes,
                 identity: connection.identity().to_owned(),
                 request_id: request.request_id,
-                // All other start policies intentionally use server defaults;
-                // metadata is the only optional field in this protocol slice.
+                // Always explicit: an UNSPECIFIED policy would defer to the
+                // server default, which the public API documents as `Fail`.
+                workflow_id_conflict_policy: request.id_conflict_policy.to_core(),
+                // Also always explicit, for the same reason (#499).
+                workflow_id_reuse_policy: request.id_reuse_policy.to_core(),
+                // Absent timeouts and retry policy keep Temporal's defaults.
+                workflow_execution_timeout,
+                workflow_run_timeout,
+                workflow_task_timeout,
+                retry_policy,
+                // Cron schedules and start delays are deliberately not sent:
+                // OCaml workers reject them (#499 keeps them deferred).
                 ..Default::default()
             }
             .into_request(),
@@ -1407,6 +2017,11 @@ pub async fn start_workflow(
     }
     .into_inner();
 
+    // Only USE_EXISTING can succeed without creating a run. Servers that
+    // predate `started` leave it false, so the other policies (whose success
+    // proves this logical request created the run, possibly as a request-ID
+    // deduplicated retry) report a new run regardless of the field.
+    let started = response.started || request.id_conflict_policy != IdConflictPolicy::UseExisting;
     let run_id = response.run_id;
     if run_id.is_empty() {
         return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
@@ -1423,10 +2038,23 @@ pub async fn start_workflow(
             "Temporal start response had invalid execution identity",
         ))
     })?;
-    Ok(StartWorkflowResponse { execution })
+    Ok(StartWorkflowResponse { execution, started })
 }
 
-/// Waits for the exact run named by `request`, never following successors.
+/// Waits for the run named by `request`, or for the workflow's current run
+/// when its run ID is empty, never following successors.
+///
+/// Each poll advertises [`FOLLOWS_NEXT_RUN_ID_FEATURE`], so Temporal returns
+/// the run's real close event: a run that a retry policy or cron schedule
+/// chained to a successor reports `Failed`, `TimedOut`, or `Completed` with
+/// that successor, and only an explicit continue-as-new reports
+/// `ContinuedAsNew`.
+///
+/// With an empty run ID Temporal resolves the current run on the first poll
+/// and pins later pages to it through the continuation token. If a long poll
+/// ends with neither an event nor a token, the next poll resolves the current
+/// run again; that can only skip a run which has already been superseded, so
+/// a caller that follows successors observes the same final run.
 pub async fn wait_workflow(
     connection: Connection,
     request: WaitWorkflowRequest,
@@ -1437,25 +2065,36 @@ pub async fn wait_workflow(
         run_id: request.run_id.clone(),
     };
     let mut next_page_token = Vec::new();
-    let mut service = connection.workflow_service();
+    let mut service = connection.clone();
 
     loop {
+        let mut poll = GetWorkflowExecutionHistoryRequest {
+            namespace: request.namespace.clone(),
+            execution: Some(WorkflowExecution {
+                workflow_id: request.workflow_id.clone(),
+                run_id: request.run_id.clone(),
+            }),
+            next_page_token: std::mem::take(&mut next_page_token),
+            skip_archival: false,
+            wait_new_event: true,
+            history_event_filter_type: i32::from(HistoryEventFilterType::CloseEvent),
+            ..Default::default()
+        }
+        .into_request();
+        // Core marks this `wait_new_event` request as a user long poll and
+        // gives it Core's long-poll transport deadline; the bridge supplies
+        // only the retry window documented on `wait_retry_options`.
+        poll.extensions_mut()
+            .insert(RetryConfigForCall(wait_retry_options()));
+        // Ask Temporal for the true close event rather than its legacy
+        // continued-as-new rewrite (#971). Core's retry path copies request
+        // metadata, so every transport attempt carries the header.
+        poll.metadata_mut().insert(
+            SUPPORTED_FEATURES_HEADER,
+            MetadataValue::from_static(FOLLOWS_NEXT_RUN_ID_FEATURE),
+        );
         let response = service
-            .get_workflow_execution_history(
-                GetWorkflowExecutionHistoryRequest {
-                    namespace: request.namespace.clone(),
-                    execution: Some(WorkflowExecution {
-                        workflow_id: request.workflow_id.clone(),
-                        run_id: request.run_id.clone(),
-                    }),
-                    next_page_token: std::mem::take(&mut next_page_token),
-                    skip_archival: false,
-                    wait_new_event: true,
-                    history_event_filter_type: HistoryEventFilterType::CloseEvent as i32,
-                    ..Default::default()
-                }
-                .into_request(),
-            )
+            .get_workflow_execution_history(poll)
             .await
             .map_err(map_rpc_status)?
             .into_inner();
@@ -1655,6 +2294,73 @@ fn map_start_status(workflow_id: &str, status: Status) -> ClientOperationError {
     }
 }
 
+/// Maps a query RPC failure, recognizing Temporal's query handler failure.
+///
+/// Temporal reports a failed query handler (or a query name the worker does
+/// not know) as `InvalidArgument` with a `QueryFailedFailure` status detail and
+/// the handler's message as the status message. The detail, not the code,
+/// identifies it: a malformed request is also `InvalidArgument` but carries no
+/// such detail, and an old server that omits the detail is indistinguishable
+/// from one, so it stays a plain RPC error. When the detail carries the full
+/// failure, its message is preferred because it is what the handler raised;
+/// otherwise the status message (the server's copy of it) is used.
+fn map_query_status(status: Status) -> ClientOperationError {
+    if status.code() == Code::InvalidArgument
+        && let Some(detail) = query_failed_detail(status.details())
+    {
+        let message = match detail.failure {
+            Some(failure) if !failure.message.is_empty() => failure.message,
+            _ => status.message().to_owned(),
+        };
+        return ClientOperationError::QueryFailed {
+            message: bounded_query_failure_message(&message),
+        };
+    }
+    map_rpc_status(status)
+}
+
+/// Fully qualified `Any` type URL of Temporal's query failure status detail.
+const QUERY_FAILED_TYPE_URL: &str =
+    "type.googleapis.com/temporal.api.errordetails.v1.QueryFailedFailure";
+
+/// Decodes the `QueryFailedFailure` status detail from encoded
+/// `google.rpc.Status` bytes. Core's generic `decode_status_detail` ignores
+/// the `Any` type URL, and protobuf decoding is lenient enough that an
+/// unrelated detail (for example a `BadRequest`) could decode as this message,
+/// so the type URL is checked first. Malformed bytes are treated as absent.
+fn query_failed_detail(
+    details: &[u8],
+) -> Option<temporalio_common::protos::temporal::api::errordetails::v1::QueryFailedFailure> {
+    use prost::Message;
+    let status = temporalio_common::protos::google::rpc::Status::decode(details).ok()?;
+    let detail = status.details.first()?;
+    if detail.type_url != QUERY_FAILED_TYPE_URL {
+        return None;
+    }
+    Message::decode(detail.value.as_slice()).ok()
+}
+
+/// Makes a handler-controlled message safe for the closed error document:
+/// NUL, which the bilateral string contract rejects, becomes U+FFFD, and the
+/// result is truncated at a character boundary to at most
+/// [`MAX_QUERY_FAILURE_MESSAGE_BYTES`] bytes. Other control characters are
+/// left to JSON escaping.
+pub(crate) fn bounded_query_failure_message(message: &str) -> String {
+    let mut bounded = String::with_capacity(message.len().min(MAX_QUERY_FAILURE_MESSAGE_BYTES));
+    for character in message.chars() {
+        let character = if character == '\0' {
+            char::REPLACEMENT_CHARACTER
+        } else {
+            character
+        };
+        if bounded.len() + character.len_utf8() > MAX_QUERY_FAILURE_MESSAGE_BYTES {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
+}
+
 /// Maps a non-start RPC failure without inventing start-specific semantics.
 ///
 /// The exact-run history operation can theoretically receive any gRPC status,
@@ -1706,6 +2412,77 @@ fn validate_start_request(value: &StartWorkflowRequest) -> Result<(), protocol::
     }
     validate_metadata(&value.memo, "$.memo")?;
     validate_metadata(&value.search_attributes, "$.search_attributes")?;
+    validate_start_policies(value)?;
+    validate_rpc_timeout(value.rpc_timeout_ms)
+}
+
+/// Validates the workflow execution policies of a start request (#499).
+///
+/// Every workflow timeout must be positive, because Temporal reads zero as
+/// "unset" and would silently apply its default. The task timeout is at most
+/// [`MAX_WORKFLOW_TASK_TIMEOUT_MS`], a run timeout may not exceed the
+/// execution timeout, and a task timeout may not exceed the run timeout (the
+/// execution timeout when no run timeout is set): Temporal would silently
+/// lower each of those values, so the bridge rejects them instead. Every
+/// combination of the reuse and conflict policies is valid: the pinned
+/// server accepts `reject_duplicate` with `use_existing` (attach to an open
+/// run, refuse a closed one).
+fn validate_start_policies(value: &StartWorkflowRequest) -> Result<(), protocol::ProtocolError> {
+    for (timeout, path, maximum) in [
+        (
+            value.execution_timeout_ms,
+            "$.execution_timeout_ms",
+            MAX_WORKFLOW_TIMEOUT_MS,
+        ),
+        (
+            value.run_timeout_ms,
+            "$.run_timeout_ms",
+            MAX_WORKFLOW_TIMEOUT_MS,
+        ),
+        (
+            value.task_timeout_ms,
+            "$.task_timeout_ms",
+            MAX_WORKFLOW_TASK_TIMEOUT_MS,
+        ),
+    ] {
+        if let Some(milliseconds) = timeout {
+            if milliseconds == 0 {
+                return Err(protocol::ProtocolError::invalid(
+                    path,
+                    "workflow timeout must be positive",
+                ));
+            }
+            if milliseconds > maximum {
+                return Err(protocol::ProtocolError::invalid(
+                    path,
+                    "workflow timeout exceeds its maximum",
+                ));
+            }
+        }
+    }
+    if let (Some(execution), Some(run)) = (value.execution_timeout_ms, value.run_timeout_ms)
+        && run > execution
+    {
+        return Err(protocol::ProtocolError::invalid(
+            "$.run_timeout_ms",
+            "run timeout exceeds the execution timeout",
+        ));
+    }
+    // Temporal runs a run without its own timeout under the execution
+    // timeout, and lowers a longer task timeout to that run bound.
+    if let (Some(task), Some(run)) = (
+        value.task_timeout_ms,
+        value.run_timeout_ms.or(value.execution_timeout_ms),
+    ) && task > run
+    {
+        return Err(protocol::ProtocolError::invalid(
+            "$.task_timeout_ms",
+            "task timeout exceeds the run timeout",
+        ));
+    }
+    if let Some(policy) = &value.retry_policy {
+        workflow_protocol::validate_retry_policy(policy, "$.retry_policy")?;
+    }
     Ok(())
 }
 
@@ -1737,15 +2514,16 @@ fn validate_metadata(fields: &[MetadataField], path: &str) -> Result<(), protoco
 fn validate_wait_request(value: &WaitWorkflowRequest) -> Result<(), protocol::ProtocolError> {
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     Ok(())
 }
 
 /// Validates one exact-run cancellation request and keeps its reason bounded.
 fn validate_cancel_request(value: &CancelWorkflowRequest) -> Result<(), protocol::ProtocolError> {
+    validate_rpc_timeout(value.rpc_timeout_ms)?;
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     validate_identifier(&value.request_id, "$.request_id")?;
     if value.reason.len() > protocol::MAX_STRING_BYTES {
         return Err(protocol::ProtocolError::invalid(
@@ -1766,9 +2544,10 @@ fn validate_cancel_request(value: &CancelWorkflowRequest) -> Result<(), protocol
 fn validate_terminate_request(
     value: &TerminateWorkflowRequest,
 ) -> Result<(), protocol::ProtocolError> {
+    validate_rpc_timeout(value.rpc_timeout_ms)?;
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     if value.reason.len() > protocol::MAX_STRING_BYTES {
         return Err(protocol::ProtocolError::invalid(
             "$.reason",
@@ -1786,9 +2565,10 @@ fn validate_terminate_request(
 
 /// Validates one exact-run reset request and its Temporal event boundary.
 fn validate_reset_request(value: &ResetWorkflowRequest) -> Result<(), protocol::ProtocolError> {
+    validate_rpc_timeout(value.rpc_timeout_ms)?;
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     validate_identifier(&value.request_id, "$.request_id")?;
     if value.workflow_task_finish_event_id <= 1 {
         return Err(protocol::ProtocolError::invalid(
@@ -1814,9 +2594,10 @@ fn validate_reset_request(value: &ResetWorkflowRequest) -> Result<(), protocol::
 /// Validates one exact-run signal request and every payload conversion before
 /// it can reach the official Temporal service.
 fn validate_signal_request(value: &SignalWorkflowRequest) -> Result<(), protocol::ProtocolError> {
+    validate_rpc_timeout(value.rpc_timeout_ms)?;
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     validate_identifier(&value.signal_name, "$.signal_name")?;
     validate_identifier(&value.request_id, "$.request_id")?;
     for payload in &value.input {
@@ -1831,9 +2612,10 @@ fn validate_signal_request(value: &SignalWorkflowRequest) -> Result<(), protocol
 /// empty argument list, but accepting and validating the closed list keeps
 /// protocol behavior explicit for the future typed-input extension.
 fn validate_query_request(value: &QueryWorkflowRequest) -> Result<(), protocol::ProtocolError> {
+    validate_rpc_timeout(value.rpc_timeout_ms)?;
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     validate_identifier(&value.query_type, "$.query_type")?;
     for payload in &value.input {
         workflow_protocol::payload_to_core(payload)
@@ -1855,9 +2637,10 @@ fn validate_query_response(value: &QueryWorkflowResponse) -> Result<(), protocol
 
 /// Validates one update admission request and every argument payload.
 fn validate_update_request(value: &UpdateWorkflowRequest) -> Result<(), protocol::ProtocolError> {
+    validate_rpc_timeout(value.rpc_timeout_ms)?;
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     validate_identifier(&value.update_id, "$.update_id")?;
     validate_identifier(&value.update_name, "$.update_name")?;
     for payload in &value.input {
@@ -1873,7 +2656,7 @@ fn validate_poll_update_request(
 ) -> Result<(), protocol::ProtocolError> {
     validate_identifier(&value.namespace, "$.namespace")?;
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.run_id, "$.run_id")?;
+    validate_run_selector(&value.run_id, "$.run_id")?;
     validate_identifier(&value.update_id, "$.update_id")?;
     Ok(())
 }
@@ -1920,6 +2703,7 @@ fn validate_update_outcome(value: &UpdateOutcome) -> Result<(), protocol::Protoc
 
 /// Validates a visibility request before any RPC or token decoding occurs.
 fn validate_visibility_request(value: &VisibilityRequest) -> Result<(), protocol::ProtocolError> {
+    validate_rpc_timeout(value.rpc_timeout_ms)?;
     validate_identifier(&value.namespace, "$.namespace")?;
     if value.query.len() > protocol::MAX_STRING_BYTES || value.query.contains('\0') {
         return Err(protocol::ProtocolError::invalid(
@@ -1957,7 +2741,12 @@ fn validate_visibility_page(value: &VisibilityPage) -> Result<(), protocol::Prot
         validate_identifier(&execution.run_id, &format!("{path}.run_id"))?;
         validate_identifier(&execution.workflow_type, &format!("{path}.workflow_type"))?;
         validate_identifier(&execution.task_queue, &format!("{path}.task_queue"))?;
-        validate_identifier(&execution.status, &format!("{path}.status"))?;
+        if !is_visibility_status_name(&execution.status) {
+            return Err(protocol::ProtocolError::invalid(
+                format!("{path}.status"),
+                "unknown visibility status",
+            ));
+        }
     }
     if let Some(token) = &value.next_page_token {
         base64::engine::general_purpose::STANDARD
@@ -1969,22 +2758,57 @@ fn validate_visibility_page(value: &VisibilityPage) -> Result<(), protocol::Prot
     Ok(())
 }
 
-/// Converts Temporal's numeric visibility enum into a stable closed string.
+/// Highest `WorkflowExecutionStatus` wire value this bridge names. Other
+/// nonzero values are reported with [`UNKNOWN_STATUS_PREFIX`].
+const MAX_KNOWN_VISIBILITY_STATUS: i32 = 8;
+
+/// Prefix of the fallback status name for a `WorkflowExecutionStatus` this
+/// bridge does not know, followed by the canonical decimal wire value (for
+/// example `unknown_9`). The OCaml decoder accepts exactly the same shape.
+const UNKNOWN_STATUS_PREFIX: &str = "unknown_";
+
+/// Converts Temporal's numeric visibility enum into a stable status string.
+///
+/// Known statuses map to fixed lowercase names. A value a newer server may
+/// add is reported as `unknown_<n>` rather than failing the whole listing
+/// (#1078), so callers can still page through and identify the row. Only
+/// `0` (unspecified) is rejected: every server sets a status on a
+/// visibility row, so an omitted one is a malformed response.
 fn visibility_status(status: i32) -> Result<String, ClientOperationError> {
+    let known = match status {
+        0 => {
+            return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
+                "visibility row has an unspecified execution status",
+            )));
+        }
+        1 => "running",
+        2 => "completed",
+        3 => "failed",
+        4 => "canceled",
+        5 => "terminated",
+        6 => "continued_as_new",
+        7 => "timed_out",
+        8 => "paused",
+        _ => return Ok(format!("{UNKNOWN_STATUS_PREFIX}{status}")),
+    };
+    Ok(known.to_owned())
+}
+
+/// Returns whether `status` is a name [`visibility_status`] can produce (or
+/// the legacy `unspecified` name the schema has always allowed). An unknown
+/// status must use the canonical decimal form of a value outside the named
+/// range, so one wire value has exactly one spelling.
+fn is_visibility_status_name(status: &str) -> bool {
     match status {
-        1 => Ok("running"),
-        2 => Ok("completed"),
-        3 => Ok("failed"),
-        4 => Ok("canceled"),
-        5 => Ok("terminated"),
-        6 => Ok("continued_as_new"),
-        7 => Ok("timed_out"),
-        8 => Ok("paused"),
-        _ => Err(ClientOperationError::Core(workflow_protocol::invalid_core(
-            "visibility row has an unknown execution status",
-        ))),
+        "running" | "completed" | "failed" | "canceled" | "terminated" | "continued_as_new"
+        | "timed_out" | "paused" | "unspecified" => true,
+        _ => status
+            .strip_prefix(UNKNOWN_STATUS_PREFIX)
+            .and_then(|digits| digits.parse::<i32>().ok().map(|value| (digits, value)))
+            .is_some_and(|(digits, value)| {
+                !(0..=MAX_KNOWN_VISIBILITY_STATUS).contains(&value) && value.to_string() == digits
+            }),
     }
-    .map(str::to_owned)
 }
 
 /// Validates one execution reference.
@@ -2071,9 +2895,15 @@ fn validate_successor_for_execution(
     Ok(())
 }
 
-/// Validates a complete wait response.
+/// Validates a complete wait response. The execution echoes the request, so
+/// its run ID is empty when the wait selected the workflow's current run:
+/// Temporal's history response does not name the run it resolved. A successor
+/// still has to name a concrete run, which then differs from the empty
+/// selector automatically.
 fn validate_wait_response(value: &WaitWorkflowResponse) -> Result<(), protocol::ProtocolError> {
-    validate_execution(&value.execution, "$.execution")?;
+    validate_identifier(&value.execution.namespace, "$.execution.namespace")?;
+    validate_identifier(&value.execution.workflow_id, "$.execution.workflow_id")?;
+    validate_run_selector(&value.execution.run_id, "$.execution.run_id")?;
     validate_outcome(&value.outcome)?;
     let successor = match &value.outcome {
         WorkflowOutcome::Completed { successor, .. }
@@ -2108,6 +2938,19 @@ fn encode_document<T: Serialize + for<'de> Deserialize<'de> + Clone + PartialEq>
     Ok(output)
 }
 
+/// Validates the run selector of a client request. An empty string selects
+/// the workflow's current run, which Temporal resolves when it handles the
+/// RPC (#791); any other value must be a valid identifier naming one exact
+/// run. Responses never use this rule: a run Temporal reports is always a
+/// concrete, non-empty identifier.
+fn validate_run_selector(value: &str, path: &str) -> Result<(), protocol::ProtocolError> {
+    if value.is_empty() {
+        Ok(())
+    } else {
+        validate_identifier(value, path)
+    }
+}
+
 /// Validates a bounded nonempty UTF-8 identifier.
 fn validate_identifier(value: &str, path: &str) -> Result<(), protocol::ProtocolError> {
     if value.is_empty() || value.len() > protocol::MAX_STRING_BYTES {
@@ -2132,12 +2975,47 @@ mod tests {
     use temporalio_client::tonic::codegen::Bytes;
 
     #[test]
-    /// Unknown and omitted Temporal visibility enum values fail closed instead
-    /// of being converted into a valid-looking status string.
-    fn unknown_visibility_status_is_rejected() {
+    /// An omitted visibility status fails closed, while a value a newer
+    /// server may add degrades to the documented `unknown_<n>` name (#1078).
+    fn visibility_status_names_unknown_values() {
         assert!(visibility_status(0).is_err());
-        assert!(visibility_status(99).is_err());
         assert_eq!(visibility_status(1).unwrap(), "running");
+        assert_eq!(visibility_status(8).unwrap(), "paused");
+        assert_eq!(visibility_status(9).unwrap(), "unknown_9");
+        assert_eq!(visibility_status(-3).unwrap(), "unknown_-3");
+        for status in [1, 8, 9, 99, -3, i32::MAX, i32::MIN] {
+            let name = visibility_status(status).unwrap();
+            assert!(is_visibility_status_name(&name), "{name}");
+        }
+    }
+
+    #[test]
+    /// The encoder accepts only names the converter can produce, with one
+    /// canonical spelling per unknown wire value, matching the OCaml decoder.
+    fn visibility_status_name_vocabulary() {
+        for accepted in [
+            "running",
+            "paused",
+            "unspecified",
+            "unknown_9",
+            "unknown_-1",
+        ] {
+            assert!(is_visibility_status_name(accepted), "{accepted}");
+        }
+        for rejected in [
+            "future_status",
+            "unknown_",
+            "unknown_1",
+            "unknown_0",
+            "unknown_8",
+            "unknown_09",
+            "unknown_+9",
+            "unknown_-0",
+            "unknown_9x",
+            "unknown_99999999999",
+        ] {
+            assert!(!is_visibility_status_name(rejected), "{rejected}");
+        }
     }
 
     /// Builds the smallest valid start document used by strict-parser tests.
@@ -2243,6 +3121,282 @@ mod tests {
         changed.task_queue = original.task_queue.clone();
         changed.input[0].data.push(0);
         assert!(!same_start_request(&original, &changed));
+
+        let mut changed_policy = original.clone();
+        changed_policy.id_conflict_policy = IdConflictPolicy::UseExisting;
+        assert!(!same_start_request(&original, &changed_policy));
+
+        // Execution policies are part of the logical start (#499).
+        let mut changed_reuse = original.clone();
+        changed_reuse.id_reuse_policy = IdReusePolicy::RejectDuplicate;
+        assert!(!same_start_request(&original, &changed_reuse));
+        let mut changed_timeout = original.clone();
+        changed_timeout.execution_timeout_ms = Some(1_000);
+        assert!(!same_start_request(&original, &changed_timeout));
+
+        // The caller's RPC deadline bounds one call, not the workflow, so a
+        // retry with another deadline is still the same logical start.
+        let mut changed_deadline = original.clone();
+        changed_deadline.rpc_timeout_ms = Some(1_000);
+        assert!(same_start_request(&original, &changed_deadline));
+    }
+
+    #[test]
+    /// The reuse policy uses closed snake-case names, defaults to
+    /// `allow_duplicate` when omitted, maps to Temporal's non-`UNSPECIFIED`
+    /// enum numbers, and has no `terminate_if_running` spelling.
+    fn start_request_id_reuse_policy_is_closed_and_explicit() {
+        let omitted = decode_start_request(&start_json()).expect("start request decodes");
+        assert_eq!(omitted.id_reuse_policy, IdReusePolicy::AllowDuplicate);
+
+        for (name, policy, core) in [
+            (
+                "allow_duplicate",
+                IdReusePolicy::AllowDuplicate,
+                WorkflowIdReusePolicy::AllowDuplicate,
+            ),
+            (
+                "allow_duplicate_failed_only",
+                IdReusePolicy::AllowDuplicateFailedOnly,
+                WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+            ),
+            (
+                "reject_duplicate",
+                IdReusePolicy::RejectDuplicate,
+                WorkflowIdReusePolicy::RejectDuplicate,
+            ),
+        ] {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&start_json()).expect("fixture is JSON");
+            json["id_reuse_policy"] = serde_json::json!(name);
+            let request = decode_start_request(&json.to_string()).expect("policy decodes");
+            assert_eq!(request.id_reuse_policy, policy);
+            assert_eq!(policy.to_core(), i32::from(core));
+        }
+
+        for invalid in [
+            serde_json::json!("terminate_if_running"),
+            serde_json::json!("unspecified"),
+            serde_json::json!(2),
+            serde_json::Value::Null,
+        ] {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&start_json()).expect("fixture is JSON");
+            json["id_reuse_policy"] = invalid;
+            assert!(decode_start_request(&json.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    /// Workflow timeouts must be positive and bounded, a run timeout may not
+    /// exceed the execution timeout, and the task timeout is capped at
+    /// Temporal's 120 seconds and at the run (or execution) timeout. Every
+    /// policy combination is accepted. Accepted values round-trip without
+    /// rounding.
+    fn start_request_execution_policies_are_validated() {
+        let with = |members: serde_json::Value| {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&start_json()).expect("fixture is JSON");
+            for (key, value) in members.as_object().expect("object").iter() {
+                json[key] = value.clone();
+            }
+            decode_start_request(&json.to_string())
+        };
+        let accepted = with(serde_json::json!({
+            "execution_timeout_ms": MAX_WORKFLOW_TIMEOUT_MS,
+            "run_timeout_ms": MAX_WORKFLOW_TASK_TIMEOUT_MS,
+            "task_timeout_ms": MAX_WORKFLOW_TASK_TIMEOUT_MS,
+            "rpc_timeout_ms": MAX_RPC_TIMEOUT_MS,
+        }))
+        .expect("bounded policies decode");
+        assert_eq!(accepted.execution_timeout_ms, Some(MAX_WORKFLOW_TIMEOUT_MS));
+        assert_eq!(
+            milliseconds_to_core(MAX_WORKFLOW_TIMEOUT_MS).expect("representable"),
+            prost_wkt_types::Duration {
+                seconds: 315_576_000_000,
+                nanos: 999_000_000,
+            }
+        );
+        assert!(
+            with(serde_json::json!({
+                "id_conflict_policy": "use_existing",
+                "id_reuse_policy": "reject_duplicate",
+            }))
+            .is_ok()
+        );
+
+        for rejected in [
+            serde_json::json!({"execution_timeout_ms": 0}),
+            serde_json::json!({"run_timeout_ms": 0}),
+            serde_json::json!({"task_timeout_ms": 0}),
+            serde_json::json!({"execution_timeout_ms": MAX_WORKFLOW_TIMEOUT_MS + 1}),
+            serde_json::json!({"task_timeout_ms": MAX_WORKFLOW_TASK_TIMEOUT_MS + 1}),
+            serde_json::json!({"execution_timeout_ms": -1}),
+            serde_json::json!({"execution_timeout_ms": 1.5}),
+            serde_json::json!({"execution_timeout_ms": 1_000, "run_timeout_ms": 1_001}),
+            serde_json::json!({"run_timeout_ms": 1_000, "task_timeout_ms": 1_001}),
+            serde_json::json!({"execution_timeout_ms": 1_000, "task_timeout_ms": 1_001}),
+            serde_json::json!({"rpc_timeout_ms": 0}),
+            serde_json::json!({"rpc_timeout_ms": MAX_RPC_TIMEOUT_MS + 1}),
+            serde_json::json!({"retry_policy": {
+                "initial_interval": {"seconds": 0, "nanoseconds": 0},
+                "backoff_coefficient_bits": 2.0_f64.to_bits().to_string(),
+                "maximum_interval": {"seconds": 1, "nanoseconds": 0},
+                "maximum_attempts": 2,
+                "non_retryable_error_types": []
+            }}),
+        ] {
+            assert!(
+                with(rejected.clone()).is_err(),
+                "{rejected} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    /// The transport reports its own expiry of an attempt's deadline as
+    /// `cancelled`. Once the caller's budget has elapsed that status, like a
+    /// server `deadline_exceeded`, is the typed `deadline_exceeded` error;
+    /// before then, and for every other status, the ordinary mapping applies.
+    fn expired_budget_statuses_are_deadline_exceeded() {
+        let deadline = ClientOperationError::Rpc {
+            code: "deadline_exceeded".to_owned(),
+        };
+        let expired = tokio::time::Instant::now() - Duration::from_millis(5);
+        for code in [Code::Cancelled, Code::DeadlineExceeded] {
+            assert_eq!(
+                budget_status(expired, Duration::from_millis(1), map_rpc_status)(Status::new(
+                    code, "timeout"
+                )),
+                deadline
+            );
+        }
+        assert_eq!(
+            budget_status(expired, Duration::from_millis(1), map_rpc_status)(Status::new(
+                Code::Unavailable,
+                "down"
+            )),
+            ClientOperationError::Rpc {
+                code: "unavailable".to_owned()
+            }
+        );
+        let fresh = tokio::time::Instant::now();
+        assert_eq!(
+            budget_status(fresh, Duration::from_secs(60), map_rpc_status)(Status::new(
+                Code::Cancelled,
+                "cancelled"
+            )),
+            ClientOperationError::Rpc {
+                code: "cancelled".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    /// Every bounded client request accepts an optional caller RPC timeout
+    /// between 1 ms and one minute and rejects anything else; the default
+    /// budget applies only when the member is absent.
+    fn client_requests_validate_rpc_timeouts() {
+        /// Reports whether one request document decodes.
+        type Decodes = fn(&str) -> bool;
+        let documents: [(&str, Decodes); 7] = [
+            (
+                r#"{"namespace":"default","workflow_id":"w","run_id":"","request_id":"r","reason":""}"#,
+                |input| decode_cancel_request(input).is_ok(),
+            ),
+            (
+                r#"{"namespace":"default","workflow_id":"w","run_id":"","reason":""}"#,
+                |input| decode_terminate_request(input).is_ok(),
+            ),
+            (
+                r#"{"namespace":"default","workflow_id":"w","run_id":"","request_id":"r","reason":"","workflow_task_finish_event_id":3}"#,
+                |input| decode_reset_request(input).is_ok(),
+            ),
+            (
+                r#"{"namespace":"default","workflow_id":"w","run_id":"","signal_name":"s","request_id":"r","input":[]}"#,
+                |input| decode_signal_request(input).is_ok(),
+            ),
+            (
+                r#"{"namespace":"default","workflow_id":"w","run_id":"","query_type":"q","input":[]}"#,
+                |input| decode_query_request(input).is_ok(),
+            ),
+            (
+                r#"{"namespace":"default","workflow_id":"w","run_id":"","update_id":"u","update_name":"n","input":[]}"#,
+                |input| decode_update_request(input).is_ok(),
+            ),
+            (
+                r#"{"namespace":"default","query":"","page_size":10,"next_page_token":null}"#,
+                |input| decode_visibility_request(input).is_ok(),
+            ),
+        ];
+        for (document, decodes) in documents {
+            assert!(decodes(document), "{document}");
+            let mut json: serde_json::Value = serde_json::from_str(document).expect("JSON");
+            for (timeout, valid) in [
+                (serde_json::json!(1), true),
+                (serde_json::json!(MAX_RPC_TIMEOUT_MS), true),
+                (serde_json::json!(0), false),
+                (serde_json::json!(MAX_RPC_TIMEOUT_MS + 1), false),
+                (serde_json::json!("1000"), false),
+            ] {
+                json["rpc_timeout_ms"] = timeout.clone();
+                assert_eq!(
+                    decodes(&json.to_string()),
+                    valid,
+                    "{document} with {timeout}"
+                );
+            }
+        }
+        assert_eq!(rpc_budget(None, CONTROL_RPC_TIMEOUT), CONTROL_RPC_TIMEOUT);
+        assert_eq!(
+            rpc_budget(Some(250), CONTROL_RPC_TIMEOUT),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    /// The conflict policy uses closed snake-case names, defaults to `Fail`
+    /// when omitted, and maps to Temporal's non-`UNSPECIFIED` enum numbers.
+    fn start_request_id_conflict_policy_is_closed_and_explicit() {
+        let omitted = decode_start_request(&start_json()).expect("start request decodes");
+        assert_eq!(omitted.id_conflict_policy, IdConflictPolicy::Fail);
+
+        for (name, policy, core) in [
+            (
+                "fail",
+                IdConflictPolicy::Fail,
+                WorkflowIdConflictPolicy::Fail,
+            ),
+            (
+                "use_existing",
+                IdConflictPolicy::UseExisting,
+                WorkflowIdConflictPolicy::UseExisting,
+            ),
+            (
+                "terminate_existing",
+                IdConflictPolicy::TerminateExisting,
+                WorkflowIdConflictPolicy::TerminateExisting,
+            ),
+        ] {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&start_json()).expect("fixture is JSON");
+            json["id_conflict_policy"] = serde_json::json!(name);
+            let request = decode_start_request(&json.to_string()).expect("policy decodes");
+            assert_eq!(request.id_conflict_policy, policy);
+            assert_eq!(policy.to_core(), i32::from(core));
+        }
+
+        for invalid in [
+            serde_json::json!("unspecified"),
+            serde_json::json!("FAIL"),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+        ] {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&start_json()).expect("fixture is JSON");
+            json["id_conflict_policy"] = invalid;
+            assert!(decode_start_request(&json.to_string()).is_err());
+        }
     }
 
     #[test]
@@ -2266,10 +3420,11 @@ mod tests {
                 workflow_id: "workflow-1".to_owned(),
                 run_id: "run-1".to_owned(),
             },
+            started: true,
         });
         assert_eq!(
             encode_start_outcome(&accepted).expect("accepted outcome encodes"),
-            r#"{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"}}"#
+            r#"{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"started":true}"#
         );
 
         let rejected = ClientOperationError::Rpc {
@@ -2391,7 +3546,8 @@ mod tests {
         let duplicate = r#"{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1","request_id":"cancel-1","request_id":"other","reason":""}"#;
         assert!(decode_cancel_request(duplicate).is_err());
 
-        for field in ["namespace", "workflow_id", "run_id", "request_id"] {
+        // An empty run_id selects the current run (#791) and is accepted.
+        for field in ["namespace", "workflow_id", "request_id"] {
             let document = serde_json::json!({
                 "namespace":"default",
                 "workflow_id":"workflow-1",
@@ -2519,13 +3675,8 @@ mod tests {
         let duplicate = r#"{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1","signal_name":"add_document","request_id":"signal-1","request_id":"other","input":[]}"#;
         assert!(decode_signal_request(duplicate).is_err());
 
-        for field in [
-            "namespace",
-            "workflow_id",
-            "run_id",
-            "signal_name",
-            "request_id",
-        ] {
+        // An empty run_id selects the current run (#791) and is accepted.
+        for field in ["namespace", "workflow_id", "signal_name", "request_id"] {
             let document = serde_json::json!({
                 "namespace":"default",
                 "workflow_id":"workflow-1",
@@ -2575,7 +3726,8 @@ mod tests {
         let duplicate = r#"{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1","query_type":"current_state","query_type":"other","input":[]}"#;
         assert!(decode_query_request(duplicate).is_err());
 
-        for field in ["namespace", "workflow_id", "run_id", "query_type"] {
+        // An empty run_id selects the current run (#791) and is accepted.
+        for field in ["namespace", "workflow_id", "query_type"] {
             let document = serde_json::json!({
                 "namespace":"default",
                 "workflow_id":"workflow-1",
@@ -2665,6 +3817,77 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    /// Keeps the close event's own kind when Temporal links it to a successor
+    /// run (#971): a retried failure stays `Failed`, a retried timeout stays
+    /// `TimedOut`, and a cron completion stays `Completed`, each carrying the
+    /// successor. Only a continue-as-new event produces `ContinuedAsNew`.
+    fn successor_bearing_close_events_keep_their_kind() {
+        use temporalio_common::protos::temporal::api::{
+            failure::v1::Failure,
+            history::v1::{
+                WorkflowExecutionCompletedEventAttributes, WorkflowExecutionFailedEventAttributes,
+                WorkflowExecutionTimedOutEventAttributes,
+            },
+        };
+        let next = SuccessorRef {
+            namespace: "default".to_owned(),
+            workflow_id: "id".to_owned(),
+            run_id: "run-2".to_owned(),
+        };
+        let outcome = |attributes| {
+            outcome_from_event(
+                HistoryEvent {
+                    attributes: Some(attributes),
+                    ..Default::default()
+                },
+                "default",
+                "id",
+            )
+            .unwrap()
+        };
+
+        let failed = outcome(Attributes::WorkflowExecutionFailedEventAttributes(
+            WorkflowExecutionFailedEventAttributes {
+                failure: Some(Failure {
+                    message: "retried".to_owned(),
+                    ..Default::default()
+                }),
+                new_execution_run_id: "run-2".to_owned(),
+                ..Default::default()
+            },
+        ));
+        let WorkflowOutcome::Failed { failure, successor } = failed else {
+            panic!("a retried failure must remain a failed outcome");
+        };
+        assert_eq!(failure.message, "retried");
+        assert_eq!(successor, Some(next.clone()));
+
+        assert_eq!(
+            outcome(Attributes::WorkflowExecutionTimedOutEventAttributes(
+                WorkflowExecutionTimedOutEventAttributes {
+                    new_execution_run_id: "run-2".to_owned(),
+                    ..Default::default()
+                },
+            )),
+            WorkflowOutcome::TimedOut {
+                successor: Some(next.clone()),
+            }
+        );
+        assert_eq!(
+            outcome(Attributes::WorkflowExecutionCompletedEventAttributes(
+                WorkflowExecutionCompletedEventAttributes {
+                    new_execution_run_id: "run-2".to_owned(),
+                    ..Default::default()
+                },
+            )),
+            WorkflowOutcome::Completed {
+                result: Vec::new(),
+                successor: Some(next),
+            }
+        );
     }
 
     #[test]
@@ -3034,6 +4257,7 @@ mod tests {
             update_id: "update-1".to_owned(),
             update_name: "set_state".to_owned(),
             input: Vec::new(),
+            rpc_timeout_ms: None,
         };
         let encoded = serde_json::to_string(&request).unwrap();
         assert_eq!(decode_update_request(&encoded).unwrap(), request);
@@ -3099,3 +4323,19 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/client_update.rs"]
+mod update_acceptance_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/client_retry.rs"]
+mod client_retry_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/client_errors.rs"]
+mod client_error_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/client_current_run.rs"]
+mod current_run_tests;

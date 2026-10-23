@@ -87,7 +87,7 @@ let test_cancel_round_trip () =
 let test_completion_variants () =
   let documents =
     [
-      {|{"task_token":"AA==","result":{"kind":"completed","result":null}}|};
+      {|{"task_token":"AA==","result":{"kind":"completed","result":{"metadata":{},"data":{"encoding":"base64","data":""}}}}|};
       {|{"task_token":"AA==","result":{"kind":"will_complete_async"}}|};
       {|{"task_token":"AA==","result":{"kind":"failed","failure":{"message":"bad input","source":"worker","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"application","type":"InvalidInput","non_retryable":true,"details":[]}}}}|};
       {|{"task_token":"AA==","result":{"kind":"cancelled","failure":{"message":"cancelled","source":"worker","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"canceled","details":[],"identity":"worker-1"}}}}|};
@@ -137,6 +137,52 @@ let test_heartbeat_validation () =
       {|{"task_token":"AA==","details":[{"metadata":{},"data":{"encoding":"raw","data":"AA=="}}]}|};
     ]
 
+(** The async heartbeat document (#1025) adds a required, nullable heartbeat
+    timeout to the heartbeat members, in the exact shape the Rust decoder
+    accepts; the plain heartbeat decoder rejects it. The bridge's fixed
+    async-heartbeat outcome words decode to the closed response type. *)
+let test_async_heartbeat () =
+  let heartbeat : Protocol.heartbeat =
+    { task_token = Bytes.of_string "\000token"; details = [] }
+  in
+  check_string "async heartbeat"
+    {|{"details":[],"heartbeat_timeout":{"nanoseconds":500000000,"seconds":2},"task_token":"AHRva2Vu"}|}
+    (unwrap
+       (Protocol.encode_async_heartbeat
+          {
+            heartbeat;
+            heartbeat_timeout = Some { seconds = 2L; nanoseconds = 500_000_000 };
+          }));
+  let unset =
+    unwrap (Protocol.encode_async_heartbeat { heartbeat; heartbeat_timeout = None })
+  in
+  check_string "unset timeout"
+    {|{"details":[],"heartbeat_timeout":null,"task_token":"AHRva2Vu"}|} unset;
+  (match Protocol.decode_async_heartbeat unset with
+  | Ok { heartbeat_timeout = None; heartbeat = { task_token; _ } }
+    when Bytes.equal task_token heartbeat.task_token -> ()
+  | _ -> failwith "async heartbeat did not round-trip");
+  require_error (Protocol.decode_heartbeat unset);
+  List.iter
+    (fun json -> require_error (Protocol.decode_async_heartbeat json))
+    [
+      {|{"task_token":"AA==","details":[]}|};
+      {|{"task_token":"AA==","details":[],"heartbeat_timeout":{"seconds":-1,"nanoseconds":0}}|};
+      {|{"task_token":"AA==","details":[],"heartbeat_timeout":null,"extra":true}|};
+    ];
+  List.iter
+    (fun (body, expected) ->
+      if Protocol.async_heartbeat_response_of_string body <> expected then
+        failwith ("async heartbeat outcome " ^ body))
+    [
+      ("", Some Protocol.Heartbeat_recorded);
+      ("cancel_requested", Some Protocol.Heartbeat_cancel_requested);
+      ("paused", Some Protocol.Heartbeat_paused);
+      ("reset", Some Protocol.Heartbeat_reset);
+      ("not_found", None);
+      ("cancelled", None);
+    ]
+
 (** Closed-object and required-nullable validation rejects protocol drift at
     every nesting level before a future worker can act on the task. *)
 let test_closed_documents () =
@@ -151,6 +197,11 @@ let test_closed_documents () =
   require_error
     (Protocol.decode_completion
        {|{"task_token":"AA==","result":{"kind":"completed"}}|});
+  (* Core rejects a successful completion without a payload, so the OCaml
+     codec refuses [null] exactly as the Rust decoder does (issue #954). *)
+  check_error_path "null completed payload" "$.result.result"
+    (Protocol.decode_completion
+       {|{"task_token":"AA==","result":{"kind":"completed","result":null}}|});
   check_error_path "nested completion duplicate" "$.result"
     (Protocol.decode_completion
        {|{"task_token":"AA==","result":{"kind":"will_complete_async","kind":"will_complete_async"}}|})
@@ -191,6 +242,52 @@ let test_semantic_validation () =
   require_error
     (Protocol.decode_completion
        {|{"task_token":"","result":{"kind":"will_complete_async"}}|})
+
+(** A task's priority was accepted by the server, which clamps fairness
+    weights to [0.001, 1000] instead of rejecting them (#1016). Weights such
+    as 5000, 0.0005 and NaN, and a NUL in the fairness key, must decode with
+    their exact bits, matching the Rust activity decoder; only the 64-byte
+    fairness-key bound still applies. Before the fix the OCaml decoder
+    applied the outbound range check and the activity failed. *)
+let test_inbound_priority () =
+  let with_priority ~key ~bits =
+    let fragment =
+      {|"priority":{"priority_key":2,"fairness_key":"tenant","fairness_weight_bits":1065353216}|}
+    in
+    let index =
+      let rec find offset =
+        if String.sub valid_start_json offset (String.length fragment) = fragment
+        then offset
+        else find (offset + 1)
+      in
+      find 0
+    in
+    String.sub valid_start_json 0 index
+    ^ Printf.sprintf
+        {|"priority":{"priority_key":2,"fairness_key":"%s","fairness_weight_bits":%Ld}|}
+        key bits
+    ^ String.sub valid_start_json
+        (index + String.length fragment)
+        (String.length valid_start_json - index - String.length fragment)
+  in
+  let bits value = Int64.logand (Int64.of_int32 (Int32.bits_of_float value)) 0xffff_ffffL in
+  List.iter
+    (fun (key, expected_key, weight) ->
+      match Protocol.decode_task (with_priority ~key ~bits:(bits weight)) with
+      | Ok { variant = Protocol.Start { priority = Some priority; _ }; _ } ->
+          if priority.fairness_weight_bits <> bits weight
+             || priority.fairness_key <> expected_key
+          then failwith "inbound priority was not preserved exactly"
+      | Ok _ -> failwith "inbound priority was dropped"
+      | Error _ -> failwith "server-valid inbound priority was rejected")
+    [
+      ("tenant", "tenant", 5000.);
+      ("tenant", "tenant", 0.0005);
+      ("tenant", "tenant", Float.nan);
+      ({|nul\u0000key|}, "nul\000key", 1.);
+    ];
+  require_error
+    (Protocol.decode_task (with_priority ~key:(String.make 65 'k') ~bits:0L))
 
 (** Typed outgoing maps cannot smuggle duplicate header keys through Yojson's
     association-list representation. *)
@@ -295,8 +392,10 @@ let () =
   run "activity completion variants" test_completion_variants;
   run "activity heartbeat round trip" test_heartbeat_round_trip;
   run "activity heartbeat validation" test_heartbeat_validation;
+  run "async activity heartbeat" test_async_heartbeat;
   run "closed activity documents" test_closed_documents;
   run "activity semantic validation" test_semantic_validation;
+  run "inbound activity priority" test_inbound_priority;
   run "outgoing activity headers" test_outgoing_header_validation;
   run "activity failure validation" test_failure_validation;
   run "activity header normalization" test_header_normalization;

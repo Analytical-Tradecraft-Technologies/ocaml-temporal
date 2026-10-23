@@ -12,14 +12,24 @@ and bridge, read the [documentation guide](../README.md) first.
 - One execution owns one scheduler, command sequence, pending-operation set,
   and continuation set.
 - A workflow operation can access its context only while that execution's
-  activation is running on the current domain.
+  activation is running on the current system thread. The current context,
+  the scheduler owner id, and the read-only query marker are dynamic
+  bindings keyed by Domain and `Thread.id` (`Thread_binding`), not plain
+  Domain-local storage: workers hosted on sibling system threads of one Domain
+  may interleave activations and must never observe, overwrite, or restore
+  each other's binding. A thread spawned inside an activation starts with no
+  workflow installed. Each binding is removed when its extent ends, including
+  by an exception, so an idle Domain holds no entries;
+  `test/runtime/test_thread_context_isolation.ml` forces two interleaved
+  activations on one Domain and checks isolation and cleanup (#765).
 - An inline query temporarily installs its owning execution context only for
   its synchronous handler, letting it inspect workflow-local state without
   running scheduler fibers. Query dispatch disables deterministic randomness,
   and the dynamic context binding is restored before its response is emitted.
-  The query may read its own live `Temporal.Scope.is_cancelled` status through
-  a separate Domain-local read marker. It cannot cancel the scope, await a
-  future, read another execution's scope, or use a scope after shutdown.
+  The query may read its own live `Temporal.Scope.is_cancelled` and `check`
+  results through a separate thread-local read marker. It cannot cancel the
+  scope, await a future, read another execution's scope, or use a scope after
+  shutdown.
 - Futures from different schedulers cannot be combined.
 - Terminal completion, failure, cancellation, eviction, and shutdown dispose
   all pending callbacks and captured continuations.
@@ -29,6 +39,17 @@ and bridge, read the [documentation guide](../README.md) first.
   still releases the run and acknowledges its native lease with no command.
 - Eviction emits no workflow command. A later replay creates a fresh execution
   rather than reusing native continuations.
+- One synchronous activity attempt runs at a time on the activity Domain,
+  under the adapter mutex. Its cancellation cell is written only by a
+  heartbeat delivery sweep, at most once, and read lock-free from any Domain;
+  the running-attempt record and deferred-task FIFO are guarded by a separate
+  delivery mutex, taken after a context's own mutex; no adapter or context
+  lock is taken while it is held. The running attempt is cleared only after
+  its context is invalidated, and the callback's result is classified only
+  after that, so the observed cancellation is final and a Core cancellation
+  can never become a second completion for a token whose completion is
+  already owned (#494). See
+  [native activities](native-activity-execution.md#cooperative-cancellation-of-a-running-callback).
 - The focused runtime regression
   [`test_eviction_allows_fresh_replay_execution`](../../test/runtime/test_native_worker_execution.ml)
   checks both halves of that rule: the evicted generation is not invoked again,
@@ -63,8 +84,28 @@ and bridge, read the [documentation guide](../README.md) first.
   checks the same stream through live execution and offline Core replay.
 - Resolving a future appends its waiters in waiter-registration order.
 - No hash-table traversal determines runnable or command ordering.
+- Per-pending-operation registrations (scheduler teardowns, condition
+  waiters, scope cancellation hooks, future observers) live in
+  `Temporal_base.Ordered_registry`: append and removal are O(1) and every
+  traversal is in explicit registration order. Settling one future therefore
+  costs O(its own registrations), not O(all pending futures), and shutdown
+  still tears down pending futures in creation order (#847).
 - Command sequence numbers are monotonic per execution and begin at one.
 - Commands are returned in emission order.
+- Workflow code must yield. An activation that runs workflow code past the
+  worker's activation deadline (default two seconds) without returning is
+  detected by a watchdog thread on the worker's supervisor owner Domain (a
+  Domain the workflow lane never runs on; #1042) that only reads an atomically
+  published activation epoch and counts its own ticks (#493). It never
+  interrupts, resumes, or inspects the stuck code and its timing never reaches
+  a command, so it cannot change deterministic decisions. On detection, the
+  watchdog and the lane race on one atomic per-activation claim; exactly one
+  of them completes the native lease. A winning watchdog fails the workflow
+  task (Temporal retries it from history), and a lane that later loses the
+  claim drops its completion and its run without a native call. Detection
+  marks the worker unhealthy for its lifetime (`Worker.health`); recovery of
+  the stuck Domain is an external process restart. See the
+  [watchdog reference](native-worker-execution.md#non-yielding-workflow-watchdog).
 
 ## Futures and continuations
 
@@ -113,10 +154,10 @@ and bridge, read the [documentation guide](../README.md) first.
   each registered activity or child-workflow cancellation hook at most once;
   timers and unscoped operations remain observation-only. Every scope
   operation is owner-checked. While the scheduler is paused between runs,
-  only `is_cancelled` may also be called by a synchronous query for the same
-  live execution; a foreign or stale handle returns a typed defect rather than
-  racing mutable state. Normal workflow
-  teardown closes any still-pending signal and its callbacks. Repeating
+  only `is_cancelled` and `check` may also be called by a synchronous query for
+  the same live execution; a foreign or stale handle returns a typed defect
+  rather than racing mutable state. Normal workflow teardown closes any
+  still-pending signal and its callbacks. Repeating
   cancellation is idempotent; hook errors are aggregated as a typed first
   error after all hooks have been attempted. The owner check compares the
   currently running scheduler with the scheduler that created the scope, so a
@@ -131,6 +172,17 @@ and bridge, read the [documentation guide](../README.md) first.
   handler must release its continuation without turning teardown into a task
   defect or discarding the chosen terminal command. This does not drain
   unfinished handlers or imply that an accepted update completed.
+- The same holds for user cleanup code that runs while a parked fiber is
+  discontinued (#1021): a `Fun.protect ~finally` block or exception handler
+  that raises, or that calls an SDK operation which raises because the run has
+  ended, and a catch-all that turns the private shutdown exception into a
+  defect. The scheduler keeps exceptions that escape fibers after shutdown
+  apart from activation failures, and the execution logs and drops any
+  task-failing error reported once the run is terminal or evicted. A defect
+  raised while the scheduler was still active still discards the whole batch.
+  A cache-eviction activation is always acknowledged with an empty completion,
+  never one carrying a task failure, because Core rejects it and workflow
+  completions are not retried.
 - The implementation uses typed closures and GADTs, not `Obj.magic` or a
   heterogeneous untyped value store.
 
@@ -149,9 +201,16 @@ and bridge, read the [documentation guide](../README.md) first.
   child resolver is registered before its command is emitted. Core resolves a
   child in two stages: the start acknowledgment stores its non-empty run ID,
   while a later terminal resolution removes the resolver and decodes its
-  payload. A start failure removes and resolves the future immediately. A
-  terminal result before start, duplicate acknowledgment, or unknown sequence
-  is a non-retryable bridge defect; no event is silently dropped.
+  payload. A start failure removes and resolves the future immediately. One
+  terminal result may arrive without a start acknowledgment: when the
+  workflow cancels a `Try_cancel` or `Abandon` child after
+  `StartChildWorkflowExecutionInitiated` but before
+  `ChildWorkflowExecutionStarted`, Core resolves it directly as cancelled.
+  That `Cancelled` resolution is accepted only after the handle emitted
+  `Cancel_child_workflow`, and completes the future with the typed
+  cancellation error. Any other terminal result before start, a duplicate
+  acknowledgment, or an unknown sequence is a non-retryable bridge defect; no
+  event is silently dropped.
 - Child task queues are optional validated identifiers. Explicit routing and
   parent-close policy survive runtime, JSON, and Core translation unchanged.
   Omission preserves existing server defaults and default command bytes. Parent
@@ -175,6 +234,19 @@ and bridge, read the [documentation guide](../README.md) first.
   [runtime regression](../../test/runtime/test_local_activity_cancellation.ml)
   and [live history/replay fixture](../../test/integration/local_activity_cancellation/README.md)
   cover these ownership boundaries.
+- Local-activity backoff commands are emitted in scheduler order, not during
+  the activation job pass (#809). The backoff job and the retry timer's firing
+  are validated in the job pass, but allocating the timer sequence and
+  emitting `StartTimer`, and later re-emitting `ScheduleLocalActivity`, are
+  queued scheduler work at that job's position, after fibers woken by earlier
+  jobs. Core may merge jobs that a live worker received in separate
+  activations (for example inside a heartbeating workflow task) into one
+  activation on replay; queuing keeps sequence numbers and command order
+  identical in both cases, as in the TypeScript and Python SDKs where the
+  coroutine awaiting the activity handles its backoff. Cancellation while
+  that work is queued settles the future and the queued work emits nothing.
+  The [split/merged activation regression](../../test/runtime/test_local_activity_backoff_order.ml)
+  compares the command streams.
 - An activity retry policy is immutable once attached to a command. Its initial
   interval is positive, its maximum interval is at least the initial interval,
   its finite backoff coefficient is at least 1.0, and its maximum-attempt count
@@ -211,22 +283,34 @@ and bridge, read the [documentation guide](../README.md) first.
   state, or nondeterministic iteration to affect commands.
 - Patch decisions belong to one workflow execution. Core's `NotifyHasPatch`
   jobs are applied before workflow fibers run; absent a known marker,
-  `Temporal.Workflow.patched` returns `not is_replaying`, retains that
-  decision, and emits a non-deprecated marker command on every call. The
-  unit-returning `Temporal.Workflow.deprecate_patch` retains the same private
-  decision state and emits a deprecated marker. The runtime does not deduplicate
-  same-mode commands or share patch state between runs, but it rejects active
-  and deprecated calls for one ID in one execution before emitting the second
-  mode. Patch IDs are durable history keys, not deployment or process state.
-- Replay-safe randomness, side effects, and workflow logging APIs remain
-  required before production release. The complete [PR #348 CI
-  run](https://github.com/mfow/ocaml-temporal/actions/runs/29411260374) verifies
-  the two original live patch-in histories. The complete [PR #356 run](https://github.com/mfow/ocaml-temporal/actions/runs/29469232271) additionally
+  `Temporal.Workflow.patched` returns `not is_replaying`. The first answer for
+  an ID is retained for the run: a notification seeds only IDs workflow code
+  has not consulted, so it never flips a returned decision. A non-deprecated
+  marker command is emitted on every call whose decision is `true` and never
+  for a `false` replay decision. The unit-returning
+  `Temporal.Workflow.deprecate_patch` retains the same private decision state
+  and emits a deprecated marker under the same condition. The runtime does not
+  deduplicate same-mode commands or share patch state between runs, but it
+  rejects active and deprecated calls for one ID in one execution before
+  emitting the second mode. Patch IDs are durable history keys, not deployment or process state.
+- Replay-safe randomness is provided by `Temporal.Workflow.random_int`.
+  Side-effect and replay-aware workflow logging APIs remain required before
+  production release. The complete [PR #348 CI
+  run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374) verifies
+  the two original live patch-in histories. The complete [PR #356 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29469232271) additionally
   verifies active-to-deprecated and deprecated-to-removed replacement.
 
 ## Core boundary assumptions
 
 - Core and every Cargo dependency are pinned and license-audited.
+- No bridge C stub can raise between taking an unmanaged resource and
+  releasing it. Every stub releases the OCaml runtime lock with
+  `caml_enter_blocking_section_no_pending`, never the plain function, because
+  the plain function runs pending OCaml signal handlers and re-raises their
+  exceptions after the stub has already taken a counted runtime borrow,
+  detached the native pointer, or copied its input to C memory (#1018). A
+  pending handler still runs, at the first OCaml poll point after the stub
+  returns.
 - Rust alone handles Temporal/Core protobuf. Strict JSON activation and
   completion documents cross the language boundary as owned buffers with one
   explicit free path; OCaml copies them into typed values before execution.
@@ -237,30 +321,59 @@ and bridge, read the [documentation guide](../README.md) first.
   invariants. A replay feeder has one bounded slot, and a completion or
   rejection is accepted only for the exact activation lease that was polled.
 - The private supervisor validates native poll bytes before returning typed
-  workflow or activity values to another Domain. It canonically encodes and
-  reparses typed completions before entering C.
+  workflow or activity values to another Domain. Workflow and activity
+  completions and activity heartbeats arrive already encoded: the worker and
+  activity adapters run the canonical encoder once and pass its bytes as an
+  abstract `Encoded_workflow_completion.t`, `Encoded_activity_completion.t` or
+  `Encoded_activity_heartbeat.t`, which only that encoder can produce, so the
+  supervisor copies them into C without a second encode. An exact retry of an
+  uncertain asynchronous completion resends the bytes encoded for its first
+  submission.
 - An activity `Start` (remote or local) creates one Core completion debt. A `Cancel` poll
   is an update to that same token: it is handed to the OCaml activity adapter
   while the token remains tracked, but it never acquires a second completion
   lease. Only a cancellation that arrives after the start has completed is
   stale and may be discarded. This keeps cancellation delivery observable
-  without allowing duplicate-token completion races.
+  without allowing duplicate-token completion races. A cancellation the poll
+  lane cannot attach to a live Start (unknown because the Start completed
+  first, repeated, retired by disposal, malformed, or polled while draining)
+  is dropped silently: it owns no completion debt, and a lane error for it
+  would end `Worker.run` over a benign race (issue #801).
 - If a Core activity task cannot be converted or encoded before it reaches the
   OCaml adapter, Rust fails only an unrepresentable `Start`, because that is
   the task that owns the completion debt. An unrepresentable `Cancel` is
   dropped as an update; failing it through the activity-completion API would
-  consume the still-needed Start lease.
+  consume the still-needed Start lease. The generated failure is a
+  non-retryable application failure of type `UnrepresentableActivityTask`
+  whose message carries only a static conversion category, because every
+  redelivery of the same task would be rejected again. Once Core accepts it
+  (which also releases the task's activity slot), the poll reports
+  `Not_ready` and the worker keeps serving the queue; only a failed Core
+  rejection is fatal (issue #801). Standalone activities (no workflow
+  execution) are not representable and take this path.
 - If OCaml cannot decode a successful poll, it returns the exact untouched
   Rust document to the private rejection ABI. Rust requires full semantic
   equality with retained handoff state before retiring the lease; changed IDs,
   tokens, or content cannot consume real outstanding work. Rejection cleanup
   for a retained Start removes ledger and semantic ownership together even
-  when Core reports an error, while the original OCaml protocol failure
-  remains the primary result. A retained Cancel is different: it is only an
+  when Core reports an error. A retained Cancel is different: it is only an
   update to the Start's shared token, so rejecting that document removes the
   one semantic update without retiring the Start's native completion debt.
-- Native `Not_ready` is represented as `Ok None`. ABI version 2 also exposes
-  bounded `Wait_workflow` and `Wait_activity` readiness operations. Only the
+  On a live worker a successful rejection is local task progress, so the
+  supervisor reports an empty poll and keeps polling (issue #801); a workflow
+  rejection then also applies the fixed 100 ms redelivery backoff. A replay
+  keeps the OCaml protocol failure as its result, because skipping history it
+  could not decode would report an unchecked replay as compatible. A failed
+  rejection always keeps the original protocol failure primary.
+- Rejecting a workflow activation fails its Core workflow task, except for a
+  pure cache eviction: it owns no workflow task, so every rejection path
+  (Rust conversion or encoding failure, OCaml decode failure, replay
+  rejection) acknowledges it with an empty completion instead. Failing an
+  eviction leaves it outstanding in release Core and panics debug Core
+  (issue #814).
+- Native `Not_ready` is represented as `Ok None`. ABI version 4 also exposes
+  bounded `Wait_workflow`, `Wait_activity`, and combined `Wait_any` readiness
+  operations. Only the
   owner-Domain supervisor may invoke them; the C boundary releases the OCaml
   runtime lock while Rust waits, and no workflow fiber or effect scheduler
   invokes or blocks on a native lock, condition variable, or timer.
@@ -271,43 +384,174 @@ and bridge, read the [documentation guide](../README.md) first.
   quiet lane, so a supervisor handler cannot strand a queued shutdown request.
   Only one idle execution lane enters a native wait at a time; the preferred
   lane alternates after each wait, with a one-yield fallback for staggered idle
-  polls. While its sibling is busy or already owns the wait, a lane yields
-  locally for 10 ms, then retries its nonblocking poll. The poll reports a
-  fatal Rust lane error even with no queued task.
+  polls. The live worker's native wait is `Wait_any`, so work on either lane
+  ends it and the token holder can never sleep through the sibling's task
+  (#806). While its sibling is busy or already owns the wait, a lane yields
+  locally, then retries its nonblocking poll. The yield never enters the
+  supervisor mailbox and is paced by `Native_worker_idle` (#994): it is zero
+  once per in-flight sibling native wait, because the next poll then queues
+  behind that wait and returns when either lane has work. The wait is marked
+  in flight just before mailbox admission, so a joining poll can be served
+  first; a lane that finds the joined wait still in flight after its poll
+  restarts its backoff at 0.1 ms for that wait instead of resuming a capped
+  sleep. Otherwise it is a
+  backoff of 0, 0.1 ms, doubling up to 10 ms, which restarts after each
+  completed task or readiness wake. A zero yield is always bounded by one such
+  event, so an idle worker settles at the 10 ms cap and never busy-spins, and
+  a stopping lane still observes its stop flag within one native wait plus one
+  capped yield. The poll reports a fatal Rust lane error even with no queued
+  task. The yield sleeps through the bridge's pacing sleep, which releases the
+  runtime lock and keeps sub-millisecond precision on Windows through a
+  per-timer high-resolution waitable timer; it never raises the process- or
+  system-wide timer resolution (#1008).
 - The workflow execution Domain and capacity-one activity execution Domain
-  share the same serialized supervisor mailbox. The activity adapter retains
+  share the same serialized supervisor mailbox. The activity Domain is spawned
+  only for a worker that polls activity tasks; a failed spawn is a typed,
+  retryable bridge error from `run` before either lane polls (#1042). The activity adapter retains
   exclusive ownership of an attempt and its completion retry. Worker shutdown
-  joins that Domain before draining either adapter or releasing native handles;
-  a callback that never returns therefore leaves shutdown waiting without an
-  overall deadline (tracked by #495).
+  waits for that Domain only until the grace period ends; see the bounded
+  shutdown invariants below (#495).
 - A retained activity completion may be retried only after the OCaml source
   receives the explicit bridge `Retryable` status. The pinned Core completion
   implementation removes the activity lease before suppressing generic network
   failures, so `Connection`, `Not_ready`, and `Worker` never authorize a
   second completion attempt. The dedicated retry backoff is a 10 ms native
   timer with the OCaml runtime lock released; it is not a readiness signal.
-- A namespace-bound async heartbeat is nonterminal and does not consume that
-  Core completion lease. An uncertain RPC `Connection` keeps the public handle
-  and adapter async lease tracked for an identical heartbeat retry. A definite
-  non-`NotFound` RPC rejection clears a fresh heartbeat request so corrected
-  details or completion may proceed, but keeps both the handle and lease live;
-  it cannot erase an earlier uncertain request. Worker drain must still report
-  the outstanding obligation. Confirmed `NotFound` maps to `Invalid_state` and
-  closes the handle. This decision does not change worker or async terminal
-  completion retry policy.
-- Adapter shutdown reopens admission only for an explicitly retryable activity
-  drain. Workflow-drain errors and permanent activity errors invoke the
-  supervisor's `Native.shutdown`/`runtime_close` path before leaving the private
-  worker closed and the public wrapper terminal; runtime disposal force-retires
-  any remaining native leases. A returned native `Error` is still
-  release-complete by that contract, so OCaml adapter maps are discarded only
-  after the result is observed. If native shutdown raises before returning, the
-  maps remain retained, a terminal-cleanup-pending flag schedules a detached
-  retry, and the worker finalizer remains a last-resort path. A same-Domain
-  shutdown defect from either execution Domain is different: it cannot wait
-  for its own lane to finish, but no teardown has started, so it remains
-  retryable for a later call from another Domain. The public wrapper checks
-  this before acquiring its shutdown mutex to avoid a cross-Domain deadlock.
+- Both the workflow and activity adapters record the first completion failure
+  that is not explicitly retryable (a typed error, an exception, or an async
+  handle admission that fails after Core accepted `WillCompleteAsync`) on the
+  retained entry. From then on neither a later `poll`, a second `Worker.run`,
+  nor a shutdown drain submits that completion again; each returns the
+  recorded error without a native call, and only terminal `discard` releases
+  it (issue #843). No workflow completion failure is retryable: the bridge
+  defines `Retryable` only for activity completion, and pinned Core reports
+  only deterministic validation failures from
+  `complete_workflow_activation`, so an identical resubmission could at best
+  fail again and, after a lost acknowledgement, could complete a later
+  activation of the same run.
+- Namespace-bound async heartbeats and async complete/fail/cancel do not
+  consume that Core completion lease, so they do not fail closed. An
+  uncertain RPC `Connection` keeps the public handle and adapter async lease
+  tracked and returns a retryable error; a terminal operation may then only
+  be retried byte-for-byte, while an uncertain heartbeat is dropped so it
+  never blocks a newer heartbeat or the terminal operation. A definite
+  non-`NotFound` RPC rejection releases that request key (even after an
+  earlier uncertain attempt of the same request) but keeps both the handle and
+  lease live for a corrected or different operation. Worker drain must still
+  report the outstanding obligation. Confirmed `NotFound` maps to
+  `Invalid_state` and closes the handle. These operations are submitted
+  client calls (#1025): the owner Domain only validates and spawns the RPC,
+  and the caller's thread awaits it, so a slow server never holds up the
+  worker's polling and completions. A submitted call reports `NotFound` as
+  the fixed outcome `not_found`, which the supervisor maps back to
+  `Invalid_state`, because an awaited `Invalid_state` means the call itself
+  was closed. The adapter's async lock covers only the claim of a lease
+  (marking it in flight, which refuses a concurrent operation on the same
+  handle) and the recording of the outcome, never the RPC. Async heartbeats
+  are not throttled: each is one server round trip. The adapter removes the
+  lease exactly
+  once: on an accepted terminal operation or a retiring error. This decision
+  does not change Core worker completion retry policy.
+- Worker shutdown is bounded (#495). Its end-to-end budget is the grace
+  period (`Worker.Options.graceful_shutdown_period`, default 30 s) plus the
+  teardown timeout (`shutdown_teardown_timeout`, default 60 s) plus 250 ms of
+  lanes slack; no step waits on user code or the server beyond it:
+  - Admission closes at once (`closed`), so both lanes stop polling and
+    activity contexts report a worker shutdown. One lanes deadline (now plus
+    the grace period) is published with a compare-and-set; whichever of
+    `shutdown` and a stopping `run` computes it first wins, so the two agree.
+  - Temporal Core stops polling the server at once too (#1028). A stopping
+    `run` sends `Initiate_worker_shutdown` after its workflow lane returned
+    (only for a stop, never after a lane failure), from a detached thread it
+    never awaits, so a mailbox occupied by a stuck activity-lane native call
+    cannot keep `run` past the deadline; the shutdown thread
+    sends it before the lanes phase; a per-worker atomic makes it one
+    request. The bridge moves its ledger to `Draining`, closes both readiness
+    signals (queued tasks still drain first) and calls Core's
+    `initiate_shutdown`, which never waits for the network. Leased tasks stay
+    completable and heartbeatable until the release, and Core's own
+    graceful-shutdown timer starts then, not after the grace period.
+  - `run` joins its activity Domain only until that deadline, and only while
+    an activity callback is running (the adapter's atomic probe, not the
+    lane's transient poll flag): any other lane, normally in a bounded
+    readiness wait, is joined for up to 150 ms past the deadline (#1023). A callback
+    still running then is detached: the Domain is not joined, keeps the
+    activity adapter lock, keeps its execution-thread identity, and exits on
+    its own after the callback returns. `run` then returns. A non-yielding
+    workflow activation runs on `run`'s own thread, so it keeps `run` (and
+    the lifecycle lock) until it returns.
+  - The rest of shutdown runs on one dedicated shutdown thread, which owns
+    each step: it takes `run_mutex` with `try_lock` until the deadline plus
+    the slack, drains each adapter only through a non-blocking `try_drain`
+    (an adapter whose lock abandoned code still holds is reported busy, never
+    waited for), retries an explicitly retryable retained completion until
+    the same deadline, releases `run_mutex` on the same thread, and only then
+    calls `Native.shutdown`. The bridge fails every task still leased to
+    OCaml (an abandoned remote activity retryably, an abandoned activation as
+    a failed workflow task), so Temporal retries it on another worker. A
+    local activity, identified by Core's own local-token predicate, is
+    reported as cancelled instead: Core retries a retryable local failure
+    in-process for about a minute, which held teardown past its timeout
+    (#1029). Its workflow task is failed by the same drain, so nothing is
+    recorded and the next worker re-executes it. Disposal applies the same
+    rule.
+  - The caller only waits for the shutdown thread's published outcome, at
+    most the teardown timeout after the release began. If the release has
+    not finished, the caller returns a report with teardown `Detached`; the
+    shutdown thread still owns and completes the one release, bounded by the
+    bridge's own Core waits below. If no thread can be created, the sequence
+    runs on the caller and only the bridge bounds it.
+  - The typed outcome distinguishes abandonment from failure. Abandoned
+    callbacks and activations, and the `Outstanding_tasks` status for the
+    leases they held, are an `Ok` report. A retained completion that could
+    not be delivered (permanently, or still retryable at the deadline) and a
+    native release error are an `Error`, after the graph is released. Retired
+    leases with nothing abandoned stay an `Error`, so a lost lease is never a
+    false success.
+  - The lanes probes (`callback_running`, which counts synchronous and
+    asynchronous callbacks alike, and the activation probe) read atomics and
+    take no lock, so the caller can use them while a lane is blocked
+    (#1023). The 250 ms lanes slack covers an idle `run`'s exit: the 150 ms
+    idle-lane allowance, one 10 ms join poll, and one 20 ms watchdog stop
+    slice.
+  - Admitted asynchronous activity leases belong to external code, not to
+    any callback. When the activity drain is busy (an abandoned callback
+    holds the adapter lock), shutdown still counts them through the separate
+    async lock (tried, never waited for) until the deadline. Any still
+    admitted then make the outcome an `Error` naming them, so the leases the
+    bridge retires are never attributed to the abandoned callback and an
+    unrelated handle is never closed behind an `Ok` report.
+  - Abandoned code is never interrupted. Its eventual completion reaches a
+    closed supervisor and is rejected as `Closed`, so it cannot complete a
+    task the bridge already retired. Adapter discard after the release uses
+    `try_discard` under a deferred-discard flag that is raised before each
+    attempt and cleared only by a successful one. When abandoned code still
+    holds an adapter lock, the next thread to release one performs the
+    discard: the detached activity lane on its own Domain right after its
+    callback returns, or `run` after its workflow lane returns. The late
+    completion bytes and adapter state are therefore dropped as soon as the
+    lock is free, not left to the garbage collector. No native resource
+    depends on them.
+- A returned native `Error` from `Native.shutdown` is still
+  release-complete by the supervisor contract, so OCaml adapter maps are
+  discarded only after the result is observed. If native shutdown raises
+  before returning, the maps remain retained, a terminal-cleanup-pending flag
+  schedules a detached retry, and the worker finalizer remains a last-resort
+  path. A shutdown defect from either execution lane's own system thread is
+  different: it
+  cannot wait for its own lane to finish, but no teardown has started, so it
+  remains retryable for a later call from any other thread. Lane identity is
+  the system thread (Domain plus `Thread.id`), so a sibling thread on a lane's
+  Domain is an ordinary caller. The public wrapper checks this before
+  acquiring its shutdown mutex to avoid a deadlock against a concurrent
+  shutdown that holds that mutex while waiting (now boundedly) for the loop.
+  That rejected
+  call, and `Worker.request_shutdown`, set a separate sticky stop-request
+  atomic that both lanes observe like the shutdown flag but that never admits
+  teardown, so the loop returns and a later `shutdown` (from any thread,
+  including the one that ran the loop) performs the drain and native release.
+  Setting it is the only lifecycle operation that is safe inside an OCaml
+  signal handler: it takes no lock and makes no native call (#830).
 - Each Rust poll lane owns one mutex-protected pending count. Producers hold
   that mutex while publishing a queue message and its wake notification;
   the supervisor holds it while receiving and decrementing. A wake is never
@@ -315,11 +559,27 @@ and bridge, read the [documentation guide](../README.md) first.
 - Shutdown closes both readiness signals before waking Core polls, but queued
   messages always take precedence over terminal state and are drained before a
   readiness wait reports shutdown or a fatal lane error.
+- The native release (`Shutdown_worker`) never waits for OCaml. Core
+  shutdown was normally initiated earlier, when the stop was observed
+  (#1028), and OCaml could complete leased tasks until the release; the
+  release initiates it if not (idempotently) and then completes every leased
+  or queued task itself while joining both poll lanes, waits at most 90 s for the join and 30 s for Core finalization,
+  and keeps the worker owned (by the graph or by the finalizer task) until
+  `finalize_shutdown` returns. A force-completed lease is reported as
+  `Outstanding_tasks` after the worker has been released (issue #769).
 - Dispose force-fails ledger debt and queued tasks before joining the Core poll
   lanes so shutdown cannot wait for OCaml. Because a poll already in flight can
-  publish a task after that first drain, dispose joins both lanes and performs a
+  publish a task after that first drain, dispose joins both lanes (with the
+  same bounded, draining join as explicit shutdown) and performs a
   final no-producer drain before finalization; no task may remain only in a
-  ready queue or ledger at the point the worker graph is released.
+  ready queue or ledger at the point the worker graph is released. Dispose
+  acknowledges a pure cache eviction empty rather than failing it (the ledger
+  records each run's eviction bit atomically with its admission, before the
+  poll lane enqueues the activation, so no ready-queue reconciliation is
+  needed), and the
+  workflow poll lane acknowledges Core's same-run eviction for a run disposal
+  already retired instead of dropping it; otherwise the workflow poll never
+  reports `ShutDown` and the lane join waits out its bound (issue #775).
 
 ## Native activation translation
 
@@ -327,7 +587,9 @@ and bridge, read the [documentation guide](../README.md) first.
   supervisor. It owns no Rust handle, performs no I/O, and does not block a
   workflow scheduler.
 - A typed activation is revalidated with the canonical protocol encoder before
-  any execution state is touched. Sequence numbers, identifiers, payloads,
+  any execution state is touched, once per activation: the worker passes the
+  private translation result to `activate_translated` instead of translating
+  again. Sequence numbers, identifiers, payloads,
   timestamps, ordering, and closed-object invariants therefore have one
   validation path for JSON input and programmatic OCaml values.
 - A rejected activation job is side-effect free: malformed child-resolution
@@ -397,6 +659,22 @@ and bridge, read the [documentation guide](../README.md) first.
 - Exactly one dedicated owner Domain creates, uses, and closes the complete
   runtime/client/worker graph for an SDK instance. Individual native handles do
   not receive their own actors.
+- The owner Domain may also host companion system threads started through the
+  `Spawn_thread` request (`spawn_owner_thread`); the native worker's
+  activation watchdog is the only one (#1042). Such a thread never sees backend
+  state and reaches the graph only through ordinary mailbox requests from its
+  own thread. Joining the owner Domain waits for every thread on it, so a
+  companion thread must exit once shutdown is admitted; the watchdog exits as
+  soon as the worker begins its native release.
+- A graph attached to a shared runtime (#832) is still owned only by its own
+  supervisor; what is shared is a reference-counted Core (Tokio executor), not
+  mutable graph state. Core is destroyed exactly once, by the last of the
+  shared handle and its attached graphs to release it, so no release order
+  can free it under a live graph. Each attachment is one lease, released
+  exactly once after its graph's `runtime_close` returns (or immediately if
+  creation fails). `Runtime.shutdown` refuses with a typed defect while any
+  lease is outstanding and otherwise returns only after Core's threads are
+  gone.
 - Backend state never appears in a producer-facing operation or result. Typed
   GADT operations may expose ordinary copied values but cannot return a raw
   native handle.
@@ -411,11 +689,37 @@ and bridge, read the [documentation guide](../README.md) first.
   releases the client/Core graph. A result already queued for an abandoned
   ticket is discarded with its receiver; it cannot cause a second task join or
   a second native free.
-- Exact-run client waits retain their history future and pagination state
-  across bounded owner turns. The runtime admits at most 64 distinct pending
-  executions and retires each on a terminal result or error. Disconnect and
-  runtime shutdown cancel all retained futures before releasing Core; no
-  background wait task outlives the owner.
+- Client RPCs are submit-and-complete (#807). The owner Domain only
+  validates, encodes, and submits a request; Rust spawns one Tokio task per
+  call that owns a connection clone and publishes exactly one outcome into
+  that call's completion cell. The caller awaits the cell on its own Domain
+  through a runtime-free C stub with the OCaml lock released, so the owner
+  never waits for the network and a pending wait, query, or update poll
+  cannot delay any other request, including shutdown admission.
+- A completion cell has one owner (the process-wide call registry) and one
+  release path: the caller's terminal read, or disconnect/close of the
+  runtime that created it. Disconnect and close first close every pending
+  cell, waking its waiter with `Invalid_state` (the typed `Closed` error in
+  OCaml), then abort the tasks and join them before the connection and Core
+  are released; the GC fallback hands the aborted handles to the cleanup
+  thread. A task that panics or is dropped without an outcome settles its
+  cell through a guard, so no waiter is stranded. Tasks never call OCaml and
+  never touch the runtime graph.
+- Deadlines keep the #499 rule: a request whose deadline expired in the
+  mailbox is completed by the owner without reaching Rust, and a live
+  deadline is lowered to the remaining budget and enforced inside the task.
+- The runtime admits at most `max_pending_waits` distinct waited executions,
+  `max_pending_starts` distinct in-flight start request IDs, and
+  `max_in_flight_calls` submitted calls in total (plus at most
+  `max_pending_starts` outstanding tickets on the retained ticket path). The
+  defaults are 64, 64, and 4,096; a connection may configure other values,
+  validated on both sides of the bridge and fixed for its lifetime (#796).
+  Admission beyond a
+  bound returns `Resource_exhausted` without side effects and leaves the
+  client usable; it never reuses `Invalid_state`, which callers treat as a
+  closed graph. The retained synchronous wait path keeps its history futures
+  across bounded owner turns and is cancelled by disconnect and shutdown in
+  the same way.
 - A backend shutdown result, including `Error`, means the graph has been
   consumed or invalidated. A retryable operation must not masquerade as
   terminal shutdown while it still owns live resources.

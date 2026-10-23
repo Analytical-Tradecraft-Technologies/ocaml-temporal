@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/blob/master/docs/schemas/bridge/worker-config.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/master/docs/schemas/bridge/worker-config.schema.json",
   "title": "OCaml Temporal Core bridge workflow worker configuration",
-  "description": "Private, strict workflow-only worker configuration sent from the OCaml supervisor to Rust.",
+  "description": "Private, strict worker configuration sent from the OCaml supervisor to Rust.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -56,6 +56,17 @@
               "type": ["string", "null"],
               "enum": ["auto_upgrade", "pinned", null]
             }
+          },
+          "if": {
+            "properties": { "use_worker_versioning": { "const": true } }
+          },
+          "then": {
+            "properties": {
+              "default_versioning_behavior": { "enum": ["auto_upgrade", "pinned"] }
+            }
+          },
+          "else": {
+            "properties": { "default_versioning_behavior": { "const": null } }
           }
         }
       ]
@@ -63,13 +74,52 @@
     "max_cached_workflows": { "type": "integer", "minimum": 0, "maximum": 1000000 },
     "max_outstanding_workflow_tasks": { "type": "integer", "minimum": 1, "maximum": 1000000 },
     "max_concurrent_workflow_task_polls": { "type": "integer", "minimum": 1, "maximum": 1000000 },
-    "graceful_shutdown_timeout_ms": { "type": "integer", "minimum": 0, "maximum": 86400000 }
+    "graceful_shutdown_timeout_ms": { "type": "integer", "minimum": 0, "maximum": 86400000 },
+    "task_types": {
+      "description": "Task kinds the worker polls, derived from its registrations (#805). workflows enables workflow polling and in-process local activities; activities enables remote activity polling. At least one must be true. When omitted, both are polled; the OCaml encoder always sends it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workflows", "activities"],
+      "properties": {
+        "workflows": { "type": "boolean" },
+        "activities": { "type": "boolean" }
+      },
+      "not": {
+        "properties": {
+          "workflows": { "const": false },
+          "activities": { "const": false }
+        }
+      }
+    },
+    "tuning": {
+      "description": "Optional Core settings from the public worker options (#498). Every member is optional and an absent member keeps Core's default; the OCaml encoder omits the whole object when no member is set. Runtime validators also require default_heartbeat_throttle_interval_ms not to exceed max_heartbeat_throttle_interval_ms when both are present, autoscaling minimum <= initial <= maximum, autoscaling maximum to equal max_concurrent_workflow_task_polls (Core applies autoscaling bounds to each of the sticky and normal poll buffers, so the two-poller cache rule applies only without autoscaling), and max_worker_activities_per_second to be at least 1/86400 so Core's reciprocal poll interval fits a Duration. Activity slot counts are intentionally absent (#777).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workflow_task_poller_autoscaling": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minimum", "maximum", "initial"],
+          "properties": {
+            "minimum": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "maximum": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "initial": { "type": "integer", "minimum": 1, "maximum": 1000000 }
+          }
+        },
+        "sticky_queue_schedule_to_start_timeout_ms": { "type": "integer", "minimum": 1, "maximum": 86400000 },
+        "max_heartbeat_throttle_interval_ms": { "type": "integer", "minimum": 1, "maximum": 86400000 },
+        "default_heartbeat_throttle_interval_ms": { "type": "integer", "minimum": 1, "maximum": 86400000 },
+        "max_worker_activities_per_second": { "type": "number", "minimum": 0.000011574074074074073 },
+        "max_task_queue_activities_per_second": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    }
   },
   "allOf": [
     {
       "if": {
         "properties": {
-          "max_cached_workflows": { "minimum": 1 }
+          "max_cached_workflows": { "minimum": 1 },
+          "tuning": { "not": { "required": ["workflow_task_poller_autoscaling"] } }
         }
       },
       "then": {

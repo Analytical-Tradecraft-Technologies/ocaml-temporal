@@ -1,0 +1,107 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-09-20T09:39:55.585600216Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048597",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "task-failure.business-permanent"
+        },
+        "taskQueue": {
+          "name": "ocaml-task-failure-recovery",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "YmluYXJ5L251bGw="
+              }
+            }
+          ]
+        },
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "01a0be2f-c041-7925-97ba-5dc4d3798946",
+        "identity": "task-failure-client",
+        "firstExecutionRunId": "01a0be2f-c041-7925-97ba-5dc4d3798946",
+        "attempt": 1,
+        "firstWorkflowTaskBackoff": "0s",
+        "workflowId": "task-failure-business-permanent"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-09-20T09:39:55.585631382Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048598",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "ocaml-task-failure-recovery",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-09-20T09:39:55.591149049Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048603",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "task-failure-broken",
+        "requestId": "8af031e8-5ef5-40a7-87e3-6b8e50af0f9f",
+        "historySizeBytes": "332",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-09-20T09:39:55.634555299Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048613",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "task-failure-broken",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            2,
+            3,
+            1
+          ],
+          "sdkName": "temporal-rust",
+          "sdkVersion": "0.5.0"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-09-20T09:39:55.634580966Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_FAILED",
+      "taskId": "1048614",
+      "workflowExecutionFailedEventAttributes": {
+        "failure": {
+          "message": "intentional business failure",
+          "source": "ocaml",
+          "applicationFailureInfo": {
+            "type": "workflow",
+            "nonRetryable": true,
+            "details": {}
+          }
+        },
+        "retryState": "RETRY_STATE_RETRY_POLICY_NOT_SET",
+        "workflowTaskCompletedEventId": "4"
+      }
+    }
+  ]
+}

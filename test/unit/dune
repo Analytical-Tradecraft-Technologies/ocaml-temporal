@@ -1,10 +1,13 @@
 (tests
  (names
   test_codec
+  test_codec_json
+  test_duration
   test_definition
   test_error
   test_workflow_authoring
   test_client_worker
+  test_worker_options
   test_activity_retry_policy
   test_interactions
   test_condition
@@ -12,9 +15,38 @@
  (libraries temporal-sdk temporal_runtime))
 
 (test
+ (name test_worker_shutdown)
+ (libraries temporal-sdk threads unix))
+
+(test
  (name test_base_error)
+ (libraries temporal_base))
+
+(test
+ (name test_base_payload)
+ (libraries temporal_base))
+
+(test
+ (name test_ordered_registry)
  (libraries temporal_base))
 
 (test
  (name test_client_request_id)
  (libraries temporal_base unix))
+
+(test
+ (name test_process_identity)
+ (libraries temporal_base unix))
+
+(test
+ (name test_example_failures)
+ (libraries temporal-sdk temporal_sdk_examples_common))
+
+(test
+ (name test_testing)
+ (libraries temporal-sdk unix))
+
+; Metrics-export option validation and bridge document encoding (#500).
+(test
+ (name test_metrics_config)
+ (libraries temporal_base))

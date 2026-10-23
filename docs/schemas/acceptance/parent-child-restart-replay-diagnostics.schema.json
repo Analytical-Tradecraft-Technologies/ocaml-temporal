@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/acceptance/parent-child-restart-replay-diagnostics.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/acceptance/parent-child-restart-replay-diagnostics.schema.json",
   "title": "Parent-child restart-replay worker diagnostics",
   "description": "Payload-free observer records for one parent workflow and its child. Root parent and child identity objects bind the record stream to exact runs. Before source replacement the stream contains exactly the two generation-one initial records in role order; after replacement it preserves those records and appends exactly the two generation-two replay records in the same role order.",
   "type": "object",

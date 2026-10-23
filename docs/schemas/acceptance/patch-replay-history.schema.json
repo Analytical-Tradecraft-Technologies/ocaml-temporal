@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/acceptance/patch-replay-history.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/acceptance/patch-replay-history.schema.json",
   "title": "Normalized workflow-patch replay history",
   "description": "Payload-free projection of one Temporal history used by the workflow-patch lifecycle acceptance. The normalizer retains only execution identity, ordered event IDs and types, the durable Core patch marker including its deprecation state, and an ActivityTaskScheduled activity type. The shell validator enforces stage-specific ordering, expected marker state, and exact initial-to-terminal prefix equality.",
   "type": "object",

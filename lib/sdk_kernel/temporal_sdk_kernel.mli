@@ -13,6 +13,9 @@ module Bridge = Temporal_core_bridge.Native_bridge
 (** One-owner-Domain supervisor for the complete native resource graph. *)
 module Supervisor = Sdk_supervisor.Native
 
+(** Shareable Core runtime and its attachment leases (#832). *)
+module Shared_runtime = Sdk_shared_runtime
+
 (** Strict client control-protocol documents exchanged with the Rust bridge. *)
 module Client_protocol = Temporal_protocol.Client_protocol
 
@@ -46,8 +49,38 @@ module Native_worker_loop = Temporal_runtime.Native_worker_loop
 (** Closed retry and shutdown classification rules for the native loop. *)
 module Native_worker_policy = Temporal_runtime.Native_worker_policy
 
+(** SDK-side worker metrics recorded into the runtime's Core meter (#500). *)
+module Native_worker_metrics = Temporal_runtime.Native_worker_metrics
+
+(** Thread-granular execution-lane identity used by shutdown re-entrancy
+    checks. *)
+module Native_worker_owner = Temporal_runtime.Native_worker_owner
+
 (** Generic private observer selection scoped to one worker constructor. *)
 module Native_worker_observer = Temporal_runtime.Native_worker_observer
 
+(** Detection-only watchdog thread for workflow activations that do not
+    yield; the native worker hosts it on its supervisor Domain. *)
+module Native_worker_watchdog = Temporal_runtime.Native_worker_watchdog
+
+(** Idle pacing between native lane polls: joins an in-flight readiness wait
+    or backs off adaptively (#994). *)
+module Native_worker_idle = Temporal_runtime.Native_worker_idle
+
+(** Bounded worker shutdown orchestration over injected lane, drain, and
+    native-release operations (#495). *)
+module Native_worker_shutdown = Temporal_runtime.Native_worker_shutdown
+
 (** Callback representation underlying the public abstract future type. *)
 module Future = Temporal_future_kernel
+
+(** Per-run workflow runtime; exposed for its private interaction-handler
+    constructors, which the in-process test environment registers. *)
+module Execution = Temporal_runtime.Execution
+
+(** Deterministic in-process engine behind [Temporal.Testing]. *)
+module Test_environment = Temporal_runtime.Test_environment
+
+(** Shared strict JSON limits and canonical binary-payload wrappers, used by
+    [Temporal.Replay] to build the private replay-history document. *)
+module Control_protocol = Temporal_protocol.Control_protocol

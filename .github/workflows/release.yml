@@ -31,8 +31,13 @@ jobs:
         run: |
           set -euo pipefail
           test "$RELEASE_REF" = refs/heads/master
-          git check-ref-format "refs/tags/$RELEASE_TAG"
+          # The descriptive tag check runs first so a "~" spelling gets its
+          # hyphen guidance; Git's ref-format check exits silently.
           sh scripts/check-release-tag.sh . "$RELEASE_TAG"
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          # The reviewed notes for this tag (docs/releases/<tag>.md) must be
+          # committed before anything is built; the publish job uses them.
+          sh scripts/check-release-notes.sh . "$RELEASE_TAG"
           make release-preflight
           sh scripts/check-release-tag-commit.sh "$RELEASE_TAG" "$GITHUB_SHA"
 
@@ -47,12 +52,123 @@ jobs:
     needs: validate
     uses: ./.github/workflows/release-preflight.yml
 
+  # Produces the exact source archive and licence notices the release
+  # publishes. Both are handed to the sandbox check and to publication as one
+  # artifact, so the bytes users download are the bytes that passed (#778).
+  source-archive:
+    name: Create the release source archive
+    needs: validate
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    outputs:
+      sha256: ${{ steps.archive.outputs.sha256 }}
+    steps:
+      - name: Check out the exact requested commit
+        uses: actions/checkout@v7
+      # Every archive redistributes the statically linked Rust graph, so its
+      # licence texts are copied from the locked package sources that
+      # `cargo metadata --locked` downloads, or for crates that publish none
+      # from the reviewed upstream texts in scripts/license-texts/crates.
+      # Generation fails if any package lacks a licence text or any text has a
+      # placeholder copyright line; the audit then proves the file lists every
+      # locked package before packaging embeds it in each archive.
+      - name: Generate third-party licence notices
+        run: |
+          set -euo pipefail
+          mkdir -p _build/release-notices
+          cargo metadata --manifest-path rust/Cargo.toml --locked --format-version 1 \
+            > _build/release-notices/cargo-metadata.json
+          python3 scripts/generate-third-party-notices.py \
+            --metadata _build/release-notices/cargo-metadata.json \
+            --project-license LICENSE \
+            --output _build/release-notices/THIRD-PARTY-NOTICES.txt
+          python3 scripts/generate-third-party-notices.py \
+            --metadata _build/release-notices/cargo-metadata.json \
+            --project-license LICENSE \
+            --audit _build/release-notices/THIRD-PARTY-NOTICES.txt
+      # The source archive vendors the locked Cargo graph so opam can build it
+      # inside its network-denying build sandbox (#778).
+      - name: Create the source archive
+        id: archive
+        run: |
+          set -euo pipefail
+          mkdir -p _build/release-source
+          cp _build/release-notices/THIRD-PARTY-NOTICES.txt _build/release-source/
+          archive="_build/release-source/ocaml-temporal-$RELEASE_TAG-source.tar.gz"
+          sh scripts/create-source-archive.sh . "$RELEASE_TAG" "$archive" \
+            _build/release-notices/THIRD-PARTY-NOTICES.txt
+          digest=$(sha256sum "$archive" | cut -d ' ' -f 1)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+      - name: Retain the source archive and notices for checking and publication
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-source
+          path: _build/release-source/
+          if-no-files-found: error
+          retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
+          compression-level: 0
+
+  # Builds the archive that will be published, byte for byte, inside an opam
+  # build sandbox; publication waits for it. See
+  # scripts/check-opam-source-archive.sh for the sandbox and probe rules.
+  source-archive-check:
+    name: Sandboxed opam build of the release source archive / macOS ARM64
+    needs: source-archive
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RUSTUP_TOOLCHAIN: 1.99.1-aarch64-apple-darwin
+      ARCHIVE_SHA256: ${{ needs.source-archive.outputs.sha256 }}
+    steps:
+      - name: Check out the exact requested commit
+        uses: actions/checkout@v7
+      - name: Set up the exact OCaml compiler
+        uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
+        with:
+          ocaml-compiler: "5.5.1"
+      - name: Set up pinned Rust toolchain
+        shell: bash
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Install Protocol Buffers compiler on macOS
+        run: brew install protobuf
+      - name: Install and verify locked OCaml dependencies
+        shell: bash
+        run: sh scripts/opam-locked-deps.sh install --assume-depexts
+      - name: Download the release source archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-source
+          path: _build/release-source
+      - name: Build the published archive inside the opam build sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="_build/release-source/ocaml-temporal-$RELEASE_TAG-source.tar.gz"
+          test "$(shasum -a 256 "$archive" | cut -d ' ' -f 1)" = "$ARCHIVE_SHA256"
+          opam exec -- sh scripts/check-opam-source-archive.sh "$archive" "$RUNNER_TEMP/opam-source-check"
+      # A downstream user's view of the same build: install it into a fresh
+      # prefix, as opam install does, and build and run the archive's
+      # installed-package consumer fixture against that prefix only, outside
+      # the checkout. See scripts/check-source-archive-consumer.sh.
+      - name: Build a consumer against the package installed from the archive
+        shell: bash
+        run: opam exec -- sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"
+
   publish:
     name: Publish the tested release
-    needs: [build, metadata]
+    needs: [build, metadata, source-archive, source-archive-check]
     runs-on: ubuntu-24.04
+    # The contents permission creates the release. The id-token permission
+    # lets the attestation step mint the OIDC token that Sigstore exchanges for
+    # a short-lived signing certificate, and the attestations permission
+    # stores the signed attestations in the repository. No other job holds the
+    # last two.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       RELEASE_TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
@@ -60,21 +176,31 @@ jobs:
       - name: Check out the exact tested commit
         uses: actions/checkout@v7
       - name: Download all four tested bridge bundles
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: rust-bridge-*
           path: _build/release-bundles
       - name: Download the audited Cargo SBOM
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-cargo-sbom
           path: _build/release-assets
       - name: Download all sixteen tested OCaml libraries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: ocaml-sdk-*
           path: _build/release-ocaml-bundles
+      # The audited notices and the source archive come from the
+      # source-archive job; the archive is the one source-archive-check built
+      # inside the opam sandbox.
+      - name: Download the checked source archive and audited notices
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-source
+          path: _build/release-source
       - name: Assemble and verify release assets
+        env:
+          ARCHIVE_SHA256: ${{ needs.source-archive.outputs.sha256 }}
         run: |
           set -euo pipefail
           sh scripts/check-release-tag.sh . "$RELEASE_TAG"
@@ -82,18 +208,37 @@ jobs:
             --bundles _build/release-bundles \
             --ocaml-bundles _build/release-ocaml-bundles \
             --output _build/release-assets \
-            --tag "$RELEASE_TAG" --commit "$GITHUB_SHA"
-          git archive --format=tar --prefix="ocaml-temporal-${RELEASE_TAG#v}/" HEAD \
-            | gzip -n > "_build/release-assets/ocaml-temporal-$RELEASE_TAG-source.tar.gz"
+            --tag "$RELEASE_TAG" --commit "$GITHUB_SHA" \
+            --license LICENSE \
+            --notices _build/release-source/THIRD-PARTY-NOTICES.txt
+          # Publish exactly the archive that passed the sandboxed opam build
+          # (#778); a digest mismatch means it is not that file.
+          archive="ocaml-temporal-$RELEASE_TAG-source.tar.gz"
+          test "$(sha256sum "_build/release-source/$archive" | cut -d ' ' -f 1)" = "$ARCHIVE_SHA256"
+          cp "_build/release-source/$archive" "_build/release-assets/$archive"
           python3 scripts/generate-cargo-sbom.py \
             --audit _build/release-assets/ocaml-temporal-cargo.spdx.json
           (
             cd _build/release-assets
-            sha256sum ./*.tar.gz ./*.json > SHA256SUMS
+            sha256sum ./*.tar.gz ./*.json ./*.txt > SHA256SUMS
             sha256sum --check SHA256SUMS
           )
-          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
-          Experimental OCaml Temporal SDK, built and tested from commit $GITHUB_SHA.
+          # Match the release preflight maturity rule: prereleases and 0.x
+          # versions are experimental; a stable version is not labelled so.
+          case "$RELEASE_TAG" in
+            *-* | v0.*) release_label="Experimental OCaml Temporal SDK" ;;
+            *) release_label="OCaml Temporal SDK" ;;
+          esac
+          # The reviewed, versioned notes come first: changes, breaking
+          # changes and migration, and residual limits. The generated asset
+          # description follows them.
+          sh scripts/check-release-notes.sh . "$RELEASE_TAG"
+          cp "docs/releases/$RELEASE_TAG.md" "$RUNNER_TEMP/release-notes.md"
+          cat >> "$RUNNER_TEMP/release-notes.md" <<EOF
+
+          ## Release assets
+
+          $release_label, built and tested from commit $GITHUB_SHA.
 
           Includes optimized Rust bridge libraries for Linux x64 and ARM64
           (Debian 12/glibc), macOS ARM64, and Windows x64 GNU/MinGW.
@@ -103,15 +248,29 @@ jobs:
           Local builds from source remain supported.
 
           See manifest.json for bridge identities and SHA256SUMS for asset digests.
+          Every archive contains LICENSE and THIRD-PARTY-NOTICES.txt, the licence
+          texts of the statically linked Rust packages; the notices are also
+          published as a separate asset.
           The SPDX document covers the Rust dependency graph; it is not a full
           application or OCaml dependency SBOM.
           EOF
+      # Signs SLSA build provenance for every file that the next step uploads,
+      # and nothing else: the source archive, the bridge and SDK archives,
+      # manifest.json, the Cargo SBOM, THIRD-PARTY-NOTICES.txt and SHA256SUMS.
+      # The assets are complete and checksummed above and are not modified
+      # afterwards, so each attested digest is the digest users download. It
+      # runs before the draft exists, so a failure here publishes nothing.
+      # Consumers verify with `gh attestation verify` (release checklist).
+      - name: Attest build provenance for the release assets
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: _build/release-assets/*
       - name: Publish the complete release from the approved tag
         run: |
           set -euo pipefail
           flags=()
           case "$RELEASE_TAG" in
-            *-*|*~*) flags=(--prerelease) ;;
+            *-*) flags=(--prerelease) ;;
           esac
           sh scripts/check-release-tag-commit.sh "$RELEASE_TAG" "$GITHUB_SHA"
           # Assets are uploaded to a draft before anything is published.

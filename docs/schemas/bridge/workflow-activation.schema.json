@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/workflow-activation.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/workflow-activation.schema.json",
   "title": "Workflow activation",
   "description": "A closed semantic activation sent from the Rust Temporal Core bridge to the private OCaml workflow runtime.",
   "type": "object",
@@ -81,10 +81,11 @@
       "type": "object", "additionalProperties": false,
       "required": ["priority_key", "fairness_key", "fairness_weight_bits"],
       "properties": {
-        "priority_key": {"type": "integer", "minimum": 0, "maximum": 2147483647},
-        "fairness_key": {"type": "string", "maxLength": 64, "pattern": "^[^\\u0000]*$"},
+        "priority_key": {"type": "integer", "minimum": -2147483648, "maximum": 2147483647},
+        "fairness_key": {"type": "string", "maxLength": 64},
         "fairness_weight_bits": {"$ref": "#/$defs/u32"}
-      }
+      },
+      "description": "The priority recorded in the start event, carried exactly as Temporal accepted it. The server clamps fairness weights instead of rejecting them, so any f32 bit pattern is represented; only the 64-byte fairness-key bound is enforced."
     },
     "retry_policy": {
       "type": "object",
@@ -95,24 +96,27 @@
         "backoff_coefficient_bits": {
           "type": "string",
           "pattern": "^(0|[1-9][0-9]{0,19})$",
-          "description": "Canonical unsigned 64-bit decimal containing the IEEE-754 bits of a finite backoff coefficient at least 1.0. Runtime validation also enforces the exact unsigned range and floating-point value."
+          "description": "Canonical unsigned 64-bit decimal containing the IEEE-754 bits of the recorded backoff coefficient. Temporal skips policy validation when maximum_attempts is 1, so the value is not range-checked inbound."
         },
         "maximum_interval": {"$ref": "#/$defs/duration"},
         "maximum_attempts": {"type": "integer", "minimum": 0, "maximum": 2147483647},
         "non_retryable_error_types": {
           "type": "array",
           "maxItems": 201326592,
-          "items": {"$ref": "#/$defs/identifier"}
+          "items": {"type": "string", "maxLength": 65536}
         }
       },
-      "description": "The effective retry policy Core applied to this workflow execution."
+      "description": "The effective retry policy Core applied to this workflow execution, as recorded. An absent or negative interval is normalized to zero."
     },
     "continuation": {
       "type": "object",
       "additionalProperties": false,
       "required": ["continued_from_execution_run_id", "initiator", "continued_failure", "last_completion_result"],
       "properties": {
-        "continued_from_execution_run_id": {"$ref": "#/$defs/identifier"},
+        "continued_from_execution_run_id": {
+          "oneOf": [{"$ref": "#/$defs/identifier"}, {"const": ""}],
+          "description": "The predecessor run, or empty for a run started by a Temporal Schedule that carries the previous action's result or failure."
+        },
         "initiator": {"enum": ["unspecified", "workflow", "retry", "cron_schedule"]},
         "continued_failure": {"oneOf": [{"$ref": "#/$defs/failure"}, {"type": "null"}]},
         "last_completion_result": {"oneOf": [{"type": "array", "maxItems": 201326592, "items": {"$ref": "#/$defs/payload"}}, {"type": "null"}]}

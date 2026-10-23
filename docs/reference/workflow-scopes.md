@@ -63,10 +63,13 @@ let await_until deadline operation =
 ```
 
 `Temporal.Scope.await` first checks ownership and whether cancellation has
-already been requested. If both the operation and the private scope signal
-are ready, the operation wins because it is registered first. Otherwise the
-first deterministic scheduler completion wins. A future error passes through
-unchanged; a scope signal produces an error whose category is `Cancelled`.
+already been requested. If the scope is already cancelled, `await` returns a
+`Cancelled` error without consulting the operation, even when the operation
+has already completed. Otherwise it waits, and the first deterministic
+scheduler completion wins. `Scope.cancel` records the cancelled state and
+resolves the private scope signal together, so the signal can never already be
+ready when `await` starts its race. A future error passes through unchanged; a
+scope signal produces an error whose category is `Cancelled`.
 Registered operation hooks run as part of `Scope.cancel`; the first hook error
 is returned after all hooks have been attempted. The future must belong to the
 same workflow execution as the scope.
@@ -82,6 +85,11 @@ The call must run during the owning workflow scheduler's active turn. A
 successful cancellation is idempotent, and it wakes scope waiters. A
 cancellation request that arrives after an operation has already completed
 does not rewrite that result; its hook is simply not registered as live work.
+The completed result stays available through `Temporal.Future.await` or
+`Temporal.Future.peek` on the operation's future, but a later
+`Temporal.Scope.await` on the cancelled scope returns `Cancelled` instead of
+the value. Read a result that completed before cancellation from the future
+itself rather than through the cancelled scope.
 
 ## Completed registrations
 
@@ -112,15 +120,19 @@ eviction. This establishes language-layer retention, not live server behavior.
 - `Temporal.Scope.create ()` succeeds only while a workflow execution is active
   on the current Domain. Outside workflow execution it returns a typed defect.
 - `Temporal.Scope.cancel`, `is_cancelled`, `check`, and `await` are all
-  owner-checked. They must run on the scheduler that created the scope while
-  that scheduler is processing workflow callbacks.
-- Calling a scope operation from another Domain, between scheduler runs, or
-  after workflow teardown returns a typed ownership defect. A retained scope
-  is not a cross-Domain synchronization primitive.
+  owner-checked. Cancellation and awaiting must run while the scheduler that
+  created the scope is processing workflow callbacks. The pure `is_cancelled`
+  and `check` reads may also run in a synchronous query for the same live
+  execution while its scheduler is paused.
+- Calling a scope operation from another Domain, outside an owning scheduler
+  turn or same-execution query, or after workflow teardown returns a typed
+  ownership defect. A retained scope is not a cross-Domain synchronization
+  primitive.
 - `Temporal.Scope.check` is a non-waiting guard: it returns `Ok ()` for an
   active scope and a typed `Cancelled` error after cancellation.
-- `Temporal.Scope.is_cancelled` reports the state without scheduling work, but
-  it has the same ownership checks as cancellation and awaiting.
+- `Temporal.Scope.is_cancelled` reports the state without scheduling work.
+  Like `check`, it may read through the query marker but cannot mutate or
+  resume workflow fibers.
 - Scope cancellation itself is a private deterministic signal. Only activity
   and child operations started with `~scope` register hooks that enqueue the
   corresponding server-cancellation command. Timer futures and unscoped
@@ -148,7 +160,7 @@ invoke scope cancellation, so it is not direct live evidence for `~scope`.
 
 A successful hook buffers a command; it does not wait for a server terminal
 outcome or preempt an OCaml activity callback. Activity task cancellation and
-worker shutdown use separate lifecycle paths. The public activity context has
-no cooperative callback cancellation probe at the audited baseline, and the
-serialized adapter cannot drain a cancellation update while its callback is
-still executing. See [native activity cancellation](native-activity-execution.md#cancellation).
+worker shutdown use separate lifecycle paths. A running callback observes the
+resulting activity cancellation only cooperatively, at its next heartbeat
+(`Temporal.Activity.Context.cancellation`, #494). See
+[native activity cancellation](native-activity-execution.md#cooperative-cancellation-of-a-running-callback).

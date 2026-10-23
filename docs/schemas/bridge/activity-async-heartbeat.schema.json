@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/activity-async-heartbeat.schema.json",
+  "title": "Asynchronous activity heartbeat",
+  "description": "A non-terminal progress record for an activity handed off with WillCompleteAsync, submitted as the OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_HEARTBEAT client call (#1025). It carries the attempt's heartbeat timeout, from which the bridge derives the per-token throttle interval; null (or a zero duration) selects the worker's default interval.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_token", "details", "heartbeat_timeout"],
+  "properties": {
+    "task_token": {"$ref": "activity-heartbeat.schema.json#/$defs/task_token"},
+    "details": {
+      "type": "array",
+      "maxItems": 201326592,
+      "items": {"$ref": "temporal-payload.schema.json"}
+    },
+    "heartbeat_timeout": {
+      "oneOf": [{"$ref": "activity-task.schema.json#/$defs/duration"}, {"type": "null"}]
+    }
+  }
+}

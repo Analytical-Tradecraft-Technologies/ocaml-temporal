@@ -53,6 +53,30 @@ let () =
   (match Temporal.Future.await (Temporal.Activity.start greeting "Ada") with
   | Error error -> assert (Temporal.Error.kind error = "defect")
   | Ok _ -> failwith "activity started outside a workflow");
+  (* Zero close timeouts are option errors and are reported before the
+     workflow-context check, so they are observable here (#812). *)
+  let zero = Temporal.Duration.of_ms 0L in
+  let expect_zero_rejected label future =
+    match Temporal.Future.await future with
+    | Error error ->
+        assert (Temporal.Error.kind error = "defect");
+        if not (String.ends_with ~suffix:"must be positive" (Temporal.Error.message error))
+        then failwith (label ^ " reported the wrong defect")
+    | Ok _ -> failwith (label ^ " accepted a zero close timeout")
+  in
+  expect_zero_rejected "schedule-to-close"
+    (Temporal.Activity.start ~schedule_to_close_timeout:zero greeting "Ada");
+  expect_zero_rejected "start-to-close"
+    (Temporal.Activity.start ~start_to_close_timeout:zero greeting "Ada");
+  expect_zero_rejected "local start-to-close"
+    (Temporal.Activity.start_local ~start_to_close_timeout:zero greeting "Ada");
+  (* protobuf allows the maximum second count plus a fractional second. *)
+  (match Temporal.Duration.of_ms 315_576_000_001_000L with
+  | _ -> failwith "duration above the protobuf maximum was accepted"
+  | exception Invalid_argument _ -> ());
+  assert (
+    Temporal.Duration.to_ms (Temporal.Duration.of_ms 315_576_000_000_999L)
+    = 315_576_000_000_999L);
   match Temporal.Workflow.sleep (Temporal.Duration.of_ms 1L) with
   | Error error -> assert (Temporal.Error.kind error = "defect")
   | Ok () -> failwith "workflow slept outside an execution"

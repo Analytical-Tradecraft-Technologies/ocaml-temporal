@@ -17,16 +17,33 @@ boundary honestly:
 
 | Target | What it is useful for today |
 | --- | --- |
-| `mock://...` | Fast deterministic unit tests for client/worker registration and dispatch. The pure runtime tests also exercise timers, activities, child scheduling, replay, cancellation, and future combinators without a server. |
+| `Temporal.Testing` | Unit tests of workflow logic: runs registered workflows, activities (real or stubbed), timers, child workflows, signals, queries, updates, and continue-as-new in-process with a time-skipping virtual clock. See [Test workflows in-process](#test-workflows-in-process). |
+| `mock://...` | Fast in-memory checks of client and worker plumbing: request validation, registration, codecs, and handle lifecycle. It is **not** a workflow test environment; see below. |
 | `http://...` or `https://...` | The OCaml-owned native client/worker path backed by Rust Temporal Core. The current native command slice handles activity, timer, terminal, cancellation, cache, and two-stage child-resolution paths. It is covered by focused bridge and adapter tests. |
 | Live Compose acceptance | Real PostgreSQL and Temporal Server validation with two separate OCaml binaries: a public worker and a public client driver. It asserts a fan-out activity result, a timer-then-activity result, and a parent awaiting a timer-owning child workflow. |
 
-The first two rows are different test boundaries, not different workflow
-languages. The same typed definitions and direct-style functions are used in
-both; `mock://` keeps tests local, while an HTTP(S) target uses the native
-OCaml/Rust bridge. The live Compose target proves the listed success paths
-through a real Temporal Server; it does not yet cover every failure, recovery,
-or child-workflow scenario.
+`mock://` is not a workflow test environment. A mock client records each start
+and `Temporal.Client.wait` echoes the encoded start input back as the output,
+without running any workflow; it returns `Completed` only when the workflow's
+output codec can decode that echoed input, and a codec error otherwise. A mock worker dispatches one
+synthetic task per registered definition with an empty `binary/null` payload,
+unrelated to anything a mock client started. If the implementation's input
+codec accepts that payload (for example `Codec.unit`), the worker calls the
+implementation, so its side effects do run, but outside a workflow context: `Activity.start`, `Workflow.sleep`, `Scope.create`,
+and similar operations return an "outside a workflow" defect (`Workflow.patched`
+and `Workflow.upsert_search_attributes` raise `Invalid_argument`), and a
+`Codec.string` input fails to decode. Queries and updates against a mock
+client return typed errors. A `mock://` test that appears to pass therefore
+says nothing about workflow logic.
+
+To unit-test workflow code, use `Temporal.Testing`, described in [Test
+workflows in-process](#test-workflows-in-process): it runs the same workflow
+runtime as a native worker without a server. For end-to-end confidence, run a
+worker with an `http://` or `https://` target against a real Temporal Server,
+such as a local development server or the repository's PostgreSQL Compose
+stack (`make test-temporal-integration`). The live Compose target proves the
+listed paths through a real Temporal Server; it does not yet cover every
+failure, recovery, or child-workflow scenario.
 
 ## The direct-style model
 
@@ -143,7 +160,7 @@ lease retirement. The live Compose fixture now also covers one parent calling
 child's durable timer. The live Compose fixture also covers propagated child
 failure, child cancellation, child retry, and duplicate-ID child-start failure;
 the complete [PR #351
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013) additionally
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29434016013) additionally
 verifies exact parent and child replay through worker replacement. Broader
 child failure recovery remains a separate acceptance scenario.
 
@@ -157,7 +174,9 @@ let normalize name = String.trim name
 let greeting input =
   let name = normalize input in
   if String.equal name "" then
-    Error (Temporal.Error.defect ~message:"name must not be empty")
+    Error
+      (Temporal.Error.make ~category:`Workflow ~non_retryable:true
+         ~message:"name must not be empty" ())
   else
     Ok ("Hello, " ^ name)
 
@@ -178,14 +197,70 @@ implementation, so it cannot be registered in `Temporal.Worker.create`.
 `result` values; it does not introduce a second effect system.
 
 The function above returns an `Error.t` value instead of raising an exception.
+Its `Workflow` category makes the empty name a deliberate business failure:
+the workflow execution fails and `Temporal.Client.wait` returns its `Failed`
+outcome. Do not use
+`Error.defect` for input validation. A propagated `Defect`, `Bridge`, or
+`Codec` error fails only the current workflow task, which Temporal retries
+while the run stays open so that corrected code can replay it. See
+[Workflow task and execution failures](../reference/workflow-failures.md).
 
-## Update indexed search attributes
+That is the normal way to report an expected workflow failure. Pattern-match
+when the caller needs to choose a recovery path, or use `let*` when the error
+should finish the workflow:
+
+```ocaml
+let greet_or_explain input =
+  match greeting input with
+  | Ok value -> Ok value
+  | Error error ->
+      Ok ("The greeting could not be created: " ^ Temporal.Error.message error)
+```
+
+Exceptions are reserved for programmer defects and broken internal invariants.
+The worker boundary catches an unexpected exception and reports a structured
+failure; workflow code should not use exceptions as its ordinary branch or
+retry mechanism. In activity code, an exception escaping the callback becomes
+a **non-retryable** application failure of type `ocaml_exception`: the retry
+policy does not apply, so the first raise fails the activity. Catch exceptions
+from libraries that raise on transient conditions (for example
+`Unix.Unix_error` or `Sys_error`) and return a retryable `Error` instead. The
+failure includes the OCaml backtrace when `Printexc.record_backtrace` is on.
+
+Workflow code must be deterministic during replay. Temporal may run the same
+function again from its recorded history, so a different decision on the
+second run would produce a different workflow. In workflow code, prefer pure
+OCaml values and SDK operations:
+
+| Safe in a workflow | Put it in an activity (or wait for a replay-safe SDK API) |
+| --- | --- |
+| String/list calculations and immutable data | Network calls, filesystem access, or subprocesses |
+| `Activity.start`, `Child_workflow.start`, timers, and future combinators | `Unix.gettimeofday`, `Random`, or another unrecorded clock/random source |
+| IDs derived from workflow input and explicit constants | Reading mutable process-global state or environment to choose a command |
+| Iteration over an ordered list | Iteration over a hash table or other unordered collection when order affects commands |
+
+Activities are the place for external work such as calling an LLM. The
+activity result is recorded by Temporal, so replay can use that recorded result
+without calling the external service again.
+
+### Update indexed search attributes
 
 Workflows can publish indexed search attributes by emitting one deterministic
-merge command. The values are ordinary `Temporal.Payload.t` values, so the
-same codecs used for activity and workflow inputs can be reused. Keys must be
-unique, non-empty, valid UTF-8 strings no longer than 65,536 bytes; invalid
-keys are programmer errors and are rejected before the command is buffered.
+merge command. The values are ordinary `Temporal.Payload.t` values, but
+Temporal Server decodes them itself with its default converter rather than
+through the worker's codecs. Each value must be a `json/plain` encoding of the
+attribute's registered type, such as the output of `Temporal.Codec.string`,
+`Temporal.Codec.int`, or `Temporal.Codec.bool`. A `binary/null` payload, such
+as `Temporal.Codec.option` encoding `None`, removes the key. A custom codec made
+with `~encoding:"json/plain"` that emits valid JSON of the registered type is
+accepted like a built-in one. Any other encoding, such as
+`Temporal.Codec.bytes` (`binary/plain`) or a custom encoding name, is rejected
+by the server with `BAD_SEARCH_ATTRIBUTES`; that fails the workflow task on every retry until
+the workflow code is corrected. Keys must be unique, non-empty, valid UTF-8
+strings no longer than 65,536 bytes; invalid keys are programmer errors and are
+rejected before the command is buffered. Upserting an empty list is a no-op and
+emits no command, so a filtered list of changed attributes can be passed
+directly.
 
 ```ocaml
 let classify_workflow () =
@@ -204,38 +279,6 @@ process-global state, which keeps replay deterministic. The current release
 has focused OCaml and Rust conversion coverage; a live visibility acceptance
 scenario is still tracked separately in the [feature coverage
 matrix](../reference/feature-coverage.md).
-That is the normal way to report an expected workflow failure. Pattern-match
-when the caller needs to choose a recovery path, or use `let*` when the error
-should finish the workflow:
-
-```ocaml
-let greet_or_explain input =
-  match greeting input with
-  | Ok value -> Ok value
-  | Error error ->
-      Ok ("The greeting could not be created: " ^ Temporal.Error.message error)
-```
-
-Exceptions are reserved for programmer defects and broken internal invariants.
-The worker boundary catches an unexpected exception and reports a structured
-failure; workflow code should not use exceptions as its ordinary branch or
-retry mechanism.
-
-Workflow code must be deterministic during replay. Temporal may run the same
-function again from its recorded history, so a different decision on the
-second run would produce a different workflow. In workflow code, prefer pure
-OCaml values and SDK operations:
-
-| Safe in a workflow | Put it in an activity (or wait for a replay-safe SDK API) |
-| --- | --- |
-| String/list calculations and immutable data | Network calls, filesystem access, or subprocesses |
-| `Activity.start`, `Child_workflow.start`, timers, and future combinators | `Unix.gettimeofday`, `Random`, or another unrecorded clock/random source |
-| IDs derived from workflow input and explicit constants | Reading mutable process-global state or environment to choose a command |
-| Iteration over an ordered list | Iteration over a hash table or other unordered collection when order affects commands |
-
-Activities are the place for external work such as calling an LLM. The
-activity result is recorded by Temporal, so replay can use that recorded result
-without calling the external service again.
 
 ### Introduce a new branch with a patch marker
 
@@ -271,7 +314,13 @@ Temporal stores values as payloads: bytes plus metadata naming the encoding.
 Temporal does not require JSON and does not inspect the payload body. The
 built-in codecs are:
 
-- `Temporal.Codec.string`, using the interoperable `json/plain` encoding;
+- `Temporal.Codec.string`, `int`, `int64`, `bool`, and `float`, using the
+  interoperable `json/plain` encoding (one JSON value per payload, as the
+  default data converters of the other Temporal SDKs write it);
+- `Temporal.Codec.json` for an arbitrary `Yojson.Safe.t` document, and
+  `Temporal.Codec.json_conv ~to_json ~of_json` for application types such as
+  records, lists, or pairs that convert to and from `Yojson.Safe.t`, both also
+  `json/plain`;
 - `Temporal.Codec.bytes`, using `binary/plain`;
 - `Temporal.Codec.unit`, using `binary/null`; and
 - `Temporal.Codec.option codec`, which uses the nested codec for `Some` and
@@ -285,7 +334,11 @@ built-in codecs are:
 value that was encoded. For every option type that another-language SDK can
 represent — `string option`, `int option`, and so on — this is also the fully
 interoperable representation (`None` is the standard `binary/null` nil; `Some v`
-is the inner codec's own encoding). The private `binary/x-ocaml-optional`
+is the inner codec's own encoding). As an input, `None` is sent as one
+`binary/null` argument, as the other SDKs send a nil value, so a Python
+activity declared `def lookup(customer_id: Optional[str])` receives `None`.
+Only `Codec.unit` inputs are sent with no argument payloads, matching a
+handler that takes no parameters. The private `binary/x-ocaml-optional`
 envelope appears only for `unit option` and nested `option`, types that have no
 counterpart in most other SDKs; a non-OCaml worker or client that received one
 would report an unknown-encoding error rather than silently reading it as `None`.
@@ -297,6 +350,40 @@ present-but-empty value is indistinguishable from absent — do not reach for
 lets you choose the encoding name and byte layout the non-OCaml counterpart
 expects. Keeping the collapse out of `Codec.option` means the default anyone
 picks stays round-trip-safe.
+
+The JSON codecs encode strict standard JSON and decode strictly, returning a
+typed codec error rather than raising:
+
+- `int` accepts only JSON integer literals (no fraction or exponent) within the
+  native OCaml range, which is 63-bit on 64-bit platforms. A value from another
+  SDK above `2^62 - 1` is rejected rather than truncated; use `int64` for the
+  full signed 64-bit range.
+- `float` refuses to encode `nan`, `infinity`, and `neg_infinity`, because JSON
+  cannot represent them, and rejects the non-standard `NaN`/`Infinity` tokens
+  and overflowing literals such as `1e400` on decode. It accepts integer
+  literals, which other SDKs write for integral floats. Finite floats round-trip
+  exactly, including `-0.0`.
+- `json` and `json_conv` validate every value: floats must be finite, strings
+  and object keys must be valid UTF-8, and `` `Intlit `` text must be a JSON
+  integer. `json_conv`'s decoder sees only a validated value.
+
+For example, a record codec built from conversion functions:
+
+```ocaml
+type order = { id : string; quantity : int }
+
+let order =
+  Temporal.Codec.json_conv
+    ~to_json:(fun { id; quantity } ->
+      `Assoc [ ("id", `String id); ("quantity", `Int quantity) ])
+    ~of_json:(function
+      | `Assoc [ ("id", `String id); ("quantity", `Int quantity) ] ->
+          Ok { id; quantity }
+      | _ -> Error (Temporal.Error.codec ~message:"expected an order"))
+```
+
+Functions generated by a Yojson deriver can be passed the same way after
+mapping their error to `Temporal.Error.codec`.
 
 Payload metadata is object-like on the Temporal wire, so each metadata name
 must occur at most once. The public and private codecs reject duplicate names
@@ -375,6 +462,17 @@ ordinary contextual activity value: it is intentionally invalid after the
 callback returns.
 
 ```ocaml
+(* Retries a handle call while its error is retryable: the worker may not have
+   accepted the handoff yet, or the RPC outcome may be uncertain. The budget
+   bounds the loop; a real completer would usually back off further. *)
+let rec deliver ?(attempts = 100) submit =
+  match submit () with
+  | Error error
+    when attempts > 1 && not (Temporal.Error.view error).non_retryable ->
+      Thread.delay 0.05;
+      deliver ~attempts:(attempts - 1) submit
+  | result -> result
+
 let delayed_summary =
   Temporal.Activity.define_async
     ~name:"delayed_summary"
@@ -383,24 +481,93 @@ let delayed_summary =
     (fun context document ->
       let handle = Temporal.Activity.Async_context.handle context in
       ignore
-        (Domain.spawn (fun () ->
+        (Thread.create
+           (fun () ->
              let value = String.trim document in
-             match Temporal.Activity.Async_handle.complete handle value with
+             match
+               deliver (fun () ->
+                   Temporal.Activity.Async_handle.complete handle value)
+             with
              | Ok () -> ()
              | Error error ->
                  Logs.err (fun report ->
                      report "delayed_summary completion failed: %s"
-                       (Temporal.Error.message error))));
+                       (Temporal.Error.message error)))
+           ());
       Temporal.Activity.Will_complete_async handle)
 ```
+
+The completer usually starts before the worker has accepted the
+`Will_complete_async` handoff, and a call made then returns a retryable error
+without sending anything, so it must retry rather than give up after one
+attempt. The example uses a system thread (the `threads.posix` library)
+rather than a `Domain` per activity, because the number of Domains is small
+and fixed; in production, hand the work to an existing pool or event loop.
 
 The handle is tied to one activity attempt and one output codec. A completion
 or failure can be submitted once; heartbeat calls keep the lease non-terminal.
 The worker first acknowledges the asynchronous handoff to Temporal Core, then
-the retained handle uses the namespace-bound client operation. If that native
-operation reports a retryable transport failure, the private adapter retains
-the byte-identical request for retry. A terminal bridge error closes the handle
-so a later call fails predictably instead of leaving worker shutdown blocked.
+the retained handle uses the namespace-bound client operation. If a
+`complete`, `fail`, or `cancel` hits a transient failure (for example the
+server is unavailable or the deadline expires), the call returns a retryable
+error and the handle stays live; retry with the identical call until it
+receives a definitive answer. If the server definitively rejects the request
+(for example a `cancel` when no cancellation was requested), the handle also
+stays live and you may call a different operation, such as `fail`. A result
+larger than the server's blob-size limit is different: Temporal fails the
+activity itself and acknowledges `complete`, which then returns `Ok`. A failed `heartbeat` is reported and forgotten: it never blocks
+a later heartbeat or the terminal call. Only acceptance of a terminal call, or
+the server reporting that the activity no longer exists, closes the handle, so
+a later call fails predictably instead of leaving worker shutdown blocked.
+
+Every handle must eventually be completed, failed, or cancelled. Until then
+the worker keeps a lease for it, and a worker shutdown waits for that lease
+for the whole graceful shutdown period and then reports it as lost. A handle
+that is never finished expires a few seconds after Temporal must have timed
+its attempt out (its start-to-close or schedule-to-close timeout, or its
+heartbeat timeout since the last heartbeat); the worker then closes it
+without contacting the server, and later calls return a non-retryable error.
+
+Activity cancellation and worker shutdown are cooperative: the worker never
+interrupts activity code, so a long-running activity must ask whether it
+should stop. Temporal delivers a cancellation, pause or reset only in the
+response to a heartbeat, so schedule such an activity with a
+`heartbeat_timeout` and heartbeat regularly:
+
+- A synchronous activity from `Activity.define_with_context` calls
+  `Activity.Context.heartbeat`, which returns a `` `Cancelled `` error once a
+  cancellation has been delivered; `Activity.Context.cancellation` then gives
+  the reason. Returning that error completes the attempt as cancelled.
+  `Activity.Context.is_worker_shutting_down` turns `true` when the worker
+  begins to stop; the callback then has the worker's graceful shutdown period
+  to finish, for example by returning a retryable error so that another
+  worker retries it.
+- An asynchronous activity learns of it from `Activity.Async_handle.heartbeat`:
+  a non-retryable `` `Cancelled `` error is a requested cancellation, to be
+  acknowledged with `Async_handle.cancel`, and a retryable one is a pause or
+  reset, to be reported with `Async_handle.fail` and that error. The heartbeat
+  is still recorded and the handle stays live until one of those calls.
+  Handles are not told about worker shutdown, so cleanup on shutdown is
+  available only to synchronous activities. A worker shutdown waits for an
+  unfinished handle for the graceful shutdown period and then closes it as a
+  lost completion; a handle that is never finished expires once Temporal must
+  have timed its attempt out (#1043). Later handle calls return a
+  non-retryable error, and Temporal retries the attempt after its heartbeat,
+  start-to-close or schedule-to-close timeout.
+
+Clean up before reporting the outcome, so a workflow that schedules the
+activity with `~cancellation_type:Wait_cancellation_completed` knows the
+cleanup ran once the activity's future resolves as cancelled. Make every
+external side effect idempotent and key it by the business operation it
+performs. Every retry of one scheduled activity shares its workflow run ID and
+activity ID, so those two (or a business key passed in the input, when the
+work must happen at most once across runs) identify it; the workflow ID alone
+does not, because a closed run's ID can be reused. Temporal delivers an
+activity at least once, and an attempt that ignores the signal past the grace period is
+abandoned and retried while its own code still runs. The runnable
+[cooperative cancellation example](../../examples/README.md#cancel-activities-cooperatively)
+shows both forms releasing a reservation on cancellation, and the synchronous
+form on worker shutdown, and is run against Temporal Server in CI.
 
 Use `Activity.remote` or `Workflow.remote` when another worker owns the
 implementation. A remote definition keeps the name and codecs needed to
@@ -452,7 +619,7 @@ optional retry policy:
 
 ```ocaml
 let policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 1_000L)
     ~backoff_coefficient:1.5
     ~maximum_interval:(Temporal.Duration.of_ms 60_000L)
@@ -554,11 +721,13 @@ let run_with_deadline input =
 `Scope.check` is a non-blocking cancellation check, and `Scope.await` returns
 an `Error.t` with category `Cancelled` when the scope has been cancelled before
 the observed future completes. `Scope.is_cancelled` is also typed because
-status reads must be serialized with the owning workflow Domain. Every scope
-operation called between scheduler runs, from another OCaml Domain, or after
-shutdown returns a typed ownership defect. This keeps signal delivery
-deterministic and prevents a cancellation request or status read from racing
-the queue that owns the scope.
+status reads must be serialized with the owning workflow Domain. A synchronous
+query for the same live execution may call `Scope.is_cancelled` or `Scope.check`
+while the scheduler is paused; cancellation and awaiting still require an owner
+scheduler turn. Other calls between scheduler runs, calls from another OCaml
+Domain, and calls after shutdown return a typed ownership defect. This keeps
+signal delivery deterministic and prevents a cancellation request or status
+read from racing the queue that owns the scope.
 
 Scope cancellation is cooperative for local observation and structured for
 selected durable operations. Starting an activity or child workflow with
@@ -568,6 +737,16 @@ Timers and operations started without `~scope` are not implicitly cancelled;
 retain their handles when they must be controlled independently. Losing
 futures in `Future.race` remain ordinary observations unless the caller
 explicitly uses a scope around the later wait.
+
+Scopes cancel work the workflow itself started. A cancellation of the
+workflow run (from `Client.cancel` or a parent) is different: the worker
+closes the run as cancelled in the activation that delivers the request, so
+workflow code cannot observe it or schedule and await cleanup first.
+Cooperative workflow cancellation with durable cleanup is excluded from the
+proposed MVP v1 scope ([#514](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/514);
+see the [v1 support policy](../reference/v1-support-policy.md)). A workflow
+that must compensate should model the stop request as a signal or update and
+run its cleanup activities before returning normally.
 
 ## 6. Child workflows: authoring versus native support
 
@@ -595,7 +774,7 @@ machine, so replay does not run an OCaml retry loop:
 
 ```ocaml
 let retry_policy =
-  Temporal.Activity.Retry_policy.make
+  Temporal.Retry_policy.make
     ~initial_interval:(Temporal.Duration.of_ms 1_000L)
     ~backoff_coefficient:2.0
     ~maximum_interval:(Temporal.Duration.of_ms 5_000L)
@@ -611,9 +790,11 @@ let run_review document =
 
 The policy's intervals are exact durations and its coefficient is carried as
 lossless IEEE-754 bits through the private JSON protocol. Omitting
-`~retry_policy` emits `null`, which selects Core's default child policy. The
-current focused tests verify command construction and the bilateral Core
-conversion; the live Compose fixture has not yet exercised a child retry.
+`~retry_policy` emits `null`, which selects Core's default child policy.
+Focused tests verify command construction and the bilateral Core conversion,
+and the live Compose fixture runs a child whose first attempt fails retryably
+and whose second attempt, scheduled by Temporal under the parent's child
+retry policy, succeeds (see the coverage summary at the end of this section).
 
 When a workflow needs to keep the child operation alongside other work, retain
 the opaque handle returned by `start_handle`:
@@ -642,22 +823,34 @@ and `execute`, so an ordinary `cancel` call requests cancellation; select
 validated before it becomes a durable command, and the handle cannot be forged
 for another child sequence.
 
+`Temporal.Child_workflow.started child` resolves with the child's run ID once
+Temporal has started it, without waiting for the result; if the child never
+starts, it resolves with the same error as the result future. A parent that
+starts a child with `~parent_close_policy:Abandon` so the child outlives it
+must await `started` before returning: Temporal Server does not start a child
+whose parent has already closed, so a child scheduled in the parent's last
+workflow task is otherwise silently never started. The Go and Java SDKs make
+the same requirement through their child-execution futures, and the Python and
+TypeScript `start_child` calls wait for the start themselves.
+
 The definitions and calls above compile, and the synthetic runtime tests cover
 child scheduling and deterministic future resolution. The native protocol and
 worker adapter also carry the child-start acknowledgment and terminal
-resolution required to resume the parent. The adapter rejects final-before-
-start, duplicate, and unknown sequences as typed bridge failures, preserving
+resolution required to resume the parent. A child cancelled by the workflow
+before it started resolves with the typed cancellation error. The adapter
+rejects any other final-before-start result, and duplicate or unknown
+sequences, as typed bridge failures, preserving
 the parent lease rather than acknowledging an unsafe completion. Focused tests
 cover the complete lifecycle. The live Compose fixture covers the parent/child
 success path, propagated failure, child cancellation, and child retry: the
 parent calls `Child_workflow.execute`, the registered child waits on a durable
 timer, and the driver asserts the parent's exact result. The complete [PR #289
-CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) also
+CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29333761719) also
 live-verifies duplicate-ID child-start failure. The complete [PR #351
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013) verifies
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29434016013) verifies
 the exact parent and child replay path. The separate
 [child-failure-after-replay acceptance](../reference/child-failure-replay-acceptance.md)
-is live-verified by the complete [PR #361 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29475615866):
+is live-verified by the complete [PR #361 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29475615866):
 it requires both replay observations before the typed child failure and the
 parent's `SMOKE:PARENT:CHILD:FAILURE_RECOVERED` result. Additional child
 failure and recovery permutations remain separate acceptance work.
@@ -672,20 +865,22 @@ like any other workflow operation:
 let refresh_signal =
   Temporal.Signal.define ~name:"refresh" ~input:Temporal.Codec.string
 
-let notify_refresh workflow_id run_id reason =
+let notify_refresh ?run_id workflow_id reason =
   Temporal.Workflow.signal_external_workflow
-    ~workflow_id ~run_id ~signal:refresh_signal ~input:reason
+    ~workflow_id ?run_id ~signal:refresh_signal ~input:reason ()
 
-let stop_other_workflow workflow_id run_id =
+let stop_other_workflow ~run_id workflow_id =
   Temporal.Workflow.cancel_external_workflow
-    ~workflow_id ~run_id ~reason:"superseded by a newer execution"
+    ~workflow_id ~run_id ~reason:"superseded by a newer execution" ()
 ```
 
 Both operations emit a deterministic command and suspend the current workflow
 until Core reports an acknowledgement or structured failure. They do not make
-network calls from OCaml or block an Eio fiber or Domain. The exact run ID is
-optional for targets that intentionally address the latest execution, but
-supplying it is safer when a workflow must never affect a replacement run.
+network calls from OCaml or block an Eio fiber or Domain. Omit `?run_id` to
+address the current execution for the workflow ID; supplying the exact run ID
+is safer when a workflow must never affect a replacement run. An explicit
+`run_id` must be a valid non-empty identifier: `""` is a typed defect, not a
+"latest run" alias.
 Input and headers are copied through the private JSON bridge; invalid names,
 payloads, NUL bytes, and duplicate sequence resolutions become typed errors.
 See the [external workflow protocol reference](../reference/core-protocol.md#external-workflow-operations)
@@ -707,8 +902,11 @@ let process_batch batch =
     process_items batch
 ```
 
-The successor input must be deterministic workflow data. A codec failure is a
-typed failure of the current run; it is not raised as an ordinary exception.
+The successor input must be deterministic workflow data. A codec failure while
+encoding that input is not raised as an ordinary exception and does not end
+the current run: it fails only the current workflow task, emits no
+continue-as-new command, and leaves the run open so corrected code can replay
+it (see [workflow failures](../reference/workflow-failures.md)).
 Calling this function outside a running workflow is programmer misuse and is
 reported as `Invalid_argument`. The private completion protocol represents the
 operation as a terminal `continue_as_new` command with a workflow type and an
@@ -716,9 +914,49 @@ ordered payload list. The bridge maps it to Temporal Core's
 `ContinueAsNewWorkflowExecution` command, fills only explicit Core defaults,
 and rejects unsupported non-default options instead of silently dropping them.
 
+Long-running workflows should not count events by hand. `Temporal.Workflow.info ()`
+returns a snapshot whose `Info.continue_as_new_suggested`,
+`Info.history_length`, and `Info.history_size_bytes` report what Temporal sent
+with the current activation, so a loop can continue as new at a safe point
+once the server suggests it:
+
+```ocaml
+let rec drain queue =
+  match Temporal.Workflow.info () with
+  | Ok info when Temporal.Workflow.Info.continue_as_new_suggested info ->
+      Temporal.Workflow.continue_as_new drain_workflow queue
+  | Ok _ -> (* process one item, then *) drain queue
+  | Error error -> Error error
+```
+
+`Info.continue_as_new_reasons` says why the server made the suggestion:
+`` `History_size_too_large ``, `` `Too_many_history_events ``, or
+`` `Too_many_updates ``, in the order Temporal reported them. The list is
+empty when no suggestion was made and may be empty with a suggestion from
+servers that do not name a reason, so branch on
+`Info.continue_as_new_suggested` and use the reasons for logging or for
+choosing what state to carry into the successor.
+
+The same snapshot carries the run's identity (workflow ID, run ID, first run
+ID of the chain, type, namespace, task queue, retry attempt, parent, and start
+time), taken from Temporal's activations and the worker's own configuration
+(the namespace and task queue) rather than host state. Identity is fixed
+for the run; history facts and `Info.is_replaying` describe the activation
+current when `info` was called, so call it again after a suspension. It also
+carries the start policy the client recorded: `Info.execution_timeout`,
+`Info.run_timeout`, `Info.task_timeout`, and `Info.retry_policy`. A successor
+run names its predecessor through `Info.continued_from_run_id`, and
+`Info.continuation_initiator` tells a `` `Retry `` apart from a
+`` `Continue_as_new ``. Start memo and search attributes come from
+`Temporal.Workflow.start_metadata` ([start metadata](../reference/workflow-start-metadata.md)).
+`Temporal.Workflow.is_replaying ()` is the shorthand for side effects outside
+workflow state, such as suppressing duplicate log lines during replay. Never
+choose a workflow command from the replay flag: replay must take the same
+branch as the original execution.
+
 `Temporal.Client.wait` treats the current run as terminal and returns its
 typed continued-as-new outcome with the successor execution reference; it does
-not follow the successor automatically. The complete [PR #253 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471)
+not follow the successor automatically. The complete [PR #253 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471)
 live-verified the successor-following path in Compose; longer continuation
 chains and other advanced history-management features remain separate work.
 
@@ -790,16 +1028,172 @@ let worker_result =
     ~workflows:[ Temporal.Worker.workflow summarize_workflow ]
     ~activities:[ Temporal.Worker.activity summarize_activity ]
     ()
-  |> Result.bind Temporal.Worker.run
+  |> fun created -> Result.bind created Temporal.Worker.run
 ```
 
-Use `http://` or `https://` for a real native worker. `mock://` is a private,
-deterministic test backend and does not contact Temporal Server. Registration
+Use `http://` or `https://` for a real native worker. `mock://` does not
+contact Temporal Server and does not run workflow code in a workflow context
+(see the start of this guide). Registration
 rejects duplicate names and remote-only definitions before a native graph is
 created. `Temporal.Worker.run` is a blocking lifecycle loop; call it from an
 ordinary dedicated OCaml Domain or system thread rather than directly from a
 cooperative Eio/Lwt scheduler fiber. `Temporal.Worker.shutdown` is idempotent
-and drains retryable completions before releasing the native graph.
+and drains retryable completions before releasing the native graph. Call it
+from any other Domain or system thread, including a sibling thread on the
+Domain running `Temporal.Worker.run`; concurrent callers all wait for the same
+teardown and return its cached result. A call from the thread running
+`Temporal.Worker.run`, such as one of the worker's own workflow or activity
+callbacks, cannot wait for its own loop: it returns a defect `Error` instead of
+deadlocking, but first requests a stop so `run` returns, after which a further
+`shutdown` completes teardown.
+
+To stop a worker from a `SIGTERM` or `SIGINT` handler, call
+`Temporal.Worker.request_shutdown` there. It is a single atomic write with no
+lock, I/O, or native call, so it is safe whichever Domain or thread the OCaml
+runtime uses to run the handler, including the thread blocked in
+`Temporal.Worker.run` in a single-Domain program. `run` then returns `Ok ()`
+once each lane finishes its current task, or once the worker's grace period
+has elapsed for an activity callback that has not finished, and the
+application calls `Temporal.Worker.shutdown` (or `shutdown_with_report`) to
+drain and release the worker within its bound (#495). Do not call the
+blocking `shutdown` from the handler itself.
+
+```ocaml
+let serve worker =
+  let stop _signal = Temporal.Worker.request_shutdown worker in
+  let previous_term = Sys.signal Sys.sigterm (Sys.Signal_handle stop) in
+  let previous_int = Sys.signal Sys.sigint (Sys.Signal_handle stop) in
+  (* Signal handlers are process-global: restore the previous ones so a later
+     signal is not swallowed by this already shut-down worker. *)
+  Fun.protect
+    ~finally:(fun () ->
+      Sys.set_signal Sys.sigterm previous_term;
+      Sys.set_signal Sys.sigint previous_int)
+    (fun () ->
+      let run_result = Temporal.Worker.run worker in
+      let shutdown_result = Temporal.Worker.shutdown worker in
+      Result.bind run_result (fun () -> shutdown_result))
+```
+
+### Workflow code that stops yielding
+
+Workflow code runs on the worker's single workflow lane until it returns or
+awaits a workflow operation. A CPU loop, `Unix.sleepf`, a blocking socket or
+file call, or waiting on a `Mutex` or `Condition` in workflow code (including
+codecs and signal, query, and update handlers) therefore stops every workflow
+on that worker. Move such work into an activity, and use `Temporal.Workflow`
+timers and futures to wait.
+
+The worker detects the mistake but cannot undo it. When an activation runs
+for longer than its deadline (two seconds by default) without yielding, a
+watchdog fails that workflow task so Temporal retries it, normally on another
+worker (a stuck query-only activation instead has its queries answered with
+failures, and a stuck eviction is acknowledged; `Stuck_workflow_activation`'s
+`abandoned` field says which happened), logs one `workflow_activation_deadline_exceeded` error naming the
+workflow type, workflow ID, and run ID, and makes `Temporal.Worker.health`
+report `Stuck_workflow_activation`. OCaml code cannot be safely interrupted,
+so the stuck code keeps running and `run` cannot return while it does, and
+the state stays unhealthy even if the code later returns.
+`Temporal.Worker.shutdown_with_report`, called from another thread, still
+returns within the grace period plus the teardown timeout and counts the
+activation in `abandoned_workflow_activations`, but the process must then
+exit. Recovery is to restart the process from an external supervisor
+(Kubernetes, systemd, or similar). Configure the deadline, or disable it while
+stepping through code in a debugger, with `Temporal.Worker.Options`:
+
+```ocaml
+let options =
+  Temporal.Worker.Options.make
+    ~workflow_activation_deadline:(`After (Temporal.Duration.of_ms 5_000L))
+    ()
+```
+
+Wire `health` into the process's liveness probe. Refresh a heartbeat from a
+thread that is not the worker's, and fail the probe when the heartbeat is
+stale or the worker is stuck; the staleness check also covers a process whose
+whole runtime is blocked:
+
+```ocaml
+let liveness_loop worker ~heartbeat_file =
+  let rec loop () =
+    match Temporal.Worker.health worker with
+    | Temporal.Worker.Health.Stuck_workflow_activation _ ->
+        (* Stop refreshing: the probe fails and the supervisor restarts us. *)
+        ()
+    | Temporal.Worker.Health.Healthy ->
+        Out_channel.with_open_text heartbeat_file (fun channel ->
+            Out_channel.output_string channel
+              (string_of_float (Unix.gettimeofday ())));
+        Thread.delay 1.0;
+        loop ()
+  in
+  Thread.create loop ()
+```
+
+A Kubernetes `livenessProbe` can then check that the file's timestamp is a
+few seconds old at most, or the application can serve the same check from an
+HTTP endpoint. Liveness probes should restart the process; readiness probes
+alone only stop routing traffic, which a Temporal worker does not receive.
+
+#### Avoid, diagnose, and recover
+
+Never do any of the following inside workflow code, its codecs, or its
+handlers; each holds the workflow lane without yielding:
+
+- unbounded or data-dependent CPU loops, including retry loops that poll a
+  value instead of awaiting a `Temporal.Workflow` condition or timer;
+- `Unix.sleepf`, `Thread.delay`, or any other wall-clock wait (use
+  `Temporal.Workflow.sleep`);
+- network, file, or database I/O, subprocesses, and blocking C calls (use an
+  activity);
+- `Mutex.lock`, `Condition.wait`, `Domain.join`, or waiting on an Eio/Lwt
+  promise owned by another scheduler.
+
+The two-second default leaves room for legitimate CPU-heavy activations. If
+an activation really needs longer, raise the deadline for that worker rather
+than disabling it, and move the work into an activity when it grows further.
+Replay does not need a larger deadline: Core replays a history one historical
+workflow task per activation, so a long history is many short activations.
+When a stuck activation was replaying, `Stuck_workflow_activation.is_replaying`
+is `true`, which points at code that loops on recorded data rather than at a
+slow new step. The deadline only fails the workflow task; it never adds a
+command to history, so a deadline that is too short for a heavy activation
+shows up as repeated workflow-task failures, never as divergent commands.
+
+To diagnose a detected activation, use the three views of the same event:
+
+- `Temporal.Worker.health` returns the workflow type, workflow ID, run ID,
+  replay flag, and a lower bound on how long the activation had run;
+- the `workflow_activation_deadline_exceeded` log record carries the same
+  identifiers and duration as tags ([observability](../reference/observability.md));
+- the run's history in the Temporal UI or CLI shows a `WorkflowTaskFailed`
+  event from the stuck worker's identity whose failure message names the
+  activation deadline.
+
+None of them includes a payload, so the stuck run's input and state stay out
+of logs. Take a stack sample of the stuck process (for example with
+`perf`, `gdb`, or `lldb`) before it is restarted if the looping code is not
+obvious.
+
+After the task fails, Temporal schedules a new workflow-task attempt for the
+same run. The attempt replays the run from history on whichever worker polls
+it, so the run recovers as soon as a worker with corrected code (a fixed build,
+or a `Temporal.Workflow.patched` branch around the change) serves its task
+queue. Until then, every attempt that reaches broken code fails again in the
+same way. While a worker is
+stuck, workflow tasks Core had already received for it wait for their
+workflow-task timeout before they are retried elsewhere. The [non-yielding
+live regression](../../test/integration/non_yielding_workflow/regression.ml)
+exercises this sequence end to end against Temporal Server.
+
+Both `Temporal.Worker.create` and `Temporal.Client.create` accept an optional
+`~identity`, which Temporal records in history events and task-queue poller
+listings. An explicit identity is used unchanged. When it is omitted, the SDK
+uses `<pid>@<hostname>`, the same convention as the official Temporal SDKs,
+computed once at creation time so separate processes stay distinguishable.
+Host names are restricted to printable ASCII and at most 255 bytes, and an
+unavailable host name becomes `unknown-host`, so the default is always a valid
+identity.
 
 This restriction applies to the worker lifecycle call, not to
 `Future.await` inside a workflow. The worker's native readiness wait releases
@@ -851,8 +1245,10 @@ identifiers therefore return a typed defect consistently with either the
 deterministic mock or the native JSON bridge. This includes keys in both the
 `~memo` and `~search_attributes` collections.
 
-When the result is `Continued_as_new successor`, use
-`Temporal.Client.follow` to make an exact-run handle for that successor:
+When the result is `Continued_as_new successor` (or a `Completed`, `Failed`,
+or `Timed_out` result whose `successor` is `Some` run started by a cron
+schedule or retry policy), use `Temporal.Client.follow` to make an exact-run
+handle for that successor:
 
 ```ocaml
 let open Temporal.Result_syntax in
@@ -862,7 +1258,6 @@ match Temporal.Client.wait handle with
       Temporal.Client.follow client ~workflow:summarize_workflow successor
     in
     Temporal.Client.wait successor_handle
-| Ok (Temporal.Client.Completed output) -> Ok (Temporal.Client.Completed output)
 | Ok terminal -> Ok terminal
 | Error error -> Error error
 ```
@@ -875,6 +1270,33 @@ supplied workflow's codecs, and returns a typed error if the client has already
 been shut down or the identity is malformed. The caller therefore chooses
 explicitly whether to observe one successor, build a loop over a chain, or
 stop after the original run.
+
+### Addressing a workflow by ID
+
+A process that did not start a workflow, such as a web service signalling a
+long-running entity workflow by its business ID, builds a handle with
+`Temporal.Client.get_handle`. Without `~run_id` the handle addresses the
+workflow's current run: every operation sends an empty run ID and Temporal
+resolves the latest run when it handles the request, so the handle keeps
+working after the workflow continues as new.
+
+```ocaml
+let open Temporal.Result_syntax in
+let* handle =
+  Temporal.Client.get_handle client ~workflow:account_workflow ~id:"account-42" ()
+in
+let* () = Temporal.Client.signal handle ~signal:deposit ~input:100 in
+Temporal.Client.wait handle
+```
+
+`wait` on such a handle follows the run chain like the official SDKs'
+result methods: it waits on each continued-as-new, cron, or retry successor
+until a run closes without one, so it never returns `Continued_as_new`.
+`Temporal.Client.run_id` returns `None` for it. Pass `~run_id` to address one
+exact run instead; that handle behaves like one built by `follow`. Building a
+handle sends nothing to Temporal, so an unknown workflow ID surfaces from the
+first operation as an error whose `Temporal.Client.rpc_status` is
+``Some `Not_found``.
 
 `Temporal.Client.cancel` sends a cancellation request for the exact run held by
 the handle and returns after Temporal acknowledges that request. It does not
@@ -890,18 +1312,304 @@ the workflow definition; the [interactive workflow reference](../reference/inter
 describes the typed definition and deterministic handler boundary. The client
 signal bridge and mock lifecycle are focused-tested at this baseline. The
 complete [PR #266 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247) live-verifies
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29311239247) live-verifies
 typed signal delivery and signal-dependent completion, and the expanded [PR #289 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) retains those
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29333761719) retains those
 assertions in the historical seventeen-result baseline. The [PR #302 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) first
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29351689638) first
 verified the long-backoff retry extension, and the complete [PR #439 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) retains
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29824441578) retains
 the signal and retry paths in its historical baseline. See the
 [current evidence audit](../reference/live-acceptance-coverage.md) for the
 later successful source snapshot and remaining condition/recovery limits. A successful
 signal call still acknowledges Temporal's RPC
 rather than the later execution of the worker-side handler.
+
+## Process and linking constraints
+
+Two properties of the hosting process are fixed by OCaml 5 and by how the
+native bridge is packaged. Neither is reported as a typed `Temporal.Error.t`;
+violating them fails at fork time or at link/load time.
+
+**Fork before creating a native client or worker.** Every `Client` or `Worker`
+with an `http://` or `https://` target owns an SDK supervisor that runs on its
+own OCaml Domain. OCaml 5 forbids `Unix.fork` once any Domain has ever been
+spawned in the process, even after that Domain has been joined, so a fork after
+`Client.create` or `Worker.create` raises
+`Failure "Unix.fork may not be called after any domain has been spawned"`.
+This holds after `Client.shutdown` as well. Daemonise, use a pre-fork server
+model, or fork test processes before the first native SDK value is created, and
+create the client or worker in the child. Starting a separate program with
+`Unix.create_process`, `Unix.open_process_in`, or a similar spawn API remains
+available at any time, because those calls do not duplicate the OCaml runtime.
+This applies to Unix platforms such as Linux and macOS. On Windows,
+`Unix.fork` is not implemented at all and raises `Invalid_argument` whether or
+not the SDK has started; use `Unix.create_process` or `Unix.open_process*` to
+run other processes there.
+
+**Link a native or bytecode executable.** The private Rust bridge and its C
+stubs are installed only as static archives; no shared library is installed
+for the bytecode runtime to load. These link modes are supported:
+
+- native executables (`ocamlfind ocamlopt ... -linkpkg`, or Dune executables
+  in the default native mode);
+- bytecode executables, including Dune `(modes byte)` executables and
+  `ocamlfind ocamlc -package temporal-sdk -linkpkg`. The installed bridge
+  library forces `-custom`, so `ocamlc` always builds a custom runtime that
+  embeds the static archives. Such an executable runs without
+  `dllocaml_temporal_core_bridge` and needs no `dune-workspace` setting in your
+  project;
+- Dune `(modes byte_complete)` executables.
+
+The toplevel or utop (`#require "temporal-sdk";;`) cannot load the bridge and
+fails with a shared-library loading error, because loading a library into a
+running bytecode interpreter needs the shared stub library that is not
+installed. Native plugins (`.cmxs`) are also unsupported. The design reasons are recorded in the
+[Core bridge reference](../reference/core-bridge.md#supported-link-modes).
+
+## Test workflows in-process
+
+`Temporal.Testing` is the supported way to unit-test workflow logic. It runs
+registered workflows on the same private scheduler and command runtime that a
+native worker uses, and replaces Temporal Server and Core with a small
+deterministic simulator: activities run when they are scheduled, child
+workflows start in the same environment, signals and cancellations are routed
+between workflows, and timers fire in **virtual time**. Whenever every
+workflow is blocked on a timer or an activity retry, `Testing.result` jumps
+the clock to the next one, so a workflow that sleeps for a week finishes
+immediately and `Workflow.now` observes the skipped time.
+
+```ocaml
+let test_summarize () =
+  let open Temporal.Result_syntax in
+  let* env =
+    Temporal.Testing.create
+      ~workflows:[ Temporal.Testing.workflow summarize_workflow ]
+      ~activities:
+        [ Temporal.Testing.mock_activity summarize (fun document ->
+              Ok ("summary of " ^ document)) ]
+      ()
+  in
+  Fun.protect
+    ~finally:(fun () -> Temporal.Testing.shutdown env)
+    (fun () -> Temporal.Testing.execute env summarize_workflow "document")
+```
+
+Register definitions with `Testing.workflow` and `Testing.activity`, which
+take the same definitions and handlers as `Temporal.Worker`.
+`Testing.mock_activity` and `Testing.mock_workflow` register a stub under an
+existing definition's name and codecs and replace any other registration of
+that name, so a test can reuse an application's registration list and swap
+out the activities that perform I/O or a child implemented by another
+worker. A remote reference or asynchronous activity registered with
+`Testing.activity` cannot run in-process and fails with a message asking for
+a mock.
+
+For interactive workflows, start the workflow and drive it step by step:
+
+```ocaml
+let* handle = Temporal.Testing.start env cart_workflow () in
+let* () = Temporal.Testing.signal handle add_item "apple" in
+let* count = Temporal.Testing.update handle add_item_update "pear" in
+let* latest = Temporal.Testing.query handle latest_item in
+let* () = Temporal.Testing.skip env (Temporal.Duration.of_ms 60_000L) in
+Temporal.Testing.result handle
+```
+
+`start`, `signal`, and `cancel` run the workflow until it is blocked without
+moving the clock; `skip` advances it by an exact amount, which exposes
+intermediate states; `result` and `update` skip time as needed and accept a
+virtual `?timeout`. A workflow blocked with nothing scheduled, such as one
+waiting for a signal no one sends, makes `result` return a defect rather
+than hang. Activity retry policies are honored with backoff in virtual time;
+an unlimited policy, including the server default, is capped by
+`create ?max_activity_attempts` (default 10). Workflow IDs, run IDs, and the
+`Workflow.random_int` seed are deterministic counters and the clock starts at
+2024-01-01T00:00:00Z unless `?start_time` is given, so repeated runs observe
+identical values.
+
+The simulator is not a server. Activities take zero virtual time and their
+timeouts are not enforced; a workflow task failure (an exception or a
+`Defect`, `Codec`, or `Bridge` error) ends the run with that error instead of
+being retried; child cancellation types are not distinguished; and
+asynchronous activities, Nexus, visibility, memos, and workflow ID reuse
+policies are not simulated. An environment must be used from one system
+thread. [`examples/testing`](../../examples/testing/example_workflow_test.ml)
+tests the example application's workflow this way, with both its real and a
+stubbed activity.
+
+## Replay recorded histories before deploying
+
+`Temporal.Testing` checks what new code does; `Temporal.Replay` checks that
+changed code is still compatible with executions that already ran. It feeds a
+recorded history to Temporal Core's replay worker, entirely offline, and
+reports whether the registered OCaml workflow produced the same commands as
+the original run. Use it in unit tests or a pre-deployment CI job with
+histories exported from the executions you must not break:
+
+```ocaml
+let check_compatibility () =
+  let bytes = In_channel.with_open_bin "order-123.pb" In_channel.input_all in
+  match
+    Temporal.Replay.History.of_protobuf ~workflow_id:"order-123" bytes
+  with
+  | Error error -> failwith (Temporal.Error.message error)
+  | Ok history -> (
+      match
+        Temporal.Replay.replay
+          ~workflows:
+            [ Temporal.Replay.workflow ~signals:[ cancel_handler ] order_workflow ]
+          history
+      with
+      | Ok () -> ()
+      | Error failure ->
+          prerr_endline (Temporal.Replay.failure_message failure);
+          exit 1)
+```
+
+Register workflows with `Replay.workflow`, which takes the same definitions
+and handlers as `Temporal.Worker.workflow`; codecs travel with the
+definitions. Only workflow code runs: recorded activity and child-workflow
+results come from the history. `Replay.replay_all` replays a list of
+histories, each in an isolated native graph, and keeps every result.
+
+The input is the binary protobuf encoding of one complete
+`temporal.api.history.v1.History` message plus the execution's workflow ID,
+which the workflow observes through `Workflow.info` during replay. Histories
+from Temporal Server 1.21 or later also record the ID in their start event;
+replay then requires the two to match and reports `Invalid_history` otherwise,
+so one execution's history cannot be replayed under another's ID. A single
+`GetWorkflowExecutionHistory` response is one page: fetch and concatenate
+every page, because a truncated history can still pass while covering only
+its first tasks. `temporal workflow show --output json` produces the
+protobuf **JSON** form, so convert it with a protobuf library that has the
+Temporal API descriptors, for example Python's
+`google.protobuf.json_format.Parse` followed by `SerializeToString`; the
+[replay example](../../examples/README.md#export-a-history) has a converter
+that also accepts the legacy Web UI and `tctl` JSON shape and several pages.
+Exported histories contain workflow inputs, results, and signal payloads;
+treat them as production data, and prefer synthetic or scrubbed executions in
+a repository. Scrub payloads only: every event must keep its `eventId` and
+`eventTime`.
+
+The result distinguishes:
+
+- `Ok ()`: Core started the recorded run, delivered it to the registered
+  workflow, and accepted every recorded workflow task, including runs that
+  recorded failed tasks or a deliberate workflow failure.
+- `Nondeterminism`: the code produced a different command sequence, for
+  example a removed timer. `message` is Core's complete description, and
+  `mismatch` gives the workflow ID and type, the first mismatching recorded
+  event and the command it was matched against when Core names them, and
+  Core's own sentence (see the troubleshooting example below).
+- `Workflow_task_failed`: the workflow code raised, returned a defect, could
+  not decode its input, or its type is not registered.
+- `Invalid_history` and `Unsupported_history`: the input is not a valid
+  history, or it uses a feature this SDK cannot replay yet.
+- `Replay_error`: the replay could not run (an invalid registration or an
+  SDK/runtime failure); the history's verdict is unknown.
+
+### Locate an incompatible change
+
+Suppose a deployed version waited for a review timer before completing, and
+a refactor drops the timer:
+
+```ocaml
+(* Recorded executions ran this. *)
+let publish draft =
+  let open Temporal.Result_syntax in
+  let* () = Temporal.Workflow.sleep review_delay in
+  Ok (finalize draft)
+
+(* The candidate release runs this. *)
+let publish draft = Ok (finalize draft)
+```
+
+Replaying a history recorded by the old version prints one line (wrapped
+here):
+
+```text
+nondeterminism (run 01a1...): workflow agent.publish (ID publish-42):
+recorded event 5 (TimerStarted) does not match the current code's Complete
+workflow command; Core: [TMPRL1100] Nondeterminism error: Complete workflow
+machine does not handle this event: HistoryEvent(id: 5, TimerStarted); guard
+intentional command changes with Temporal.Workflow.patched
+```
+
+Read it as: at recorded event 5 the original run started a timer, but the
+current code completed the workflow instead. Open the history at that event
+(`temporal workflow show --workflow-id publish-42`, or the Temporal UI) to see
+which timer, activity, or child workflow the original code issued there and
+which workflow task (the `WorkflowTaskCompleted` before it) produced it; then
+find the command in the current code that now takes its place. The same
+fields are available to programs:
+
+```ocaml
+match Temporal.Replay.replay ~workflows history with
+| Error (Temporal.Replay.Nondeterminism { mismatch; _ }) ->
+    Option.iter (Printf.printf "first mismatch at event %Ld\n")
+      mismatch.event_id
+| Error _ | Ok () -> ()
+```
+
+The line is always single and bounded: control characters in a workflow ID
+or type are escaped (`\n`, `\xHH`), and each value is cut to 256 bytes
+(Core's reason to 1,024) with `...(N bytes truncated)`; the `mismatch`
+fields keep the exact values. `event_id`, `event_type`, and `command` are
+`None` whenever Core's text does
+not state them, for example when Core reports a recorded patch marker that
+no `patched` call claimed; the SDK never guesses an event or an OCaml source
+location. If the change is intentional, keep the old commands for recorded
+executions behind a
+[patch marker](#introduce-a-new-branch-with-a-patch-marker), and replay
+histories recorded both before and after the change.
+
+A clean replay is evidence only for the paths those histories recorded. A
+branch no recorded execution has reached yet, such as an error handler or a
+rarely sent signal, can still be incompatible, so keep histories that cover
+the branches you change.
+
+A successful replay covers only the paths the recorded history took, and Core
+compares command shapes, not payload values: a changed activity argument or
+result replays successfully. Guard intentional command changes with
+[patch markers](#introduce-a-new-branch-with-a-patch-marker) and replay
+histories recorded before and after the change. `replay` blocks the calling
+thread; do not call it from workflow or activity code. Every call releases
+its native resources before returning, on success and on every failure.
+
+### Run a replay check before deploying
+
+[`examples/replay`](../../examples/replay) is a small command to copy into an
+application and run as the pre-deployment gate. Its reusable
+`replay_command.ml` reads binary history files, replays each one offline,
+prints one `PASS` or `FAIL` line per history, and exits with a distinct status
+for nondeterminism (1), a failed workflow task (2), an invalid (3) or
+unsupported (4) history, a replay that could not run (5), a usage error (64)
+and an unreadable file (66). The application supplies only the entry point,
+which must link the same workflow definitions, codecs, and handlers as the
+production worker:
+
+```ocaml
+let () =
+  Replay_command.main
+    ~workflows:
+      [
+        Temporal.Replay.workflow ~signals:[ cancel_handler ] order_workflow;
+        Temporal.Replay.workflow invoice_workflow;
+      ]
+```
+
+```sh
+order_replay.exe --workflow-id order-123 histories/order-123.pb \
+  --workflow-id order-456 histories/order-456.pb
+```
+
+Run it in the job that builds the release candidate and fail the job on any
+non-zero status. The command needs no server or credentials, only history
+files exported with read access to the namespace. The
+[examples guide](../../examples/README.md#export-a-history) gives the complete
+`temporal workflow show --output json` export and JSON-to-protobuf conversion
+steps, and the exit status table.
 
 ## 10. Validate locally
 
@@ -915,7 +1623,7 @@ make test-temporal-integration
 ```
 
 The first two use deterministic test seams and do not require a running
-server. The integration target starts a fresh PostgreSQL and Temporal Server
+server; `make test-unit` includes the `Temporal.Testing` suite. The integration target starts a fresh PostgreSQL and Temporal Server
 Compose project, checks the schemas and frontend, runs the OCaml-owned Core
 lifecycle executable, then runs a public worker and a separate public driver.
 The worker executes registered workflows and activities. The driver is a
@@ -927,16 +1635,16 @@ workflow failure, direct cancellation and termination, queries, updates,
 direct and workflow-to-workflow signals, and external cancellation. Readiness
 markers guard control operations, and the start-to-close and heartbeat-timeout
 retries remain serialized after the shorter heartbeat path. The complete [PR
-#439 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+#439 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29824441578)
 passed all current terminal assertions against Temporal Server 1.31 and
 PostgreSQL. The historical [PR #289 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29333761719) verifies
-the earlier seventeen-result baseline, and [PR #302](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638)
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29333761719) verifies
+the earlier seventeen-result baseline, and [PR #302](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29351689638)
 first verifies its long-backoff extension. The
 [PR #266 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247) remains focused
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29311239247) remains focused
 evidence for typed signal delivery and condition wake-up, while the historical
-[PR #210 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859)
+[PR #210 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29221151859)
 remains evidence for the earlier nine-scenario slice. The implementation scope
 and evidence boundary are described in the [acceptance design](../reference/two-ocaml-binary-e2e-acceptance.md)
 and [live acceptance coverage](../reference/live-acceptance-coverage.md).

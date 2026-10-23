@@ -51,6 +51,30 @@ module Tag = struct
     Logs.Tag.def ~doc:"Registered Temporal workflow type"
       "temporal.workflow_type" Format.pp_print_string
 
+  let workflow_id =
+    Logs.Tag.def ~doc:"Temporal workflow ID" "temporal.workflow_id"
+      Format.pp_print_string
+
+  let run_id =
+    Logs.Tag.def ~doc:"Temporal workflow run ID" "temporal.run_id"
+      Format.pp_print_string
+
+  let replaying =
+    Logs.Tag.def ~doc:"Whether the activation was replaying history"
+      "temporal.replaying" Format.pp_print_bool
+
+  let activity_id =
+    Logs.Tag.def ~doc:"Temporal activity ID" "temporal.activity_id"
+      Format.pp_print_string
+
+  let activity_type =
+    Logs.Tag.def ~doc:"Registered Temporal activity type"
+      "temporal.activity_type" Format.pp_print_string
+
+  let attempt =
+    Logs.Tag.def ~doc:"One-based activity attempt number" "temporal.attempt"
+      Format.pp_print_int
+
   let job_count =
     Logs.Tag.def ~doc:"Jobs in one workflow activation" "temporal.job_count"
       Format.pp_print_int
@@ -83,12 +107,19 @@ let non_negative_finite value =
 let non_negative_count value = Int.max 0 value
 
 (** Constructs a bounded tag set in a fixed, reviewable order. *)
-let tags ~operation ?duration_ms ?workflow_type ?job_count ?command_count
+let tags ~operation ?duration_ms ?workflow_type ?workflow_id ?run_id
+    ?replaying ?activity_id ?activity_type ?attempt ?job_count ?command_count
     ?bridge_status ?error_kind () =
   Logs.Tag.empty
   |> Logs.Tag.add Tag.operation (bounded operation)
   |> add_optional Tag.duration_ms non_negative_finite duration_ms
   |> add_optional Tag.workflow_type bounded workflow_type
+  |> add_optional Tag.workflow_id bounded workflow_id
+  |> add_optional Tag.run_id bounded run_id
+  |> add_optional Tag.replaying Fun.id replaying
+  |> add_optional Tag.activity_id bounded activity_id
+  |> add_optional Tag.activity_type bounded activity_type
+  |> add_optional Tag.attempt non_negative_count attempt
   |> add_optional Tag.job_count non_negative_count job_count
   |> add_optional Tag.command_count non_negative_count command_count
   |> add_optional Tag.bridge_status bounded bridge_status
@@ -107,3 +138,16 @@ let measure_ms action =
 let report ~src level ~tags message =
   try Logs.msg ~src level (fun log -> log ~tags "%s" message)
   with _reporter_or_formatter_defect -> ()
+
+(** Times [action] only when [src] currently accepts [Debug] records. The
+    level is read before the action, so a level change during the action
+    cannot produce a record without a start time. *)
+let debug_timed ~src ~operation action =
+  match Logs.Src.level src with
+  | Some Logs.Debug ->
+      let value, duration_ms = measure_ms action in
+      report ~src Logs.Debug
+        ~tags:(tags ~operation ~duration_ms ())
+        "codec operation completed";
+      value
+  | _ -> action ()

@@ -34,10 +34,12 @@ if ! jq -e '
   echo 'cache eviction marker has the wrong identity or reason' >&2
   exit 1
 fi
-a_run_id=$(jq -er '.run_id' "$marker")
 
-if ! jq -e --arg run_id "$a_run_id" '
-  .workflow_id == "two-binary-cache-eviction-a" and .run_id == $run_id
+# Read A's run ID inside jq rather than through command substitution: a native
+# Windows jq writes CRLF text output, and the carried carriage return would
+# make the exact run-ID comparison fail.
+if ! jq -e --slurpfile marker "$marker" '
+  .workflow_id == "two-binary-cache-eviction-a" and .run_id == $marker[0].run_id
   and (.events | type == "array" and length >= 7)
   and ([.events[].type] as $types
        | $types[0] == "WorkflowExecutionStarted"

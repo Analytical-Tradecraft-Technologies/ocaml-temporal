@@ -84,14 +84,26 @@ val encode_object : Yojson.Safe.t -> (string, error) result
     every field except canonical payload data. *)
 val decode_payload_object : string -> (Yojson.Safe.t, error) result
 
-(** Encodes and reparses an already semantically validated operation object
-    that may contain maximum-size base64 payload strings. *)
 val encode_payload_object : Yojson.Safe.t -> (string, error) result
-(** Validates, normalizes, and independently reparses one outgoing semantic
-    object that may contain maximum-size canonical payload data. *)
+(** Validates, normalizes, and serializes one outgoing semantic object that may
+    contain maximum-size canonical payload data. The tree receives the same
+    duplicate-key, UTF-8, integer, depth, and string checks as
+    [decode_payload_object], and the serialized bytes the same raw document,
+    nesting, and string-length preflight, without a second parse. *)
 
 val decode_payload : string -> (bytes, error) result
 (** Decodes a closed canonical-base64 payload wrapper. *)
 
 val encode_payload : bytes -> (string, error) result
-(** Encodes opaque bytes with canonical padded base64 and self-validation. *)
+(** Encodes opaque bytes as a closed canonical padded-base64 wrapper. *)
+
+val decode_payload_json : Yojson.Safe.t -> (bytes, error) result
+(** Decodes an already-parsed closed payload wrapper directly from its base64
+    string, without serializing or reparsing it. It applies every check of
+    [decode_payload] after parsing: exactly the [encoding] and [data] members,
+    [encoding] equal to ["base64"], canonical padded base64, and the encoded
+    and decoded size limits. Errors never contain payload bytes. *)
+
+val payload_json : bytes -> (Yojson.Safe.t, error) result
+(** Builds the closed canonical wrapper that [encode_payload] serializes.
+    Fails only when the bytes exceed [max_payload_bytes]. *)

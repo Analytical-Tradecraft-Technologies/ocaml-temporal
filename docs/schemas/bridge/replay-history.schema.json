@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/replay-history.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/replay-history.schema.json",
   "title": "Internal replay history document",
   "description": "Strict JSON envelope used by the private Rust replay feeder. The history body is a canonical padded standard-base64 encoding of Temporal Core's History protobuf. Runtime validation additionally enforces the decoded byte limit and Core history invariants.",
   "type": "object",
@@ -11,7 +11,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 65536,
-      "description": "UTF-8 workflow identifier attached to the history because Temporal History does not contain it. The Rust validator applies the authoritative byte limit and rejects NUL bytes."
+      "description": "UTF-8 workflow identifier under which Core replays the history. Histories from Temporal Server 1.21 or later also record it in the start event; when that recorded ID is non-empty, the Rust validator requires this value to equal it. The Rust validator also applies the authoritative byte limit and rejects NUL bytes."
     },
     "history": {
       "type": "object",

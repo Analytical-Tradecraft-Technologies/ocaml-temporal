@@ -13,7 +13,7 @@ background threads.
 
 ## Version and symbols
 
-ABI version 2 uses only symbols beginning with `ocaml_temporal_core_v2_`.
+ABI version 4 uses only symbols beginning with `ocaml_temporal_core_v4_`.
 Before using the bridge, OCaml asks Rust which ABI version it implements and
 checks that it matches `OCAML_TEMPORAL_CORE_ABI_VERSION`. The bridge represents
 the Rust runtime with one opaque handle. Client connection and worker state are
@@ -29,6 +29,91 @@ an OCaml object and Rust archive built from different contracts fail during
 startup negotiation instead of reaching worker construction with ambiguous
 JSON semantics.
 
+Version 3 is intentionally incompatible with version 2 for the same reason.
+The client start request carries a strict `id_conflict_policy` field that a
+version 2 Rust decoder rejects as unknown, and the start response and start
+outcome documents carry a required `started` flag that a version 2 Rust
+archive never emits and a version 2 OCaml decoder rejects as unknown. Without
+a bump, either mixed pairing would pass negotiation and then fail every
+`Client.start` with a protocol error. Renaming the symbol prefix to
+`ocaml_temporal_core_v4_` together with the constant makes a stale archive or
+stale OCaml object fail at link time or during startup negotiation instead.
+
+Version 4 is intentionally incompatible with version 3. The closed client
+error document gained a `query_failed` kind that carries the bounded message
+of a workflow query handler failure (issue #823). A version 3 OCaml decoder
+rejects that kind as unknown, so a stale OCaml object paired with a version 4
+archive would turn every query handler failure into a protocol error, and a
+version 3 archive never emits it. The symbol prefix therefore moves to
+`ocaml_temporal_core_v4_` together with the constant.
+
+Version 4 also carries the current-run selector (#791) without a bump.
+Client requests after start may send an empty `run_id`, which a version 4
+archive built before that change rejects as an invalid identifier, and a
+current-run wait response echoes that empty run ID. Neither direction can
+silently change meaning: an older OCaml object never sends an empty run ID,
+so every document it exchanges with a newer archive is byte-for-byte
+unchanged, and a newer OCaml object paired with an older archive gets a typed
+protocol error for current-run operations only, before any RPC, while every
+exact-run operation keeps working. No release has shipped a version 4
+archive, and renaming every symbol would collide with concurrent bridge work,
+so the selector is recorded here as an additive version 4 capability rather
+than a version 5 contract. The completed-run successor exposed by the OCaml
+client in the same change (#837) was already part of the version 4 wait
+response.
+
+Submitted client calls (#807) are also additive within version 4.
+`ocaml_temporal_core_v4_client_submit_json` takes a closed `uint32_t`
+operation selector (`OCAML_TEMPORAL_CORE_CLIENT_CALL_*`) and the operation's
+existing request document, spawns the RPC on a Tokio task, and returns the
+handle `<owner>.<call>`: the submitting graph's random owner identity and the
+call identifier. `ocaml_temporal_core_v4_client_await_call(owner, call,
+timeout_ms)` takes that pair, not a runtime, and serves only the owner that
+submitted the call; any other owner gets the same `INVALID_STATE` as an
+unknown call and leaves the call untouched.
+`ocaml_temporal_core_v4_client_release_call(owner, call)` abandons a call
+without reading it; a call counts against the connection's in-flight ceiling
+(`max_in_flight_calls`, 4,096 by default; see
+[client admission limits](client-protocol.md#client-admission-limits-796))
+until it is read, released, or its runtime closes, even after its RPC ends.
+The await symbol waits a bounded interval for the outcome, which is the
+same document or failure the synchronous symbol returns (a start yields the
+ticket path's outcome document). No document, status value, or existing
+symbol changes, and an older OCaml object never calls the three new
+symbols, so
+the version and symbol prefix stay at 4. The completion registry, its
+ownership, and its shutdown behavior are described in the
+[client protocol](client-protocol.md#submitted-client-calls-807).
+
+The worker idle pacing sleep (#1008) is also additive within version 4.
+`ocaml_temporal_core_v4_pacing_sleep_ns(nanoseconds)` sleeps the calling
+thread for at most `OCAML_TEMPORAL_CORE_MAX_PACING_SLEEP_NS` (one second)
+through `std::thread::sleep`, which uses a per-timer high-resolution waitable
+timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) on Windows 10 1803 and later
+and `Sleep` only where that is unavailable. It changes no process- or
+system-wide timer resolution (no `timeBeginPeriod`), touches no bridge state,
+and takes no result object, so the idle path allocates nothing; it returns
+`OK`, or `PANIC` if a panic was contained. The OCaml stub releases the
+runtime lock around it. No existing symbol or document changes, and an older
+OCaml object never calls it.
+
+The async activity heartbeat selector (`ASYNC_ACTIVITY_HEARTBEAT`, #1025) is
+the one selector whose document is not its synchronous symbol's: it adds the
+attempt's required, nullable `heartbeat_timeout`
+([schema](../schemas/bridge/activity-async-heartbeat.schema.json)), and its
+outcome may also be the fixed value `cancel_requested`, `reset`, or
+`paused`. The selector was added and then changed before any release
+shipped it, so this stays within version 4. The bridge throttles those
+heartbeats per task token with the worker's heartbeat throttle settings
+(`rust/core-bridge/src/heartbeat_throttle.rs`). Each throttled token has one
+driver task on Core's Tokio runtime that owns a client (a connection
+clone); the runtime owner keeps every driver's `JoinHandle`, and disconnect
+and close abort and join the drivers after the submitted calls, before the
+connection is dropped (the GC close path hands them to the cleanup thread
+with the other aborted tasks). Throttle state is bounded by the
+connection's `max_in_flight_calls`; see
+[native activity execution](native-activity-execution.md#async-heartbeat-throttling).
+
 The canonical header is
 `rust/core-bridge/include/ocaml_temporal_core.h`. Both Rust and C compile-time
 assertions protect the status width, every numeric status value, and field
@@ -37,6 +122,62 @@ the C header is consumed by OCaml's private stubs and by downstream native
 executables, so a seemingly harmless enum renumbering or padding change must
 fail during compilation instead of becoming a delayed, cross-language memory
 or error-handling defect. C11 and C++11 consumers get equivalent checks.
+
+## Temporal Core revision
+
+The bridge links Temporal Core commit
+`8fe478ee179ed754614d230f39586f3edb57da71`, the commit of upstream release tags
+`v1.1.0` and `core-v0.10.0` (crates `temporalio-client`/`-common` 1.1.0 and
+`temporalio-sdk-core`/`-protos` 0.10.0). `TEMPORAL_CORE_REVISION` in
+`rust/core-bridge/src/lib.rs` records it; the weekly freshness check described
+in [dependencies](../dependencies.md#temporal-core-pin-upgrades) reports when
+upstream releases past it.
+
+The upgrade from `95e97686` (crate 0.5.0, issue #824) changed no C symbol,
+status value, `repr(C)` layout or JSON document, so the ABI stays at version 4.
+The adaptations keep the previous behaviour:
+
+- Core 1.x routes `AsyncActivityHandle` through the client data converter and
+  takes a high-level `ApplicationFailure`. Asynchronous activity completion and
+  heartbeat therefore call the four `RespondActivityTask*`/
+  `RecordActivityTaskHeartbeat` RPCs directly with the exact payloads and
+  failure decoded from OCaml, and classify `NotFound` exactly as Core did.
+- New protobuf fields are set to their previous meaning: no local-activity
+  arguments in result markers, no workflow-cancellation details, no command
+  event-group markers, no external-storage metrics, and an unspecified
+  activity failure cause. The reverse conversion rejects any non-default value.
+- The two new child-start failure causes (`NamespaceNotFound`,
+  `InvalidVersioningOverride`) reach OCaml as `unspecified`. The previous pin
+  could not represent them and failed the workflow task instead.
+- Worker heartbeats keep omitting the host environment details Core 1.x would
+  attach by default (`disable_environment_info`).
+- Workflow and activity pollers stay explicit; Core 1.x would otherwise
+  auto-enrol an unset poller behavior in autoscaling.
+- Client connection is bounded. `Connection::connect` performs the
+  transport connect and then an unretried `GetSystemInfo` that only Core's
+  30 s per-call default bounds. A refused or closed connection still fails in
+  milliseconds. However, an endpoint that accepts the connection without
+  answering held `Client.create` for the full 30 s, which made the
+  transport-interruption refuse scenario intermittent in CI. The bridge now
+  bounds the whole handshake with `CLIENT_CONNECT_TIMEOUT` (10 s). It also
+  sets Core 1.x's new transport `connect_timeout` to the same value, which is
+  unset by default. Expiry is reported as the usual `STATUS_CONNECTION` with
+  `cause=timeout`, so OCaml still sees a typed `Bridge` error. Workers reuse
+  this one runtime connection and have no separate connect path.
+
+Core 1.x enforces namespace payload limits in the worker by default: an
+oversized activity result or heartbeat becomes a `PayloadsTooLarge` activity
+failure (a heartbeat also queues a Cancel task), and an oversized workflow
+completion becomes a workflow-task failure reported on its first attempt only.
+Previously the server rejected such requests. The bridge keeps Core's default.
+Core also accepts late child results after a `TryCancel` child was cancelled
+(sdk-core #1455) and waits for in-flight activity completions during shutdown
+(sdk-core #1538); neither changes a document the bridge exchanges.
+
+Inbound fields added by Core 1.x that the semantic protocol does not carry yet
+are dropped: the failure `cause` of external signal and cancel resolutions,
+`InitializeWorkflow.original_execution_run_id`, and
+`SignalWorkflow.originating_event_id`.
 
 ## Semantic workflow adapter
 
@@ -47,7 +188,11 @@ performs the inverse conversion for workflow commands. The private OCaml module
 `Temporal_protocol.Workflow_protocol` implements the same model and validation
 without importing protobuf definitions.
 
-Both encoders reparse their own output before it can cross the native boundary.
+Both encoders check their own output against the receiver's rules before it can
+cross the native boundary. Rust reparses its output; OCaml applies the
+decoder's semantic rules to the validated tree and the parser's raw-text
+preflight to the serialized bytes, so payload bytes are not parsed and base64
+decoded a second time (#846).
 Both decoders reject duplicate or unknown fields, unknown variants, numeric
 range violations, non-canonical base64, invalid workflow invariants, and
 oversized values. Core fields not represented by the current semantic slice are
@@ -60,6 +205,21 @@ The [structured parser fuzz smoke](bridge-parser-fuzz.md) mutates committed
 valid and rejected fixtures against the independently callable Rust envelope,
 payload, activation, and completion decoders. Its limits and instrumentation
 scope are stated separately from the fixed-fixture and C ABI sanitizer tests.
+The [decoder fuzz](bridge-decoder-fuzz.md) applies the same approach to every
+other Rust decoder reached through the ABI (activity, client request, client
+and worker configuration, and replay history documents) and to every OCaml
+decoder of a bridge response. It also checks typed rejection statuses and
+bounded allocation.
+
+The [lifecycle stress](bridge-lifecycle-stress.md) runs seeded,
+reproducible operation sequences against the ABI. The sequences interleave
+runtime, replay-worker, and live-worker operations: create, poll, complete,
+reject, shutdown, finalize, free, and GC-fallback dispose, including calls
+that misuse the ABI. A model and two ledgers check every handle and lease
+against them. A companion OCaml test runs the custom-block finalizer and
+supervisor cycles under GC pressure. A concurrent stress runs graphs on several threads
+and shared runtimes, and an OCaml test closes runtimes across Domains while
+their owners are inside native calls.
 
 There is one normal-start compatibility default in the initializer: Temporal
 Core maps the server's `first_workflow_task_backoff` to
@@ -129,7 +289,7 @@ This plumbing is unit-tested native evidence plus the implemented acceptance
 controller. The public C/OCaml replay operation remains separate work. The
 two-generation Docker Compose restart target now proves the exact run, replay
 marker, terminal result, and fresh PostgreSQL-volume cleanup in the [PR #253
-Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471).
+Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471).
 
 ## Native client start and exact-run wait
 
@@ -158,7 +318,38 @@ the entire request, including `request_id`, and share the existing ten-second
 overall deadline. A definitive rejection remains terminal; an unanswered
 request remains uncertain when the deadline expires. Callback-transport tests
 under `tests/support/client_start.rs` cover recovery, request identity,
-non-retryable rejection, and cancellation of a hung request.
+non-retryable rejection, cancellation of a hung request, the default 64-ticket
+admission bound, and a configured bound of two (#796).
+
+Every other client RPC (wait, signal, query, cancel, terminate, reset,
+update, update poll, and visibility listing) goes through the same retrying
+`Connection` (#820). Core decides which statuses are transient (`unavailable`,
+`resource_exhausted`, `unknown`, `internal`, `aborted`, `out_of_range`,
+`data_loss`, and transport-level cancellation) and re-sends the identical
+request, so `request_id` or the update ID deduplicates a retried mutation.
+Each bounded RPC replaces Core's ten-second retry window with its own budget
+(three seconds for the signal, cancel, reset, and terminate control RPCs, ten
+for visibility, thirty for query, update acceptance, and update polling) and
+uses that budget as every attempt's gRPC deadline; the outer timeout still
+caps an attempt in flight when the budget ends. The pinned Core accepts a
+`resource_exhausted` retry using its ordinary backoff and then replaces the
+wait with a separate throttle backoff (1 s, 2 s, 4 s, ... up to 10 s, each
++/-20%) without rechecking the retry window, so the control budget is three
+seconds rather than one: one throttled re-send fits, while a throttle wait
+still pending when the budget ends is cut off by the outer timeout and
+reported as the RPC's deadline error. Terminate has no idempotency key, so
+Core re-sends it only after `resource_exhausted`; `unavailable`, a
+per-attempt `deadline_exceeded` or `cancelled`, and the outer deadline may
+follow an applied termination and are reported as
+`termination_outcome_uncertain` without a re-send. The `wait` history long poll has no
+total budget: Core measures its retry window from the start of a call, which
+would forbid retrying a long poll that failed after ten healthy seconds, so the
+wait instead allows up to thirty consecutive attempts per long poll (roughly
+two minutes of outage with Core's default backoff). Tests under
+`tests/support/client_retry.rs` cover recovery of each RPC, identical
+re-sends, non-retried rejections, the terminate restriction and its
+uncertain `unavailable` result, a throttled signal re-send inside the control
+budget, and that budget's bound on a persistent outage.
 
 The wait request names `namespace`, `workflow_id`, and one concrete `run_id`.
 There is no `follow_runs` escape hatch in the document: the operation always
@@ -171,10 +362,34 @@ and pagination state: 100 ms bounds owner occupancy, not RPC lifetime. Slow
 successful requests therefore make progress across calls while the owner can
 still admit shutdown and other lifecycle messages.
 
-At most 64 distinct exact-run observations may be retained per runtime. Calls
+At most `max_pending_waits` distinct exact-run observations (64 by default)
+may be retained per runtime. Calls
 with the same namespace, workflow ID, and run ID share an in-flight future;
-admitting a new identity at capacity returns `INVALID_STATE`. A terminal
-result or error removes its entry before returning to OCaml. A later wait may
+admitting a new identity at capacity returns status `15`
+(`RESOURCE_EXHAUSTED`). That status is reserved for a full bounded
+client-operation registry: nothing was sent to Temporal and the client stays
+connected, so it is distinct from the `INVALID_STATE` returned for a closed
+client or runtime. The same status applies to outstanding asynchronous start
+tickets, bounded by `max_pending_starts` (64 by default), and to the
+submitted-call ceiling `max_in_flight_calls` (4,096 by default).
+
+The three limits are fixed per connection (#796). The client connect document
+may carry each one as an optional integer field; `connect_client` validates
+them through `client_calls::ClientLimits::from_config` (1 to 4,096 for waits
+and starts, 1 to 65,536 for calls, otherwise `CONFIGURATION`) before any
+network access, and stores the result on the runtime only when the
+connection succeeds. Every admission check reads the runtime's
+`client_limits` instead of a constant, and the capacity message names the
+configured value. An omitted field keeps the default, and the OCaml encoder
+omits defaults, so the document and behavior of a default client are
+unchanged and ABI version 4 still applies; see
+[client admission limits](client-protocol.md#client-admission-limits-796).
+The public adapter maps the status to a retryable
+`bridge` error with `error_type` `resource_exhausted`, which
+`Client.is_at_capacity` recognizes.
+
+A terminal wait result or error removes its retained observation before
+returning to OCaml. A later wait may
 observe the same closed run again through a fresh request; this table is not
 a result cache. Client disconnect and both explicit and finalizer runtime
 close cancel all retained futures before releasing the connection and Core.
@@ -184,7 +399,11 @@ directly without spawning or detaching tasks.
 Completed, failed, and timed-out close events retain any successor run ID
 exposed by Core. A continued-as-new close is returned as a terminal
 `continued_as_new` outcome with a required successor execution reference; the
-bridge never follows that run implicitly. This prevents an exact-run caller
+bridge never follows that run implicitly. A wait request with an empty run ID
+observes whichever run is current when Temporal handles the history poll and
+echoes the empty run ID in its response; only the public OCaml client decides,
+for a handle obtained by workflow ID, to follow successors with further
+exact-run waits. This prevents an exact-run caller
 from accidentally observing a different execution identity. Any successor
 must retain the waited namespace and workflow ID and must identify a different
 run. Both language validators enforce that cross-object relationship because
@@ -214,10 +433,57 @@ returns only `invalid lifecycle configuration JSON`; Serde's syntax, location,
 and unknown-field details are kept inside Rust so application-controlled input
 cannot become a diagnostic at the C/OCaml boundary.
 
+Client connection failures are the documented exception (#833). Because a
+constant message made DNS, refused, TLS, and timeout failures
+indistinguishable, `STATUS_CONNECTION` from client connect carries a closed
+cause category plus the bounded (512-byte), control-character-escaped local
+transport error chain. A failed `GetSystemInfo` contributes only its gRPC code
+name, never the server's status message. Core's own rejection of connection
+options maps to `STATUS_CONFIGURATION` with a constant message, because that
+text may echo configured headers. `rust/core-bridge/src/diagnostics.rs` owns
+this reduction; the message format is described in
+[observability](observability.md).
+
+Runtime creation configures Core telemetry with a push logger at the level
+selected by `OCAML_TEMPORAL_CORE_LOG` (default `warn`, `off` disables it).
+Core invokes the consumer synchronously on whichever thread emitted the
+record, including Tokio workers driving network progress and the supervisor
+thread inside a blocking bridge call, so the consumer performs no I/O. It
+formats one bounded line and offers it to a bounded queue
+(`CORE_LOG_QUEUE_CAPACITY`, 1,024 lines) with a non-blocking `try_send`. When
+the queue is full the line is dropped and counted, never waited for. The
+consumer holds no OCaml value, never calls back into OCaml, and contains
+formatting panics.
+
+Each runtime with logging enabled owns exactly one Core log writer thread
+(`diagnostics::CoreLogWriter`), spawned before Core and stored in the runtime
+handle. The writer drains the queue to stderr, ignores write errors, contains
+sink panics, and never calls OCaml. Before the next line, after one idle
+second, and at shutdown it writes one `N Core log records dropped` summary
+for any drops. Its single release path runs on the runtime cleanup thread
+after Core has been dropped, so Core's shutdown records are still flushed.
+That path disconnects the queue, waits up to `CORE_LOG_CLOSE_TIMEOUT`
+(500 ms) for the writer to drain and exit, and then joins it. A writer still
+blocked in a stderr write after that bound means the stderr reader has
+stalled. Waiting longer could hang runtime close indefinitely, so the thread
+is detached instead. A detached writer owns only the queue receiver, the drop
+counter, and stderr: no Core, Tokio, or OCaml state. It exits once its write
+returns, or ends with the process. A stalled stderr therefore delays runtime
+close by at most the bound. If runtime construction fails after the writer
+was spawned, dropping it runs the same bounded close.
+
+Core also installs the subscriber as the thread-local default on the thread
+that creates the runtime (the owning supervisor thread). That guard is removed
+only if the runtime is dropped on the same thread; otherwise it stays with
+that thread and keeps one reference to the consumer. Because the writer's
+close takes the queue sender explicitly, rather than waiting for Core to drop
+its consumer, records reaching such a stale subscriber are discarded without
+blocking.
+
 All client-operation identifiers are nonempty and NUL-free. The schemas state the
 65,536-character necessary bound, while the bilateral runtime validators apply
 the authoritative 65,536-byte UTF-8 limit, reject duplicate members, and
-reparse encoded output. JSON Schema counts Unicode characters rather than
+check encoded output against the receiver's limits. JSON Schema counts Unicode characters rather than
 encoded bytes, so schema validation alone is not a substitute for the runtime
 checks.
 
@@ -237,8 +503,10 @@ client waits use the expected `NOT_READY` status. For a worker lane it means no
 task is queued; for a client wait it means the 100 ms owner interval elapsed
 without a terminal result. In both cases the caller or a later orchestration
 loop can resume through the supervisor mailbox.
-`OUTSTANDING_TASKS` means shutdown cannot finalize until the language side
-completes leased work.
+For live worker shutdown, `OUTSTANDING_TASKS` means a task leased to the
+language side was never completed: the bridge force-completed it, finalized
+the worker, and released it, and reports the abandoned work so the caller can
+surface it. For replay it means recorded input was not fully drained.
 
 A result has one success buffer and one error buffer. At most one owns memory:
 
@@ -250,7 +518,7 @@ A result has one success buffer and one error buffer. At most one owns memory:
 
 Rust owns both allocations. The caller may copy their bytes but must never
 mutate or directly free their fields. It must call
-`ocaml_temporal_core_v2_result_free` exactly once after consuming an initialized
+`ocaml_temporal_core_v4_result_free` exactly once after consuming an initialized
 result. That function clears the object, so accidentally calling it again on
 the same object is safe. Copying a live result structure creates no new
 ownership; freeing both copies is invalid.
@@ -262,7 +530,7 @@ result when passed to another operation. Free the previous result first.
 
 The private C stubs allocate an OCaml custom block before entering Rust. That
 block is the sole owner of the ABI result and has a finalizer which calls
-`ocaml_temporal_core_v2_result_free`. The OCaml wrapper also uses
+`ocaml_temporal_core_v4_result_free`. The OCaml wrapper also uses
 `Fun.protect` to release the result deterministically after copying its bytes.
 This gives every path two compatible safeguards: normal operation frees
 immediately, while an OCaml allocation failure or other exception leaves a
@@ -320,6 +588,7 @@ native worker adapter and are not part of the public workflow-authoring API:
 | `worker_reject_workflow_json` | Retire the lease when OCaml cannot decode the exact Rust-produced activation document | `unit` |
 | `worker_try_poll_activity` | Drain one already-ready remote or local activity task without waiting | semantic activity JSON bytes |
 | `worker_wait_activity` | Wait for activity readiness without consuming a task | `unit` wake signal |
+| `worker_wait_any` | Wait for readiness on either lane without consuming a task | `unit` wake signal |
 | `worker_record_activity_heartbeat_json` | Validate and record progress for an outstanding activity lease without completing it; Core reports cancellation, pause, and reset asynchronously in a later `Cancel` task | `unit` acknowledgement |
 | `worker_complete_activity_json` | Validate and complete one leased activity task | `unit` |
 | `worker_reject_activity_json` | Retire the lease when OCaml cannot decode the exact Rust-produced activity document | `unit` |
@@ -355,26 +624,32 @@ and cannot retire the real lease. The malformed-byte case is defensive:
 successful Rust poll encoding cannot produce malformed JSON, but both language
 decoders and both rejection entry points still validate it.
 
-`Sdk_supervisor.Native` is the private OCaml adapter for these ABI version 2
+`Sdk_supervisor.Native` is the private OCaml adapter for these ABI version 4
 operations. It exposes a typed GADT rather than raw JSON bytes:
 
 | Supervisor operation | Result and boundary behavior |
 | --- | --- |
 | `Try_poll_workflow` | `Workflow_protocol.activation option`; `None` means the workflow lane was empty at that instant |
 | `Wait_workflow` | bounded native readiness wait; it does not consume an activation and releases the OCaml runtime lock |
-| `Complete_workflow completion` | canonical strict JSON is generated and reparsed before the native completion call |
+| `Complete_workflow encoded` | an `Encoded_workflow_completion.t` holding the canonical JSON from the worker adapter's single encoder pass; the supervisor copies those bytes into the native completion call without encoding or reparsing them, and Rust strictly decodes them |
 | `Try_poll_activity` | `Activity_protocol.task option`; `None` means the activity lane was empty at that instant |
 | `Wait_activity` | bounded native readiness wait; it does not consume an activity task and releases the OCaml runtime lock |
-| `Record_activity_heartbeat heartbeat` | canonical strict heartbeat JSON is validated and recorded for the outstanding activity lease without retiring it; the acknowledgement carries no cancellation flags, which arrive later on the activity poll lane |
-| `Complete_activity completion` | the opaque token and result are validated before the native completion call |
+| `Wait_any` | bounded native readiness wait that any queued workflow activation or activity task ends; it consumes nothing and releases the OCaml runtime lock |
+| `Record_activity_heartbeat encoded` | an `Encoded_activity_heartbeat.t` holding the canonical JSON from the activity adapter's single encoder pass, which validated the token and details; the supervisor copies those bytes into the native call without encoding them again (#1001), and Rust records them for the outstanding activity lease without retiring it. The acknowledgement carries no cancellation flags, which arrive later on the activity poll lane. `Record_async_activity_heartbeat` takes the same value; the worker's throttled `Rpc_async_activity_heartbeat` client call instead takes an `Encoded_async_activity_heartbeat.t`, which adds the attempt's heartbeat timeout, and returns the activity state of the token's latest send (#1025) |
+| `Complete_activity encoded` | an `Encoded_activity_completion.t` holding the canonical JSON from the activity adapter's single encoder pass, which validated the opaque token and result; the supervisor copies those bytes into the native completion call without encoding them again, and Rust strictly decodes them. `Complete_async_activity` takes the same value |
 
-All seven operations enter the same bounded mailbox as client and worker
+All eight operations enter the same bounded mailbox as client and worker
 lifecycle changes. A poll, completion, worker shutdown, and runtime shutdown
 therefore cannot race native graph state. The pure protocol conversion module
 is visible only from the private supervisor library so both serialization
 directions can be tested without constructing a Core worker.
 
 The two Rust readiness signals use one mutex-protected pending count per lane.
+Each signal also notifies a worker-wide combined wake after releasing its lane
+mutex; `worker_wait_any` holds that wake's mutex while it checks both lane
+predicates, so a task published on either lane after the check still wakes it
+(#806). Queued work on either lane wins over a fatal error, which wins over
+closure.
 The poll task holds that mutex while it sends a message and increments the
 count; the supervisor holds it while receiving and decrementing. This makes a
 send and its wake notification one linearizable operation and prevents a
@@ -402,12 +677,52 @@ The Rust integration suite invokes the common wrapper with a deliberate panic;
 the panic test hook is not exported in the C header and is not part of the
 stable ABI.
 
+### SIGPIPE containment (#1041)
+
+The bridge never changes the process-wide SIGPIPE disposition. A Rust
+executable starts with SIGPIPE ignored, but that startup code does not run
+when the bridge is a static library in an OCaml executable, and OCaml keeps
+the default, terminating action. Rust std's scalar socket writes pass
+`MSG_NOSIGNAL`, while vectored writes (used by h2, hyper and tokio-rustls for
+gRPC, TLS and the Prometheus endpoint) are a plain `writev`. On Linux a
+`writev` to a connection the peer has reset therefore raised SIGPIPE and
+killed the process with status 141. macOS sockets created by std and mio set
+`SO_NOSIGPIPE`; Windows has no SIGPIPE.
+
+A SIGPIPE raised by a write is directed at the writing thread, so the bridge
+blocks it in thread signal masks instead (`rust/core-bridge/src/sigpipe.rs`):
+
+- every Tokio worker and blocking-pool thread of Core's runtime blocks it at
+  start, through Core's `lang_on_thread_start` hook, as do the runtime
+  cleanup threads and the Core log writer;
+- on Linux, the common ABI wrapper (`invoke`) blocks it for the duration of
+  each call on the application's thread, where `block_on` can drive connection setup
+  such as a TLS handshake. On return it consumes a SIGPIPE that became
+  pending during the call and restores the caller's exact mask. A caller that
+  had already blocked SIGPIPE is left untouched. Threads Core spawns during a
+  guarded call inherit the blocked mask. The drain is a zero-timeout
+  `sigtimedwait`, so it cannot block if another thread accepted a
+  process-directed SIGPIPE first. Other platforms skip the guard: macOS
+  bridge sockets never raise SIGPIPE, and without `sigtimedwait` a drain
+  could block indefinitely.
+
+The write then fails with `EPIPE` and follows the ordinary error path.
+Setting `SIG_IGN` instead (as the Rust, Python and Node runtimes do) was
+rejected because it silently changes an application setting that is also
+inherited by every child process the application later executes. An
+application that sets its own disposition or handler is unaffected.
+`rust/core-bridge/tests/sigpipe_containment.rs` covers both halves with the
+default disposition restored, including Linux `writev` into reset
+connections and aborted metrics scrapes; `test/bridge/test_runtime_metrics.ml`
+aborts scrapes from an OCaml host.
+
 ## Stateful handle ownership
 
 The reserved runtime, client, and worker types are opaque references to
 Rust-owned SDK state, not OS handles and not public OCaml values. Only the
-runtime pointer crosses the current C ABI; client and worker state are fields
-within that Rust runtime:
+runtime pointer (and, for an application-shared Core, the shared-runtime
+pointer described under [Shared runtime](#shared-runtime-832)) crosses the
+current C ABI; client and worker state are fields within that Rust runtime:
 
 - a runtime owns Tokio and shared Core infrastructure;
 - a client owns one cluster connection and its authentication/configuration;
@@ -422,12 +737,260 @@ The supervisor serializes lifecycle transitions and destroys workers before
 clients and the runtime. Rust retains internal Tokio concurrency; workflow
 executions retain their separate deterministic effect schedulers.
 
+### Runtime thread budget (#832)
+
+Each runtime builds its own multi-thread Tokio executor. Tokio's default of
+one worker per core made every client and worker cost dozens of idle threads
+on a large host, so runtime creation takes an explicit worker count through
+`ocaml_temporal_core_v4_runtime_new_with_worker_threads`. `0` selects the
+bridge default, `min(available parallelism, DEFAULT_RUNTIME_WORKER_THREADS_CAP)`
+(4), falling back to one thread when parallelism cannot be queried.
+`1..=OCAML_TEMPORAL_CORE_MAX_RUNTIME_WORKER_THREADS` (256) is used unchanged,
+and a larger value returns `STATUS_INVALID_ARGUMENT` before anything is
+allocated, leaving the runtime slot null. `ocaml_temporal_core_v4_runtime_new`
+is the same call with `0`. The count is resolved before Core is built, so it
+adds no owner or release path: the Tokio pool remains owned by Core inside the
+runtime handle and is shut down by the existing runtime destruction path.
+
+OCaml exposes the bound as the implementation-neutral `?io_threads` on
+`Client.create` and `Worker.create`: the public documentation promises only an
+upper bound on network and server-communication threads, so the Tokio mapping
+stays private and could change without a public API migration. The SDK
+validates the same range as a typed defect before any supervisor or native
+allocation, and passes it through
+`Sdk_supervisor.Native.create` to `Native_bridge.runtime_create`. The C stub
+maps a negative or oversized OCaml integer to `UINT32_MAX` so Rust rejects it
+rather than truncating. Each instance still owns a separate runtime, its
+cleanup thread, and its supervisor Domain unless it is attached to a shared
+runtime (below).
+
+### Shared runtime (#832)
+
+Several SDK instances can share one Core runtime, and so one Tokio pool,
+through an explicit, application-owned value. The native graph is split at
+one seam: Core moves out of the per-instance graph into a reference-counted
+`SharedCore` (Core plus its optional log writer), and every holder owns one
+`Arc` reference to it.
+
+- `ocaml_temporal_core_v4_shared_runtime_new(worker_threads, &shared, out)`
+  builds one `SharedCore` behind an opaque `SharedRuntime` handle that owns
+  one reference and its own cleanup thread. It carries no client or worker.
+- `ocaml_temporal_core_v4_runtime_new_attached(shared, &runtime, out)`
+  creates an ordinary instance graph (one client, one worker, its own cleanup
+  thread, released by `runtime_free`/`runtime_dispose`) that holds a cloned
+  reference instead of building its own Core. A null `shared` is
+  `INVALID_ARGUMENT`; concurrent attaches on one live handle are permitted.
+- `ocaml_temporal_core_v4_shared_runtime_free` releases the handle's
+  reference and waits; `..._shared_runtime_dispose` is the non-waiting GC
+  fallback. Both clear the slot first and are idempotent on a null slot.
+- `ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(worker_threads,
+  input, input_len, &shared, out)` (#500) is `shared_runtime_new` plus a
+  strict telemetry document of at most 16 KiB; the plain constructor now
+  delegates to it with `{}`. The only member today is optional
+  `prometheus`: `{"bind_address": "<ip>:<port>", "global_tags":
+  [{"name": ..., "value": ...}], "counters_total_suffix": bool,
+  "unit_suffix": bool, "durations_as_seconds": bool}` (the tag list and the
+  three switches default to empty and `false`; unknown members are
+  rejected). `src/telemetry.rs` validates it with the same rules as
+  `Temporal_base.Metrics_config` (IP socket address only, at most 16 tags,
+  names `[A-Za-z_][A-Za-z0-9_]*` up to 64 bytes without `__` prefix or a
+  label Core already uses, values 1..256 bytes without control characters,
+  unique names) before Core is built, so a rejected document allocates
+  nothing. It then builds Core, binds the public listener on
+  `bind_address` itself, starts Core's own
+  `start_prometheus_metric_exporter` on an ephemeral loopback port of the
+  same address family inside Core's Tokio context, and attaches the
+  returned meter with `attach_late_init_metrics` before the handle is
+  published, so every graph attached later hands the meter to its client
+  (`ConnectionOptions::metrics_meter`) and worker. A bind failure is
+  `CONFIGURATION` naming the configured address and the `io::ErrorKind`
+  only; the just-built Core is dropped on the calling thread. The success
+  value is the public bound address as UTF-8 (port `0` resolved), or empty
+  without an exporter.
+
+  Accept resilience (#1030). Core's scrape server returns from its accept
+  loop on the first `accept()` error, closing its listener for good, and
+  Core exposes no way to serve its registry from another listener. The
+  bridge therefore runs its own accept loop on the public listener and
+  relays each connection byte for byte to Core's loopback server.
+  Connection-scoped errors (`ConnectionAborted`, `ConnectionReset`,
+  `Interrupted`) are skipped. Any other error, such as `EMFILE`, is logged
+  as a `warn` record with its kind and OS error number and retried after a
+  backoff that doubles from 10 ms to 1 s and resets after a successful
+  accept. Core's own accept loop now sees only the bridge's relay
+  connections, so it can stop only on a resource error on its private
+  listener. A relay that then finds Core's task finished answers
+  `503 Service Unavailable` with a short explanation and logs one `error`
+  record per exporter, so a stopped server is visible to Prometheus and in
+  the log rather than a silently closed port. Recovery from that state
+  requires recreating the runtime. The bridge records go through Core's log
+  pipeline (`TEMPORAL_CORE_LOG`) like Core's own records.
+
+  Descriptor headroom. Each relayed scrape needs the public `accept()`, the
+  relay's private `connect()`, Core's `accept()` of that connection, and a
+  free descriptor for the follow-up `accept()` Core's loop makes at once:
+  Tokio keeps accepting until `WouldBlock`, and Linux allocates the new
+  descriptor before checking the queue, so that call fails with `EMFILE`
+  instead of `EAGAIN` at the limit. Any such `EMFILE` stops Core's server.
+  The relays therefore share a reserve of three spare descriptors (open handles to `/dev/null`; nothing on Windows).
+  A relay first reads the scraper's request head, dropping a connection that
+  sends nothing within 5 s. Under an async mutex it then refills the
+  reserve, releases it immediately before `connect()`, forwards the head,
+  and refills the reserve only after Core's first response bytes arrive
+  (proof that Core has accepted), or after 5 s. If the reserve cannot be
+  refilled, the scraper receives a transient `503` ("Too few file
+  descriptors ...") rather than risking Core's server. The descriptor table
+  is process-wide, so another thread opening a file in the instant between
+  release and Core's accept can still take a released descriptor. The
+  reserve removes the deterministic starvation, not that race.
+
+  Connection cap (#500). The accept loop takes one of
+  `MAX_CONCURRENT_SCRAPES` (8) permits of a `tokio::sync::Semaphore`
+  before spawning a relay, and the relay task owns the permit until it ends,
+  so every exit path (including the abort at shutdown) returns it. A
+  connection accepted while every permit is held never connects to Core and
+  never touches the reserve: if one of `MAX_PENDING_REJECTIONS` (16)
+  rejection permits is free, a rejection task reads its request head and
+  answers `503` ("Too many concurrent metrics scrapes ..."), all within 1 s;
+  otherwise the stream is dropped (closed) on the accept loop. Reading the
+  head first matters: closing with unread request bytes makes the kernel
+  reset the connection, and macOS then discards the queued `503` before the
+  scraper reads it. The first rejection per exporter is a `warn` record,
+  later ones `debug`. Relays are bounded in time so permits cannot be held
+  forever: 5 s for the request head (as before), then a copy loop
+  (`tokio::select!` over both directions, forwarding end-of-input as a write
+  shutdown like `copy_bidirectional`) that ends after 10 s without a byte
+  moving in either direction (including a write the peer will not drain),
+  and an overall deadline 60 s after `accept()`. The limits are constants in
+  `src/telemetry.rs`, not part of the telemetry document.
+  `rust/core-bridge/tests/metrics_connection_cap.rs` holds every permit with
+  idle and kept-alive clients, requires a burst of idle over-cap
+  connections to be closed within the rejection timeout and further
+  scrapes to receive the busy `503` (never metrics) within 2 s, waits for
+  the bridge to close every holder, then requires real scrapes to succeed
+  and (on Unix) the process descriptor count to return to its baseline.
+
+  The returned `MetricsExporter` guard is the first field of `SharedCore`:
+  dropping the last Core reference aborts both the accept loop and Core's
+  scrape task, then drops Core's Tokio runtime, which joins its workers and
+  so closes both listening sockets and any relayed connection before the
+  release returns (`rust/core-bridge/tests/metrics_exporter.rs`, which also
+  covers the 503 state; `rust/core-bridge/tests/metrics_accept_retry.rs`
+  provokes a real `EMFILE` from `accept()`;
+  `rust/core-bridge/tests/metrics_core_accept_headroom.rs` frees two or
+  three descriptors at a time at the limit and requires Core's server to
+  keep running). Scrapes are served entirely on
+  Tokio threads and never call OCaml. Enabling it requires
+  `temporalio-common`'s `prometheus` feature, which adds only the
+  Apache-2.0 `prometheus` crate (see [dependencies](../dependencies.md)).
+
+Ownership rules. Each graph still has exactly one owner (its supervisor's
+owner Domain) and one release path; supervisors never share mutable native
+state, so "one supervisor actor per SDK instance owns its graph" still holds,
+with Core moved out of the graph. Core is destroyed exactly once, by
+whichever holder drops the last reference, in any order: releasing the
+shared handle first never frees Core under a live graph, it only defers
+destruction to that graph's `runtime_free`. Every holder drops its reference
+on a plain OS thread (a cleanup thread, or an OCaml thread with the runtime
+lock released), never on a Tokio worker, where dropping a Tokio runtime
+panics. Field order in `SharedCore` drops Core before closing the log writer,
+so Core's shutdown records are still flushed. A Core worker finalizer that
+was detached after a bounded timeout ends when the last reference is dropped,
+which for a shared runtime is the shared runtime's release rather than the
+graph's.
+
+The OCaml side adds a stricter, typed ordering rule on top of that memory
+safety. `Sdk_shared_runtime` (private) owns the `Native_bridge.shared_runtime`
+custom block, whose C owner has the same counted-borrow gate and malloc'd
+layout as the per-instance runtime owner. Each attachment is a lease acquired
+before any graph exists; `Sdk_supervisor.Native.create ?runtime:lease` takes
+ownership of the lease, releases it if creation fails, and otherwise releases
+it in backend shutdown only after `runtime_close` has returned. `shutdown`
+refuses with `Still_attached n` while any lease is outstanding and otherwise
+holds its mutex across the native free, so every `Ok` return happens after
+Core and its threads are gone. The public `Temporal.Runtime` maps that refusal
+to a `Defect`. If an instance is abandoned without shutdown its lease stays
+held, so `Runtime.shutdown` keeps refusing; the Rust references still
+guarantee Core is never freed early.
+
+Tests: `rust/core-bridge/tests/shared_runtime.rs` proves two attached graphs
+share one Core and Tokio pool and run independent replay workers, that
+releasing the shared handle first leaves graphs usable, and the invalid
+argument paths; `shared_runtime_cleanup.rs` (its own process) proves Core is
+destroyed exactly once by the last holder in both orders and through the GC
+fallback; the C harness covers the symbols under ASan/UBSan; and
+`test/bridge/test_shared_runtime.ml` covers the bridge, the lease ledger, two
+real supervisors on one runtime, the public ordering errors with `mock://`
+and refused `http://` targets, and a Linux thread-count leak check.
+
 The implemented private supervisor owns the real runtime, one official client
 connection, and one Core worker for workflows and remote activities. Its backend protocol exposes
 typed GADT operations but never the owner-confined state, preventing a raw
 handle from escaping through an otherwise convenient callback. See
 [ADR 0004](../decisions/0004-sdk-instance-supervisor.md) for its lifecycle,
 failure, and scheduler contracts.
+
+### SDK metric meter (#500)
+
+Core records its own worker and client metrics, but some worker states exist
+only in the OCaml SDK (activity-lane occupancy, refused tasks, retained
+completion retries, shutdown outcomes, expired asynchronous leases). Four
+additive version 4 symbols let the SDK record them into the same Prometheus
+registry as Core's instruments, so they share the endpoint, Core's
+`temporal_` prefix, its `service_name` label, and the runtime's global tags.
+An older archive lacks the symbols, so a stale pairing fails at link time.
+
+- `ocaml_temporal_core_v4_shared_runtime_metric_meter(shared, &meter, out)`
+  returns an owned `MetricMeter` built from Core's prefixed meter
+  (`get_temporal_metric_meter`), or leaves `*meter` null when the runtime has
+  no exporter; the SDK then records nothing at all. The meter holds a clone
+  of Core's meter (the Prometheus registry), not of `SharedCore`, so it never
+  keeps Core's Tokio runtime alive and may outlive the shared handle and every
+  attached graph; recording afterwards updates a registry nobody scrapes. A
+  null `shared` (which is what the C gate passes for a closed owner) is
+  `INVALID_ARGUMENT`.
+- `ocaml_temporal_core_v4_metric_meter_register_json(meter, input, input_len,
+  &id, out)` registers one series from a strict document of at most 8 KiB:
+  `{"kind": K, "name": N, "description": D, "labels": [{"name": L, "value":
+  V}, ...]}`, with `K` one of `counter`, `up_down_counter`, `gauge`,
+  `histogram`, `duration_histogram`. Names are `[a-z_][a-z0-9_]*` up to 128
+  bytes, without `__` or the `temporal_` prefix Core adds; at most 8 labels,
+  names `[a-z_][a-z0-9_]*` up to 64 bytes, unique, not `le`, `quantile`,
+  `service_name` or a configured global tag; values 1 to 256 bytes without
+  control characters; descriptions up to 512 bytes without control
+  characters; one name keeps one kind and one description; at most 1,024
+  series per meter. A violation is `CONFIGURATION` with a message that names
+  the rule, never the rejected text, and `*id` is `UINT32_MAX`. An identical
+  registration returns the first identifier, so two workers on one task queue
+  share their series. Each series is bound to its label set once here.
+- `ocaml_temporal_core_v4_metric_meter_record(meter, id, value)` is the hot
+  path: no result, no allocation once the series has been recorded into, only
+  a read lock, no I/O. A counter, gauge or histogram needs `value >= 0`; an
+  up-down counter adds the signed delta (exported as a gauge); a duration
+  histogram reads microseconds and Core exports it in milliseconds, or in
+  seconds with `durations_as_seconds`. An unknown identifier or a negative
+  unsigned value is `INVALID_ARGUMENT`; a panic is contained as `PANIC`.
+- `ocaml_temporal_core_v4_metric_meter_free(&meter)` clears the slot and drops
+  the meter. It touches only memory, never Core or Tokio, so the OCaml
+  custom-block finalizer calls it directly.
+
+OCaml ownership: `Native_bridge.metric_meter` is a custom block whose payload
+is the Rust pointer (possibly null). It is never released explicitly, only by
+its finalizer once no OCaml value can reach it, so no borrow gate is needed
+and recorders on several Domains can never observe a freed handle. The record
+stub keeps the runtime lock and is `[@@noalloc]`; the register stub borrows
+the OCaml string in place for the same reason (Rust neither calls back nor
+retains it). `Sdk_shared_runtime` creates the meter once with the runtime, so
+every worker on it shares one set of series; `Native_worker_metrics` registers
+a worker's fixed series and records into them.
+
+Tests: `rust/core-bridge/tests/sdk_metrics.rs` registers every kind,
+records, and reads the values back from the runtime's real scrape (with Core's
+prefix, `service_name` and the global tag); checks every registration bound,
+the kind and description conflict rule, identifier reuse, the series cap and
+the recording errors; checks that a runtime without an exporter has no meter
+and that a meter outlives its runtime safely; and records from eight threads
+at once with an exact total.
 
 ### Lifecycle configuration JSON
 
@@ -436,8 +999,63 @@ assemble these strings themselves. The client document contains exactly
 `target_url` and `identity`. The worker document contains exactly `namespace`,
 `task_queue`, `build_id`, `versioning`, `max_cached_workflows`,
 `max_outstanding_workflow_tasks`, `max_concurrent_workflow_task_polls`, and
-`graceful_shutdown_timeout_ms`. Closed Draft 2020-12 schemas live under
-`docs/schemas/bridge/`.
+`graceful_shutdown_timeout_ms`, plus `task_types` and an optional `tuning`
+object. Closed Draft 2020-12 schemas live under `docs/schemas/bridge/`.
+
+`tuning` (#498) carries the optional Core settings from the public
+`Worker.Options`: `workflow_task_poller_autoscaling` (`minimum`, `maximum`,
+`initial`), `sticky_queue_schedule_to_start_timeout_ms`,
+`max_heartbeat_throttle_interval_ms`, `default_heartbeat_throttle_interval_ms`,
+`max_worker_activities_per_second` and
+`max_task_queue_activities_per_second`. Every member is optional, and an
+absent member keeps Core's default. The OCaml encoder omits the whole object
+when no member is set, so a default worker sends exactly the pre-#498
+document. Both sides validate it:
+
+- durations are 1 ms to one day;
+- rates must be positive normal numbers;
+- the worker rate must also be at least one per day, because Core's
+  `PollRateLimiter::new` converts its reciprocal with
+  `Duration::from_secs_f64` and panics during worker construction when that
+  overflows (the task-queue rate is only forwarded to the server);
+- an explicit default heartbeat interval must not exceed an explicit
+  maximum;
+- autoscaling bounds must satisfy `minimum <= initial <= maximum`, with
+  `maximum` equal to `max_concurrent_workflow_task_polls`.
+
+Core's `wft_poller_behavior` splits a fixed `max_concurrent_workflow_task_polls`
+between the normal and sticky poll buffers, but hands an autoscaling behavior
+unchanged to each buffer. Autoscaling bounds are therefore per queue: a
+caching worker may keep up to twice `maximum` polls open. The two-poller
+cache rule applies only to a fixed count, since autoscaling always gives
+each queue at least one poll. The object is closed like every other
+document. The change is additive within ABI version 4. An older OCaml object
+never sends `tuning`. A newer object paired with an archive built before #498
+gets a typed configuration error at worker start, and only when it sets a
+tuning option. Activity and local-activity slot counts are deliberately not
+in the document: they stay pinned to the serial OCaml executor (#777).
+`rust/core-bridge/tests/support/worker_tuning.rs` decodes the exact document
+that `test/bridge/test_worker_tuning.ml` asserts the OCaml encoder produces,
+and checks each resulting `WorkerConfig` field.
+
+`task_types` is a closed `{ "workflows": bool, "activities": bool }` object
+that the OCaml worker derives from its registrations: a kind with no
+registered implementation is `false` (#805). Rust maps it onto Core's
+`WorkerTaskTypes` in `worker_bridge::bridge_task_types`: `workflows` enables
+workflow polling and in-process local activities, and `activities` enables
+remote activity polling; Nexus is always off. A worker that registers no
+activities therefore never takes an activity task from a shared task queue
+that a sibling activity worker could have executed, and an activity-only
+worker never takes workflow tasks. A document with both `false` is rejected
+with `STATUS_CONFIGURATION`. The member may be omitted for compatibility, in
+which case both kinds are polled; the OCaml encoder always sends it.
+`PollLanes::start` derives its lanes from the configuration Core actually
+received: no workflow poll lane runs without workflows (Core's workflow poll
+would otherwise report `ShutDown` and shut the whole worker down), and the
+activity lane runs whenever local or remote activities are enabled. A lane
+that is not started stays open and idle — polls report no work and readiness
+waits time out — until shutdown closes it, so the OCaml run loop never sees a
+spurious lane shutdown.
 
 `versioning` is a closed object: `{ "kind": "none" }` preserves the existing
 unversioned worker behavior, while `{ "kind": "legacy_build_id", "build_id":
@@ -458,9 +1076,11 @@ The modern deployment form is:
 
 Its nested `build_id` is subject to the same equality check. The deployment
 name identifies the Temporal deployment, while `use_worker_versioning` and
-the optional `default_versioning_behavior` (`"auto_upgrade"` or `"pinned"`)
-are passed to Core's `WorkerDeploymentBased` strategy. A behavior is rejected
-when worker versioning is disabled. Registration, rollout, and compatibility
+`default_versioning_behavior` (`"auto_upgrade"` or `"pinned"`) are passed
+to Core's `WorkerDeploymentBased` strategy. A behavior is rejected when worker
+versioning is disabled and required when it is enabled, because completions
+never carry a per-workflow behavior and Core substitutes only the configured
+worker default for `UNSPECIFIED`. Registration, rollout, and compatibility
 set management remain server-side responsibilities.
 
 Temporal Core requires at least two workflow-task pollers when
@@ -468,15 +1088,18 @@ Temporal Core requires at least two workflow-task pollers when
 and the JSON Schema all enforce that relationship before worker construction;
 the public native worker default is two pollers.
 
-For the pinned Core revision `95e9768`, cache-enabled workers also cap effective
-workflow-task permits at `max(max_cached_workflows, 2)`. Core's poller balancer
-reads the slot supplier's capacity rather than that independent cap. The bridge
-therefore passes the smaller of the requested task limit and this cache-derived
-capacity to Core. Otherwise, a one-entry cache with the default 1,000-task limit
-advertises 1,000 slots while allowing only two permits, so sticky polls can
-reserve capacity needed by the normal queue. This adjustment preserves the
-capacity Core already enforces, caller limits below the cap, and uncached
-workers. Reassess it when updating Core's permit dealer or poller balancer.
+Cache-enabled workers cap effective workflow-task permits at
+`max(max_cached_workflows, 2)`. At the previous pin (`95e9768`) Core's poller
+balancer read the slot supplier's capacity rather than that independent cap,
+so a one-entry cache with the default 1,000-task limit advertised 1,000 slots
+while allowing only two permits, and sticky polls could reserve capacity needed
+by the normal queue (#555). The bridge therefore passes the smaller of the
+requested task limit and this cache-derived capacity to Core. The current pin
+(`8fe478e`, v1.1.0) bounds its balancer by the same cap and stops sticky polls
+from reserving slots once the sticky target is reached, so the clamp is no
+longer load-bearing; it is kept because it only makes the advertised capacity
+equal what Core enforces. It preserves caller limits below the cap and uncached
+workers.
 
 The regression in `rust/core-bridge/tests/support/worker_slot_limits.rs` checks
 the one-entry/default-limit combination, larger cache bounds, stricter caller
@@ -484,14 +1107,16 @@ limits, uncached workers, and rejection of a one-task cached worker. Live
 qualification uses `make test-temporal-worker-cache-eviction`, which must
 observe A's `cache_full` eviction after starting B and typed cancellation of
 both runs. Increasing the watchdog or accepting a successful retry is not a
-substitute for those observations. CI artifact retention and release
-qualification remain tracked by issues #490 and #501.
+substitute for those observations. Issues #490 (CI artifact retention) and
+#501 (the cache-eviction timeout) are closed; the exact release candidate must
+still pass its own cache-eviction controller, as the v1 support policy
+requires.
 
 The public `Temporal.Worker.create` accepts validated `Temporal.Worker.Options`
 for routing and resource policy. `Options.make ~versioning:(Legacy_build_id
-"build-v2") ()` enables legacy build-ID routing. It also accepts an optional
-`max_cached_workflows` bound for applications that need to tune sticky
-workflow memory. Omitting it retains the bounded default of 1,000 cached
+"build-v2") ()` enables legacy build-ID routing, and `Options.make
+~max_cached_workflows` bounds sticky workflow memory for applications that
+need to tune it. Omitting it retains the bounded default of 1,000 cached
 workflows. A zero value disables the Core cache, while a positive value can
 produce explicit `RemoveFromCache` activations when the bound is reached; the
 worker acknowledges those activations with an empty completion.
@@ -507,8 +1132,25 @@ Client connection and worker namespace validation are synchronous ABI calls.
 The C stub copies input before releasing the OCaml runtime lock, Rust performs
 the Tokio wait, and the stub reacquires the lock only to copy the result. A
 failed connection publishes no client. A failed worker construction or
-validation gracefully finalizes the temporary worker and leaves the client
-available for a corrected retry.
+validation releases the temporary worker and leaves the client available for a
+corrected retry.
+
+The validation-failure path (for example, a namespace the server reports as
+missing) is the sole owner of the unpublished Core worker. Core's
+`finalize_shutdown` completes only after both `poll_workflow_activation` and
+`poll_activity_task` have returned `ShutDown`, and no poll lane exists yet, so
+awaiting the finalizer directly hangs forever (issue #770). Rust therefore
+initiates shutdown, drives both poll APIs to `ShutDown` itself (force-failing
+any task Core unexpectedly hands out), and then finalizes, all in one task
+on the Core runtime that owns the worker until `finalize_shutdown` finishes.
+The worker is never dropped mid-release, because only `finalize_shutdown`
+performs Core's `finalize_unregister`; a dropped worker would stay in the
+client's worker registry and keep the client alive. `Worker.create` waits at
+most `UNVALIDATED_WORKER_RELEASE_TIMEOUT` (10 s) for that task, so it always
+returns the typed `Temporal workflow worker validation failed` error instead
+of wedging the supervisor Domain; after the bound the task completes the
+release in the background. `rust/core-bridge/tests/worker_validation_cleanup.rs`
+covers this path with a plaintext HTTP/2 gRPC double rather than a server.
 
 The worker owns two Tokio poll lanes: exactly one calls Core's workflow poll and
 exactly one calls its activity poll. The activity lane admits both remote and
@@ -525,12 +1167,12 @@ and no long Core poll occupies the supervisor Domain. Keeping the lanes
 independent prevents an idle activity poll from delaying workflow completion,
 or vice versa.
 
-ABI version 2 includes private readiness-wait symbols for the two independent
-poll lanes. The supervisor may invoke them only from the owner-domain mailbox
-handler; the C boundary releases the OCaml runtime lock while Rust waits and
-reacquires it before returning. Callers must not turn a readiness wait into a
-blocking condition wait on a workflow scheduler fiber or allow a second owner
-to access the native worker graph.
+ABI version 4 includes private readiness-wait symbols for the two independent
+poll lanes and one combined wait over both. The supervisor may invoke them
+only from the owner-domain mailbox handler; the C boundary releases the OCaml
+runtime lock while Rust waits and reacquires it before returning. Callers must
+not turn a readiness wait into a blocking condition wait on a workflow scheduler
+fiber or allow a second owner to access the native worker graph.
 
 One mutex-protected ledger is the authority for every task Core expects the
 language runtime to complete. A task enters the ledger before its ready message
@@ -546,13 +1188,29 @@ one workflow-task or activity failure for Core and retires the inaccessible
 lease on every outcome. For an activity cancellation, however, the task is an
 update to a previously leased Start and does not own another completion debt;
 an unrepresentable cancellation is dropped without completing the shared
-token. A rejected generated completion remains a fatal worker error, but it
-cannot also leave a fabricated language-side debt that blocks shutdown
-forever. Regression tests cover this rule independently for workflow and
-activity conversion failures, including the cancellation classification.
+token. The generated activity failure is a non-retryable application failure
+of type `UnrepresentableActivityTask` with a static conversion category as its
+message: representability is deterministic, so a retryable failure would only
+make the server redeliver the task to be rejected again. Once Core accepts the
+generated completion, the poll returns `NOT_READY` and the worker keeps
+polling, exactly as for a rejected workflow activation; one task such as a
+standalone activity or a header key another SDK allowed therefore cannot end
+`Worker.run` for the whole task queue (issue #801). A rejected generated
+completion remains a fatal worker error, but it cannot also leave a fabricated
+language-side debt that blocks shutdown forever. Regression tests cover this
+rule independently for workflow and activity conversion failures, including
+the cancellation classification, and
+`rust/core-bridge/tests/activity_task_rejection.rs` drives the activity case
+through the ABI against a gRPC double.
+
+The activity poll lane applies the same reasoning to cancellations it cannot
+attach to a live Start. An unknown cancellation (its Start completed between
+Core's poll returning and admission), a repeated or retired one, or one
+polled while draining owns no completion debt, so the lane drops it without a
+completion and without publishing a lane error.
 
 There is also a post-handoff decode-failure path for version or implementation
-drift between the two strict decoders. OCaml preserves its original protocol
+drift between the two strict decoders. OCaml keeps its original protocol
 error, returns the exact Rust-produced bytes to the private rejection ABI, and
 never reflects those bytes in diagnostics. Rust accepts rejection only after
 full semantic equality with retained handoff state. For a Start, it then
@@ -561,16 +1219,57 @@ semantic state even if Core reports that generated failure as unsuccessful.
 For a Cancel update, it retires only that retained semantic state: the shared
 Start debt remains owned by the activity implementation. This prevents
 shutdown from waiting forever without turning a malformed cancellation into a
-spurious `UnknownActivity` completion failure, while keeping the original
-decode failure primary.
+spurious `UnknownActivity` completion failure. When the rejection succeeds on
+a live worker, the task is handled: Rust writes the static diagnostic (and,
+for a workflow activation, applies the 100 ms redelivery backoff) and the
+OCaml supervisor reports an empty poll so `Worker.run` continues (issue #801).
+A replay instead returns the protocol error, because it must not report
+history it never checked as compatible. If the rejection itself fails, the
+original decode failure stays primary with the rejection category appended.
 
 Shutdown first closes ledger admission and both readiness signals, then asks
-Core to wake both polls and joins the lane tasks. Existing ready and leased
-work remains completable while the worker drains. Core finalization is refused
-until the ledger is empty, and only then consumes the worker before client and
-runtime destruction. The garbage-collection fallback cannot obtain missing
+Core to wake both polls. From that point the supervisor Domain is blocked in
+the shutdown call and OCaml has already stopped its run loop and drained its
+retained completions, or abandoned a lane still running user code when its
+grace period ended (#495), so no language completion can arrive: a late one
+reaches a closed supervisor and is rejected. Core, however,
+returns `ShutDown` from a poll only after every task it produced has been
+completed, so joining the lanes without completing those tasks hung forever
+(issue #769). `PollLanes::drain_and_join_for_shutdown` therefore completes each
+outstanding debt exactly once while it joins both lanes: a lease taken by
+OCaml is removed from the ledger and failed (or acknowledged empty if it was a
+pure cache eviction, which owns no workflow task); a queued handoff is removed
+and completed from its own queue message; activity cancellations and lane
+diagnostics own no debt and are dropped. It keeps draining both queues while
+the lanes run, because polls in flight and Core's follow-up evictions publish
+new tasks until each lane sees `ShutDown`. Each identity leaves the ledger
+before its Core completion is awaited, and no tombstone is written, so a
+same-run eviction that answers a failed workflow task is admitted and
+acknowledged. The drain is bounded by `WORKER_SHUTDOWN_DRAIN_TIMEOUT` (90 s,
+above one server long poll); on timeout the unjoined lanes stay owned by the
+graph, the ledger is marked as having lost a lease, and the call returns a
+worker failure so runtime close disposes the worker. Core finalization then
+runs in a Tokio task that owns the worker until `finalize_shutdown` returns,
+and the caller waits at most `WORKER_FINALIZE_TIMEOUT` (30 s); after that the
+task finishes the release in the background, so a worker is never dropped
+between the lane join and Core's `finalize_unregister`. Tasks that never
+reached OCaml are retired silently and shutdown returns `OK`; if a leased task
+had to be force-completed, the worker is still released but shutdown returns
+`OUTSTANDING_TASKS`. The garbage-collection fallback cannot obtain missing
 language completions. On the dedicated cleanup thread it force-fails
-outstanding Core tasks, joins the poll lanes, and attempts normal finalization;
+outstanding Core tasks, joins the poll lanes with the same bounded drain, and
+attempts the same bounded finalization. Its force-completion acknowledges a
+pure cache eviction (leased or queued) empty and fails every other activation,
+and it tombstones each completed run ID until the lanes join. The workflow
+lane records the eviction bit in the same ledger critical section that admits
+the run, so dispose classifies an entry correctly even when the lane has
+admitted it but not yet enqueued its message. Core answers
+each such failure with a same-run eviction; the workflow poll lane
+acknowledges a retired run's eviction empty instead of dropping it as a
+duplicate, because Core keeps at most one activation outstanding per run and
+reports `ShutDown` only after that eviction is completed. Dropping it made
+runtime close wait out the whole drain bound and release an unfinalized
+worker (issue #775);
 it drops an undrained worker only if finalization still fails. This preserves
 memory ownership and collector progress, while explicit supervisor shutdown
 remains the required graceful path.
@@ -595,8 +1294,11 @@ already failed, Rust uses its defensive synchronous fallback to reclaim the
 graph on the caller thread rather than leak it. In either case the finalizer
 itself never invokes OCaml runtime operations. Both paths clear the handle
 before transfer and are idempotent; exactly one path can own the native graph.
-Cleanup finalizes worker, drops client, then drops Core even when callers did
-not explicitly close the children.
+Cleanup finalizes worker, drops client, then drops the graph's Core reference
+even when callers did not explicitly close the children; Core itself is
+destroyed there unless a shared runtime or another attached graph still holds
+it. A shared-runtime handle has the same two paths (`shared_runtime_free` and
+the finalizer's `shared_runtime_dispose`) and its own cleanup thread.
 
 ## Verification
 
@@ -657,6 +1359,8 @@ dynamically linked foreign archives. The internal OCaml library uses
 `no_dynlink`, because a native plugin (`.cmxs`) would be another dynamic bridge
 artifact and is neither supported nor needed by the final executable.
 
+### Supported link modes
+
 The supported deployment artifact is an OCaml-owned native executable; the
 project does not need a separately loadable bridge DLL. This distinction is
 important on Windows: Rust correctly reports GNU linker tokens for the final
@@ -664,3 +1368,24 @@ native link, but FlexDLL cannot reinterpret all of those tokens while
 constructing an intermediate OCaml stub DLL. Keeping the C and Rust inputs as
 static foreign archives removes that unnecessary link step without changing
 the installed OCaml API or final executable.
+
+Because only the static archives are installed, a bytecode consumer can only
+use them through a custom runtime. `ocamlc` nevertheless records the foreign
+archives in the `.cma` as `-dllib` entries. Outside a workspace that sets
+`disable_dynamically_linked_foreign_archives`, an ordinary bytecode link would
+therefore look for the absent `dllocaml_temporal_core_bridge` shared library
+(#1020). The bridge library is archived with `ocamlc -a -custom`, which stores
+"force custom" in the `.cma`. Every bytecode executable that links the SDK
+(Dune `(modes byte)`, `ocamlfind ocamlc -linkpkg`) is then linked in custom
+mode: the static archives are embedded and no shared library is loaded at
+startup. A custom link does not search the library's own directory, so the
+`.cma` also carries `-ccopt -L"$CAMLORIGIN"`. OCaml expands that to the
+installed directory, which keeps relocated installations working. These are
+`ocamlc_flags` rather than `library_flags` because `ocamlopt` rejects
+`-custom`. The toplevel still cannot load the bridge, because loading into a
+running interpreter needs a shared stub library. `test/bridge/test_install.sh`
+and the prebuilt-library consumer build and run the install-consumer fixture
+as a Dune `(modes byte)` executable in its own Dune root, without the SDK's
+`dune-workspace`. The user-facing statement of
+this constraint, together with the related `Unix.fork` restriction, is in the
+[workflow guide](../guides/workflows.md#process-and-linking-constraints).

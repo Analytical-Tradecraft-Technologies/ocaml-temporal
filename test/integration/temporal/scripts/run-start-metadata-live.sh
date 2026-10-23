@@ -4,7 +4,10 @@ set -eu
 # Exercises isolated start metadata, their combination, continue-as-new, and an
 # official Temporal CLI (Go SDK) start with deadlines. Each exact active run is
 # queried before and after replacing the OCaml worker, then
-# signaled to completion. Raw histories and visibility descriptions remain in
+# signaled to completion. A second phase runs three more starts on a worker
+# with one sticky-cache slot, interleaved so that Core evicts every run with
+# reason cache-full and rebuilds it from history (#512). Raw histories,
+# visibility descriptions and the cache worker's eviction records remain in
 # the ignored build tree for conformance/corpus work; this is not a new corpus.
 root=$(CDPATH='' cd -- "$(dirname "$0")/../../../.." && pwd)
 fixture="$root/test/integration/temporal"
@@ -41,6 +44,9 @@ application() {
     --env TEMPORAL_NAMESPACE=temporal-sdk-test \
     --env METADATA_PREFIX="$prefix" \
     --env METADATA_RUNS="$container_evidence/runs.tsv" \
+    --env METADATA_CACHE_RUNS="$container_evidence/cache-runs.tsv" \
+    --env METADATA_CACHE_SNAPSHOTS="$container_evidence/cache-snapshots.tsv" \
+    --env METADATA_CACHE_EVENTS="$container_evidence/cache-events.tsv" \
     --env METADATA_IDENTITY="metadata-worker-$generation" \
     --entrypoint timeout "$image" --signal=KILL "${TEMPORAL_METADATA_TIMEOUT_SECONDS:-300}" \
     opam exec -- "$executable" "$mode"
@@ -102,6 +108,31 @@ while IFS="$(printf '\t')" read -r id run _expected; do
   admin workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.terminal.json"
   admin workflow describe --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.describe.terminal.json"
 done < "$evidence/runs.tsv"
+
+# Cache-full phase: a fresh worker with max_cached_workflows = 1 on its own
+# task queue, so no default-cache worker can take these tasks. The client
+# parks A, B and C in turn (each start evicts the previous run) and then
+# queries, signals and completes them in start order, which evicts C and
+# rebuilds every run from history. Stopping generation two first keeps the
+# phase to one worker process.
+docker logs "$worker" > "$evidence/worker-two.log" 2>&1
+docker rm -f "$worker" >/dev/null
+generation=cache
+mode=cache-worker
+application --detach --name "$worker" > "$evidence/worker-cache.container"
+mode=cache-start
+application --rm --name "$client" > "$evidence/cache-start.log" 2>&1
+while IFS="$(printf '\t')" read -r id run _expected; do
+  admin workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.initial.json"
+  admin workflow describe --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.describe.initial.json"
+done < "$evidence/cache-runs.tsv"
+mode=cache-finish
+application --rm --name "$client" > "$evidence/cache-finish.log" 2>&1
+while IFS="$(printf '\t')" read -r id run _expected; do
+  admin workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.terminal.json"
+  admin workflow describe --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.describe.terminal.json"
+done < "$evidence/cache-runs.tsv"
+docker logs "$worker" > "$evidence/worker-cache.log" 2>&1
 sh "$fixture/scripts/verify-start-metadata-history.sh" "$evidence"
-cat "$evidence/start.log" "$evidence/finish.log"
-printf 'Metadata restart acceptance passed. Raw evidence: %s\n' "$evidence"
+cat "$evidence/start.log" "$evidence/finish.log" "$evidence/cache-start.log" "$evidence/cache-finish.log"
+printf 'Metadata restart and cache-full acceptance passed. Raw evidence: %s\n' "$evidence"

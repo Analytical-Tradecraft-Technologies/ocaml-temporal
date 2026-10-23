@@ -1,3 +1,8 @@
 [default.extend-identifiers]
 # Standard OCaml open_flag constructor for opening an output channel.
 Open_wronly = "Open_wronly"
+
+[default.extend-words]
+# `flate2` is the Rust gzip crate the test gRPC server double uses; the
+# dependency inventory and its contract test name it in prose and shell.
+flate = "flate"

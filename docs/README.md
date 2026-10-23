@@ -5,7 +5,9 @@ building a worker SDK, not only a client that submits a request and reads a
 result. Read the documents in this order when you are new to the repository:
 
 1. [Writing workflows](guides/workflows.md) introduces the public OCaml API
-   and marks which examples are synthetic-only versus native-ready.
+   and marks which examples are synthetic-only versus native-ready. The
+   [worker sizing guide](guides/worker-sizing.md) explains the worker resource
+   options, background I/O threads, and the metrics that show saturation.
 2. [Verified progress](progress.md) records what has actually been implemented
    and tested at each milestone. The [live evidence audit](reference/live-acceptance-coverage.md)
    records the current tested source and CI boundary.
@@ -30,7 +32,9 @@ The remaining reference documents are useful when changing one subsystem:
 - [OCaml activity protocol adapter](reference/activity-protocol.md) documents
   remote activity tasks, completions, heartbeats, and opaque task-token
   ownership. The heartbeat schema is
-  [`activity-heartbeat.schema.json`](schemas/bridge/activity-heartbeat.schema.json).
+  [`activity-heartbeat.schema.json`](schemas/bridge/activity-heartbeat.schema.json);
+  an async handle's throttled heartbeat uses
+  [`activity-async-heartbeat.schema.json`](schemas/bridge/activity-async-heartbeat.schema.json).
 - [Native workflow execution](reference/native-worker-execution.md) documents
   the current native worker command slice and two-stage child resolution.
 - [Native activity execution](reference/native-activity-execution.md) documents
@@ -71,6 +75,10 @@ The remaining reference documents are useful when changing one subsystem:
 - [Live acceptance coverage](reference/live-acceptance-coverage.md) separates
   synthetic evidence from the verified real-server two-binary success path
   and planned scenario expansion.
+- [Transport fault qualification](reference/transport-fault-qualification.md)
+  describes the deterministic TCP fault proxy and the typed client and worker
+  outcomes it verifies when a connection is refused or an acknowledgement is
+  lost. It also explains how to reconcile an uncertain operation.
 - [Worker restart and replay acceptance design](reference/worker-restart-replay-acceptance.md)
   specifies the controlled worker-replacement scenario, its exact assertions,
   diagnostic evidence, and fresh-volume cleanup rules, and records the live
@@ -79,6 +87,9 @@ The remaining reference documents are useful when changing one subsystem:
 - [Internal replay worker bridge](reference/replay-bridge.md) documents the
   bounded Rust history feeder, strict JSON/base64 format, Core ownership, and
   the local evidence for the first replay-plumbing slice.
+- [Replay history corpus](reference/history-corpus.md) documents the versioned
+  histories, manifest schema, Docker-free replay gate, capture command and
+  addition rules for replay compatibility.
 - [Live diagnostic artifacts](reference/live-diagnostic-artifacts.md) describes
   bounded CI retention, redaction, partial failure evidence and retrieval.
 - [Worker restart/replay diagnostic contract](reference/worker-restart-replay-diagnostics.md)
@@ -97,17 +108,27 @@ The remaining reference documents are useful when changing one subsystem:
   libraries are package-private and the installed-consumer regression that
   protects the public `Temporal` surface.
 - [Public API compatibility](reference/api-stability.md) documents the
-  pre-`0.1.0` compatibility policy and the installed-consumer type witness.
+  prerelease (`0.1.0~rc.1`) compatibility policy and the installed-consumer
+  type witness.
 - [Precompiled OCaml SDK](reference/prebuilt-ocaml.md) describes compatible binary
   installations and downstream linking without recompiling the SDK.
+- [MVP v1 prerelease scope](reference/v1-support-policy.md) proposes the core
+  workflow/client/worker boundary, exact live environment, experimental gaps,
+  and qualification responsibilities for `v0.1.0-rc.1`. Maintainer approval
+  on PR #557 and merge are required before it takes effect; #489 tracks the
+  decision.
 - [Release preflight](reference/release-preflight.md) documents the clean-tree
   metadata and source-input gate, deterministic CI-only Cargo
   SBOM audit, and stable/prerelease tag-to-manifest consistency check.
-- [Architecture specification](superpowers/specs/2026-07-11-ocaml-temporal-sdk-design.md)
-  records the long-term design. APIs described there may be future work.
-
-Files under `superpowers/plans/` are historical implementation plans. When a
-plan and the source disagree, the source, tests, and progress record win.
+- [Release checklist](reference/release-checklist.md) lists the maintainer
+  steps, gates and sign-off for publishing a version, and how to supersede a
+  bad release when version tags are immutable.
+- [Architecture specification](design/sdk-architecture.md) records the
+  long-term design. APIs described there may be future work. The
+  [workflow authoring API](design/workflow-authoring-api.md) and
+  [JSON control protocol foundation](design/json-control-protocol-foundation.md)
+  designs record earlier phase decisions; when a design and the source
+  disagree, the source, tests, and progress record win.
 
 ## How the pieces fit together
 
@@ -153,10 +174,11 @@ links. Keep current support wording aligned with the v1 policy decision.
 | Layer | Evidence | Important limit |
 | --- | --- | --- |
 | Workflow runtime | Focused tests for typed definitions, scheduling, futures, deterministic time/randomness, conditions and scope hooks; live timer/activity/child waits | Detailed ordering and direct scope cancellation remain focused-test evidence. |
-| Activities | Remote retry/heartbeat/timeout/async paths and local activity success pass live | Parallel activity callbacks, cooperative cancellation observation, local retry/recovery and bounded shutdown remain incomplete. |
+| Activities | Remote retry/heartbeat/timeout/async paths and local activity success pass live | Parallel activity callbacks and local retry/recovery remain incomplete. Shutdown is bounded and live-tested with a non-cooperative activity (#495), but abandoned callbacks are not interrupted. |
 | Children and recovery | Live success, failure, explicit cancellation, retry and start rejection; separate controllers prove exact parent/child replay and child failure after replay | Broader policies, races and repeated recovery combinations remain unqualified. |
 | Client/interactions | Named exact-run controls, both query forms, typed updates, direct/external signals and external cancellation pass live, including completed-target signal rejection | Reset/visibility, suspended updates, deadlines and interaction replay/eviction need additional live cases. |
 | Patching and versioning | Live patch-in/deprecation/removal histories; focused legacy/deployment routing support | Dedicated live routing, rollout and arbitrary-history compatibility remain open. |
+| Start metadata and task failures | Post-baseline live controllers cover start memo/search attributes across worker replacement and recovery from workflow-task defects | Not part of the audited September 19 run; search-attribute upserts and priority metadata are not live-qualified. |
 | Native ownership and packaging | OCaml/C/Rust lifecycle, validation, package/installed-consumer, license and preflight gates | Public authentication, supported compatibility/release delivery and production operational qualification remain separate gates. |
 
 The [generated inventory](reference/live-acceptance-inventory.md) lists the
@@ -190,39 +212,22 @@ Clippy checks, Rust tests, bridge/install smoke tests, and the repository
 quality contract. `make quality` is a separate host-tool gate and requires the
 pinned `cargo-deny`, `cargo-machete`, and `typos` binaries. The license audit is
 intentionally separate from the OCaml-version matrix and runs in containers.
-If a local Docker VM has limited memory for native linkers, set
-`DUNE_JOBS=1` (or another small value) on build/lint targets; the variable is
-empty by default so CI keeps its normal parallelism.
+Make passes `DUNE_JOBS` to every Dune build, test, and `dune exec` it runs.
+It defaults to 2 locally so concurrent native links fit a default Docker VM, and
+to Dune's automatic count when `CI` is set; use `DUNE_JOBS=1` on a smaller VM
+or `DUNE_JOBS=auto` to restore Dune's default (#851). Make exports a non-empty
+`DUNE_JOBS`, and the fixture's `dev` Compose service passes it through. Dune
+reads that variable itself only from 3.22, so the test scripts and the worker
+launcher that start Dune also pass it as an explicit `-j`. This bounds nested
+builds and long-lived worker containers on Dune 3.18 and later.
 For the real server smoke, the Makefile owns Compose project selection,
 readiness checks, failure logs, and volume cleanup; do not run the fixture's
 Compose file from the repository root.
 
 ### CI lanes
 
-A code pull request runs representative compatibility lanes: Linux amd64 on
-OCaml 5.2 and 5.5, Linux arm64 on OCaml 5.5, macOS ARM64 on OCaml 5.5, the
-quality and dependency-license audits, and the OCaml 5.5 Temporal/PostgreSQL
-smoke. The Windows x64 OCaml 5.5 native lane is enabled when native bridge,
-build/toolchain, workflow, or composite-action configuration changes.
-Documentation-only pull requests still run the standalone license audit; JSON
-protocol schemas under `docs/schemas/` are instead treated as code. A pull
-request that changes only the live acceptance fixture under
-`test/integration/temporal/` runs the license audit and its live smoke rather
-than the representative matrix. A push to `master` and the scheduled run are
-the exhaustive gate: OCaml 5.2–5.5 on both Linux architectures, both OCaml 5.5
-native desktop jobs, quality, license audit, and the live smoke.
-
-When a GitHub Actions run is still `queued`, it has not produced verification
-evidence. The representative local baseline is `make check OCAML_VERSION=5.2`,
-which combines `make verify` with the package/OCaml license audit. Run
-`make quality` separately for the pinned host scanners, and run
-`make native-verify` on a matching Windows or macOS host for the native
-compatibility path. The locked Cargo license scanner is intentionally a single
-CI-only job; `make license-check` does not claim to replace that scanner. Use
-`make test-temporal-integration` only when a real Temporal Server/PostgreSQL
-result is required. These local results are useful interim evidence, but they
-do not turn an unexecuted matrix, platform, or live-server job green; queued
-required checks still need to finish when Actions becomes available.
+See [quality and security gates](reference/quality-gates.md) for the current
+event triggers, CI matrix, required checks, cache policy, and local equivalents.
 
 `make test-temporal-worker-restart-contract` is the Docker-free contract gate:
 it validates the normalized history/replay diagnostic contract, the ordered
@@ -236,11 +241,11 @@ the live target is required for that claim.
 validates the checked-in patch-history, replay-diagnostic, and controller
 fixtures plus fail-closed normalization and validation cases. The umbrella
 `make test-temporal-workflow-patching` runs that contract before the real
-two-scenario Compose controller. A green contract-only run is not evidence of
+three-scenario Compose controller. A green contract-only run is not evidence of
 Temporal Server replay. The complete [PR #348 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29411260374) is the
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374) is the
 corresponding real-server evidence for the original patch-in cases; the
-complete [PR #356 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29469232271)
+complete [PR #356 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29469232271)
 verifies the expanded lifecycle cases.
 
 ## Terms used in this project

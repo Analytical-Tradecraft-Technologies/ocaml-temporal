@@ -17,7 +17,7 @@ let require_native = function
   | Ok value -> value
   | Error (Native.Backend { message; _ }) -> failwith message
   | Error Native.Closed -> failwith "replay supervisor closed early"
-  | Error (Native.Supervisor_failed exn) -> raise exn
+  | Error (Native.Supervisor_failed exn | Native.Owner_unavailable exn) -> raise exn
 
 (** Observes actual Core jobs and acknowledged OCaml completions outside the
     workflow, using the production supervisor's replay operations. *)
@@ -50,9 +50,12 @@ module Source = struct
       (Native.perform source.native Native.Try_poll_replay_workflow)
 
   (** Records results only after Core has acknowledged the completion lease. *)
-  let complete_workflow source (completion : Protocol.completion) =
+  let complete_workflow source ~(completion : Protocol.completion) encoded =
+    (* The adapter passes the typed completion beside the canonical bytes it
+       was encoded into, so commands are inspected without parsing JSON;
+       only the bytes are submitted. *)
     if completion.task_failure <> None then failwith "initial signals failed their task";
-    let result = Native.perform source.native (Native.Complete_replay_workflow completion) in
+    let result = Native.perform source.native (Native.Complete_replay_workflow encoded) in
     Result.iter (fun () ->
       List.iter (function
         | Protocol.Complete_workflow { result = Some payload } ->
@@ -69,6 +72,14 @@ module Source = struct
     | Native.Backend { message; _ } -> message
     | Native.Closed -> "replay supervisor closed"
     | Native.Supervisor_failed _ -> "replay supervisor failed"
+    | Native.Owner_unavailable _ -> "replay supervisor could not start"
+
+  (** Replay completions are never resubmitted after a failure: the source
+      cannot prove the replay lease is still outstanding. *)
+  let error_is_retryable _ = false
+
+  (** A raised replay completion is equally fail-closed. *)
+  let exception_is_retryable _ = false
 end
 
 (** Uses the ordinary worker registry and deterministic execution machinery. *)

@@ -19,21 +19,27 @@ updates have an experimental typed slice: a registered one-input handler may
  suspend on a workflow future; acceptance is emitted before it parks and
  completion is emitted when it resumes. PR #266 provides the first focused live proof of the typed
 signal/condition path; the recorded seventeen-result Compose baseline is
-also covered by the [PR #289 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368).
-The [PR #302 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638)
+also covered by the [PR #289 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368).
+The [PR #302 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29351689638)
 first verifies the later long-backoff extension, and the complete [PR #439
-Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578)
+Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29824441578)
 retains both paths in its historical baseline. The [current evidence audit](live-acceptance-coverage.md)
 records the later successful source snapshot and the distinction between
 signal-dependent completion and focused tests of already-parked condition wake-up.
-The [PR #406 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29557704643)
+The [PR #406 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29557704643)
 also proves an output-only client query against the exact signal-condition run
-while it is parked. The complete [PR #434 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836)
+while it is parked. The complete [PR #434 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29684113836)
 also proves the typed-input query against that parked run, while the [PR #428
-Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29676120429)
-proves typed update admission and completion. Suspended update recovery,
-query deadlines and replay/cache-eviction behavior, and broader interaction
-coverage remain future work.
+Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29676120429)
+proves typed update admission and completion. The `interaction_recovery`
+live regression (#530) covers queries and an accepted, suspended update after
+sticky-cache eviction and after worker replacement; see
+[Recovery after eviction and restart](#recovery-after-eviction-and-restart).
+The `update_run_close` live regression (#520) pins the typed result every
+update caller receives when the run completes, is cancelled, or is terminated
+before the update finishes; see
+[Update callers when the run closes](#update-callers-when-the-run-closes).
+Query deadlines and broader interaction coverage remain future work.
 
 `Temporal.Client.query` is a separate control-plane operation: it asks an
 already registered workflow for an output-only query through an exact
@@ -56,10 +62,17 @@ the workflow. The callback is queued on that execution's scheduler, so it can
 use deterministic workflow APIs and follows the same source ordering as root,
 timer, activity, and child continuations.
 
-The native public handler currently accepts exactly one payload. An activation
-with zero or multiple payloads is completed as a non-retryable workflow failure
-instead of dropping data or choosing an arbitrary element. A signal with no
-matching handler follows the same fail-closed path. Identity and headers are
+The native public handler accepts one payload. An activation with zero
+payloads, which the Temporal CLI, Web UI, and other SDKs send for a
+no-argument signal, is decoded as the canonical `binary/null` unit payload, the
+same rule used for workflow start input; a handler whose codec rejects unit
+reports its decode error. An activation with multiple payloads is reported as
+a `Codec` error instead of dropping data or choosing an arbitrary element.
+
+Signal delivery is deliberately fail-closed in v1 (see
+[unknown and undecodable signals](#unknown-and-undecodable-signals)): a signal
+with no matching handler, a payload that fails to decode, and a payload list
+with more than one element all fail the **workflow task**, not the run. Identity and headers are
 validated and retained by the runtime, but the first public handler API exposes
 only the typed payload; a later API can add those metadata fields without
 changing the transport contract.
@@ -73,13 +86,23 @@ non-retryable query failure rather than silently dropping data. Query callbacks
 are synchronous and non-suspending; they do not enter the workflow scheduler.
 
 Native update activations are validated and copied in the same way, then routed
-by update name to a typed `Temporal.Update.Handler.t`. The adapter requires
-exactly one input payload. It runs the validator when Core requests it, skips
+by update name to a typed `Temporal.Update.Handler.t`.
+`Update.Handler.dispatch_payloads` applies the signal arity rule: zero
+payloads, which the Temporal CLI, Web UI, other SDKs, and this SDK's client
+send for a no-argument update, decode as the canonical `binary/null` unit
+payload; multiple payloads are rejected before validation. It runs the
+validator when Core requests it, skips
 validation on replay, and emits accepted before invoking the handler. A handler
 that awaits a workflow future retains its continuation in the execution-owned
 pending map; a later activation emits completed or rejected and removes that
-entry. Codec failures, missing handlers, unsupported input arity, duplicate
-pending protocol IDs, and callback errors become typed rejections. Focused
+entry. Before acceptance, missing handlers, unsupported input arity, input
+codec failures, duplicate pending protocol IDs, and every validator error
+become typed rejections, including an `Error.defect` returned by the validator
+or an exception it raises: only the read-only validator has run, so nothing
+needs to be discarded. After acceptance, a typed non-defect handler error is a
+rejection, while a handler exception or defect fails the workflow task and
+discards the speculative acceptance and buffered commands (see
+[workflow failures](workflow-failures.md)). Focused
 native tests prove this behavior; live typed admission/completion and the
 missing-handler rejection are verified by PRs #428 and #432.
 
@@ -101,9 +124,10 @@ native transport and the remaining handler/response lifecycles are described
 in the [native interaction design](../design/native-interactions.md). Signal
 and typed query activation delivery plus two-phase update responses are
 implemented. Output-only query acceptance is live-verified by PR #406, both
-query forms by PR #434, and typed update admission/completion by PR #428. The
-remaining live boundaries are suspended update recovery, query deadlines and
-replay/cache-eviction behavior, and broader handler policies.
+query forms by PR #434, typed update admission/completion by PR #428, and
+query and suspended-update recovery after eviction and restart by the #530
+regression. The remaining live boundaries are query deadlines and broader
+handler policies.
 
 ## Definitions
 
@@ -249,9 +273,11 @@ worker. The execution mode depends on the interaction kind:
 The `ref` above is deliberately small synthetic-test state. It demonstrates
 that a handler can close over ordinary OCaml values; it is not a substitute
 for replay-safe workflow state and it is not synchronized for concurrent
-Domains. Keep a dispatcher and its callback-owned mutable state on one owning
-Domain until native worker scheduling supplies the corresponding ownership
-boundary.
+Domains. Keep a local `Interaction` dispatcher and its callback-owned mutable
+state on one Domain. The native worker already runs each registered handler on
+its execution's owner scheduler, but a module-level value captured by a handler
+is still shared by every execution the worker runs and is not reconstructed by
+replay.
 
 For state that belongs to each workflow execution, use
 `Temporal.Workflow_context.Local` instead of a module-level mutable value:
@@ -333,8 +359,14 @@ Registration and routing have these rules:
 - A call made with a definition whose name has no local handler returns a
   non-retryable `Workflow` error for signals and queries, or an `Update` error
   for updates.
-- A name match with incompatible encoding metadata returns a typed `Codec`
-  error before the callback is invoked.
+- A name match with incompatible *input* encoding metadata returns a typed
+  `Codec` error before the callback is invoked, because the handler decodes
+  its input before calling it.
+- A name match with incompatible *output* encoding metadata is detected only
+  after the handler has run, when the caller decodes the result. For a query
+  the read-only callback has already executed; for an update the validator and
+  implementation have already run and any state change they made stands, even
+  though the caller receives a typed `Codec` error instead of the result.
 - A duplicate registration returns a non-retryable `Defect` from
   `Interaction.create`.
 - A validator's own `Error` is returned unchanged and its implementation is
@@ -353,24 +385,151 @@ The first native signal-handler slice is implemented. `Worker.workflow` carries
 its handler list into the private runtime registration, and each
 `SignalWorkflow` activation is validated before the matching callback is queued
 on the execution scheduler. The handler sees exactly one decoded payload in the
-public API; malformed arity, a missing name, a codec failure, or a callback
-error produces a typed non-retryable workflow failure. The handler's ordinary
-workflow commands are returned in that activation's completion.
+public API. A missing name, malformed arity, or a codec failure fails the
+workflow task under the fail-closed policy below; a typed error returned by the
+callback keeps its own classification. The handler's ordinary workflow commands
+are returned in that activation's completion.
 
 The supervisor remains the sole owner of the Rust handle graph, and native
 readiness is observed through its scheduler-safe boundary. Rust never calls an
 OCaml closure. The focused runtime tests prove scheduler delivery, metadata
 retention, and fail-closed handling. PR #266 established the first focused
 live signal/condition acceptance, and the recorded seventeen-result baseline
-is covered by the [PR #289 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368).
+is covered by the [PR #289 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368).
 Native query delivery now uses the same private registration path:
 query IDs, repeated arguments, and headers are retained, handlers run
 synchronously on the owner Domain, and argument arity is checked by the
 registered output-only or typed handler rather than discarded. The remaining native
 interaction work is:
 
-- live acceptance scenarios for update handlers that suspend, including
-  recovery and shutdown/eviction cleanup;
-- query deadlines and query behavior across replay or cache eviction;
-- Docker Compose acceptance scenarios for updates, including workflow-side
-  assertions through Temporal Server.
+- live checks that a graceful worker shutdown releases suspended update
+  handlers (recovery after eviction and worker replacement is covered, see
+  below);
+- query deadlines;
+- live update deadline and retry scenarios beyond the verified admission,
+  completion, rejection, and recovery paths.
+
+### Recovery after eviction and restart
+
+`test/integration/interaction_recovery` (#530, run by
+`make test-temporal-live-regressions`) verifies against a live server that:
+
+- a query answers from state rebuilt by replay, both after Core evicts the run
+  from a one-entry sticky cache and in a fresh worker process;
+- an update accepted while its handler is suspended stays accepted and not
+  completed across eviction and replacement, then completes exactly once on
+  the same run with the same update ID once the signal it waits for arrives;
+  a handle re-attached with that update ID returns the same result;
+- replaying an accepted update does not run its validator again, while new
+  requests are still validated (Core passes `run_validator = false` for
+  updates replayed from history);
+- queries and validator-rejected updates add no history events: apart from
+  workflow-task events, the recovered runs' histories, including payloads,
+  update outcomes and the timer duration, equal a control run that had none
+  of them.
+
+No runtime defect was found by this suite.
+
+### Unknown and undecodable signals
+
+The v1 policy is fail-closed. Any client that can signal the namespace can
+record a signal in a run's history, and the SDK will not silently drop one it
+cannot apply:
+
+| Signal delivered to a native worker | Outcome |
+| --- | --- |
+| No handler registered under the signal's name | Failed workflow task (`Defect`), no commands |
+| Payload the handler's codec cannot decode, including zero payloads for a non-unit codec | Failed workflow task (`Codec`), callback not run |
+| More than one payload | Failed workflow task (`Codec`), callback not run |
+| Callback raises or returns a `Defect`, `Bridge`, or `Codec` error | Failed workflow task |
+| Callback returns any other typed error, such as a `Workflow` error | Terminal workflow failure; the run closes as Failed |
+
+A failed task discards that activation's commands and leaves the run open,
+with a bounded diagnostic (an unknown signal's name is quoted up to 256 bytes)
+in the workflow-task failure. Because the signal is already in history, every
+replay fails the same way, so the run makes no progress until a worker with a
+matching handler and codec is deployed, or an operator resets the run to an
+event before the signal or terminates it. Treat a mistyped signal name or a
+payload sent with another encoding as a deployment incident: the
+`workflow_signal_unhandled` and `workflow_task_failed` events (see
+[observability](observability.md)) identify it.
+
+Fail-closed is chosen over dropping or buffering because a worker that
+silently ignores a signal another worker version applies would let the two
+diverge on replay, and because the typed handler API has no channel for a
+signal it cannot type. Wrong arity is classified with decode failures rather
+than as a terminal workflow failure so that a malformed sender can never close
+a run that a corrected worker could still complete.
+
+### Handler races with completion and cancellation
+
+The SDK does not wait for unfinished handlers, and workflow cancellation is
+immediate (cooperative cleanup is [#514]). The deterministic race matrix in
+[`test/runtime/test_race_matrix.ml`](../../test/runtime/test_race_matrix.ml)
+feeds scripted Core activations to the workflow runtime and pins these
+outcomes. "Same activation" means Core delivered the jobs in one workflow
+task; Core orders signal and update jobs before timer, activity, child, and
+cancellation jobs.
+
+| Ordering | Worker commands | Update outcome |
+| --- | --- | --- |
+| Suspended update finishes before the root completes | `accepted`, then `completed`, then `Complete_workflow` | Completed |
+| Handler and root timers fire in one activation, handler's first | `completed`, `Complete_workflow` | Completed |
+| Non-suspending update and root completion in one activation | `accepted`, `completed`, `Complete_workflow` | Completed |
+| Validator rejects in the activation where the root completes | `rejected`, `Complete_workflow` | Rejected |
+| Suspended update when the root completes or the run is cancelled | `accepted` earlier; then only the terminal command | Abandoned |
+| Handler and root timers fire in one activation, root's first | `Complete_workflow` only | Abandoned (known gap [#962]) |
+| Update and `Cancel_workflow` in one activation | `Cancel_workflow_execution` only; handler not invoked | Unanswered (known gap [#962]) |
+| Signal and `Cancel_workflow` in one activation | `Cancel_workflow_execution` only; handler not invoked | n/a (known gap [#962]) |
+
+An abandoned update is accepted, and its completion is never sent. When the run
+closes, the Temporal Server fails the caller's pending update request; see
+[Update callers when the run closes](#update-callers-when-the-run-closes). A
+replay with `run_validator = false` reproduces each accepted row exactly even
+when the validator would now reject, because a replayed update follows its
+recorded acceptance.
+
+### Update callers when the run closes
+
+`test/integration/update_run_close` (#520, run by
+`make test-temporal-live-regressions`) closes real runs against Temporal
+Server 1.32 while an update is unfinished, and pins what every caller
+receives. No caller hangs: each result arrives within 10 seconds of the close
+(in practice well under one second), and the suite fails with a named error
+otherwise.
+
+| Update state when the run closes | How the run closes | Caller result |
+| --- | --- | --- |
+| Accepted, handler suspended | Body completes (`Completed`) | `Error`: category `` `Update ``, non-retryable, `error_type = Some "AcceptedUpdateCompletedWorkflow"`, no RPC status |
+| Accepted, handler suspended | Cancellation (`Cancelled`) | Same as above |
+| Accepted, handler suspended | Termination (`Terminated`) | Same as above |
+| Admitted, not yet accepted | Termination | `Error`: category `` `Bridge ``, non-retryable, RPC status `` `Not_found `` |
+
+The accepted-update failure is the update's own outcome, set by the server
+with the message "Workflow Update failed because the Workflow completed before
+the Update completed." The same result is returned to a `wait_update` that was
+already polling when the run closed, to a later `wait_update` on the same
+handle, and to a `start_update` that re-attaches with the same update ID after
+the close. History records the acceptance and no completion. The suite closes
+the run only after the SDK's `temporal.sdk.bridge` debug records show the
+first caller's poll submitted to the native transport and still unanswered
+after a full one-second await slice, with no other client call in between.
+That proves `wait_update` is blocked on an outstanding poll RPC when the close
+is sent. It does not prove the server had registered the poll, because
+Temporal does not expose pending update polls.
+
+For an admitted update the server aborts the in-flight request ("workflow
+update was aborted by closing workflow", gRPC `aborted`). Temporal Core's
+client retries `aborted` as transient, so the retried request finds the run
+closed and the caller receives `` `Not_found ``, as does any later
+`start_update` with that update ID. The update was never accepted, history
+has no update event, and no retry can make it run. The suite makes the
+admitted state observable without timing: the run's only worker is stopped
+after its first task, so the pending workflow task `describe` then reports
+can only be the speculative task the server schedules for the update. The
+same caller result is expected for the unanswered [#962] ordering (an update
+in the activation that cancels the workflow), but that ordering is not
+produced live.
+
+[#514]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/514
+[#962]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/962

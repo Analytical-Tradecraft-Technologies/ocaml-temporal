@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use temporalio_client::callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse};
 use temporalio_client::tonic::Status as RpcStatus;
+use temporalio_common::protos::temporal::api::enums::v1::{
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+};
 use temporalio_common::protos::temporal::api::workflowservice::v1::{
     StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
 };
@@ -18,6 +21,9 @@ enum Reply {
     Recovering,
     Denied,
     Hung,
+    /// Answers like a server applying `USE_EXISTING` to an open run: the
+    /// existing run ID with `started = false`.
+    Existing,
 }
 
 /// Records wire requests and the release of their in-flight transport futures.
@@ -42,7 +48,7 @@ impl Drop for RpcDrop {
 fn connected_runtime(reply: Reply) -> (Runtime, Arc<Probe>) {
     let options = RuntimeOptions::builder().build().expect("runtime options");
     let core = CoreRuntime::new(options, TokioRuntimeBuilder::default()).expect("Core runtime");
-    let mut runtime = Runtime::new(core).expect("runtime cleanup thread");
+    let mut runtime = Runtime::with_owned_core(core).expect("runtime cleanup thread");
     let probe = Arc::new(Probe::default());
     let observed = Arc::clone(&probe);
     let service = CallbackBasedGrpcService {
@@ -64,6 +70,17 @@ fn connected_runtime(reply: Reply) -> (Runtime, Arc<Probe>) {
                     }
                     Reply::Denied => return Err(RpcStatus::permission_denied("synthetic denial")),
                     Reply::Hung => std::future::pending::<()>().await,
+                    Reply::Existing => {
+                        return Ok(GrpcSuccessResponse {
+                            headers: Default::default(),
+                            proto: StartWorkflowExecutionResponse {
+                                run_id: "existing-run".to_owned(),
+                                started: false,
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                        });
+                    }
                     Reply::Recovering => {}
                 }
                 Ok(GrpcSuccessResponse {
@@ -99,6 +116,20 @@ fn connected_runtime(reply: Reply) -> (Runtime, Arc<Probe>) {
 /// Admits one logical start, then observes it through bounded owner turns.
 fn start(runtime: &mut Runtime) -> serde_json::Value {
     let request = br#"{"request_id":"stable-request-1","namespace":"default","workflow_id":"workflow-1","workflow_type":"Workflow","task_queue":"queue","input":[]}"#;
+    start_document(runtime, request)
+}
+
+/// Admits one start with an explicit workflow ID conflict policy name.
+fn start_with_policy(runtime: &mut Runtime, policy: &str) -> serde_json::Value {
+    let request = format!(
+        r#"{{"request_id":"stable-request-1","namespace":"default","workflow_id":"workflow-1","workflow_type":"Workflow","task_queue":"queue","input":[],"id_conflict_policy":"{policy}"}}"#
+    );
+    start_document(runtime, request.as_bytes())
+}
+
+/// Admits one encoded start request and polls its ticket to a terminal
+/// outcome within the start deadline.
+fn start_document(runtime: &mut Runtime, request: &[u8]) -> serde_json::Value {
     let ticket = runtime
         .begin_start_workflow_json(request)
         .expect("start ticket");
@@ -128,6 +159,56 @@ fn transient_start_failures_retry_the_identical_request() {
     assert!(runtime.pending_starts.is_empty());
 }
 
+/// Each closed policy name reaches the wire as Temporal's explicit enum
+/// value; an omitted policy is sent as `FAIL` rather than `UNSPECIFIED`. A
+/// server that predates `StartWorkflowExecutionResponse.started` leaves it
+/// false, so a successful non-`USE_EXISTING` start is still reported as a
+/// newly started run.
+#[test]
+fn id_conflict_policy_reaches_the_start_request() {
+    for (policy, expected) in [
+        (None, WorkflowIdConflictPolicy::Fail),
+        (Some("fail"), WorkflowIdConflictPolicy::Fail),
+        (
+            Some("terminate_existing"),
+            WorkflowIdConflictPolicy::TerminateExisting,
+        ),
+    ] {
+        let (mut runtime, probe) = connected_runtime(Reply::Recovering);
+        let outcome = match policy {
+            None => start(&mut runtime),
+            Some(policy) => start_with_policy(&mut runtime, policy),
+        };
+        assert_eq!(outcome["kind"], "accepted");
+        assert_eq!(outcome["execution"]["run_id"], "run-1");
+        assert_eq!(outcome["started"], true);
+        let requests = probe.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.workflow_id_conflict_policy == i32::from(expected))
+        );
+    }
+}
+
+/// `USE_EXISTING` returns the open run Temporal reports, not a fabricated new
+/// run, and preserves `started = false` so OCaml can tell the two apart.
+#[test]
+fn use_existing_returns_the_existing_run_id() {
+    let (mut runtime, probe) = connected_runtime(Reply::Existing);
+    let outcome = start_with_policy(&mut runtime, "use_existing");
+    assert_eq!(outcome["kind"], "accepted");
+    assert_eq!(outcome["execution"]["run_id"], "existing-run");
+    assert_eq!(outcome["started"], false);
+    let requests = probe.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].workflow_id_conflict_policy,
+        i32::from(WorkflowIdConflictPolicy::UseExisting)
+    );
+    assert_eq!(requests[0].request_id, "stable-request-1");
+}
+
 /// A definitive rejection must not be retried or reported as uncertain.
 #[test]
 fn permanent_start_rejection_is_not_retried() {
@@ -152,4 +233,252 @@ fn hung_start_keeps_the_existing_deadline_and_releases_the_request() {
     assert_eq!(probe.requests.lock().unwrap().len(), 1);
     assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
     assert!(runtime.pending_starts.is_empty());
+}
+
+/// Explicit client disconnect is part of SDK shutdown and must succeed while
+/// another caller still holds a ticket whose RPC already reached the
+/// transport. The ticket is retired exactly once, the in-flight transport
+/// future is cancelled and released before disconnect returns, and a later
+/// read of the abandoned ticket is a lifecycle error (which the OCaml adapter
+/// reports as an uncertain start) rather than a fabricated outcome.
+#[test]
+fn disconnect_aborts_an_in_flight_start_and_releases_its_request() {
+    let (mut runtime, probe) = connected_runtime(Reply::Hung);
+    let request = br#"{"request_id":"stable-request-1","namespace":"default","workflow_id":"workflow-1","workflow_type":"Workflow","task_queue":"queue","input":[]}"#;
+    let ticket = runtime
+        .begin_start_workflow_json(request)
+        .expect("start ticket");
+
+    // Wait until the request is on the wire, so Temporal could have accepted
+    // it and the start outcome is genuinely uncertain at disconnect time.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probe.requests.lock().unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "start RPC never reached transport"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let disconnected = runtime.disconnect_client();
+    assert!(
+        disconnected.is_ok(),
+        "disconnect must not fail on an in-flight start: {:?}",
+        disconnected.err().map(|failure| failure.message)
+    );
+    assert!(runtime.pending_starts.is_empty());
+    assert!(runtime.client.is_none());
+    assert_eq!(probe.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        probe.dropped.load(Ordering::SeqCst),
+        1,
+        "the aborted start task must be joined before disconnect returns"
+    );
+
+    let read = runtime
+        .wait_start_workflow_json(&ticket)
+        .expect_err("an abandoned ticket has no observable outcome");
+    assert_eq!(read.status, STATUS_INVALID_STATE);
+
+    // Disconnect stays idempotent, and close has no start left to release.
+    assert!(runtime.disconnect_client().is_ok());
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
+/// Builds a distinct start document so each admission occupies its own slot.
+fn start_request(index: usize) -> Vec<u8> {
+    format!(
+        r#"{{"request_id":"capacity-request-{index}","namespace":"default","workflow_id":"workflow-{index}","workflow_type":"Workflow","task_queue":"queue","input":[]}}"#
+    )
+    .into_bytes()
+}
+
+/// A full start registry rejects only new logical starts, with the dedicated
+/// retryable capacity status rather than the closed-client invalid-state
+/// status. The client stays connected, an identical retry of an admitted
+/// request still returns its original ticket, and freeing one slot admits the
+/// previously rejected start.
+#[test]
+fn pending_start_capacity_rejects_only_new_requests() {
+    let (mut runtime, _probe) = connected_runtime(Reply::Hung);
+    let mut tickets = Vec::with_capacity(MAX_PENDING_STARTS);
+    for index in 0..MAX_PENDING_STARTS {
+        tickets.push(
+            runtime
+                .begin_start_workflow_json(&start_request(index))
+                .expect("start admitted below capacity"),
+        );
+    }
+
+    let excess = runtime
+        .begin_start_workflow_json(&start_request(MAX_PENDING_STARTS))
+        .expect_err("start beyond capacity must be rejected");
+    assert_eq!(excess.status, STATUS_RESOURCE_EXHAUSTED);
+    assert!(
+        excess
+            .message
+            .contains(&format!("limit {MAX_PENDING_STARTS}")),
+        "{}",
+        excess.message
+    );
+    assert_eq!(runtime.pending_starts.len(), MAX_PENDING_STARTS);
+    assert!(runtime.client.is_some());
+
+    let retry = runtime
+        .begin_start_workflow_json(&start_request(0))
+        .expect("identical retry at capacity reuses its ticket");
+    assert_eq!(retry, tickets[0]);
+
+    // Retire one ticket as the owner would after a terminal result, joining
+    // its aborted task so no transport future outlives the slot. The freed
+    // slot must admit the start that was rejected above.
+    let ticket: serde_json::Value = serde_json::from_slice(&tickets[0]).unwrap();
+    let pending = runtime
+        .pending_starts
+        .remove(ticket["ticket"].as_str().expect("ticket field"))
+        .expect("first start is pending");
+    pending.task.abort();
+    let _ = runtime
+        .core
+        .as_ref()
+        .unwrap()
+        .tokio_handle()
+        .block_on(pending.task);
+    runtime
+        .begin_start_workflow_json(&start_request(MAX_PENDING_STARTS))
+        .expect("start admitted after a slot is released");
+    assert_eq!(runtime.pending_starts.len(), MAX_PENDING_STARTS);
+
+    assert!(runtime.disconnect_client().is_ok());
+    assert!(runtime.pending_starts.is_empty());
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
+/// Workflow execution policies (#499) reach `StartWorkflowExecutionRequest`
+/// unchanged: the reuse policy as Temporal's explicit enum value, each
+/// millisecond timeout as the equivalent protobuf duration, and the retry
+/// policy with its exact coefficient bits. An omitted reuse policy is sent as
+/// `ALLOW_DUPLICATE` rather than `UNSPECIFIED`, and omitted timeouts and
+/// retry policy stay absent so Temporal applies its defaults.
+#[test]
+fn execution_policies_reach_the_start_request() {
+    let (mut runtime, probe) = connected_runtime(Reply::Recovering);
+    let request = format!(
+        r#"{{"request_id":"stable-request-1","namespace":"default","workflow_id":"workflow-1","workflow_type":"Workflow","task_queue":"queue","input":[],"id_reuse_policy":"allow_duplicate_failed_only","execution_timeout_ms":90500,"run_timeout_ms":60000,"task_timeout_ms":1250,"retry_policy":{{"initial_interval":{{"seconds":1,"nanoseconds":0}},"backoff_coefficient_bits":"{}","maximum_interval":{{"seconds":10,"nanoseconds":0}},"maximum_attempts":3,"non_retryable_error_types":["Fatal"]}},"rpc_timeout_ms":5000}}"#,
+        2.0_f64.to_bits()
+    );
+    let outcome = start_document(&mut runtime, request.as_bytes());
+    assert_eq!(outcome["kind"], "accepted");
+    let requests = probe.requests.lock().unwrap();
+    let sent = &requests[0];
+    assert_eq!(
+        sent.workflow_id_reuse_policy,
+        i32::from(WorkflowIdReusePolicy::AllowDuplicateFailedOnly)
+    );
+    let duration = |seconds, nanos| Some(prost_wkt_types::Duration { seconds, nanos });
+    assert_eq!(sent.workflow_execution_timeout, duration(90, 500_000_000));
+    assert_eq!(sent.workflow_run_timeout, duration(60, 0));
+    assert_eq!(sent.workflow_task_timeout, duration(1, 250_000_000));
+    let retry = sent.retry_policy.as_ref().expect("retry policy sent");
+    assert_eq!(retry.initial_interval, duration(1, 0));
+    assert_eq!(retry.maximum_interval, duration(10, 0));
+    assert_eq!(retry.backoff_coefficient.to_bits(), 2.0_f64.to_bits());
+    assert_eq!(retry.maximum_attempts, 3);
+    assert_eq!(retry.non_retryable_error_types, vec!["Fatal".to_owned()]);
+    drop(requests);
+
+    let (mut runtime, probe) = connected_runtime(Reply::Recovering);
+    assert_eq!(start(&mut runtime)["kind"], "accepted");
+    let requests = probe.requests.lock().unwrap();
+    assert_eq!(
+        requests[0].workflow_id_reuse_policy,
+        i32::from(WorkflowIdReusePolicy::AllowDuplicate)
+    );
+    assert_eq!(requests[0].workflow_execution_timeout, None);
+    assert_eq!(requests[0].workflow_run_timeout, None);
+    assert_eq!(requests[0].workflow_task_timeout, None);
+    assert_eq!(requests[0].retry_policy, None);
+}
+
+/// A caller-selected start deadline replaces the ten-second default: a hung
+/// server yields the uncertain `unknown` outcome (the server may still have
+/// accepted the request) well before the default would expire, and the
+/// in-flight transport future is released.
+#[test]
+fn caller_rpc_timeout_bounds_a_hung_start() {
+    let (mut runtime, probe) = connected_runtime(Reply::Hung);
+    let started = Instant::now();
+    let outcome = start_document(
+        &mut runtime,
+        br#"{"request_id":"stable-request-1","namespace":"default","workflow_id":"workflow-1","workflow_type":"Workflow","task_queue":"queue","input":[],"rpc_timeout_ms":200}"#,
+    );
+    assert_eq!(outcome["kind"], "unknown");
+    assert_eq!(outcome["request_id"], "stable-request-1");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(probe.requests.lock().unwrap().len(), 1);
+    assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
+    assert!(runtime.pending_starts.is_empty());
+}
+
+/// Invalid execution policies are rejected when the start is admitted, before
+/// any request reaches the transport.
+#[test]
+fn invalid_execution_policies_never_reach_the_transport() {
+    for fields in [
+        r#""execution_timeout_ms":0"#,
+        r#""task_timeout_ms":120001"#,
+        r#""execution_timeout_ms":1000,"run_timeout_ms":1001"#,
+        r#""run_timeout_ms":1000,"task_timeout_ms":1001"#,
+        r#""id_reuse_policy":"terminate_if_running""#,
+        r#""rpc_timeout_ms":0"#,
+        r#""rpc_timeout_ms":60001"#,
+    ] {
+        let (mut runtime, probe) = connected_runtime(Reply::Recovering);
+        let request = format!(
+            r#"{{"request_id":"stable-request-1","namespace":"default","workflow_id":"workflow-1","workflow_type":"Workflow","task_queue":"queue","input":[],{fields}}}"#
+        );
+        assert!(
+            runtime
+                .begin_start_workflow_json(request.as_bytes())
+                .is_err(),
+            "{fields} must be rejected"
+        );
+        assert!(probe.requests.lock().unwrap().is_empty());
+        assert!(runtime.pending_starts.is_empty());
+    }
+}
+
+/// A configured start limit of two (#796) replaces the default of 64 on both
+/// the ticket path and the submitted-call path: a third distinct request ID
+/// is refused with the retryable capacity status naming the configured limit.
+#[test]
+fn configured_start_limit_is_enforced() {
+    let (mut runtime, _probe) = connected_runtime(Reply::Hung);
+    runtime.client_limits =
+        crate::client_calls::ClientLimits::from_config(None, Some(2), None).expect("valid limits");
+    for index in 0..2 {
+        runtime
+            .begin_start_workflow_json(&start_request(index))
+            .expect("start admitted below the configured limit");
+    }
+    let excess = runtime
+        .begin_start_workflow_json(&start_request(2))
+        .expect_err("ticket start beyond the configured limit");
+    assert_eq!(excess.status, STATUS_RESOURCE_EXHAUSTED);
+    assert!(excess.message.contains("limit 2"), "{}", excess.message);
+
+    for index in 10..12 {
+        runtime
+            .submit_client_call(1, &start_request(index))
+            .expect("submitted start admitted below the configured limit");
+    }
+    let excess = runtime
+        .submit_client_call(1, &start_request(12))
+        .expect_err("submitted start beyond the configured limit");
+    assert_eq!(excess.status, STATUS_RESOURCE_EXHAUSTED);
+    assert!(excess.message.contains("limit 2"), "{}", excess.message);
+
+    assert!(runtime.disconnect_client().is_ok());
+    assert!(runtime.pending_starts.is_empty());
+    assert_eq!(runtime.close(true), STATUS_OK);
 }

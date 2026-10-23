@@ -15,6 +15,7 @@ type status =
   | Already_started
   | Retryable
   | Async_heartbeat_rejected
+  | Resource_exhausted
   | Unknown of int
 
 (** Error copied into the OCaml heap. Once returned, it contains no pointer to
@@ -27,6 +28,12 @@ type error = {
 (** Private owner of the Temporal Core runtime and Tokio executor for one SDK
     instance. It is intentionally abstract and never enters the public API. *)
 type runtime
+
+(** Private owner of one Core runtime (Tokio executor) that several [runtime]
+    graphs can share (#832). Each graph created by {!runtime_attach} holds
+    its own native reference to that Core, so closing this value never frees
+    Core under a live graph; Core is destroyed by whichever releases last. *)
+type shared_runtime
 
 (** Validated settings for one official Temporal client connection. The JSON
     representation and concrete fields remain private so callers cannot bypass
@@ -67,19 +74,140 @@ val check_abi_version : int32 -> (unit, error) result
     exists to test memory ownership; workflow code does not use it. *)
 val echo : bytes -> (bytes, error) result
 
+(** Returns a monotonic clock reading in nanoseconds with an arbitrary
+    origin. Readings are only meaningful relative to each other in one
+    process; client RPC deadlines (#499) use them so the time a request spends
+    queued in the supervisor counts against its budget and wall-clock changes
+    cannot move a deadline. Raises [Failure] only if the platform has no
+    monotonic clock, which is a host defect. *)
+val monotonic_now_ns : unit -> int64
+
+(** [pacing_sleep seconds] blocks the calling thread for about [seconds],
+    releasing the OCaml runtime lock meanwhile, like [Thread.delay]. It exists
+    for worker idle pacing (#1008): on Windows, [Thread.delay] passes whole
+    milliseconds to [Sleep], so a sub-millisecond request returns at once and
+    a longer one lasts until the next 15.6 ms system timer tick. This sleep
+    uses a per-timer high-resolution waitable timer there instead (Windows 10
+    1803 and later; older systems fall back to [Sleep]) and never changes the
+    process- or system-wide timer resolution. Elsewhere it is [nanosleep].
+
+    A request that is not positive returns at once; requests above one second
+    are clamped to one second. Pending OCaml signal handlers are not run
+    before the sleep, but run at the next poll point after it. It is not a
+    workflow timer and must not be called from workflow code. *)
+val pacing_sleep : float -> unit
+
 (** Waits in Rust for at most 1,000 milliseconds while allowing other OCaml
     Domains to run. This tests the blocking-call design used by future worker
     polling. Values outside 0 through 1,000 return an error. *)
 val conformance_wait_ms : int -> (unit, error) result
 
+(** Admission limits of one client connection (#796). Each [None] keeps the
+    bridge default; an explicit value must be at least 1 and at most the
+    matching [max_configurable_*] bound.
+
+    - [max_pending_waits] (default 64) bounds the distinct exact runs being
+      waited on; repeated waits on one run share its slot.
+    - [max_pending_starts] (default 64) bounds the distinct start request IDs
+      in flight; a retry with the same request ID shares its slot.
+    - [max_in_flight_calls] (default 4,096) bounds every submitted call of
+      the client, counted until its outcome is read or released.
+
+    Admission beyond a limit is refused with [Resource_exhausted] before
+    anything is sent to Temporal. *)
+type client_limits = {
+  max_pending_waits : int option;
+  max_pending_starts : int option;
+  max_in_flight_calls : int option;
+}
+
+(** Every client limit set to [None]. *)
+val default_client_limits : client_limits
+
+(** Largest accepted [max_pending_waits] (4,096), mirrored by the Rust bridge. *)
+val max_configurable_pending_waits : int
+
+(** Largest accepted [max_pending_starts] (4,096), mirrored by the Rust bridge. *)
+val max_configurable_pending_starts : int
+
+(** Largest accepted [max_in_flight_calls] (65,536), mirrored by the Rust
+    bridge. *)
+val max_configurable_in_flight_calls : int
+
+(** Returns a [Configuration] error naming the first limit outside its
+    accepted range; all-[None] limits are always valid. *)
+val validate_client_limits : client_limits -> (unit, error) result
+
 (** Validates connection settings without opening a connection. The bridge
     applies only transport-safety checks; Core and Temporal Server retain
-    authority over namespace-configurable semantic limits. *)
+    authority over namespace-configurable semantic limits. [limits] defaults
+    to {!default_client_limits}. *)
 val client_config :
-  target_url:string -> identity:string -> (client_config, error) result
+  ?limits:client_limits ->
+  target_url:string ->
+  identity:string ->
+  unit ->
+  (client_config, error) result
 
-(** Validates workflow-only worker settings without constructing a worker.
-    Counts are explicit so resource policy is visible to the application. *)
+(** Returns the exact JSON document {!client_connect} sends for [config]. An
+    explicit limit is appended after [identity]; a client with default limits
+    produces the document accepted before #796, byte for byte. Exposed for
+    encoding tests. *)
+val client_config_document : client_config -> string
+
+(** Autoscaling bounds for Core's workflow-task pollers: at least [minimum]
+    and at most [maximum] concurrent polls, starting from [initial]. *)
+type poller_autoscaling = { minimum : int; maximum : int; initial : int }
+
+(** Optional Core worker settings added by #498. Each [None] keeps Core's
+    default. Durations are milliseconds and rates are tasks per second.
+
+    - [workflow_task_poller_autoscaling] replaces the fixed workflow poller
+      count with Core's server-driven autoscaling; its [maximum] must equal
+      [max_concurrent_workflow_task_polls]. Core applies these bounds to the
+      sticky and normal poll buffers separately, whereas it splits a fixed
+      count between them, so the two-poller cache rule applies only to a
+      fixed count.
+    - [sticky_queue_schedule_to_start_timeout_ms] (Core default 10 s) bounds
+      how long a task waits on this worker's sticky queue before the server
+      moves it to the normal queue.
+    - [max_heartbeat_throttle_interval_ms] (default 60 s) and
+      [default_heartbeat_throttle_interval_ms] (default 30 s) bound how often
+      activity heartbeats are flushed to the server.
+    - [max_worker_activities_per_second] limits this worker's remote activity
+      starts; [max_task_queue_activities_per_second] asks the server to limit
+      the whole task queue, and the most recent poller's value wins.
+
+    An all-[None] value is not serialized, so a default worker sends exactly
+    the document that bridges built before #498 accept. *)
+type worker_tuning = {
+  workflow_task_poller_autoscaling : poller_autoscaling option;
+  sticky_queue_schedule_to_start_timeout_ms : int64 option;
+  max_heartbeat_throttle_interval_ms : int64 option;
+  default_heartbeat_throttle_interval_ms : int64 option;
+  max_worker_activities_per_second : float option;
+  max_task_queue_activities_per_second : float option;
+}
+
+(** Every tuning field set to [None]. *)
+val default_worker_tuning : worker_tuning
+
+(** Validates worker settings without constructing a worker.
+    Counts are explicit so resource policy is visible to the application.
+
+    [workflow_tasks] and [activity_tasks] (both default [true]) select which
+    task kinds Core polls from the server. A worker must pass [false] for a
+    kind it has no registered implementation for, or it would take and fail
+    tasks that a sibling worker on the same task queue could execute. Local
+    activities follow [workflow_tasks] because Core dispatches them in-process.
+    At least one kind must be enabled; otherwise a [Configuration] error is
+    returned. Replay workers ignore both: Core forces workflow-only replay.
+
+    [tuning] (default {!default_worker_tuning}) is validated here and again
+    by Rust: tuning durations must be between 1 ms and one day, rates must be
+    positive finite numbers, the worker rate must be at least one per day, an explicit default heartbeat throttle interval
+    must not exceed an explicit maximum, and autoscaling bounds must satisfy
+    [1 <= minimum <= initial <= maximum]. *)
 val worker_config :
   namespace:string ->
   task_queue:string ->
@@ -89,12 +217,31 @@ val worker_config :
   max_outstanding_workflow_tasks:int ->
   max_concurrent_workflow_task_polls:int ->
   graceful_shutdown_timeout_ms:int64 ->
+  ?tuning:worker_tuning ->
+  ?workflow_tasks:bool ->
+  ?activity_tasks:bool ->
   unit ->
   (worker_config, error) result
 
+(** The exact private JSON document that worker startup sends to Rust. It
+    contains only routing and resource settings, never credentials, so it can
+    be logged or compared in tests to inspect the effective configuration. *)
+val worker_config_document : worker_config -> string
+
+(** Largest explicit Tokio worker-thread count accepted by [runtime_create]. *)
+val max_runtime_worker_threads : int
+
+(** Returns [Invalid_argument] unless an explicit count is between [1] and
+    [max_runtime_worker_threads]; [None] is always valid. *)
+val validate_runtime_worker_threads : int option -> (unit, error) result
+
 (** Creates a native runtime after checking that the statically linked bridge
-    implements the compatibility contract expected by this OCaml build. *)
-val runtime_create : unit -> (runtime, error) result
+    implements the compatibility contract expected by this OCaml build.
+    [worker_threads] bounds the runtime's Tokio worker pool (#832); when
+    omitted the bridge uses the host's available parallelism capped at 4. An
+    out-of-range count returns [Invalid_argument] before anything is
+    allocated. *)
+val runtime_create : ?worker_threads:int -> unit -> (runtime, error) result
 
 (** Connects the official Core-based Temporal client. The network wait occurs
     in Rust while the C stub has released the OCaml runtime lock. *)
@@ -155,6 +302,79 @@ val client_wait_start_workflow_json : runtime -> bytes -> (bytes, error) result
     continued-as-new is returned as a terminal response and is never followed
     implicitly. *)
 val client_wait_workflow_json : runtime -> bytes -> (bytes, error) result
+
+(** The client operation performed by one submitted call (#807). Each
+    selects the request document of the matching synchronous operation
+    above, except [Call_async_activity_heartbeat].
+    [Call_async_activity_completion] (#1025) takes the document of
+    {!client_complete_async_activity_json}. [Call_async_activity_heartbeat]
+    takes an async heartbeat document, which adds the attempt's heartbeat
+    timeout to the heartbeat of {!client_record_async_activity_heartbeat_json};
+    the bridge throttles these heartbeats per task token. Both outcomes are
+    empty on success, or exactly [not_found] where the synchronous operation
+    would fail with [Invalid_state], since an awaited [Invalid_state] means
+    the call itself was closed. A heartbeat's outcome may instead be
+    [cancel_requested], [reset], or [paused], the activity state reported by
+    the token's latest send. *)
+type client_call_kind =
+  | Call_start
+  | Call_wait
+  | Call_cancel
+  | Call_terminate
+  | Call_reset
+  | Call_signal
+  | Call_query
+  | Call_update
+  | Call_poll_update
+  | Call_visibility
+  | Call_async_activity_completion
+  | Call_async_activity_heartbeat
+
+(** Handle of one submitted client call: the identity of the runtime graph
+    that submitted it plus the call identifier. It names a Rust-owned
+    completion cell, not a pointer, and is only meaningful to
+    {!client_await_call}. Rust serves an await only for the submitting
+    graph's identity, so a call cannot be collected by another client. *)
+type client_call
+
+(** Parses the ASCII [<owner>.<call>] handle that Rust returns from a
+    submission; both parts must be positive decimal integers. Exposed so
+    the handle format can be tested; a parsed handle that Rust did not issue
+    to this graph is answered as an unknown call. *)
+val parse_client_call : string -> client_call option
+
+(** Longest [timeout_ms] {!client_await_call} accepts: one minute. *)
+val max_client_await_ms : int
+
+(** Submits one client RPC without waiting for Temporal. Only the runtime's
+    owner Domain may call this. Rust validates the request document, checks
+    capacity ([Resource_exhausted] beyond the start, wait, or overall
+    limits), and spawns one task that performs the RPC, then returns the call
+    identifier at once. A start's eventual outcome is the
+    accepted/rejected/unknown outcome document; every other outcome is what
+    the matching synchronous operation returns. *)
+val client_submit_json :
+  runtime -> client_call_kind -> bytes -> (client_call, error) result
+
+(** Waits at most [timeout_ms] for one submitted call's outcome and retires
+    the call when it is terminal. It borrows no runtime, so any Domain or
+    thread may await its own call while the owner serves other requests; the
+    C stub releases the OCaml runtime lock while waiting. [Not_ready] means
+    the interval elapsed and the call may be awaited again. [Invalid_state]
+    means the call will never complete: its runtime disconnected or closed,
+    or the call was already consumed or is not this handle's. Raises [Invalid_argument] when
+    [timeout_ms] is negative or above {!max_client_await_ms}. *)
+val client_await_call :
+  client_call -> timeout_ms:int -> (bytes, error) result
+
+(** Abandons one submitted call without reading it (#807). A call counts
+    against its connection's [max_in_flight_calls] ceiling (4,096 by default;
+    see {!type-client_limits}) until it is read, released, or
+    the runtime closes, even after its RPC has finished; a caller that stops
+    awaiting (for example because of an exception) releases it here. Any
+    published outcome is dropped, and releasing a call that was already
+    read, released, or closed is a no-op. Borrows no runtime. *)
+val client_release_call : client_call -> (unit, error) result
 
 (** Completes an activity already handed off with [WillCompleteAsync] through
     the namespace-bound Temporal client. This does not touch the worker's
@@ -232,6 +452,12 @@ val worker_try_poll_activity : runtime -> (bytes, error) result
     same bounded lock-release semantics as [worker_wait_workflow]. *)
 val worker_wait_activity : runtime -> (unit, error) result
 
+(** Waits for readiness on either worker lane without consuming a task. It has
+    the same bounded lock-release semantics as [worker_wait_workflow], but a
+    queued task on either lane ends it, so the worker loop's single idle wait
+    cannot sleep through work on the lane it did not expect. *)
+val worker_wait_any : runtime -> (unit, error) result
+
 (** Applies the fixed native delay used only after an explicit retryable
     activity-completion transport outcome. *)
 val worker_wait_activity_completion_retry_backoff :
@@ -245,7 +471,9 @@ val worker_complete_activity_json :
 (** Validates and submits progress for a currently leased remote activity. The
     task remains outstanding for its later terminal completion. The result is
     acknowledgement-only; pinned Temporal Core delivers cancellation, pause,
-    and reset flags asynchronously in a later Cancel task. *)
+    and reset flags asynchronously in a later Cancel task. A heartbeat whose
+    details exceed the namespace payload limit makes Core fail the activity
+    itself and also queue a Cancel task. *)
 val worker_record_activity_heartbeat_json :
   runtime -> bytes -> (unit, error) result
 
@@ -253,6 +481,14 @@ val worker_record_activity_heartbeat_json :
     failure. Rust matches the complete retained task, extracts its canonical
     opaque token, and retires that native obligation exactly once. *)
 val worker_reject_activity_json : runtime -> bytes -> (unit, error) result
+
+(** Stops the worker from taking new tasks without releasing it (#1028).
+    Admission and readiness close and Core stops polling the server, but
+    tasks already leased to OCaml may still be completed or heartbeated until
+    {!worker_shutdown}; Core's own graceful-shutdown timer starts now. It
+    never waits for Core or the network. Absence, and repetition, are
+    success. *)
+val worker_initiate_shutdown : runtime -> (unit, error) result
 
 (** Gracefully finalizes the worker. Absence is treated as already shut down,
     making sequential repeated calls safe. *)
@@ -267,3 +503,87 @@ val client_disconnect : runtime -> (unit, error) result
     remain useful for deterministic diagnostics but are not required for
     leak-free defensive cleanup. *)
 val runtime_close : runtime -> (unit, error) result
+
+(** Creates a Core runtime that several graphs can share, after the same ABI
+    check and [worker_threads] validation as {!runtime_create}. The value
+    holds no client or worker. *)
+val shared_runtime_create :
+  ?worker_threads:int -> unit -> (shared_runtime, error) result
+
+(** Like {!shared_runtime_create}, additionally passing [telemetry], a strict
+    JSON telemetry document (#500), to Rust. On success returns the handle
+    and the socket address the metrics endpoint is bound to, or [""] when
+    the document configures no exporter. An invalid document or an unusable
+    address is a [Configuration] error, and nothing is left running. *)
+val shared_runtime_create_with_telemetry :
+  ?worker_threads:int ->
+  telemetry:string ->
+  unit ->
+  (shared_runtime * string, error) result
+
+(** Creates one graph (used and closed exactly like a {!runtime_create}
+    graph) that runs on [shared]'s Core instead of building its own. A closed
+    [shared] returns [Invalid_argument]. Callers must not close [shared]
+    concurrently with this call; the C borrow gate makes such a race return
+    an error rather than a use-after-free. *)
+val runtime_attach : shared_runtime -> (runtime, error) result
+
+(** Releases [shared]'s Core reference, waiting with the OCaml runtime lock
+    released. Core is destroyed before this returns only if no attached graph
+    remains; otherwise the last graph's {!runtime_close} destroys it.
+    Repeating the call is safe. *)
+val shared_runtime_close : shared_runtime -> (unit, error) result
+
+(** {1 SDK metrics (#500)}
+
+    Core instruments its own workers and clients. Worker states that exist
+    only in the OCaml SDK are recorded through a {!metric_meter} into the
+    same Prometheus registry, with Core's [temporal_] name prefix, its
+    [service_name] label and the runtime's global tags. *)
+
+(** Recorder over one shared runtime's Core meter. It references the
+    meter, not Core, so it stays valid (recording into a registry nobody
+    scrapes any longer) after the runtime is shut down. It is released only
+    by the GC, so values may be shared freely between Domains. *)
+type metric_meter
+
+(** Kind of one series; one metric name keeps one kind. [Up_down_counter]
+    adds signed deltas and is exported as a gauge; [Duration_histogram]
+    records microseconds and is exported in milliseconds (or seconds with
+    [durations_as_seconds]) like Core's latency histograms. *)
+type metric_kind =
+  | Counter
+  | Up_down_counter
+  | Gauge
+  | Histogram
+  | Duration_histogram
+
+(** Creates [shared]'s recorder, or [None] when the runtime was created
+    without a metrics exporter (recording is then skipped entirely). A
+    closed [shared] returns [Invalid_argument]. *)
+val shared_runtime_metric_meter :
+  shared_runtime -> (metric_meter option, error) result
+
+(** Registers one series and returns its identifier; registering an
+    identical series again returns the same identifier. Names omit the
+    [temporal_] prefix and, like label names, match [[a-z_][a-z0-9_]*]. At
+    most 8 labels, values of 1 to 256 bytes without control characters, a
+    label may not repeat [le], [quantile], [service_name] or a global tag,
+    and one meter holds at most 1,024 series. Callers must keep label values
+    bounded (task queue, namespace, closed enumerations); a rejected
+    registration is a [Configuration] error. *)
+val metric_register :
+  metric_meter ->
+  kind:metric_kind ->
+  name:string ->
+  description:string ->
+  labels:(string * string) list ->
+  (int, error) result
+
+(** [metric_record meter id value] records into series [id]: a counter adds
+    [value], an up-down counter adds the signed delta, a gauge is set, a
+    histogram observes [value] (microseconds for a duration histogram).
+    Returns [false], recording nothing, for an unknown identifier or a
+    negative value on an unsigned instrument. Allocation-free and safe from
+    any Domain; it never blocks on I/O. *)
+val metric_record : metric_meter -> int -> int -> bool

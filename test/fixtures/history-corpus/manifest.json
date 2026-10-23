@@ -1,0 +1,1806 @@
+{
+  "schema": "ocaml-temporal/history-corpus/v1",
+  "captures": {
+    "live-2026-10-08": {
+      "kind": "live",
+      "captured_on": "2026-10-08",
+      "sdk_commit": "4cf43eabd024b1b7ce74d9c64de31aa541a750e5",
+      "sdk_tree_dirty": true,
+      "core_revision": "95e97686a079dcfe6c42e3254b2f3f5e3d97408f",
+      "temporal_server_image": "temporalio/server:1.32.0@sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae",
+      "temporal_cli_image": "temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca",
+      "worker_toolchains": [
+        "OCaml 5.4.1 (Unix)"
+      ],
+      "capture_command": "make temporal-start; HISTORY_CORPUS_RUN='env TEMPORAL_ADDRESS=http://127.0.0.1:7233 TEMPORAL_NAMESPACE=temporal-sdk-test _build/default/test/history_corpus/capture/history_corpus_capture.exe' HISTORY_CORPUS_TEMPORAL_CLI='docker compose ... run --rm --no-deps -T temporal-admin-tools temporal' sh test/history_corpus/scripts/capture-history-corpus.sh (native macOS arm64 worker; equivalent to make history-corpus-capture)",
+      "protobuf_export": {
+        "tool": "Python protobuf 6.33.6 json_format",
+        "descriptor_sha256": "aa0a3d968a421026e3a141b4faeea1d3609ddfe25e38683da05c5015321cbe9d",
+        "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
+      },
+      "notes": "Captured while seeding the corpus for #518. The worker and client ran natively on macOS arm64 against the Compose Temporal stack. The only tracked-file difference from sdk_commit was the new .gitignore entry; the SDK library sources matched sdk_commit, and the frozen corpus definitions were the ones committed with this corpus."
+    },
+    "task-failure-2026-09-20": {
+      "kind": "live",
+      "captured_on": "2026-09-20",
+      "sdk_commit": "beae10d0a58e58fb8e076734cd38113d7a2b4466",
+      "sdk_tree_dirty": true,
+      "core_revision": "95e97686a079dcfe6c42e3254b2f3f5e3d97408f",
+      "temporal_server_image": "temporalio/server:1.32.0@sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae",
+      "temporal_cli_image": "temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca",
+      "worker_toolchains": [
+        "OCaml 5.5.1 (Unix)"
+      ],
+      "capture_command": "make test-temporal-task-failure-live",
+      "protobuf_export": {
+        "tool": "Python protobuf 6.33.6 json_format",
+        "descriptor_sha256": "66f4545747106ff4da8f8a6917570673200c86383cebcb587a75b1c52f34f131",
+        "descriptor_source": "Cargo-generated temporalio-protos descriptor set at the pinned Core revision"
+      },
+      "source": "test/integration/temporal/task_failure/histories (copied byte-for-byte; manifest.json there records run IDs, binary hashes and the tracked source diff SHA-256 b08ddc6f9a7ab2aadb359b1aa766d9fb18bdb9796eeae26ec6f33ee1b73a5d6f)",
+      "notes": "Reused from the #511 workflow-task failure recovery gate (merged in b099fb6b). Replayed against the corrected generation."
+    },
+    "initial-signals-synthetic": {
+      "kind": "synthetic",
+      "captured_on": "2026-09-29",
+      "sdk_commit": "3e6b61ef15aba973ac68c1b5dc04127bc7919c61",
+      "core_revision": "95e97686a079dcfe6c42e3254b2f3f5e3d97408f",
+      "temporal_server_image": "none",
+      "capture_command": "hand-written test/integration/temporal/initial_signals/history.json, encoded with protoc --include_imports descriptors and Python protobuf json_format.ParseDict (see that directory's README.md)",
+      "source": "test/integration/temporal/initial_signals (history.json copied; the .pb is the base64-decoded history of history.replay.json)",
+      "notes": "Synthetic seven-event history from the #694 fix; not produced by a live server."
+    },
+    "live-2026-10-11": {
+      "kind": "live",
+      "captured_on": "2026-10-11",
+      "sdk_commit": "95179768fb4c70c49d893531d25f257b9b212710",
+      "sdk_tree_dirty": false,
+      "core_revision": "95e97686a079dcfe6c42e3254b2f3f5e3d97408f",
+      "temporal_server_image": "temporalio/server:1.32.0@sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae",
+      "temporal_cli_image": "temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca",
+      "worker_toolchains": [
+        "OCaml 5.4.1 (Unix)"
+      ],
+      "capture_command": "TEMPORAL_FRONTEND_PORT=17531 make temporal-start TEMPORAL_COMPOSE_PROJECT=ocaml-temporal-issue531; HISTORY_CORPUS_CAPTURE_ID=live-2026-10-11 HISTORY_CORPUS_GENERATIONS='corpus-lifecycle-legacy corpus-lifecycle-patched corpus-lifecycle-deprecated corpus-lifecycle-removed' HISTORY_CORPUS_RUN='env TEMPORAL_ADDRESS=http://127.0.0.1:17531 TEMPORAL_NAMESPACE=temporal-sdk-test _build/default/test/history_corpus/capture/history_corpus_capture.exe' HISTORY_CORPUS_TEMPORAL_CLI='docker compose ... run --rm --no-deps -T temporal-admin-tools temporal' sh test/history_corpus/scripts/capture-history-corpus.sh (native macOS arm64 worker; equivalent to make history-corpus-capture with HISTORY_CORPUS_GENERATIONS set to the four corpus-lifecycle generations)",
+      "protobuf_export": {
+        "tool": "Python protobuf 6.33.6 json_format",
+        "descriptor_sha256": "aa0a3d968a421026e3a141b4faeea1d3609ddfe25e38683da05c5015321cbe9d",
+        "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
+      },
+      "notes": "Captured for #531 with only the four corpus-lifecycle generations (HISTORY_CORPUS_GENERATIONS). The worker and client ran natively on macOS arm64 against a Compose Temporal stack under its own project name and frontend port. The working tree was clean at sdk_commit, which contains the frozen lifecycle definitions. The capture script ran with capture ID live-2026-10-11-lifecycle; the same recorded runs were then re-exported unchanged by export-history-corpus.py with capture ID live-2026-10-11 so entry IDs do not repeat the word lifecycle. The handover run was started by the corpus-lifecycle-legacy process, parked, and finished by a fresh corpus-lifecycle-patched process."
+    }
+  },
+  "entries": [
+    {
+      "id": "live-2026-10-08-patch-deprecated",
+      "purpose": "Deprecated generation records a deprecated patch marker.",
+      "features": [
+        "patch",
+        "patch-deprecated"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-deprecated",
+      "run_id": "01a11a23-8069-75fa-bb4a-e100d132e01a",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1-patch-deprecated",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-deprecated.pb",
+        "protobuf_sha256": "899219e6d9c0225d8ae0431a3b826027346950c28c6b4412bafc0ed421d8c6ac",
+        "json": "histories/live-2026-10-08-patch-deprecated.json",
+        "json_sha256": "7664b38ff9bddfb7acf874c7b7f1a5a0cf660fc5dd3980f4a6b3858fe63ec121"
+      },
+      "replay_definitions": "corpus-v1-patch-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-patch-marker-free",
+      "purpose": "Pre-patch generation; history has no patch marker.",
+      "features": [
+        "patch",
+        "patch-marker-free"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-marker-free",
+      "run_id": "01a11a23-7c1b-7cdf-8c43-4f33887252e5",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1-patch-legacy",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-marker-free.pb",
+        "protobuf_sha256": "03e0a2e69afd3bf39945e0e65ca1d704d8c4698fdc283f6225c1af9f348d94e4",
+        "json": "histories/live-2026-10-08-patch-marker-free.json",
+        "json_sha256": "dbbcf12f281517409c357bb0cd0b4c07d6cdcf6a2586915f2c83fe5b32a7f962"
+      },
+      "replay_definitions": "corpus-v1-patch-legacy",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-activity",
+      "purpose": "One activity scheduled, started and completed.",
+      "features": [
+        "activity"
+      ],
+      "workflow_type": "corpus.activity",
+      "workflow_id": "history-corpus-activity",
+      "run_id": "01a11a23-88c9-74b5-b36e-6abd0ac3c75c",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-activity.pb",
+        "protobuf_sha256": "6e77d3400a48591a23def3ec94760c94d37ab9b3378d8d7f611ef25551793549",
+        "json": "histories/live-2026-10-08-activity.json",
+        "json_sha256": "10f024f5878250f7b342d3593d8c527b722eaf61a5436c8331e8a2879b0c1977"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-timer",
+      "purpose": "One durable timer started and fired.",
+      "features": [
+        "timer"
+      ],
+      "workflow_type": "corpus.timer",
+      "workflow_id": "history-corpus-timer",
+      "run_id": "01a11a23-88ed-7d4a-bd17-721a837b08e5",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-timer.pb",
+        "protobuf_sha256": "fe32c05828b95849703e8069bed5d14371fc2d52c449549056bb4b9996205bd5",
+        "json": "histories/live-2026-10-08-timer.json",
+        "json_sha256": "630c5c438289e1d1eec31da471681307ff92365a8eaae94bbcdd9d3d28c7dc82"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-activity-retry",
+      "purpose": "Activity fails its first attempt and succeeds on the policy retry.",
+      "features": [
+        "activity",
+        "activity-retry"
+      ],
+      "workflow_type": "corpus.activity_retry",
+      "workflow_id": "history-corpus-activity-retry",
+      "run_id": "01a11a23-8cf0-7237-9d97-a77a8751bb7a",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-activity-retry.pb",
+        "protobuf_sha256": "fec015f6e939a63c91a8dc6171e8bcb7417a2a6baf29c486e8935a18e852fbf6",
+        "json": "histories/live-2026-10-08-activity-retry.json",
+        "json_sha256": "b5594f3edf57b4abb0948aedeeec23f4077fc86a786715b9be9188ef9466377e"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-interaction",
+      "purpose": "Signal and accepted update satisfy a parked condition. A query also ran against this run during capture, but queries record no history events, so the entry does not claim query coverage.",
+      "features": [
+        "signal",
+        "update",
+        "condition"
+      ],
+      "workflow_type": "corpus.interaction",
+      "workflow_id": "history-corpus-interaction",
+      "run_id": "01a11a23-90ff-78d5-ae6b-81654f0308b4",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-interaction.pb",
+        "protobuf_sha256": "4e1b2321ba4ca94c0f1889c1936e8b331c9dd046f7701edeab570e9c446b30a5",
+        "json": "histories/live-2026-10-08-interaction.json",
+        "json_sha256": "ee33d9ef8307f8d20622ccac0e4dbae6cc1068a018c7de0f542c8adcec6aa83c"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-parent",
+      "purpose": "Parent starts one child and returns its result.",
+      "features": [
+        "child-workflow"
+      ],
+      "workflow_type": "corpus.parent",
+      "workflow_id": "history-corpus-parent",
+      "run_id": "01a11a23-913a-7be2-968d-11ad7518864c",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-parent.pb",
+        "protobuf_sha256": "052daf50155b5ecf5aaee40bd5a455720b07da0fd4669f359b58097ce1d07e1f",
+        "json": "histories/live-2026-10-08-parent.json",
+        "json_sha256": "2ebf466919130c25224198ca18a274d8787942727487dff73701f76b3c9dcdfe"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-child",
+      "purpose": "Child run started by the parent.",
+      "features": [
+        "child-workflow",
+        "child-side"
+      ],
+      "workflow_type": "corpus.child",
+      "workflow_id": "history-corpus-child-corpus",
+      "run_id": "01a11a23-914a-75ec-b656-7254c2fecfb0",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-child.pb",
+        "protobuf_sha256": "6d659e3a5418031b922814ad85abf869afce9481a251e2eb7548950e5d1fdb59",
+        "json": "histories/live-2026-10-08-child.json",
+        "json_sha256": "a765dcc4cafd995caf0f4eacea742ac8ed9360838a507578c45df559e493e297"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-continue-as-new-first",
+      "purpose": "First run ends with WorkflowExecutionContinuedAsNew.",
+      "features": [
+        "continue-as-new"
+      ],
+      "workflow_type": "corpus.continue_as_new",
+      "workflow_id": "history-corpus-continue-as-new",
+      "run_id": "01a11a23-916d-7983-82ee-1bf8bfd56dc4",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-continue-as-new-first.pb",
+        "protobuf_sha256": "02587d60e7de06007e4da0cdc692585a758cbdfbf26c086a491963ce69f2b86d",
+        "json": "histories/live-2026-10-08-continue-as-new-first.json",
+        "json_sha256": "6e0d253e7ba8d4492a038e3fcf83b5d0a20793d4e8383b608cc9ec3f8cfbaadf"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-continue-as-new-second",
+      "purpose": "Successor run started by continue-as-new completes.",
+      "features": [
+        "continue-as-new",
+        "continue-as-new-successor"
+      ],
+      "workflow_type": "corpus.continue_as_new",
+      "workflow_id": "history-corpus-continue-as-new",
+      "run_id": "f779af44-096b-42f1-bf43-2da1df687b46",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-continue-as-new-second.pb",
+        "protobuf_sha256": "2958a9924bd82683f07bba20095f9836cba6eda17b1c301d9a33002043623e58",
+        "json": "histories/live-2026-10-08-continue-as-new-second.json",
+        "json_sha256": "6f74aea6cf6a5c8172ce7e51a46a7b173749d9538437d5222f559f88fd21c391"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-08-patch-active",
+      "purpose": "Patched generation records an active patch marker.",
+      "features": [
+        "patch",
+        "patch-active"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-active",
+      "run_id": "01a11a23-84b5-728d-b3a5-816493a01d16",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-active.pb",
+        "protobuf_sha256": "19036e87ce3fc75e8368e1e0cdd9e7f065cbfa0e580c9d24408b2e87b6880f99",
+        "json": "histories/live-2026-10-08-patch-active.json",
+        "json_sha256": "cf73558f4e2adfcec2b37605393c6003011ba0088909e3521b1dafc4a9e081ce"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "task-failure-body",
+      "purpose": "Timer committed, then the workflow body raised; the corrected generation completes the same run.",
+      "features": [
+        "timer",
+        "workflow-task-failure-recovery"
+      ],
+      "workflow_type": "task-failure.body",
+      "workflow_id": "task-failure-body",
+      "run_id": "01a0be2f-c02c-77d6-9d48-0ae535904d59",
+      "capture": "task-failure-2026-09-20",
+      "history": {
+        "protobuf": "histories/task-failure-body.pb",
+        "protobuf_sha256": "411f720e5dbf2befe9fdd2389daa3c37bddcc74e0e2ef4e0de38a31d1898d646",
+        "json": "histories/task-failure-body.json",
+        "json_sha256": "ec6c570272024ec1f3e764a24a12df21b8187dcb2d01a0a4861557fa872b43bb"
+      },
+      "replay_definitions": "task-failure-corrected",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "task-failure-encoder",
+      "purpose": "Timer committed, then result encoding failed; the corrected generation completes the same run.",
+      "features": [
+        "timer",
+        "workflow-task-failure-recovery"
+      ],
+      "workflow_type": "task-failure.encoder",
+      "workflow_id": "task-failure-encoder",
+      "run_id": "01a0be2f-c033-7c8b-9adb-05c699a7b417",
+      "capture": "task-failure-2026-09-20",
+      "history": {
+        "protobuf": "histories/task-failure-encoder.pb",
+        "protobuf_sha256": "5489f6b26fd8c07b8895d8ccfd519979ede13761babe85fa3c16fa724f44d3ef",
+        "json": "histories/task-failure-encoder.json",
+        "json_sha256": "10372495ba7f9cdbb05e6d6fcf7cf01b2f923ee1466975266d32c13483a940d0"
+      },
+      "replay_definitions": "task-failure-corrected",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "task-failure-missing",
+      "purpose": "First task failed on a worker without the registration; the corrected generation completes the same run.",
+      "features": [
+        "workflow-task-failure-recovery",
+        "missing-registration"
+      ],
+      "workflow_type": "task-failure.missing",
+      "workflow_id": "task-failure-missing",
+      "run_id": "01a0be2f-c038-798b-b385-b3e39970d515",
+      "capture": "task-failure-2026-09-20",
+      "history": {
+        "protobuf": "histories/task-failure-missing.pb",
+        "protobuf_sha256": "2b2ce70eef66986331a5dadbde6e77c51f9d86ab1b6d4bf9dcef2d893a215a50",
+        "json": "histories/task-failure-missing.json",
+        "json_sha256": "9f66ebfb91d8cd9213c9c7ae1a9a5662404baf4a3a95af8040e40a1c57054c78"
+      },
+      "replay_definitions": "task-failure-corrected",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "task-failure-business-retryable",
+      "purpose": "Workflow fails with a retryable application error and no workflow retry policy.",
+      "features": [
+        "workflow-failure"
+      ],
+      "workflow_type": "task-failure.business-retryable",
+      "workflow_id": "task-failure-business-retryable",
+      "run_id": "01a0be2f-c03d-74ef-b9e3-ff8abc523370",
+      "capture": "task-failure-2026-09-20",
+      "history": {
+        "protobuf": "histories/task-failure-business-retryable.pb",
+        "protobuf_sha256": "24088ff4c25f612ca62a8fd0397492eeea863886e78e08ec486b19182a910503",
+        "json": "histories/task-failure-business-retryable.json",
+        "json_sha256": "24f00eb60a958745ebe523d171fc208595c5a71fdac4bee69cfbb6b5fe139108"
+      },
+      "replay_definitions": "task-failure-corrected",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "task-failure-business-permanent",
+      "purpose": "Workflow fails with a non-retryable application error.",
+      "features": [
+        "workflow-failure",
+        "non-retryable-failure"
+      ],
+      "workflow_type": "task-failure.business-permanent",
+      "workflow_id": "task-failure-business-permanent",
+      "run_id": "01a0be2f-c041-7925-97ba-5dc4d3798946",
+      "capture": "task-failure-2026-09-20",
+      "history": {
+        "protobuf": "histories/task-failure-business-permanent.pb",
+        "protobuf_sha256": "ef678273e25a5b7ba9a9685744f651aee83233e0f680cb74a97f6d609f27098b",
+        "json": "histories/task-failure-business-permanent.json",
+        "json_sha256": "54710f8e0084295f8d0e7fe66c29b8b0d11fb63d621e3aac4faeaf822710d17e"
+      },
+      "replay_definitions": "task-failure-corrected",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "initial-signals",
+      "purpose": "Two signals recorded before the first workflow task are delivered with initialization, before the root runs.",
+      "features": [
+        "signal",
+        "signal-before-first-task"
+      ],
+      "workflow_type": "initial-signals",
+      "workflow_id": "initial-signals-id",
+      "run_id": "run-initial-signals",
+      "capture": "initial-signals-synthetic",
+      "history": {
+        "protobuf": "histories/initial-signals.pb",
+        "protobuf_sha256": "f2784c1bd0ba24a6b40b2ab065ffb4aec7abadb7b6971b88ecd036ceec7b6767",
+        "json": "histories/initial-signals.json",
+        "json_sha256": "0c084b9f0f5e690e077a72690f1af13685f566f4c4e0c6292cb41a4c977dd56e"
+      },
+      "replay_definitions": "initial-signals",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "compat-patch-marker-free-on-patched",
+      "purpose": "Marker-free pre-patch history replays on the patched generation; Workflow.patched reports false and the legacy branch is kept.",
+      "features": [
+        "patch",
+        "patch-marker-free",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-marker-free",
+      "run_id": "01a11a23-7c1b-7cdf-8c43-4f33887252e5",
+      "capture": "live-2026-10-08",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-marker-free.pb",
+        "protobuf_sha256": "03e0a2e69afd3bf39945e0e65ca1d704d8c4698fdc283f6225c1af9f348d94e4",
+        "json": "histories/live-2026-10-08-patch-marker-free.json",
+        "json_sha256": "dbbcf12f281517409c357bb0cd0b4c07d6cdcf6a2586915f2c83fe5b32a7f962"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "compat-patch-active-on-deprecated",
+      "purpose": "Active-marker history replays on the deprecated generation without a new marker.",
+      "features": [
+        "patch",
+        "patch-active",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-active",
+      "run_id": "01a11a23-84b5-728d-b3a5-816493a01d16",
+      "capture": "live-2026-10-08",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-active.pb",
+        "protobuf_sha256": "19036e87ce3fc75e8368e1e0cdd9e7f065cbfa0e580c9d24408b2e87b6880f99",
+        "json": "histories/live-2026-10-08-patch-active.json",
+        "json_sha256": "cf73558f4e2adfcec2b37605393c6003011ba0088909e3521b1dafc4a9e081ce"
+      },
+      "replay_definitions": "corpus-v1-patch-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-timer-removed",
+      "purpose": "Negative control: the timer workflow with its timer removed must be reported as nondeterministic.",
+      "features": [
+        "timer",
+        "negative-control"
+      ],
+      "workflow_type": "corpus.timer",
+      "workflow_id": "history-corpus-timer",
+      "run_id": "01a11a23-88ed-7d4a-bd17-721a837b08e5",
+      "capture": "live-2026-10-08",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-timer.pb",
+        "protobuf_sha256": "fe32c05828b95849703e8069bed5d14371fc2d52c449549056bb4b9996205bd5",
+        "json": "histories/live-2026-10-08-timer.json",
+        "json_sha256": "630c5c438289e1d1eec31da471681307ff92365a8eaae94bbcdd9d3d28c7dc82"
+      },
+      "replay_definitions": "negative-timer-removed",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-08-timer"
+    },
+    {
+      "id": "negative-patch-active-on-legacy",
+      "purpose": "Negative control: a history that took the patched branch cannot replay on the pre-patch generation (different activity type).",
+      "features": [
+        "patch",
+        "negative-control"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-active",
+      "run_id": "01a11a23-84b5-728d-b3a5-816493a01d16",
+      "capture": "live-2026-10-08",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-active.pb",
+        "protobuf_sha256": "19036e87ce3fc75e8368e1e0cdd9e7f065cbfa0e580c9d24408b2e87b6880f99",
+        "json": "histories/live-2026-10-08-patch-active.json",
+        "json_sha256": "cf73558f4e2adfcec2b37605393c6003011ba0088909e3521b1dafc4a9e081ce"
+      },
+      "replay_definitions": "corpus-v1-patch-legacy",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-08-patch-active"
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-multi-deprecated",
+      "purpose": "Three patches around an activity, a timer and a child workflow; recorded by the deprecated generation (Workflow.deprecate_patch).",
+      "features": [
+        "patch",
+        "patch-deprecated",
+        "patch-multiple"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-deprecated",
+      "run_id": "01a129e8-cf2a-7769-83b9-968086a65464",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-deprecated",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-deprecated.pb",
+        "protobuf_sha256": "e2162261d75f37e593bd16999f1b1f121d242d40ea54bc1e47deb832d6c43abc",
+        "json": "histories/live-2026-10-11-lifecycle-multi-deprecated.json",
+        "json_sha256": "f2ffe54077c9102b36faf199e6e3fdda9923322110317eba9eddc07bbc54d03c"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-loop-deprecated",
+      "purpose": "One patch consulted in each of three loop iterations; recorded by the deprecated generation (Workflow.deprecate_patch).",
+      "features": [
+        "patch",
+        "patch-deprecated",
+        "patch-loop"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-deprecated",
+      "run_id": "01a129e8-d36c-7bd0-88df-caa47ca56778",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-deprecated",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-deprecated.pb",
+        "protobuf_sha256": "1e7fcee312a119244f4b9bdfbff31b6c22bb279939176fbf27e12b4ecf2bad28",
+        "json": "histories/live-2026-10-11-lifecycle-loop-deprecated.json",
+        "json_sha256": "a16e97c5422c611c49abf29effb10bf6873fe8a7704de8c8fa25dd085d607b3d"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-handlers-deprecated",
+      "purpose": "Patches inside a signal handler and an update handler, each running an activity; recorded by the deprecated generation (Workflow.deprecate_patch).",
+      "features": [
+        "patch",
+        "patch-deprecated",
+        "patch-signal-handler",
+        "patch-update-handler",
+        "signal",
+        "update"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-deprecated",
+      "run_id": "01a129e8-d3b0-7186-997b-def9362f4732",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-deprecated",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-deprecated.pb",
+        "protobuf_sha256": "47205a6ce34140fd855521c153be80351045ab93bbe5bfb9a33b57c0e50d37b6",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-deprecated.json",
+        "json_sha256": "64e94d5e0d908c8f8b3c2697b56d9fff3be4143150034307e756e9a8ab381335"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-multi-legacy",
+      "purpose": "Three patches around an activity, a timer and a child workflow; recorded by the legacy generation (no patch call).",
+      "features": [
+        "patch",
+        "patch-marker-free",
+        "patch-multiple"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-legacy",
+      "run_id": "01a129e8-c806-704c-a350-c9a2056a3171",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-legacy",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-legacy.pb",
+        "protobuf_sha256": "4c38affdc27cf2de3d1d17528607460360a6cacb4c604ca604cec95d21dc6714",
+        "json": "histories/live-2026-10-11-lifecycle-multi-legacy.json",
+        "json_sha256": "ad7c5c23c0a8728ee438eff3ceaffb7935e99bf80197e6eaf523a1cbe3ea5ab9"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-loop-legacy",
+      "purpose": "One patch consulted in each of three loop iterations; recorded by the legacy generation (no patch call).",
+      "features": [
+        "patch",
+        "patch-marker-free",
+        "patch-loop"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-legacy",
+      "run_id": "01a129e8-c865-7691-aacd-54c6c9409800",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-legacy",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-legacy.pb",
+        "protobuf_sha256": "e8bfba7c298aacde7d232c51561bff429d393314afd37fdfb5315416e769fc89",
+        "json": "histories/live-2026-10-11-lifecycle-loop-legacy.json",
+        "json_sha256": "ac98c32bc1152c2951f0515bfdfded05036c0e7c46f69913c27e855be56c75fe"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-handlers-legacy",
+      "purpose": "Patches inside a signal handler and an update handler, each running an activity; recorded by the legacy generation (no patch call).",
+      "features": [
+        "patch",
+        "patch-marker-free",
+        "patch-signal-handler",
+        "patch-update-handler",
+        "signal",
+        "update"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-legacy",
+      "run_id": "01a129e8-c8a8-706e-857b-5f237cbac7dc",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-legacy",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-legacy.pb",
+        "protobuf_sha256": "ed769bcc7a478fca9c79ab44d9f41dcfb25ff9767ad1405c4d4e79d8098c1d0e",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-legacy.json",
+        "json_sha256": "a69908cf2e28c809d7dc57373346f4c2db7863eb440688f006bb33fe29ebd836"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-multi-patched",
+      "purpose": "Three patches around an activity, a timer and a child workflow; recorded by the patched generation (Workflow.patched).",
+      "features": [
+        "patch",
+        "patch-active",
+        "patch-multiple"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-patched",
+      "run_id": "01a129e8-c950-7b94-9093-8b1060b1d079",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-patched",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-patched.pb",
+        "protobuf_sha256": "0bd57adf9aaff4f8c79ad623dcfc19f4ae18713535ed664f42cee1da2c3037c4",
+        "json": "histories/live-2026-10-11-lifecycle-multi-patched.json",
+        "json_sha256": "0fe8e6aa3773aaad9187bf73bae5b1dfe06d48634ee72430102526dc5cdd8756"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-loop-patched",
+      "purpose": "One patch consulted in each of three loop iterations; recorded by the patched generation (Workflow.patched).",
+      "features": [
+        "patch",
+        "patch-active",
+        "patch-loop"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-patched",
+      "run_id": "01a129e8-cd87-7a03-9365-be919176bb80",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-patched",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-patched.pb",
+        "protobuf_sha256": "e6ba96642034c494e03822fbd45b1a04b77dc0e94a25f93a1e396b18c57758a2",
+        "json": "histories/live-2026-10-11-lifecycle-loop-patched.json",
+        "json_sha256": "21e4b547ac8806a5a595cbe46164f82f8cc32a31fe591956f13da54f5fce48fb"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-handlers-patched",
+      "purpose": "Patches inside a signal handler and an update handler, each running an activity; recorded by the patched generation (Workflow.patched).",
+      "features": [
+        "patch",
+        "patch-active",
+        "patch-signal-handler",
+        "patch-update-handler",
+        "signal",
+        "update"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-patched",
+      "run_id": "01a129e8-cde6-793f-ac38-35e5f746fa06",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-patched",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-patched.pb",
+        "protobuf_sha256": "866fe0b151552fb583f0acaa91cc04b3632ea50c556433f5b44129aa52ecc352",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-patched.json",
+        "json_sha256": "ac27339b837569d426a918044562f111c08dfc9cce1b9cb500d6f118a7e576fb"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-handover",
+      "purpose": "Rolling-deploy handover: started and parked by the legacy generation, then released on a fresh patched-generation worker, which reaches the patch point for the first time and records the marker mid-run.",
+      "features": [
+        "patch",
+        "patch-active",
+        "patch-mid-run-upgrade",
+        "signal"
+      ],
+      "workflow_type": "corpus.lifecycle.handover",
+      "workflow_id": "history-corpus-lifecycle-handover",
+      "run_id": "01a129e8-c8da-7584-9e6c-7f0f1b55dec2",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-patched",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handover.pb",
+        "protobuf_sha256": "dd2a54266dbbb09b13ff9161a6ae75a5842160ccf4ad7628820b55e37f79da27",
+        "json": "histories/live-2026-10-11-lifecycle-handover.json",
+        "json_sha256": "d53f1f9dcbf712107829d601cab8d5c3b55513ecb1ff21e3afdb9b00b182857e"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "replays_ok",
+      "notes": "Producing generations: corpus-lifecycle-legacy completed the first workflow task; corpus-lifecycle-patched replayed it and recorded the marker after the release signal."
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-multi-removed",
+      "purpose": "Three patches around an activity, a timer and a child workflow; recorded by the removed generation (patch call deleted, new branch).",
+      "features": [
+        "patch",
+        "patch-removed",
+        "patch-multiple"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-removed",
+      "run_id": "01a129e8-d43f-7b51-bb43-aad11ee8cc41",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-removed",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-removed.pb",
+        "protobuf_sha256": "99e2b0e5b6755fab9efbfba015b76f2133735eb2f6dac6c8a82bee31653ee738",
+        "json": "histories/live-2026-10-11-lifecycle-multi-removed.json",
+        "json_sha256": "8cf317c8507a62927a6472a7d0fda9f2bbac60bde148f57edf222b655ce5db13"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-loop-removed",
+      "purpose": "One patch consulted in each of three loop iterations; recorded by the removed generation (patch call deleted, new branch).",
+      "features": [
+        "patch",
+        "patch-removed",
+        "patch-loop"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-removed",
+      "run_id": "01a129e8-d876-77f8-a799-bf81bc75dd43",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-removed",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-removed.pb",
+        "protobuf_sha256": "5bf6beb06caceb3b9535e8eacb28be31429c61b4a87df4fe5f688e8139eba46f",
+        "json": "histories/live-2026-10-11-lifecycle-loop-removed.json",
+        "json_sha256": "2e112816771e3c7dc29dc9835d75315f62bbecab20c7c40c675e491a58d511e7"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-11-lifecycle-handlers-removed",
+      "purpose": "Patches inside a signal handler and an update handler, each running an activity; recorded by the removed generation (patch call deleted, new branch).",
+      "features": [
+        "patch",
+        "patch-removed",
+        "patch-signal-handler",
+        "patch-update-handler",
+        "signal",
+        "update"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-removed",
+      "run_id": "01a129e8-d8be-7281-b65a-ff2eea456ba3",
+      "capture": "live-2026-10-11",
+      "generation": "corpus-lifecycle-removed",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-removed.pb",
+        "protobuf_sha256": "ef5119857e052b120d5613f182e3a310250966778d171877efc2ef38c1f1cb04",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-removed.json",
+        "json_sha256": "2cb11a47c05fde3d06e7e4b171fce0ec2ac07e9e65bae1ed0dbb80bc090fefd6"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "compat-lifecycle-multi-legacy-on-patched",
+      "purpose": "The multi-patch marker-free legacy-branch history replays on the patched generation: Workflow.patched reports false and keeps the legacy branch.",
+      "features": [
+        "patch",
+        "patch-marker-free",
+        "patch-multiple",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-legacy",
+      "run_id": "01a129e8-c806-704c-a350-c9a2056a3171",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-legacy.pb",
+        "protobuf_sha256": "4c38affdc27cf2de3d1d17528607460360a6cacb4c604ca604cec95d21dc6714",
+        "json": "histories/live-2026-10-11-lifecycle-multi-legacy.json",
+        "json_sha256": "ad7c5c23c0a8728ee438eff3ceaffb7935e99bf80197e6eaf523a1cbe3ea5ab9"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-lifecycle-multi-legacy-on-deprecated",
+      "purpose": "Negative control: the multi-patch marker-free legacy-branch history on the deprecated generation is nondeterministic: deprecate_patch accepts a missing marker but the new branch schedules different commands (the first deprecation gate).",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-multiple"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-legacy",
+      "run_id": "01a129e8-c806-704c-a350-c9a2056a3171",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-legacy.pb",
+        "protobuf_sha256": "4c38affdc27cf2de3d1d17528607460360a6cacb4c604ca604cec95d21dc6714",
+        "json": "histories/live-2026-10-11-lifecycle-multi-legacy.json",
+        "json_sha256": "ad7c5c23c0a8728ee438eff3ceaffb7935e99bf80197e6eaf523a1cbe3ea5ab9"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-multi-legacy",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.legacy' does not match activity type of activity command 'corpus.lifecycle.new'"
+    },
+    {
+      "id": "negative-lifecycle-multi-legacy-on-removed",
+      "purpose": "Negative control: the multi-patch marker-free legacy-branch history on the removed generation is nondeterministic: the new branch schedules different commands.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-multiple"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-legacy",
+      "run_id": "01a129e8-c806-704c-a350-c9a2056a3171",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-legacy.pb",
+        "protobuf_sha256": "4c38affdc27cf2de3d1d17528607460360a6cacb4c604ca604cec95d21dc6714",
+        "json": "histories/live-2026-10-11-lifecycle-multi-legacy.json",
+        "json_sha256": "ad7c5c23c0a8728ee438eff3ceaffb7935e99bf80197e6eaf523a1cbe3ea5ab9"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-multi-legacy",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.legacy' does not match activity type of activity command 'corpus.lifecycle.new'"
+    },
+    {
+      "id": "negative-lifecycle-multi-patched-on-legacy",
+      "purpose": "Negative control: the multi-patch active-marker history on the legacy generation is nondeterministic: the legacy branch schedules different commands and nothing consumes the marker.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-multiple"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-patched",
+      "run_id": "01a129e8-c950-7b94-9093-8b1060b1d079",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-patched.pb",
+        "protobuf_sha256": "0bd57adf9aaff4f8c79ad623dcfc19f4ae18713535ed664f42cee1da2c3037c4",
+        "json": "histories/live-2026-10-11-lifecycle-multi-patched.json",
+        "json_sha256": "0fe8e6aa3773aaad9187bf73bae5b1dfe06d48634ee72430102526dc5cdd8756"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-multi-patched",
+      "expected_message": "Non-deprecated patch marker encountered for change corpus.lifecycle.multi.activity.v1, but there is no corresponding change command"
+    },
+    {
+      "id": "compat-lifecycle-multi-patched-on-deprecated",
+      "purpose": "The multi-patch active-marker history replays on the deprecated generation: deprecate_patch consumes the active marker.",
+      "features": [
+        "patch",
+        "patch-active",
+        "patch-multiple",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-patched",
+      "run_id": "01a129e8-c950-7b94-9093-8b1060b1d079",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-patched.pb",
+        "protobuf_sha256": "0bd57adf9aaff4f8c79ad623dcfc19f4ae18713535ed664f42cee1da2c3037c4",
+        "json": "histories/live-2026-10-11-lifecycle-multi-patched.json",
+        "json_sha256": "0fe8e6aa3773aaad9187bf73bae5b1dfe06d48634ee72430102526dc5cdd8756"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-lifecycle-multi-patched-on-removed",
+      "purpose": "Negative control: the multi-patch active-marker history on the removed generation is nondeterministic: deleting the patch call before deprecation leaves a non-deprecated marker with no matching command (the second gate).",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-multiple"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-patched",
+      "run_id": "01a129e8-c950-7b94-9093-8b1060b1d079",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-patched.pb",
+        "protobuf_sha256": "0bd57adf9aaff4f8c79ad623dcfc19f4ae18713535ed664f42cee1da2c3037c4",
+        "json": "histories/live-2026-10-11-lifecycle-multi-patched.json",
+        "json_sha256": "0fe8e6aa3773aaad9187bf73bae5b1dfe06d48634ee72430102526dc5cdd8756"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-multi-patched",
+      "expected_message": "Non-deprecated patch marker encountered for change corpus.lifecycle.multi.activity.v1, but there is no corresponding change command"
+    },
+    {
+      "id": "negative-lifecycle-multi-deprecated-on-legacy",
+      "purpose": "Negative control: the multi-patch deprecated-marker history on the legacy generation is nondeterministic: the legacy branch schedules different commands.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-multiple"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-deprecated",
+      "run_id": "01a129e8-cf2a-7769-83b9-968086a65464",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-deprecated.pb",
+        "protobuf_sha256": "e2162261d75f37e593bd16999f1b1f121d242d40ea54bc1e47deb832d6c43abc",
+        "json": "histories/live-2026-10-11-lifecycle-multi-deprecated.json",
+        "json_sha256": "f2ffe54077c9102b36faf199e6e3fdda9923322110317eba9eddc07bbc54d03c"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-multi-deprecated",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.new' does not match activity type of activity command 'corpus.lifecycle.legacy'"
+    },
+    {
+      "id": "compat-lifecycle-multi-deprecated-on-patched",
+      "purpose": "The multi-patch deprecated-marker history replays on the patched generation: rolling back from deprecation, Workflow.patched sees the deprecated marker and keeps the new branch.",
+      "features": [
+        "patch",
+        "patch-deprecated",
+        "patch-multiple",
+        "patch-rollback"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-deprecated",
+      "run_id": "01a129e8-cf2a-7769-83b9-968086a65464",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-deprecated.pb",
+        "protobuf_sha256": "e2162261d75f37e593bd16999f1b1f121d242d40ea54bc1e47deb832d6c43abc",
+        "json": "histories/live-2026-10-11-lifecycle-multi-deprecated.json",
+        "json_sha256": "f2ffe54077c9102b36faf199e6e3fdda9923322110317eba9eddc07bbc54d03c"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "compat-lifecycle-multi-deprecated-on-removed",
+      "purpose": "The multi-patch deprecated-marker history replays on the removed generation: Core skips the deprecated marker after the patch call is deleted.",
+      "features": [
+        "patch",
+        "patch-deprecated",
+        "patch-multiple",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-deprecated",
+      "run_id": "01a129e8-cf2a-7769-83b9-968086a65464",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-deprecated.pb",
+        "protobuf_sha256": "e2162261d75f37e593bd16999f1b1f121d242d40ea54bc1e47deb832d6c43abc",
+        "json": "histories/live-2026-10-11-lifecycle-multi-deprecated.json",
+        "json_sha256": "f2ffe54077c9102b36faf199e6e3fdda9923322110317eba9eddc07bbc54d03c"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-lifecycle-multi-removed-on-legacy",
+      "purpose": "Negative control: the multi-patch marker-free new-branch history from the removed generation on the legacy generation is nondeterministic: the legacy branch schedules different commands.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-multiple"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-removed",
+      "run_id": "01a129e8-d43f-7b51-bb43-aad11ee8cc41",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-removed.pb",
+        "protobuf_sha256": "99e2b0e5b6755fab9efbfba015b76f2133735eb2f6dac6c8a82bee31653ee738",
+        "json": "histories/live-2026-10-11-lifecycle-multi-removed.json",
+        "json_sha256": "8cf317c8507a62927a6472a7d0fda9f2bbac60bde148f57edf222b655ce5db13"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-multi-removed",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.new' does not match activity type of activity command 'corpus.lifecycle.legacy'"
+    },
+    {
+      "id": "negative-lifecycle-multi-removed-on-patched",
+      "purpose": "Negative control: the multi-patch marker-free new-branch history from the removed generation on the patched generation is nondeterministic: rolling back from removal to the patched code, Workflow.patched reports false without a marker and takes the legacy branch.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-multiple"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-removed",
+      "run_id": "01a129e8-d43f-7b51-bb43-aad11ee8cc41",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-removed.pb",
+        "protobuf_sha256": "99e2b0e5b6755fab9efbfba015b76f2133735eb2f6dac6c8a82bee31653ee738",
+        "json": "histories/live-2026-10-11-lifecycle-multi-removed.json",
+        "json_sha256": "8cf317c8507a62927a6472a7d0fda9f2bbac60bde148f57edf222b655ce5db13"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-multi-removed",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.new' does not match activity type of activity command 'corpus.lifecycle.legacy'"
+    },
+    {
+      "id": "compat-lifecycle-multi-removed-on-deprecated",
+      "purpose": "The multi-patch marker-free new-branch history from the removed generation replays on the deprecated generation: rolling back from removal, deprecate_patch without a marker is allowed and the branch is unchanged.",
+      "features": [
+        "patch",
+        "patch-removed",
+        "patch-multiple",
+        "patch-rollback"
+      ],
+      "workflow_type": "corpus.lifecycle.multi",
+      "workflow_id": "history-corpus-lifecycle-multi-removed",
+      "run_id": "01a129e8-d43f-7b51-bb43-aad11ee8cc41",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-multi-removed.pb",
+        "protobuf_sha256": "99e2b0e5b6755fab9efbfba015b76f2133735eb2f6dac6c8a82bee31653ee738",
+        "json": "histories/live-2026-10-11-lifecycle-multi-removed.json",
+        "json_sha256": "8cf317c8507a62927a6472a7d0fda9f2bbac60bde148f57edf222b655ce5db13"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "compat-lifecycle-loop-legacy-on-patched",
+      "purpose": "The loop-patch marker-free legacy-branch history replays on the patched generation: Workflow.patched reports false and keeps the legacy branch.",
+      "features": [
+        "patch",
+        "patch-marker-free",
+        "patch-loop",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-legacy",
+      "run_id": "01a129e8-c865-7691-aacd-54c6c9409800",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-legacy.pb",
+        "protobuf_sha256": "e8bfba7c298aacde7d232c51561bff429d393314afd37fdfb5315416e769fc89",
+        "json": "histories/live-2026-10-11-lifecycle-loop-legacy.json",
+        "json_sha256": "ac98c32bc1152c2951f0515bfdfded05036c0e7c46f69913c27e855be56c75fe"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-lifecycle-loop-legacy-on-deprecated",
+      "purpose": "Negative control: the loop-patch marker-free legacy-branch history on the deprecated generation is nondeterministic: deprecate_patch accepts a missing marker but the new branch schedules different commands (the first deprecation gate).",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-loop"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-legacy",
+      "run_id": "01a129e8-c865-7691-aacd-54c6c9409800",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-legacy.pb",
+        "protobuf_sha256": "e8bfba7c298aacde7d232c51561bff429d393314afd37fdfb5315416e769fc89",
+        "json": "histories/live-2026-10-11-lifecycle-loop-legacy.json",
+        "json_sha256": "ac98c32bc1152c2951f0515bfdfded05036c0e7c46f69913c27e855be56c75fe"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-loop-legacy",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.legacy' does not match activity type of activity command 'corpus.lifecycle.new'"
+    },
+    {
+      "id": "negative-lifecycle-loop-legacy-on-removed",
+      "purpose": "Negative control: the loop-patch marker-free legacy-branch history on the removed generation is nondeterministic: the new branch schedules different commands.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-loop"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-legacy",
+      "run_id": "01a129e8-c865-7691-aacd-54c6c9409800",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-legacy.pb",
+        "protobuf_sha256": "e8bfba7c298aacde7d232c51561bff429d393314afd37fdfb5315416e769fc89",
+        "json": "histories/live-2026-10-11-lifecycle-loop-legacy.json",
+        "json_sha256": "ac98c32bc1152c2951f0515bfdfded05036c0e7c46f69913c27e855be56c75fe"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-loop-legacy",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.legacy' does not match activity type of activity command 'corpus.lifecycle.new'"
+    },
+    {
+      "id": "negative-lifecycle-loop-patched-on-legacy",
+      "purpose": "Negative control: the loop-patch active-marker history on the legacy generation is nondeterministic: the legacy branch schedules different commands and nothing consumes the marker.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-loop"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-patched",
+      "run_id": "01a129e8-cd87-7a03-9365-be919176bb80",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-patched.pb",
+        "protobuf_sha256": "e6ba96642034c494e03822fbd45b1a04b77dc0e94a25f93a1e396b18c57758a2",
+        "json": "histories/live-2026-10-11-lifecycle-loop-patched.json",
+        "json_sha256": "21e4b547ac8806a5a595cbe46164f82f8cc32a31fe591956f13da54f5fce48fb"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-loop-patched",
+      "expected_message": "Non-deprecated patch marker encountered for change corpus.lifecycle.loop.v1, but there is no corresponding change command"
+    },
+    {
+      "id": "compat-lifecycle-loop-patched-on-deprecated",
+      "purpose": "The loop-patch active-marker history replays on the deprecated generation: deprecate_patch consumes the active marker.",
+      "features": [
+        "patch",
+        "patch-active",
+        "patch-loop",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-patched",
+      "run_id": "01a129e8-cd87-7a03-9365-be919176bb80",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-patched.pb",
+        "protobuf_sha256": "e6ba96642034c494e03822fbd45b1a04b77dc0e94a25f93a1e396b18c57758a2",
+        "json": "histories/live-2026-10-11-lifecycle-loop-patched.json",
+        "json_sha256": "21e4b547ac8806a5a595cbe46164f82f8cc32a31fe591956f13da54f5fce48fb"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-lifecycle-loop-patched-on-removed",
+      "purpose": "Negative control: the loop-patch active-marker history on the removed generation is nondeterministic: deleting the patch call before deprecation leaves a non-deprecated marker with no matching command (the second gate).",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-loop"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-patched",
+      "run_id": "01a129e8-cd87-7a03-9365-be919176bb80",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-patched.pb",
+        "protobuf_sha256": "e6ba96642034c494e03822fbd45b1a04b77dc0e94a25f93a1e396b18c57758a2",
+        "json": "histories/live-2026-10-11-lifecycle-loop-patched.json",
+        "json_sha256": "21e4b547ac8806a5a595cbe46164f82f8cc32a31fe591956f13da54f5fce48fb"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-loop-patched",
+      "expected_message": "Non-deprecated patch marker encountered for change corpus.lifecycle.loop.v1, but there is no corresponding change command"
+    },
+    {
+      "id": "negative-lifecycle-loop-deprecated-on-legacy",
+      "purpose": "Negative control: the loop-patch deprecated-marker history on the legacy generation is nondeterministic: the legacy branch schedules different commands.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-loop"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-deprecated",
+      "run_id": "01a129e8-d36c-7bd0-88df-caa47ca56778",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-deprecated.pb",
+        "protobuf_sha256": "1e7fcee312a119244f4b9bdfbff31b6c22bb279939176fbf27e12b4ecf2bad28",
+        "json": "histories/live-2026-10-11-lifecycle-loop-deprecated.json",
+        "json_sha256": "a16e97c5422c611c49abf29effb10bf6873fe8a7704de8c8fa25dd085d607b3d"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-loop-deprecated",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.new' does not match activity type of activity command 'corpus.lifecycle.legacy'"
+    },
+    {
+      "id": "compat-lifecycle-loop-deprecated-on-patched",
+      "purpose": "The loop-patch deprecated-marker history replays on the patched generation: rolling back from deprecation, Workflow.patched sees the deprecated marker and keeps the new branch.",
+      "features": [
+        "patch",
+        "patch-deprecated",
+        "patch-loop",
+        "patch-rollback"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-deprecated",
+      "run_id": "01a129e8-d36c-7bd0-88df-caa47ca56778",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-deprecated.pb",
+        "protobuf_sha256": "1e7fcee312a119244f4b9bdfbff31b6c22bb279939176fbf27e12b4ecf2bad28",
+        "json": "histories/live-2026-10-11-lifecycle-loop-deprecated.json",
+        "json_sha256": "a16e97c5422c611c49abf29effb10bf6873fe8a7704de8c8fa25dd085d607b3d"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "compat-lifecycle-loop-deprecated-on-removed",
+      "purpose": "The loop-patch deprecated-marker history replays on the removed generation: Core skips the deprecated marker after the patch call is deleted.",
+      "features": [
+        "patch",
+        "patch-deprecated",
+        "patch-loop",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-deprecated",
+      "run_id": "01a129e8-d36c-7bd0-88df-caa47ca56778",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-deprecated.pb",
+        "protobuf_sha256": "1e7fcee312a119244f4b9bdfbff31b6c22bb279939176fbf27e12b4ecf2bad28",
+        "json": "histories/live-2026-10-11-lifecycle-loop-deprecated.json",
+        "json_sha256": "a16e97c5422c611c49abf29effb10bf6873fe8a7704de8c8fa25dd085d607b3d"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-lifecycle-loop-removed-on-legacy",
+      "purpose": "Negative control: the loop-patch marker-free new-branch history from the removed generation on the legacy generation is nondeterministic: the legacy branch schedules different commands.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-loop"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-removed",
+      "run_id": "01a129e8-d876-77f8-a799-bf81bc75dd43",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-removed.pb",
+        "protobuf_sha256": "5bf6beb06caceb3b9535e8eacb28be31429c61b4a87df4fe5f688e8139eba46f",
+        "json": "histories/live-2026-10-11-lifecycle-loop-removed.json",
+        "json_sha256": "2e112816771e3c7dc29dc9835d75315f62bbecab20c7c40c675e491a58d511e7"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-loop-removed",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.new' does not match activity type of activity command 'corpus.lifecycle.legacy'"
+    },
+    {
+      "id": "negative-lifecycle-loop-removed-on-patched",
+      "purpose": "Negative control: the loop-patch marker-free new-branch history from the removed generation on the patched generation is nondeterministic: rolling back from removal to the patched code, Workflow.patched reports false without a marker and takes the legacy branch.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-loop"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-removed",
+      "run_id": "01a129e8-d876-77f8-a799-bf81bc75dd43",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-removed.pb",
+        "protobuf_sha256": "5bf6beb06caceb3b9535e8eacb28be31429c61b4a87df4fe5f688e8139eba46f",
+        "json": "histories/live-2026-10-11-lifecycle-loop-removed.json",
+        "json_sha256": "2e112816771e3c7dc29dc9835d75315f62bbecab20c7c40c675e491a58d511e7"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-loop-removed",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.new' does not match activity type of activity command 'corpus.lifecycle.legacy'"
+    },
+    {
+      "id": "compat-lifecycle-loop-removed-on-deprecated",
+      "purpose": "The loop-patch marker-free new-branch history from the removed generation replays on the deprecated generation: rolling back from removal, deprecate_patch without a marker is allowed and the branch is unchanged.",
+      "features": [
+        "patch",
+        "patch-removed",
+        "patch-loop",
+        "patch-rollback"
+      ],
+      "workflow_type": "corpus.lifecycle.loop",
+      "workflow_id": "history-corpus-lifecycle-loop-removed",
+      "run_id": "01a129e8-d876-77f8-a799-bf81bc75dd43",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-loop-removed.pb",
+        "protobuf_sha256": "5bf6beb06caceb3b9535e8eacb28be31429c61b4a87df4fe5f688e8139eba46f",
+        "json": "histories/live-2026-10-11-lifecycle-loop-removed.json",
+        "json_sha256": "2e112816771e3c7dc29dc9835d75315f62bbecab20c7c40c675e491a58d511e7"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "compat-lifecycle-handlers-legacy-on-patched",
+      "purpose": "The handler-patch marker-free legacy-branch history replays on the patched generation: Workflow.patched reports false and keeps the legacy branch.",
+      "features": [
+        "patch",
+        "patch-marker-free",
+        "patch-signal-handler",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-legacy",
+      "run_id": "01a129e8-c8a8-706e-857b-5f237cbac7dc",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-legacy.pb",
+        "protobuf_sha256": "ed769bcc7a478fca9c79ab44d9f41dcfb25ff9767ad1405c4d4e79d8098c1d0e",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-legacy.json",
+        "json_sha256": "a69908cf2e28c809d7dc57373346f4c2db7863eb440688f006bb33fe29ebd836"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-lifecycle-handlers-legacy-on-deprecated",
+      "purpose": "Negative control: the handler-patch marker-free legacy-branch history on the deprecated generation is nondeterministic: deprecate_patch accepts a missing marker but the new branch schedules different commands (the first deprecation gate).",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-signal-handler"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-legacy",
+      "run_id": "01a129e8-c8a8-706e-857b-5f237cbac7dc",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-legacy.pb",
+        "protobuf_sha256": "ed769bcc7a478fca9c79ab44d9f41dcfb25ff9767ad1405c4d4e79d8098c1d0e",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-legacy.json",
+        "json_sha256": "a69908cf2e28c809d7dc57373346f4c2db7863eb440688f006bb33fe29ebd836"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-handlers-legacy",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.legacy' does not match activity type of activity command 'corpus.lifecycle.new'"
+    },
+    {
+      "id": "negative-lifecycle-handlers-legacy-on-removed",
+      "purpose": "Negative control: the handler-patch marker-free legacy-branch history on the removed generation is nondeterministic: the new branch schedules different commands.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-signal-handler"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-legacy",
+      "run_id": "01a129e8-c8a8-706e-857b-5f237cbac7dc",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-legacy.pb",
+        "protobuf_sha256": "ed769bcc7a478fca9c79ab44d9f41dcfb25ff9767ad1405c4d4e79d8098c1d0e",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-legacy.json",
+        "json_sha256": "a69908cf2e28c809d7dc57373346f4c2db7863eb440688f006bb33fe29ebd836"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-handlers-legacy",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.legacy' does not match activity type of activity command 'corpus.lifecycle.new'"
+    },
+    {
+      "id": "negative-lifecycle-handlers-patched-on-legacy",
+      "purpose": "Negative control: the handler-patch active-marker history on the legacy generation is nondeterministic: the legacy branch schedules different commands and nothing consumes the marker.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-signal-handler"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-patched",
+      "run_id": "01a129e8-cde6-793f-ac38-35e5f746fa06",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-patched.pb",
+        "protobuf_sha256": "866fe0b151552fb583f0acaa91cc04b3632ea50c556433f5b44129aa52ecc352",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-patched.json",
+        "json_sha256": "ac27339b837569d426a918044562f111c08dfc9cce1b9cb500d6f118a7e576fb"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-handlers-patched",
+      "expected_message": "Non-deprecated patch marker encountered for change corpus.lifecycle.signal.v1, but there is no corresponding change command"
+    },
+    {
+      "id": "compat-lifecycle-handlers-patched-on-deprecated",
+      "purpose": "The handler-patch active-marker history replays on the deprecated generation: deprecate_patch consumes the active marker.",
+      "features": [
+        "patch",
+        "patch-active",
+        "patch-signal-handler",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-patched",
+      "run_id": "01a129e8-cde6-793f-ac38-35e5f746fa06",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-patched.pb",
+        "protobuf_sha256": "866fe0b151552fb583f0acaa91cc04b3632ea50c556433f5b44129aa52ecc352",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-patched.json",
+        "json_sha256": "ac27339b837569d426a918044562f111c08dfc9cce1b9cb500d6f118a7e576fb"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-lifecycle-handlers-patched-on-removed",
+      "purpose": "Negative control: the handler-patch active-marker history on the removed generation is nondeterministic: deleting the patch call before deprecation leaves a non-deprecated marker with no matching command (the second gate).",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-signal-handler"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-patched",
+      "run_id": "01a129e8-cde6-793f-ac38-35e5f746fa06",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-patched.pb",
+        "protobuf_sha256": "866fe0b151552fb583f0acaa91cc04b3632ea50c556433f5b44129aa52ecc352",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-patched.json",
+        "json_sha256": "ac27339b837569d426a918044562f111c08dfc9cce1b9cb500d6f118a7e576fb"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-handlers-patched",
+      "expected_message": "Non-deprecated patch marker encountered for change corpus.lifecycle.signal.v1, but there is no corresponding change command"
+    },
+    {
+      "id": "negative-lifecycle-handlers-deprecated-on-legacy",
+      "purpose": "Negative control: the handler-patch deprecated-marker history on the legacy generation is nondeterministic: the legacy branch schedules different commands.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-signal-handler"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-deprecated",
+      "run_id": "01a129e8-d3b0-7186-997b-def9362f4732",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-deprecated.pb",
+        "protobuf_sha256": "47205a6ce34140fd855521c153be80351045ab93bbe5bfb9a33b57c0e50d37b6",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-deprecated.json",
+        "json_sha256": "64e94d5e0d908c8f8b3c2697b56d9fff3be4143150034307e756e9a8ab381335"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-handlers-deprecated",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.new' does not match activity type of activity command 'corpus.lifecycle.legacy'"
+    },
+    {
+      "id": "compat-lifecycle-handlers-deprecated-on-patched",
+      "purpose": "The handler-patch deprecated-marker history replays on the patched generation: rolling back from deprecation, Workflow.patched sees the deprecated marker and keeps the new branch.",
+      "features": [
+        "patch",
+        "patch-deprecated",
+        "patch-signal-handler",
+        "patch-rollback"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-deprecated",
+      "run_id": "01a129e8-d3b0-7186-997b-def9362f4732",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-deprecated.pb",
+        "protobuf_sha256": "47205a6ce34140fd855521c153be80351045ab93bbe5bfb9a33b57c0e50d37b6",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-deprecated.json",
+        "json_sha256": "64e94d5e0d908c8f8b3c2697b56d9fff3be4143150034307e756e9a8ab381335"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "compat-lifecycle-handlers-deprecated-on-removed",
+      "purpose": "The handler-patch deprecated-marker history replays on the removed generation: Core skips the deprecated marker after the patch call is deleted.",
+      "features": [
+        "patch",
+        "patch-deprecated",
+        "patch-signal-handler",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-deprecated",
+      "run_id": "01a129e8-d3b0-7186-997b-def9362f4732",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-deprecated.pb",
+        "protobuf_sha256": "47205a6ce34140fd855521c153be80351045ab93bbe5bfb9a33b57c0e50d37b6",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-deprecated.json",
+        "json_sha256": "64e94d5e0d908c8f8b3c2697b56d9fff3be4143150034307e756e9a8ab381335"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-lifecycle-handlers-removed-on-legacy",
+      "purpose": "Negative control: the handler-patch marker-free new-branch history from the removed generation on the legacy generation is nondeterministic: the legacy branch schedules different commands.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-signal-handler"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-removed",
+      "run_id": "01a129e8-d8be-7281-b65a-ff2eea456ba3",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-removed.pb",
+        "protobuf_sha256": "ef5119857e052b120d5613f182e3a310250966778d171877efc2ef38c1f1cb04",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-removed.json",
+        "json_sha256": "2cb11a47c05fde3d06e7e4b171fce0ec2ac07e9e65bae1ed0dbb80bc090fefd6"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-handlers-removed",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.new' does not match activity type of activity command 'corpus.lifecycle.legacy'"
+    },
+    {
+      "id": "negative-lifecycle-handlers-removed-on-patched",
+      "purpose": "Negative control: the handler-patch marker-free new-branch history from the removed generation on the patched generation is nondeterministic: rolling back from removal to the patched code, Workflow.patched reports false without a marker and takes the legacy branch.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-signal-handler"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-removed",
+      "run_id": "01a129e8-d8be-7281-b65a-ff2eea456ba3",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-removed.pb",
+        "protobuf_sha256": "ef5119857e052b120d5613f182e3a310250966778d171877efc2ef38c1f1cb04",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-removed.json",
+        "json_sha256": "2cb11a47c05fde3d06e7e4b171fce0ec2ac07e9e65bae1ed0dbb80bc090fefd6"
+      },
+      "replay_definitions": "corpus-lifecycle-patched",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-handlers-removed",
+      "expected_message": "Activity type of scheduled event 'corpus.lifecycle.new' does not match activity type of activity command 'corpus.lifecycle.legacy'"
+    },
+    {
+      "id": "compat-lifecycle-handlers-removed-on-deprecated",
+      "purpose": "The handler-patch marker-free new-branch history from the removed generation replays on the deprecated generation: rolling back from removal, deprecate_patch without a marker is allowed and the branch is unchanged.",
+      "features": [
+        "patch",
+        "patch-removed",
+        "patch-signal-handler",
+        "patch-rollback"
+      ],
+      "workflow_type": "corpus.lifecycle.handlers",
+      "workflow_id": "history-corpus-lifecycle-handlers-removed",
+      "run_id": "01a129e8-d8be-7281-b65a-ff2eea456ba3",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handlers-removed.pb",
+        "protobuf_sha256": "ef5119857e052b120d5613f182e3a310250966778d171877efc2ef38c1f1cb04",
+        "json": "histories/live-2026-10-11-lifecycle-handlers-removed.json",
+        "json_sha256": "2cb11a47c05fde3d06e7e4b171fce0ec2ac07e9e65bae1ed0dbb80bc090fefd6"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-lifecycle-handover-on-legacy",
+      "purpose": "Negative control: the handover history (legacy prefix, active marker recorded mid-run) on the legacy generation is nondeterministic: an old worker would take the legacy branch at the patch point, so a run that already reached it on a new worker cannot be rolled back.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-mid-run-upgrade"
+      ],
+      "workflow_type": "corpus.lifecycle.handover",
+      "workflow_id": "history-corpus-lifecycle-handover",
+      "run_id": "01a129e8-c8da-7584-9e6c-7f0f1b55dec2",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handover.pb",
+        "protobuf_sha256": "dd2a54266dbbb09b13ff9161a6ae75a5842160ccf4ad7628820b55e37f79da27",
+        "json": "histories/live-2026-10-11-lifecycle-handover.json",
+        "json_sha256": "d53f1f9dcbf712107829d601cab8d5c3b55513ecb1ff21e3afdb9b00b182857e"
+      },
+      "replay_definitions": "corpus-lifecycle-legacy",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-handover",
+      "expected_message": "Non-deprecated patch marker encountered for change corpus.lifecycle.handover.v1, but there is no corresponding change command"
+    },
+    {
+      "id": "compat-lifecycle-handover-on-deprecated",
+      "purpose": "Upgrade: the handover history (legacy prefix, active marker recorded mid-run) replays on the deprecated generation: deprecate_patch consumes the mid-run marker.",
+      "features": [
+        "patch",
+        "patch-active",
+        "patch-mid-run-upgrade",
+        "patch-upgrade"
+      ],
+      "workflow_type": "corpus.lifecycle.handover",
+      "workflow_id": "history-corpus-lifecycle-handover",
+      "run_id": "01a129e8-c8da-7584-9e6c-7f0f1b55dec2",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handover.pb",
+        "protobuf_sha256": "dd2a54266dbbb09b13ff9161a6ae75a5842160ccf4ad7628820b55e37f79da27",
+        "json": "histories/live-2026-10-11-lifecycle-handover.json",
+        "json_sha256": "d53f1f9dcbf712107829d601cab8d5c3b55513ecb1ff21e3afdb9b00b182857e"
+      },
+      "replay_definitions": "corpus-lifecycle-deprecated",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-lifecycle-handover-on-removed",
+      "purpose": "Negative control: the handover history (legacy prefix, active marker recorded mid-run) on the removed generation is nondeterministic: its non-deprecated marker has no matching command.",
+      "features": [
+        "patch",
+        "negative-control",
+        "patch-mid-run-upgrade"
+      ],
+      "workflow_type": "corpus.lifecycle.handover",
+      "workflow_id": "history-corpus-lifecycle-handover",
+      "run_id": "01a129e8-c8da-7584-9e6c-7f0f1b55dec2",
+      "capture": "live-2026-10-11",
+      "history": {
+        "protobuf": "histories/live-2026-10-11-lifecycle-handover.pb",
+        "protobuf_sha256": "dd2a54266dbbb09b13ff9161a6ae75a5842160ccf4ad7628820b55e37f79da27",
+        "json": "histories/live-2026-10-11-lifecycle-handover.json",
+        "json_sha256": "d53f1f9dcbf712107829d601cab8d5c3b55513ecb1ff21e3afdb9b00b182857e"
+      },
+      "replay_definitions": "corpus-lifecycle-removed",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-11-lifecycle-handover",
+      "expected_message": "Non-deprecated patch marker encountered for change corpus.lifecycle.handover.v1, but there is no corresponding change command"
+    },
+    {
+      "id": "invalid-truncated-protobuf-activity-retry",
+      "purpose": "Malformed-history control: the activity-retry history cut to its first half (a partial export) is not a History protobuf and must be refused, not replayed as a prefix.",
+      "features": [
+        "malformed-history",
+        "invalid-history-truncated-protobuf"
+      ],
+      "workflow_type": "corpus.activity_retry",
+      "workflow_id": "history-corpus-activity-retry",
+      "run_id": "01a11a23-8cf0-7237-9d97-a77a8751bb7a",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-activity-retry.pb",
+        "protobuf_sha256": "fec015f6e939a63c91a8dc6171e8bcb7417a2a6baf29c486e8935a18e852fbf6",
+        "json": "histories/live-2026-10-08-activity-retry.json",
+        "json_sha256": "b5594f3edf57b4abb0948aedeeec23f4077fc86a786715b9be9188ef9466377e"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "invalid_history",
+      "negative_control_of": "live-2026-10-08-activity-retry",
+      "history_mutation": "truncate-protobuf",
+      "expected_message": "history failed strict validation"
+    },
+    {
+      "id": "invalid-event-id-gap-timer",
+      "purpose": "Malformed-history control: the timer history with event 3 missing (later events renumbered one higher) must be refused before Core sees it.",
+      "features": [
+        "malformed-history",
+        "invalid-history-event-id-gap"
+      ],
+      "workflow_type": "corpus.timer",
+      "workflow_id": "history-corpus-timer",
+      "run_id": "01a11a23-88ed-7d4a-bd17-721a837b08e5",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-timer.pb",
+        "protobuf_sha256": "fe32c05828b95849703e8069bed5d14371fc2d52c449549056bb4b9996205bd5",
+        "json": "histories/live-2026-10-08-timer.json",
+        "json_sha256": "630c5c438289e1d1eec31da471681307ff92365a8eaae94bbcdd9d3d28c7dc82"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "invalid_history",
+      "negative_control_of": "live-2026-10-08-timer",
+      "history_mutation": "event-id-gap",
+      "expected_message": "event IDs are not contiguous from 1"
+    },
+    {
+      "id": "invalid-missing-task-queue-interaction",
+      "purpose": "Malformed-history control: the interaction history without a task queue on its start event must be refused promptly (Core's replay poll would otherwise panic and stall).",
+      "features": [
+        "malformed-history",
+        "invalid-history-missing-task-queue"
+      ],
+      "workflow_type": "corpus.interaction",
+      "workflow_id": "history-corpus-interaction",
+      "run_id": "01a11a23-90ff-78d5-ae6b-81654f0308b4",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-interaction.pb",
+        "protobuf_sha256": "4e1b2321ba4ca94c0f1889c1936e8b331c9dd046f7701edeab570e9c446b30a5",
+        "json": "histories/live-2026-10-08-interaction.json",
+        "json_sha256": "ee33d9ef8307f8d20622ccac0e4dbae6cc1068a018c7de0f542c8adcec6aa83c"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "invalid_history",
+      "negative_control_of": "live-2026-10-08-interaction",
+      "history_mutation": "drop-start-task-queue",
+      "expected_message": "start event has no task queue"
+    },
+    {
+      "id": "invalid-first-task-rejected-continue-as-new",
+      "purpose": "Malformed-history control: the first continue-as-new run with the attributes of its first WorkflowTaskScheduled event removed passes the bridge's structural checks, but Core cannot apply the event in the run's first workflow task and auto-fails it; replay must refuse the history instead of reporting Ok without running workflow code.",
+      "features": [
+        "malformed-history",
+        "invalid-history-first-task-rejected"
+      ],
+      "workflow_type": "corpus.continue_as_new",
+      "workflow_id": "history-corpus-continue-as-new",
+      "run_id": "01a11a23-916d-7983-82ee-1bf8bfd56dc4",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-continue-as-new-first.pb",
+        "protobuf_sha256": "02587d60e7de06007e4da0cdc692585a758cbdfbf26c086a491963ce69f2b86d",
+        "json": "histories/live-2026-10-08-continue-as-new-first.json",
+        "json_sha256": "6e0d253e7ba8d4492a038e3fcf83b5d0a20793d4e8383b608cc9ec3f8cfbaadf"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "invalid_history",
+      "negative_control_of": "live-2026-10-08-continue-as-new-first",
+      "history_mutation": "drop-first-workflow-task-scheduled-attributes",
+      "expected_message": "This history is invalid"
+    },
+    {
+      "id": "invalid-workflow-id-mismatch-patch-active",
+      "purpose": "Malformed-history control: the unchanged patch-active history replayed under another corpus execution's workflow ID (history-corpus-patch-marker-free) must be refused, so a history cannot be replayed under a different execution's identity.",
+      "features": [
+        "malformed-history",
+        "invalid-history-workflow-id-mismatch"
+      ],
+      "workflow_type": "corpus.patch",
+      "workflow_id": "history-corpus-patch-marker-free",
+      "run_id": "01a11a23-84b5-728d-b3a5-816493a01d16",
+      "capture": "live-2026-10-08",
+      "generation": "corpus-v1",
+      "history": {
+        "protobuf": "histories/live-2026-10-08-patch-active.pb",
+        "protobuf_sha256": "19036e87ce3fc75e8368e1e0cdd9e7f065cbfa0e580c9d24408b2e87b6880f99",
+        "json": "histories/live-2026-10-08-patch-active.json",
+        "json_sha256": "cf73558f4e2adfcec2b37605393c6003011ba0088909e3521b1dafc4a9e081ce"
+      },
+      "replay_definitions": "corpus-v1",
+      "expected": "invalid_history",
+      "negative_control_of": "live-2026-10-08-patch-active",
+      "expected_message": "records a different workflow ID than the one supplied"
+    }
+  ]
+}

@@ -21,6 +21,13 @@ state. An activity-side attempt log must still contain exactly one invocation
 per execution after replay. The driver terminates its remaining executions and
 stops/reaps its workers on exit; an overall timeout bounds failed runs.
 
+Each history read is one `temporal workflow show` invocation with a 30-second
+`--command-timeout`. The CLI reports an expired deadline only as "program
+interrupted"; the original 5-second budget expired on a loaded CI runner.
+While waiting for the retry timer, a failed read is logged and polled again
+until a 60-second deadline; a completed history is read up to three times. The
+event assertions are unchanged.
+
 The fixture uses the private runtime scheduling handle because the public local
 activity API currently exposes only a future. It does not introduce a public
 cancellation API. The client, worker, signal, and query paths use the public SDK.
@@ -34,5 +41,10 @@ Verified on 2026-09-21 with OCaml 5.4.1, pinned Core
 1.32.0 using a native SQLite development server. All three histories contained
 one `core_local_activity` marker, one retry timer, cancellation of that timer,
 and workflow completion. Fresh-worker queries reconstructed the cancelled
-result without another activity invocation. This is focused native evidence;
-the Docker/PostgreSQL and platform matrices remain separate gates.
+result without another activity invocation. That run is focused native
+evidence; the platform matrices remain separate gates.
+
+CI runs this suite against the Compose Temporal/PostgreSQL stack through
+`make test-temporal-live-regressions`, which `make test-temporal-live-ci`
+invokes. That target supplies the `default` namespace and the pinned
+admin-tools CLI.

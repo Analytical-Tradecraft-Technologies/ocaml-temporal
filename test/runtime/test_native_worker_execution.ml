@@ -163,17 +163,26 @@ type fake_supervisor = {
      lets retry tests compare the retained command value with the later
      acknowledgement without granting the fake source ownership of it. *)
   attempts : Protocol.completion list ref;
+  (* The exact canonical bytes of every completion attempt, newest first.
+     Retry tests compare these to prove a retained completion is resubmitted
+     byte for byte rather than re-encoded. *)
+  submitted : string list ref;
   (* Optional source error returned by the next poll, modelling a lower-layer
      semantic rejection whose lease has already been retired. *)
   poll_error : source_error option ref;
   (* Number of poll errors observed; tests use this to prove the source-side
      rejection path ran exactly once. *)
   rejected_poll_count : int ref;
-  (* One-shot completion rejection used to verify retained-completion retry
-     without rerunning workflow code. *)
+  (* One-shot completion rejection that the fake classifies as explicitly
+     retryable, used to verify retained-completion retry without rerunning
+     workflow code. *)
   reject_next_completion : bool ref;
-  (* One-shot completion exception used to verify exact completion retention
-     even when the native acknowledgement is uncertain. *)
+  (* One-shot completion rejection that is not retryable. It models a failure
+     after which the lease may already be consumed, so the adapter must never
+     resubmit the retained completion (issue #843). *)
+  reject_next_completion_permanently : bool ref;
+  (* One-shot completion exception, classified as explicitly retryable, used
+     to verify exact completion retention across a raised acknowledgement. *)
   raise_next_completion : bool ref;
   (* Models Core acceptance followed by loss of the language acknowledgement. *)
   accept_then_raise : bool ref;
@@ -186,12 +195,35 @@ let fake_supervisor () =
     leased = Hashtbl.create 8;
     completions = ref [];
     attempts = ref [];
+    submitted = ref [];
     poll_error = ref None;
     rejected_poll_count = ref 0;
     reject_next_completion = ref false;
+    reject_next_completion_permanently = ref false;
     raise_next_completion = ref false;
     accept_then_raise = ref false;
   }
+
+(** Returns the typed completion a fake supervisor received after proving
+    that it is exactly the value the submitted bytes were encoded from, so
+    fixtures can assert on typed commands while still checking what was
+    actually submitted. Re-encoding here is test-only; the adapter never
+    encodes a completion twice. *)
+let submitted_completion ~completion encoded =
+  match Protocol.encode_completion completion with
+  | Ok expected
+    when String.equal expected
+           (Temporal_protocol.Encoded_workflow_completion.to_string encoded) ->
+      completion
+  | Ok _ -> failwith "typed completion does not match the submitted bytes"
+  | Error error ->
+      failwith
+        ("submitted completion does not re-encode: "
+        ^ (Protocol.error_view error).message)
+
+(** The only exception the fake source classifies as a retryable completion
+    failure. Every other exception is an uncertain acknowledgement. *)
+exception Transient_completion_exception
 
 (** Implements the typed supervisor contract over the fake lease ledger. *)
 module Fake_supervisor = struct
@@ -214,15 +246,23 @@ module Fake_supervisor = struct
           Ok (Some activation)
 
   (** Accepts one completion only for an active run ID, then removes that lease
-      and records the immutable semantic completion for assertions. *)
-  let complete_workflow supervisor (completion : Protocol.completion) =
+      and records both its exact bytes and its decoded semantic value for
+      assertions. *)
+  let complete_workflow supervisor ~completion encoded =
+    supervisor.submitted :=
+      Temporal_protocol.Encoded_workflow_completion.to_string encoded
+      :: !(supervisor.submitted);
+    let completion = submitted_completion ~completion encoded in
     supervisor.attempts := completion :: !(supervisor.attempts);
     if !(supervisor.raise_next_completion) then begin
       supervisor.raise_next_completion := false;
-      raise (Failure "injected completion exception")
+      raise Transient_completion_exception
     end else if !(supervisor.reject_next_completion) then begin
       supervisor.reject_next_completion := false;
       Error { code = "temporarily_unavailable"; message = "completion transport unavailable" }
+    end else if !(supervisor.reject_next_completion_permanently) then begin
+      supervisor.reject_next_completion_permanently := false;
+      Error { code = "core_rejected"; message = "completion rejected by Core" }
     end else if Hashtbl.mem supervisor.leased completion.run_id then begin
       Hashtbl.remove supervisor.leased completion.run_id;
       supervisor.completions := completion :: !(supervisor.completions);
@@ -239,6 +279,15 @@ module Fake_supervisor = struct
 
   (** Exposes the stable source diagnostic required by the adapter signature. *)
   let error_message error = error.message
+
+  (** Only the injected transient rejection proves the lease is still
+      outstanding; stale leases and permanent rejections fail closed. *)
+  let error_is_retryable error = String.equal error.code "temporarily_unavailable"
+
+  (** Only the dedicated transient exception authorizes a retry. *)
+  let exception_is_retryable = function
+    | Transient_completion_exception -> true
+    | _ -> false
 end
 
 (** The test worker instantiates the production functor with the deterministic
@@ -1261,6 +1310,138 @@ let test_query_validation_failure_preserves_run () =
     (activation ~run_id [ Protocol.Fire_timer { seq = timer_seq } ]);
   expect_completed ~terminal:true (Result.get_ok (Worker.poll worker))
 
+(** Tags of every [workflow_activation_rejected] record reported while
+    [action] runs, newest first. Logs state is restored afterwards. *)
+let capture_rejection_records action =
+  let records = ref [] in
+  let reporter =
+    let report _source _level ~over continuation messagef =
+      messagef (fun ?header:_ ?(tags = Logs.Tag.empty) format ->
+          Format.ikfprintf
+            (fun _ ->
+              (match
+                 Logs.Tag.find Temporal_base.Observability.Tag.operation tags
+               with
+              | Some "workflow_activation_rejected" -> records := tags :: !records
+              | _ -> ());
+              over ();
+              continuation ())
+            Format.str_formatter format)
+    in
+    { Logs.report }
+  in
+  let previous_reporter = Logs.reporter () in
+  let previous_level = Logs.level () in
+  Logs.set_reporter reporter;
+  Logs.set_level (Some Logs.Debug);
+  Fun.protect
+    ~finally:(fun () ->
+      Logs.set_reporter previous_reporter;
+      Logs.set_level previous_level)
+    action;
+  !records
+
+(** Asserts that the newest rejection record names [workflow_id], [run_id],
+    and [replaying]. *)
+let expect_rejection_correlation ~label ~workflow_id ~run_id ~replaying records =
+  let module Tag = Temporal_base.Observability.Tag in
+  match records with
+  | tags :: _ ->
+      if Logs.Tag.find Tag.workflow_id tags <> Some workflow_id then
+        failwith (label ^ ": rejection record lacks the workflow ID");
+      if Logs.Tag.find Tag.run_id tags <> Some run_id then
+        failwith (label ^ ": rejection record lacks the run ID");
+      if Logs.Tag.find Tag.replaying tags <> Some replaying then
+        failwith (label ^ ": rejection record lacks the replay flag")
+  | [] -> failwith (label ^ ": no workflow_activation_rejected record")
+
+(** Rejected activations keep their correlation (#500): an initial
+    activation rejected before its run is cached (unknown type, undecodable
+    input) still names the workflow from its initialization job, and a
+    rejection on a cached run reads the workflow ID from the registry. Each
+    record carries the activation's replay flag. *)
+let test_rejected_activation_log_correlation () =
+  let supervisor = fake_supervisor () in
+  let invalid_query =
+    Raw_adapter.make_query_handler ~name:"invalid-payload"
+      ~dispatch:(fun _query ->
+        Ok { Temporal_base.Payload.metadata = [ ("", "invalid") ]; data = Bytes.empty })
+  in
+  let string_input =
+    Temporal.Workflow.define ~name:"native_worker_rejection_string_input"
+      ~input:Temporal.Codec.string ~output:Temporal.Codec.unit (fun _ ->
+        Temporal.Workflow.sleep (Temporal.Duration.of_ms 25L))
+  in
+  let worker =
+    worker supervisor
+      [ Adapter.register string_input;
+        Adapter.register ~query_handlers:[ invalid_query ]
+          (Temporal.Workflow.define ~name:"native_worker_rejection_cached"
+             ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+               Temporal.Workflow.sleep (Temporal.Duration.of_ms 25L))) ]
+  in
+  let expect_rejected ~label =
+    match Worker.poll worker with
+    | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+    | Ok _ -> failwith (label ^ ": activation was not rejected")
+    | Error error -> failwith (label ^ ": poll failed: " ^ error.message)
+  in
+  (* Unknown workflow type, first execution. *)
+  let run_id = "run-reject-unknown-type" in
+  let records =
+    capture_rejection_records (fun () ->
+        enqueue supervisor
+          { (activation ~run_id
+               [ initialize ~run_id ~workflow_type:"native_worker_not_registered" ])
+            with is_replaying = false };
+        expect_rejected ~label:"unknown type")
+  in
+  expect_rejection_correlation ~label:"unknown type"
+    ~workflow_id:("workflow-" ^ run_id) ~run_id ~replaying:false records;
+  (* Undecodable input during replay. *)
+  let run_id = "run-reject-invalid-input" in
+  let records =
+    capture_rejection_records (fun () ->
+        enqueue supervisor
+          (activation ~run_id
+             [ Protocol.Initialize_workflow
+                 {
+                   workflow_id = "workflow-" ^ run_id;
+                   workflow_type = "native_worker_rejection_string_input";
+                   arguments = [ encoded_protocol Temporal.Codec.int 7 ];
+                   randomness_seed = "1";
+                   attempt = 1;
+                   context = None;
+                 } ]);
+        expect_rejected ~label:"invalid input")
+  in
+  expect_rejection_correlation ~label:"invalid input"
+    ~workflow_id:("workflow-" ^ run_id) ~run_id ~replaying:true records;
+  (* Cached run: a query-only activation (no initialization job) whose
+     handler result fails validation. *)
+  let run_id = "run-reject-cached" in
+  enqueue supervisor
+    (activation ~run_id
+       [ initialize ~run_id ~workflow_type:"native_worker_rejection_cached" ]);
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  let records =
+    capture_rejection_records (fun () ->
+        enqueue supervisor
+          { (activation ~run_id
+               [ Protocol.Query_workflow
+                   {
+                     query_id = "query-reject-cached";
+                     query_type = "invalid-payload";
+                     arguments = [];
+                     headers = [];
+                   } ])
+            with is_replaying = false };
+        expect_rejected ~label:"cached run")
+  in
+  expect_rejection_correlation ~label:"cached run"
+    ~workflow_id:("workflow-" ^ run_id) ~run_id ~replaying:false records
+
+
 (** Overlong unhandled query names are bounded before protocol encoding. The
     query type is individually valid at the bridge limit, but the constructed
     diagnostic would exceed that limit without truncation. *)
@@ -1294,10 +1475,11 @@ let test_unhandled_query_failure_message_is_bounded () =
   | _ -> failwith "long unhandled query did not emit a failed query result"
   end
 
-(** A SignalWorkflow with no matching registration fails the workflow
-    non-retryably. Silently acknowledging an unknown signal would make replay
-    diverge from the worker's observable state, so the run is removed only
-    after Core acknowledges the explicit failure command. *)
+(** A SignalWorkflow with no matching registration fails only the workflow
+    task (the v1 fail-closed policy, #811). Silently acknowledging an unknown
+    signal would make replay diverge from the worker's observable state, so
+    the poisoned execution is removed only after Core acknowledges the failed
+    task, and no terminal workflow command is emitted. *)
 let test_unhandled_signal_fails_closed () =
   let supervisor = fake_supervisor () in
   let workflow =
@@ -1324,9 +1506,10 @@ let test_unhandled_signal_fails_closed () =
   begin
     match (latest_completion supervisor).commands, (latest_completion supervisor).task_failure with
     | [], Some { message; _ }
-      when String.equal message "unhandled workflow signal: missing" ->
+      when String.starts_with ~prefix:"unhandled workflow signal: missing "
+             message ->
         ()
-    | _ -> failwith "unhandled signal did not produce a non-retryable failure"
+    | _ -> failwith "unhandled signal did not fail only the workflow task"
   end;
   if Hashtbl.length supervisor.leased <> 0 then
     failwith "unhandled signal left a native lease outstanding";
@@ -2525,7 +2708,9 @@ let test_retryable_child_failure_preserves_retryability () =
           info = Protocol.Child_workflow { info with retry_state = Protocol.Timeout };
         }
     | Protocol.Application _ | Protocol.Canceled _ | Protocol.Activity _
-    | Protocol.Timeout_failure _ | Protocol.Terminated _ ->
+    | Protocol.Timeout_failure _ | Protocol.Terminated _ | Protocol.Server _
+    | Protocol.Reset_workflow _ | Protocol.Nexus_operation _
+    | Protocol.Nexus_handler _ | Protocol.Absent ->
         failwith "child terminal failure fixture lost its child-workflow info"
   in
   let child =
@@ -2664,6 +2849,54 @@ let test_task_queue_validation () =
   expect_invalid "oversized" (String.make 65_537 'x');
   expect_invalid "UTF-8" (String.make 1 (Char.chr 0xff))
 
+(** The adapter rejects a malformed namespace as typed configuration, like
+    the task queue, rather than deferring the defect to the first activation. *)
+let test_namespace_validation () =
+  let supervisor = fake_supervisor () in
+  match Worker.create ~supervisor ~namespace:"bad\000namespace" ~workflows:[] () with
+  | Error { code = "invalid_configuration"; path = "$.namespace"; message }
+    when not (String.equal message "") -> ()
+  | Error error ->
+      failwith
+        (Printf.sprintf "namespace returned %s at %s" error.code error.path)
+  | Ok _ -> failwith "NUL-containing namespace was accepted"
+
+(** Core activations do not carry the namespace, so the adapter copies its
+    configured namespace into every execution for [Temporal.Workflow.info]
+    (#792). *)
+let test_namespace_reaches_workflow_info () =
+  let supervisor = fake_supervisor () in
+  let observed = ref None in
+  let workflow =
+    Temporal.Workflow.define ~name:"native_worker_namespace"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        observed :=
+          Some
+            (Result.map
+               (fun info ->
+                 ( Temporal.Workflow.Info.namespace info,
+                   Temporal.Workflow.Info.task_queue info ))
+               (Temporal.Workflow.info ()));
+        Ok ())
+  in
+  enqueue supervisor
+    (activation ~run_id:"run-namespace"
+       [ initialize ~run_id:"run-namespace" ~workflow_type:"native_worker_namespace" ]);
+  let worker =
+    match
+      Worker.create ~supervisor ~namespace:"payments" ~task_queue:"orders"
+        ~workflows:[ Adapter.register workflow ] ()
+    with
+    | Ok worker -> worker
+    | Error error -> failwith ("worker creation failed: " ^ error.message)
+  in
+  expect_completed ~terminal:true (Result.get_ok (Worker.poll worker));
+  match !observed with
+  | Some (Ok ("payments", "orders")) -> ()
+  | Some (Ok _) -> failwith "workflow observed the wrong namespace or queue"
+  | Some (Error error) -> failwith (Temporal.Error.message error)
+  | None -> failwith "namespace workflow did not run"
+
 (** A body exception discards a timer buffered in that same task. Retrying a
     failed acknowledgement preserves its exact value and never invokes code
     again; a corrected registration can initialize the same run from scratch. *)
@@ -2772,7 +3005,137 @@ let test_accepted_completion_exception_never_reexecutes () =
   if !calls <> 1 || Queue.length supervisor.queue <> 1 ||
       List.length !(supervisor.completions) <> 1 || latest_attempt supervisor <> retained then
     failwith "uncertain acknowledgement reran code or replaced the command";
+  (* Issue #843: the lost acknowledgement is not retryable, so neither the
+     second poll nor a shutdown drain may submit the completion again. *)
+  begin match Worker.drain worker with
+  | Error { code = "completion_failed"; _ } -> ()
+  | _ -> failwith "drain hid an uncertain workflow acknowledgement"
+  end;
+  if List.length !(supervisor.attempts) <> 1 then
+    failwith "uncertain acknowledgement was resubmitted";
   Worker.discard worker
+
+(** A typed completion rejection that the source does not classify as
+    retryable is fail-closed (issue #843). The exact completion stays owned by
+    the adapter and keeps blocking the run, but no later poll or drain submits
+    it again; only terminal [discard] releases it. *)
+let test_non_retryable_completion_is_never_resubmitted () =
+  let calls = ref 0 in
+  let definition =
+    Temporal.Workflow.define ~name:"fail-closed-completion"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        incr calls;
+        Ok ())
+  in
+  let supervisor = fake_supervisor () in
+  let run_id = "fail-closed-run" in
+  let worker = worker supervisor [ Adapter.register definition ] in
+  enqueue supervisor
+    (activation ~run_id [ initialize ~run_id ~workflow_type:"fail-closed-completion" ]);
+  supervisor.reject_next_completion_permanently := true;
+  (* Matches the fail-closed error and returns it for later comparison. *)
+  let expect_refusal context (result : (_, Adapter.error_view) result) =
+    match result with
+    | Error ({ code = "completion_failed"; _ } as error) -> error
+    | Error error ->
+        failwith (Printf.sprintf "%s returned the wrong error: %s" context error.code)
+    | Ok _ -> failwith (context ^ " acknowledged a refused completion")
+  in
+  let first = expect_refusal "poll" (Worker.poll worker) in
+  let retained = latest_attempt supervisor in
+  (* Another run's activation must not be polled past the retained completion. *)
+  enqueue supervisor
+    (activation ~run_id:"fail-closed-next"
+       [ initialize ~run_id:"fail-closed-next" ~workflow_type:"fail-closed-completion" ]);
+  let again = expect_refusal "second poll" (Worker.poll worker) in
+  let drained = expect_refusal "drain" (Worker.drain worker) in
+  if again <> first || drained <> first then
+    failwith "fail-closed refusal changed its recorded diagnostic";
+  if List.length !(supervisor.attempts) <> 1 || latest_attempt supervisor <> retained then
+    failwith "non-retryable workflow completion was resubmitted";
+  if !calls <> 1 || Queue.length supervisor.queue <> 1 then
+    failwith "fail-closed completion allowed further workflow execution";
+  if Hashtbl.length supervisor.leased <> 1 then
+    failwith "fake lease changed although nothing was resubmitted";
+  Worker.discard worker;
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("discard left a retained completion: " ^ error.code)
+
+(** Issue #846: the worker submits the canonical bytes from the completion's
+    single encoder pass. The bytes the source receives must be exactly what
+    [Workflow_protocol.encode_completion] produces for that completion (the
+    document the supervisor used to build by encoding it a second time), so
+    the wire format is unchanged. A retryable rejection must then resubmit the
+    physically identical string: the retained completion is never re-encoded,
+    and the workflow is not re-run. *)
+let test_submitted_completion_is_encoded_once () =
+  let calls = ref 0 in
+  (* Every byte value, so canonical base64 padding and the full alphabet are
+     both exercised in the payload carried by the activity command. *)
+  let argument = Bytes.init (32 * 1024 + 2) (fun index -> Char.chr (index land 0xff)) in
+  let activity =
+    Temporal.Activity.remote ~name:"native_worker_single_encode_activity"
+      ~input:Temporal.Codec.bytes ~output:Temporal.Codec.unit
+  in
+  let workflow =
+    Temporal.Workflow.define ~name:"native_worker_single_encode"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        incr calls;
+        Temporal.Activity.execute activity (Bytes.copy argument))
+  in
+  let supervisor = fake_supervisor () in
+  let run_id = "run-single-encode" in
+  let worker = worker supervisor [ Adapter.register workflow ] in
+  enqueue supervisor
+    (activation ~run_id [ initialize ~run_id ~workflow_type:"native_worker_single_encode" ]);
+  supervisor.reject_next_completion := true;
+  begin match Worker.poll worker with
+  | Error { code = "completion_failed"; _ } -> ()
+  | Error error -> failwith ("single-encode rejection returned " ^ error.code)
+  | Ok _ -> failwith "rejected single-encode completion was acknowledged"
+  end;
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  let first, retried =
+    match !(supervisor.submitted) with
+    | [ retried; first ] -> (first, retried)
+    | _ -> failwith "expected exactly one rejected and one accepted submission"
+  in
+  if retried != first then
+    failwith "retained completion was re-encoded instead of resubmitted";
+  if !calls <> 1 then failwith "completion retry re-ran workflow code";
+  let completion = latest_completion supervisor in
+  begin match Protocol.encode_completion completion with
+  | Ok expected when String.equal expected first -> ()
+  | Ok _ -> failwith "submitted bytes differ from the canonical completion encoding"
+  | Error _ -> failwith "submitted completion does not re-encode"
+  end;
+  match completion.commands with
+  | [ Protocol.Schedule_activity { arguments = [ payload ]; _ } ]
+    when Bytes.equal payload.data argument ->
+      ()
+  | _ -> failwith "submitted activity command lost its payload bytes"
+
+(** An adapter-built failure completion is encoded once, by the adapter, and
+    submitted as canonical bytes. The unknown-run path never creates an
+    execution, so this covers [retire_with_failure] independently of
+    [Native_execution]. *)
+let test_failure_completion_is_canonical () =
+  let supervisor = fake_supervisor () in
+  let worker = worker supervisor [] in
+  let run_id = "run-unknown-single-encode" in
+  enqueue supervisor
+    (activation ~run_id [ Protocol.Fire_timer { seq = 1L } ]);
+  begin match Worker.poll worker with
+  | Ok (Adapter.Rejected { lease_retired = true; _ }) -> ()
+  | _ -> failwith "unknown run was not retired with a failure completion"
+  end;
+  match !(supervisor.submitted) with
+  | [ submitted ] -> (
+      match Protocol.encode_completion (latest_completion supervisor) with
+      | Ok expected when String.equal expected submitted -> ()
+      | _ -> failwith "failure completion bytes are not the canonical encoding")
+  | _ -> failwith "expected exactly one failure completion submission"
 
 (** An accepted update may mutate state and buffer commands before raising.
     Neither those commands nor its speculative acceptance may reach history;
@@ -2800,6 +3163,53 @@ let test_update_defect_discards_acceptance_and_commands () =
   let completion = latest_completion supervisor in
   if completion.commands <> [] || Option.is_none completion.task_failure then
     failwith "broken update leaked accepted response or buffered timer"
+
+(** A validator's defect, whether returned or raised, rejects the update
+    before acceptance instead of failing the workflow task (#790). The
+    documented validator example returns [Error.defect]; failing the task
+    would discard buffered commands and stall the workflow on redelivery. *)
+let test_update_validator_defect_rejects () =
+  let update = Temporal.Update.define ~name:"validated-update"
+      ~input:Temporal.Codec.string ~output:Temporal.Codec.unit in
+  let calls = ref 0 in
+  let handler = Temporal.Update.Handler.make update
+      ~validator:(function
+        | "" -> Error (Temporal.Error.defect ~message:"tool name is empty")
+        | "raise" -> failwith "validator defect"
+        | _ -> Ok ())
+      (fun _ -> incr calls; Ok ()) in
+  let definition = Temporal.Workflow.define ~name:"update-validator-defect"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        Temporal.Workflow.sleep (Temporal.Duration.of_ms 1000L)) in
+  let supervisor = fake_supervisor () in
+  let run_id = "update-validator-defect-run" in
+  let worker = worker supervisor [ Adapter.register
+      ~update_handlers:[ public_update_handler handler ] definition ] in
+  enqueue supervisor (activation ~run_id
+      [ initialize ~run_id ~workflow_type:"update-validator-defect" ]);
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  enqueue supervisor (activation ~run_id
+      [ update_job ~id:"empty" ~protocol_instance_id:"empty-protocol"
+          ~name:"validated-update"
+          ~input:[ encoded_protocol Temporal.Codec.string "" ] ~run_validator:true;
+        update_job ~id:"raise" ~protocol_instance_id:"raise-protocol"
+          ~name:"validated-update"
+          ~input:[ encoded_protocol Temporal.Codec.string "raise" ]
+          ~run_validator:true ]);
+  expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+  let completion = latest_completion supervisor in
+  if Option.is_some completion.task_failure then
+    failwith "validator defect failed the workflow task";
+  (match completion.commands with
+  | [ Protocol.Update_response
+        { protocol_instance_id = "empty-protocol";
+          response = Protocol.Update_rejected _ };
+      Protocol.Update_response
+        { protocol_instance_id = "raise-protocol";
+          response = Protocol.Update_rejected _ } ] -> ()
+  | _ -> failwith "validator defects were not rejected in order");
+  if !calls <> 0 then failwith "rejected update ran its handler";
+  Worker.discard worker
 
 (** A terminated child resolves as an ordinary typed error. The parent handles
     it, schedules more work, and completes; another run on the same worker can
@@ -2863,10 +3273,14 @@ let test_terminated_child_recovery () =
 let () =
   test_terminated_child_recovery ();
   test_accepted_completion_exception_never_reexecutes ();
+  test_non_retryable_completion_is_never_resubmitted ();
+  test_submitted_completion_is_encoded_once ();
+  test_failure_completion_is_canonical ();
   test_defect_discards_commands_and_reconstructs ();
   test_output_encoder_failure_is_task_failure ();
   test_deliberate_application_failure_remains_terminal ();
   test_update_defect_discards_acceptance_and_commands ();
+  test_update_validator_defect_rejects ();
   test_terminal_workflow ();
   test_completed_workflow_queries ();
   test_activation_metadata_hook ();
@@ -2884,6 +3298,7 @@ let () =
   test_update_terminal_and_eviction_cleanup ();
   test_query_adapter_failure_uses_query_results ();
   test_query_validation_failure_preserves_run ();
+  test_rejected_activation_log_correlation ();
   test_unhandled_query_failure_message_is_bounded ();
   test_unhandled_signal_fails_closed ();
   test_eviction ();
@@ -2911,4 +3326,6 @@ let () =
   test_unknown_run_retires_lease ();
   test_malformed_activation_error_is_typed ();
   test_registration_validation ();
-  test_task_queue_validation ()
+  test_task_queue_validation ();
+  test_namespace_validation ();
+  test_namespace_reaches_workflow_info ()

@@ -9,6 +9,9 @@
 *)
 
 module Protocol = Temporal_protocol.Activity_protocol
+module Encoded = Temporal_protocol.Encoded_activity_completion
+module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
+module Encoded_async_heartbeat = Temporal_protocol.Encoded_async_activity_heartbeat
 module Raw_adapter = Temporal_runtime.Native_activity_execution
 module Base_async = Temporal_base.Async_activity
 module Bridge = Temporal_core_bridge.Native_bridge
@@ -71,26 +74,44 @@ let base_async_activity (definition : ('input, 'output) Temporal.Activity.t) =
     ~input:(base_codec (Temporal.Activity.input definition))
     ~output:(base_codec (Temporal.Activity.output definition)) ~implementation
 
-(** Copies a protocol completion through the strict semantic codec. The fake
-    therefore owns independent token and payload storage exactly as a native
-    implementation must. *)
-let copy_completion completion =
-  match Protocol.encode_completion completion with
+(** Strictly decodes the adapter's single-encode completion bytes, as the Rust
+    bridge does, and checks that they are the canonical encoding of the
+    decoded value. The fake therefore owns independent token and payload
+    storage exactly as a native implementation must, and never encodes a
+    submission itself (issue #995). *)
+let copy_completion encoded =
+  let json = Encoded.to_string encoded in
+  match Protocol.decode_completion json with
   | Error _ -> failwith "async fake received an invalid completion"
-  | Ok json -> (
-      match Protocol.decode_completion json with
-      | Ok value -> value
-      | Error _ -> failwith "async fake could not reparse its completion")
+  | Ok value ->
+      if Protocol.encode_completion value <> Ok json then
+        failwith "async fake received non-canonical completion bytes";
+      value
 
-(** Copies a protocol heartbeat through the strict codec to test ownership of
-    late detail payloads as well as their semantic shape. *)
-let copy_heartbeat heartbeat =
-  match Protocol.encode_heartbeat heartbeat with
+(** Strictly decodes the adapter's single-encode heartbeat bytes, as the
+    Rust bridge does, and checks that they are canonical. Decoding gives the
+    fake its own storage for late detail payloads, and the fake never encodes
+    a submission itself (#1001). *)
+let copy_heartbeat encoded =
+  let json = Encoded_heartbeat.to_string encoded in
+  match Protocol.decode_heartbeat json with
   | Error _ -> failwith "async fake received an invalid heartbeat"
-  | Ok json -> (
-      match Protocol.decode_heartbeat json with
-      | Ok value -> value
-      | Error _ -> failwith "async fake could not reparse its heartbeat")
+  | Ok value ->
+      if Protocol.encode_heartbeat value <> Ok json then
+        failwith "async fake received non-canonical heartbeat bytes";
+      value
+
+(** Strictly decodes an async handle's single-encode heartbeat bytes, which
+    also carry the attempt's heartbeat timeout (#1025), and checks that they
+    are canonical, as [copy_heartbeat] does for a worker heartbeat. *)
+let copy_async_heartbeat encoded =
+  let json = Encoded_async_heartbeat.to_string encoded in
+  match Protocol.decode_async_heartbeat json with
+  | Error _ -> failwith "async fake received an invalid async heartbeat"
+  | Ok value ->
+      if Protocol.encode_async_heartbeat value <> Ok json then
+        failwith "async fake received non-canonical async heartbeat bytes";
+      value
 
 type source_error = {
   code : string;
@@ -111,16 +132,39 @@ type fake_supervisor = {
   async_heartbeats : Protocol.heartbeat list ref;
   async_completion_calls : int ref;
   async_heartbeat_calls : int ref;
+  async_completion_documents : string list ref;
+  async_heartbeat_documents : string list ref;
   reject_next_worker_completion : bool ref;
   reject_next_async_completion : bool ref;
   reject_next_async_completion_terminal : bool ref;
+  reject_next_async_completion_rejected : bool ref;
   reject_next_async_heartbeat : bool ref;
   reject_next_async_heartbeat_connection : bool ref;
   reject_next_async_heartbeat_rejected : bool ref;
   reject_next_async_heartbeat_terminal : bool ref;
+  async_heartbeat_hook : (unit -> unit) ref;
+      (** Runs first in every async heartbeat, standing for the time the RPC
+          spends on the network; a test may block in it (#1025). *)
+  async_heartbeat_timeouts : Protocol.duration option list ref;
+      (** Heartbeat timeout carried by each accepted async heartbeat, newest
+          first (#1025). *)
+  async_heartbeat_response : Protocol.async_heartbeat_response ref;
+      (** Activity state every accepted async heartbeat reports, standing
+          for the flags of the token's latest send (#1025). *)
+  free_client_call_slots : int ref;
+      (** Free slots of the bridge's pending client-call registry, which
+          every namespace-bound async call must occupy while it runs. At
+          zero the registry is full and a call is refused with
+          [Resource_exhausted] before any RPC exists (#1104). *)
+  refused_client_calls : int ref;
+      (** Async calls refused because the registry was full; they are not
+          counted as submissions. *)
 }
 (** Fake native state. [leased] and [async_leased] intentionally model
     different Temporal APIs and are never allowed to substitute for one another.
+    [async_completion_documents] and [async_heartbeat_documents] keep, newest
+    first, the exact strings each namespace-bound call received, so a test can
+    check physical identity of a retried submission (#1001).
 *)
 
 let fake_supervisor () =
@@ -135,13 +179,21 @@ let fake_supervisor () =
     async_heartbeats = ref [];
     async_completion_calls = ref 0;
     async_heartbeat_calls = ref 0;
+    async_completion_documents = ref [];
+    async_heartbeat_documents = ref [];
     reject_next_worker_completion = ref false;
     reject_next_async_completion = ref false;
     reject_next_async_completion_terminal = ref false;
+    reject_next_async_completion_rejected = ref false;
     reject_next_async_heartbeat = ref false;
     reject_next_async_heartbeat_connection = ref false;
     reject_next_async_heartbeat_rejected = ref false;
     reject_next_async_heartbeat_terminal = ref false;
+    async_heartbeat_hook = ref ignore;
+    async_heartbeat_timeouts = ref [];
+    async_heartbeat_response = ref Protocol.Heartbeat_recorded;
+    free_client_call_slots = ref max_int;
+    refused_client_calls = ref 0;
   }
 
 (** Removes the first byte-identical token from a lease ledger. Tokens are
@@ -162,6 +214,26 @@ let has_token token tokens =
 (** Creates a stable fake error for stale or unavailable leases. *)
 let source_error ?(retryable = false) ?native_status code message =
   { code; message; retryable; native_status }
+
+(** Runs one namespace-bound async call while it occupies a slot of the
+    fake client-call registry, as the bridge's submitted-call admission does
+    (#1104). A full registry refuses the call with [Resource_exhausted]
+    before [call] runs, so nothing is submitted or recorded; otherwise the
+    slot is held for the duration of [call] and released afterwards. *)
+let with_client_call_slot supervisor call =
+  if !(supervisor.free_client_call_slots) <= 0 then begin
+    incr supervisor.refused_client_calls;
+    Error
+      (source_error ~native_status:Bridge.Resource_exhausted
+         "resource_exhausted"
+         "too many Temporal client calls are pending (limit 1)")
+  end
+  else begin
+    decr supervisor.free_client_call_slots;
+    Fun.protect
+      ~finally:(fun () -> incr supervisor.free_client_call_slots)
+      call
+  end
 
 (** Implements the complete supervisor contract needed by the adapter. All
     methods copy values before retaining them, and late operations consult only
@@ -187,7 +259,8 @@ module Fake_supervisor = struct
       deferred local result before retiring its token; the optional one-shot
       transport failure checks that an ordinary local failure is retried
       without rerunning the callback. *)
-  let complete_activity supervisor (completion : Protocol.completion) =
+  let complete_activity supervisor encoded =
+    let completion = copy_completion encoded in
     let token = completion.Protocol.task_token in
     if not (has_token token !(supervisor.leased)) then
       Error (source_error "stale_lease" "worker lease is not active")
@@ -209,7 +282,7 @@ module Fake_supervisor = struct
       supervisor.leased := remaining;
       let _, remaining_local = remove_token token !(supervisor.local_leased) in
       supervisor.local_leased := remaining_local;
-      supervisor.completions := copy_completion completion :: !(supervisor.completions);
+      supervisor.completions := completion :: !(supervisor.completions);
       begin
         match completion.Protocol.result with
         | Protocol.Will_complete_async ->
@@ -222,10 +295,17 @@ module Fake_supervisor = struct
     end
 
   (** Accepts one late terminal completion only from the async ledger. The
-      one-shot rejection proves that the OCaml handle retains and retries the
-      exact request without rerunning user code. *)
-  let complete_async_activity supervisor (completion : Protocol.completion) =
+      one-shot failures return the native statuses the Rust bridge actually
+      emits for namespace-bound completions: [Invalid_state] for a server
+      [NotFound], [Connection] for an ambiguous RPC outcome, and
+      [Async_heartbeat_rejected] for a definitive rejection. A full fake
+      client-call registry refuses the call first ([Resource_exhausted]). *)
+  let complete_async_activity supervisor encoded =
+    with_client_call_slot supervisor @@ fun () ->
+    let completion = copy_completion encoded in
     incr supervisor.async_completion_calls;
+    supervisor.async_completion_documents :=
+      Encoded.to_string encoded :: !(supervisor.async_completion_documents);
     if !(supervisor.reject_next_async_completion_terminal) then begin
       supervisor.reject_next_async_completion_terminal := false;
       (* A terminal [NotFound] response means the native task token is no
@@ -237,13 +317,20 @@ module Fake_supervisor = struct
       in
       supervisor.async_leased := remaining;
       Error
-        (source_error "not_found" "async activity no longer exists")
+        (source_error ~native_status:Bridge.Invalid_state "not_found"
+           "async activity no longer exists")
     end
     else if !(supervisor.reject_next_async_completion) then begin
       supervisor.reject_next_async_completion := false;
       Error
-        (source_error ~retryable:true "temporarily_unavailable"
+        (source_error ~native_status:Bridge.Connection "connection"
            "async completion transport unavailable")
+    end
+    else if !(supervisor.reject_next_async_completion_rejected) then begin
+      supervisor.reject_next_async_completion_rejected := false;
+      Error
+        (source_error ~native_status:Bridge.Async_heartbeat_rejected
+           "async_heartbeat_rejected" "async completion request rejected")
     end
     else
       let found, remaining =
@@ -254,22 +341,29 @@ module Fake_supervisor = struct
       else begin
         supervisor.async_leased := remaining;
         supervisor.async_completions :=
-          copy_completion completion :: !(supervisor.async_completions);
+          completion :: !(supervisor.async_completions);
         Ok ()
       end
 
   (** Records ordinary activity heartbeats only while the worker lease remains
       active. Async callbacks use [record_async_activity_heartbeat] instead. *)
-  let record_activity_heartbeat supervisor (heartbeat : Protocol.heartbeat) =
+  let record_activity_heartbeat supervisor encoded =
+    let heartbeat = copy_heartbeat encoded in
     if has_token heartbeat.Protocol.task_token !(supervisor.leased) then begin
-      supervisor.heartbeats := copy_heartbeat heartbeat :: !(supervisor.heartbeats);
+      supervisor.heartbeats := heartbeat :: !(supervisor.heartbeats);
       Ok ()
     end
     else Error (source_error "stale_lease" "worker lease is not active")
 
   (** Records heartbeat details against the namespace-bound async lease. *)
-  let record_async_activity_heartbeat supervisor (heartbeat : Protocol.heartbeat) =
+  let record_async_activity_heartbeat supervisor encoded =
+    with_client_call_slot supervisor @@ fun () ->
+    !(supervisor.async_heartbeat_hook) ();
+    let { Protocol.heartbeat; heartbeat_timeout } = copy_async_heartbeat encoded in
     incr supervisor.async_heartbeat_calls;
+    supervisor.async_heartbeat_documents :=
+      Encoded_async_heartbeat.to_string encoded
+      :: !(supervisor.async_heartbeat_documents);
     if !(supervisor.reject_next_async_heartbeat_terminal) then begin
       supervisor.reject_next_async_heartbeat_terminal := false;
       let _, remaining =
@@ -299,9 +393,10 @@ module Fake_supervisor = struct
            "async heartbeat transport unavailable")
     end
     else if has_token heartbeat.Protocol.task_token !(supervisor.async_leased) then begin
-      supervisor.async_heartbeats :=
-        copy_heartbeat heartbeat :: !(supervisor.async_heartbeats);
-      Ok ()
+      supervisor.async_heartbeats := heartbeat :: !(supervisor.async_heartbeats);
+      supervisor.async_heartbeat_timeouts :=
+        heartbeat_timeout :: !(supervisor.async_heartbeat_timeouts);
+      Ok !(supervisor.async_heartbeat_response)
     end
     else Error (source_error "stale_async_lease" "async lease is not active")
 
@@ -313,11 +408,12 @@ module Fake_supervisor = struct
     | Some status -> Worker_policy.activity_completion_retryable status
     | None -> error.retryable
 
-  (** Exercise the production heartbeat classifier on statuses that the Rust
-      async client actually returns, rather than on a premarked retryable fake. *)
-  let async_heartbeat_error_disposition error =
+  (** Exercise the production async-operation classifier on statuses that the
+      Rust async client actually returns, rather than on a premarked retryable
+      fake. *)
+  let async_operation_error_disposition error =
     match error.native_status with
-    | Some status -> Worker_policy.async_heartbeat_disposition status
+    | Some status -> Worker_policy.async_operation_disposition status
     | None ->
         if error.retryable then Worker_policy.Retry_exact
         else Worker_policy.Retired
@@ -404,7 +500,10 @@ let enqueue supervisor task = Queue.add task supervisor.queue
 (** Creates an adapter worker and turns setup failures into readable test
     failures. *)
 let worker supervisor activities =
-  match Worker.create ~supervisor ~activities with
+  match
+    Worker.create ~supervisor ~activities
+      ~worker_shutting_down:(fun () -> false)
+  with
   | Ok worker -> worker
   | Error (error : Raw_adapter.error_view) ->
       failwith
@@ -576,7 +675,7 @@ let test_deferred_lifecycle () =
     failwith "accepted async completion did not retire the client lease";
   begin
     match !(supervisor.async_completions) with
-    | [ { Protocol.result = Protocol.Completed (Some payload); task_token } ] ->
+    | [ { Protocol.result = Protocol.Completed payload; task_token } ] ->
         if not (Bytes.equal task_token token) then
           failwith "async completion changed the opaque token";
         if decode_output Temporal.Codec.string payload <> "finished" then
@@ -626,7 +725,9 @@ let test_invalid_async_payload_preserves_handle () =
       ~decode:(fun _ -> Error (Temporal_base.Error.codec
         ~message:"output-only test codec")) in
   let cases =
-    [ ("invalid-utf8", [ ("opaque", "\255") ]);
+    [ (* A binary metadata value and a NUL in a key are valid (#1048);
+         a key that is not UTF-8 is not. *)
+      ("non-utf8-key", [ ("bad\255key", "value") ]);
       ("duplicate", [ ("opaque", "one"); ("opaque", "two") ]);
       ("oversized", [ (String.make 65_537 'k', "value") ]) ]
   in
@@ -718,27 +819,27 @@ let test_async_codec_error_preserves_handle () =
   | Ok () when !(supervisor.async_leased) = [] -> ()
   | _ -> failwith "codec recovery left completion debt"
 
-(** A public codec can emit an invalid encoding marker while successfully
-    encoding its body. A corrected option value must still complete normally. *)
-let test_async_invalid_encoding_preserves_handle () =
+(** Payload metadata values are arbitrary bytes in Temporal's protocol
+    (#1048), so a public codec whose encoding marker is not UTF-8 produces a
+    valid payload. The asynchronous completion must be submitted once with the
+    marker unchanged instead of being rejected locally. *)
+let test_async_binary_encoding_is_submitted () =
   let codec = Temporal.Codec.option
       (Temporal.Codec.make ~encoding:"\255"
         ~encode:(fun value -> Ok (Bytes.of_string value))
         ~decode:(fun bytes -> Ok (Bytes.to_string bytes))) in
   let supervisor, worker, handle, _, _ = payload_validation_fixture (base_codec codec) in
   (match Temporal.Activity.Async_handle.complete handle (Some "value") with
-  | Error _ -> ()
-  | Ok () -> failwith "invalid public codec encoding was accepted");
-  if !(supervisor.async_completion_calls) <> 0 then
-    failwith "invalid public codec encoding reached the supervisor";
-  (match Temporal.Activity.Async_handle.complete handle None with
   | Ok () -> ()
   | Error error -> failwith (Temporal.Error.message error));
+  if !(supervisor.async_completion_calls) <> 1 then
+    failwith "binary encoding marker did not reach the supervisor exactly once";
   match Worker.drain worker with
   | Ok () when !(supervisor.async_leased) = [] -> ()
-  | _ -> failwith "corrected public codec output left completion debt"
+  | _ -> failwith "binary encoding completion left completion debt"
 
-(** A rejected late completion retains the exact request key. Retrying it
+(** An ambiguous [Connection] failure of a late completion keeps the handle
+    and native lease and retains the exact request key (#821). Retrying it
     succeeds without invoking the asynchronous implementation again. *)
 let test_async_completion_retry () =
   let supervisor = fake_supervisor () in
@@ -763,12 +864,17 @@ let test_async_completion_retry () =
   let handle = Option.get !retained in
   begin
     match Temporal.Activity.Async_handle.complete handle "once" with
+    | Error error when (Temporal.Error.view error).non_retryable ->
+        failwith "uncertain async completion was reported as non-retryable"
     | Error _ -> ()
     | Ok () -> failwith "rejected async completion was reported as accepted"
   end;
   if !calls <> 1 then failwith "async completion retry reran the callback";
   if not (has_token token !(supervisor.async_leased)) then
     failwith "async completion rejection retired the client lease";
+  (match Worker.drain worker with
+  | Error { code = "outstanding_async_leases"; retryable = true; _ } -> ()
+  | _ -> failwith "uncertain completion dropped the adapter async lease");
   (match Temporal.Activity.Async_handle.complete handle "different" with
   | Error _ -> ()
   | Ok () -> failwith "uncertain completion allowed a different output");
@@ -788,7 +894,16 @@ let test_async_completion_retry () =
   if List.length !(supervisor.async_completions) <> 1 then
     failwith "async completion retry submitted more than one accepted result";
   if !(supervisor.async_completion_calls) <> 2 then
-    failwith "async completion did not submit exactly one identical retry"
+    failwith "async completion did not submit exactly one identical retry";
+  (* The retry reuses the bytes validated and encoded for the first
+     submission rather than preparing the completion again (#1001). *)
+  match !(supervisor.async_completion_documents), !(supervisor.async_completions) with
+  | [ retry; first ], [ accepted ] ->
+      if not (retry == first) then
+        failwith "async completion retry submitted a re-encoded document";
+      if Protocol.encode_completion accepted <> Ok first then
+        failwith "async completion bytes are not the canonical encoding"
+  | _ -> failwith "async completion retry recorded unexpected submissions"
 
 (** A terminal native rejection closes both sides of the retained capability.
     The adapter must drop its lease so worker drain cannot wait forever, while
@@ -856,10 +971,101 @@ let heartbeat_status_fixture ~name ~token =
   expect_deferred (Worker.poll worker);
   (supervisor, worker, Option.get !retained, calls)
 
+(** An async heartbeat crosses the supervisor as the bytes of its single
+    encoder pass (#1001). The fake decodes them strictly, as Rust does, and
+    each accepted heartbeat yields exactly one document: the canonical
+    encoding of what was recorded. The document is an immutable snapshot, so
+    mutating the caller's detail buffer afterwards cannot change it, and a
+    heartbeat the encoder rejects never reaches the supervisor. *)
+let test_async_heartbeat_single_encode () =
+  let token = Bytes.of_string "\000async-heartbeat-encode\255" in
+  let supervisor, worker, handle, _ =
+    heartbeat_status_fixture ~name:"async_heartbeat_single_encode" ~token
+  in
+  let detail : Temporal.Payload.t =
+    { metadata = [ ("encoding", "binary/plain") ];
+      data = Bytes.of_string "progress" }
+  in
+  (match Temporal.Activity.Async_handle.heartbeat handle [ detail ] with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("async heartbeat failed: " ^ Temporal.Error.message error));
+  Bytes.fill detail.data 0 (Bytes.length detail.data) 'x';
+  (match !(supervisor.async_heartbeat_documents), !(supervisor.async_heartbeats) with
+  | [ document ], [ recorded ] ->
+      if
+        Protocol.encode_async_heartbeat
+          { Protocol.heartbeat = recorded; heartbeat_timeout = None }
+        <> Ok document
+      then failwith "async heartbeat bytes are not the canonical encoding";
+      if not (Bytes.equal recorded.Protocol.task_token token) then
+        failwith "async heartbeat changed the opaque token";
+      (match Protocol.decode_async_heartbeat document with
+      | Ok { Protocol.heartbeat = { Protocol.details = [ payload ]; _ }; _ }
+        when Bytes.equal payload.Protocol.data (Bytes.of_string "progress") -> ()
+      | _ -> failwith "async heartbeat document observed a later buffer mutation")
+  | _ -> failwith "async heartbeat was not submitted exactly once");
+  let duplicate : Temporal.Payload.t =
+    { metadata = [ ("opaque", "one"); ("opaque", "two") ];
+      data = Bytes.of_string "invalid" }
+  in
+  (match Temporal.Activity.Async_handle.heartbeat handle [ duplicate ] with
+  | Error _ -> ()
+  | Ok () -> failwith "encoder-rejected async heartbeat was accepted");
+  if !(supervisor.async_heartbeat_calls) <> 1 then
+    failwith "encoder-rejected async heartbeat reached the supervisor";
+  (match Temporal.Activity.Async_handle.complete handle "done" with
+  | Ok () -> ()
+  | Error error -> failwith (Temporal.Error.message error));
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error _ -> failwith "completed async heartbeat handle still blocked drain"
+
+(** The retry cache is keyed on the handle's request identity, not on
+    structural equality of the operation (#1001). A [Fail] without an explicit
+    [error_type] and one with [error_type = "activity"] are structurally
+    different but send the same failure type for category [Activity], so the
+    handle admits the second as the exact retry of the first; it must resend
+    the first submission's string physically rather than re-encode it. *)
+let test_async_retry_reuses_bytes_for_equal_request_key () =
+  let token = Bytes.of_string "async-retry-key-token" in
+  let supervisor, worker, handle, calls =
+    heartbeat_status_fixture ~name:"async_retry_request_key" ~token
+  in
+  supervisor.reject_next_async_completion := true;
+  let implicit =
+    Temporal.Error.make ~category:`Activity ~message:"external work failed" ()
+  in
+  (match Temporal.Activity.Async_handle.fail handle implicit with
+  | Error error when not (Temporal.Error.view error).non_retryable -> ()
+  | Error _ -> failwith "uncertain async failure was reported as non-retryable"
+  | Ok () -> failwith "rejected async failure was reported as accepted");
+  let explicit =
+    Temporal.Error.make ~error_type:"activity" ~category:`Activity
+      ~message:"external work failed" ()
+  in
+  (match Temporal.Activity.Async_handle.fail handle explicit with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("equal-key async failure retry was refused: "
+        ^ Temporal.Error.message error));
+  if !calls <> 1 then failwith "async failure retry reran the callback";
+  (match !(supervisor.async_completion_documents), !(supervisor.async_completions) with
+  | [ retry; first ], [ accepted ] ->
+      if not (retry == first) then
+        failwith "equal-key async retry submitted a re-encoded document";
+      if Protocol.encode_completion accepted <> Ok first then
+        failwith "async failure bytes are not the canonical encoding"
+  | _ -> failwith "equal-key async retry recorded unexpected submissions");
+  match Worker.drain worker with
+  | Ok () when !(supervisor.async_leased) = [] -> ()
+  | _ -> failwith "accepted async failure retry left completion debt"
+
 (** A native [Connection] heartbeat result is uncertain, not terminal: the
     client did not consume the worker completion lease, and the server activity
-    can still be live. Keep both OCaml registries until the exact heartbeat is
-    retried, then accept one terminal completion. *)
+    can still be live. The handle and lease survive, and because a heartbeat is
+    superseded by the next one, a newer heartbeat and the terminal completion
+    are both allowed immediately (#836). *)
 let test_async_connection_heartbeat_keeps_handle () =
   let token = Bytes.of_string "async-connection-token" in
   let supervisor, worker, handle, calls =
@@ -867,7 +1073,7 @@ let test_async_connection_heartbeat_keeps_handle () =
   in
   let detail : Temporal.Payload.t =
     { metadata = [ ("encoding", "binary/plain") ];
-      data = Bytes.of_string "progress" }
+      data = Bytes.of_string "50" }
   in
   supervisor.reject_next_async_heartbeat_connection := true;
   (match Temporal.Activity.Async_handle.heartbeat handle [ detail ] with
@@ -881,28 +1087,24 @@ let test_async_connection_heartbeat_keeps_handle () =
   (match Worker.drain worker with
   | Error { code = "outstanding_async_leases"; retryable = true; _ } -> ()
   | _ -> failwith "connection failure let worker drain an active async lease");
-  let changed_detail : Temporal.Payload.t =
-    { detail with data = Bytes.of_string "changed" }
+  let newer_detail : Temporal.Payload.t =
+    { detail with data = Bytes.of_string "60" }
   in
-  (match Temporal.Activity.Async_handle.heartbeat handle [ changed_detail ] with
-  | Error _ -> ()
-  | Ok () -> failwith "uncertain heartbeat allowed changed retry details");
-  (match Temporal.Activity.Async_handle.complete handle "premature" with
-  | Error _ -> ()
-  | Ok () -> failwith "uncertain heartbeat allowed a terminal operation");
-  if !(supervisor.async_heartbeat_calls) <> 1
-     || !(supervisor.async_completion_calls) <> 0 then
-    failwith "conflicting async request reached the native client";
-  (match Temporal.Activity.Async_handle.heartbeat handle [ detail ] with
+  (match Temporal.Activity.Async_handle.heartbeat handle [ newer_detail ] with
   | Ok () -> ()
   | Error error ->
-      failwith ("identical heartbeat retry failed: " ^ Temporal.Error.message error));
+      failwith ("uncertain heartbeat blocked a newer heartbeat: "
+        ^ Temporal.Error.message error));
+  supervisor.reject_next_async_heartbeat_connection := true;
+  (match Temporal.Activity.Async_handle.heartbeat handle [ newer_detail ] with
+  | Error _ -> ()
+  | Ok () -> failwith "second connection failure was reported as accepted");
   (match Temporal.Activity.Async_handle.complete handle "done" with
   | Ok () -> ()
   | Error error ->
-      failwith ("completion after heartbeat recovery failed: "
+      failwith ("uncertain heartbeat blocked completion: "
         ^ Temporal.Error.message error));
-  if !calls <> 1 || !(supervisor.async_heartbeat_calls) <> 2
+  if !calls <> 1 || !(supervisor.async_heartbeat_calls) <> 3
      || List.length !(supervisor.async_heartbeats) <> 1
      || !(supervisor.async_completion_calls) <> 1
      || List.length !(supervisor.async_completions) <> 1
@@ -911,6 +1113,47 @@ let test_async_connection_heartbeat_keeps_handle () =
   (match Worker.drain worker with
   | Ok () -> ()
   | Error _ -> failwith "completed async handle still blocked drain")
+
+(** A definitive server rejection of a terminal request (for example cancel
+    without a cancel request) leaves the activity live:
+    the handle stays usable, the lease stays registered, and a different
+    terminal operation can still finish the activity (#821). *)
+let test_async_rejected_completion_keeps_live_handle () =
+  let token = Bytes.of_string "async-rejected-cancel-token" in
+  let supervisor, worker, handle, calls =
+    heartbeat_status_fixture ~name:"async_rejected_cancel" ~token
+  in
+  supervisor.reject_next_async_completion_rejected := true;
+  (match Temporal.Activity.Async_handle.cancel handle [] with
+  | Error error when (Temporal.Error.view error).non_retryable -> ()
+  | Error _ -> failwith "rejected cancellation was marked retryable"
+  | Ok () -> failwith "rejected cancellation was reported as accepted");
+  if !calls <> 1 || !(supervisor.async_leased) <> [ token ] then
+    failwith "rejected cancellation retired the live async activity";
+  (match Worker.drain worker with
+  | Error { code = "outstanding_async_leases"; retryable = true; _ } -> ()
+  | _ -> failwith "rejected cancellation dropped the adapter async lease");
+  (match Temporal.Activity.Async_handle.heartbeat handle [] with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("rejected cancellation blocked a heartbeat: "
+        ^ Temporal.Error.message error));
+  let failure =
+    Temporal.Error.make ~category:`Activity ~message:"external work failed" ()
+  in
+  (match Temporal.Activity.Async_handle.fail handle failure with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("fail after rejected cancellation was blocked: "
+        ^ Temporal.Error.message error));
+  (match !(supervisor.async_completions) with
+  | [ { Protocol.result = Protocol.Failed _; _ } ] -> ()
+  | _ -> failwith "fail after rejected cancellation was not submitted once");
+  if !(supervisor.async_completion_calls) <> 2 || !(supervisor.async_leased) <> []
+  then failwith "rejected cancellation recovery did not retire the lease";
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error _ -> failwith "failed async handle still blocked drain"
 
 (** A definitive server rejection discards only that heartbeat request. The
     activity token may still be live, so a corrected heartbeat and one terminal
@@ -1078,6 +1321,134 @@ let test_async_failure () =
     | _ -> failwith "async failure did not submit one failed completion"
   end
 
+(** An asynchronous callback reads the start task's metadata through
+    [Async_context.info], including the effective timeouts. Sub-millisecond
+    timeouts are rounded up instead of rejecting the task, so exposing them
+    adds no new failure path (#792). This includes a 500 microsecond heartbeat
+    timeout: only synchronous contexts need its exact value, so the async
+    path must not apply that check. *)
+let test_async_context_info () =
+  let supervisor = fake_supervisor () in
+  let observed = ref None in
+  let activity =
+    Temporal.Activity.define_async ~name:"async_info"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+      (fun context () ->
+        observed := Some (Temporal.Activity.Async_context.info context);
+        Temporal.Activity.Completed ())
+  in
+  let token = Bytes.of_string "async-info-token" in
+  let task =
+    start_task ~token ~activity_type:"async_info"
+      ~input:[ encode_input Temporal.Codec.unit () ]
+  in
+  let task =
+    match task.variant with
+    | Protocol.Start start ->
+        {
+          task with
+          variant =
+            Protocol.Start
+              {
+                start with
+                attempt = 2L;
+                schedule_to_close_timeout = Some { seconds = 60L; nanoseconds = 1 };
+                start_to_close_timeout = Some { seconds = 0L; nanoseconds = 500_000 };
+                heartbeat_timeout = Some { seconds = 0L; nanoseconds = 500_000 };
+              };
+        }
+    | _ -> failwith "fixture did not build a start task"
+  in
+  enqueue supervisor task;
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  begin
+    match Worker.poll worker with
+    | Ok (Raw_adapter.Completed { kind = Raw_adapter.Succeeded; _ }) -> ()
+    | _ -> failwith "async info activity did not complete synchronously"
+  end;
+  let module Info = Temporal.Activity.Info in
+  let ms = Option.map Temporal.Duration.to_ms in
+  match !observed with
+  | None -> failwith "async info callback did not run"
+  | Some (Error error) ->
+      failwith ("async context info failed: " ^ Temporal.Error.message error)
+  | Some (Ok info) ->
+      if Info.namespace info <> "default" then failwith "async info namespace";
+      if Info.workflow info
+         <> { Info.workflow_id = "async-workflow-1"; run_id = "async-run-1";
+              workflow_type = "async_test_workflow" }
+      then failwith "async info workflow";
+      if Info.activity_id info <> "async-activity-1" then failwith "async info id";
+      if Info.activity_type info <> "async_info" then failwith "async info type";
+      if Info.attempt info <> 2 then failwith "async info attempt";
+      if Info.is_local info then failwith "async info locality";
+      if ms (Info.schedule_to_close_timeout info) <> Some 60_001L then
+        failwith "schedule-to-close timeout was not rounded up";
+      if ms (Info.start_to_close_timeout info) <> Some 1L then
+        failwith "sub-millisecond start-to-close timeout was not rounded up";
+      if ms (Info.heartbeat_timeout info) <> Some 1L then
+        failwith "sub-millisecond heartbeat timeout was not rounded up"
+
+(** The largest valid protobuf duration (315,576,000,000 s plus 999,999,999 ns)
+    rounds up one millisecond past the public [Duration.t] maximum. Every
+    timeout accessor must clamp it to 315,576,000,000,999 ms instead of
+    raising [Invalid_argument] from [Duration.of_ms]. *)
+let test_async_context_info_maximum_timeouts () =
+  let supervisor = fake_supervisor () in
+  let observed = ref None in
+  let activity =
+    Temporal.Activity.define_async ~name:"async_info_max"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+      (fun context () ->
+        observed := Some (Temporal.Activity.Async_context.info context);
+        Temporal.Activity.Completed ())
+  in
+  let token = Bytes.of_string "async-info-max-token" in
+  let task =
+    start_task ~token ~activity_type:"async_info_max"
+      ~input:[ encode_input Temporal.Codec.unit () ]
+  in
+  let maximum : Protocol.duration =
+    { seconds = 315_576_000_000L; nanoseconds = 999_999_999 }
+  in
+  let task =
+    match task.variant with
+    | Protocol.Start start ->
+        {
+          task with
+          variant =
+            Protocol.Start
+              {
+                start with
+                schedule_to_close_timeout = Some maximum;
+                start_to_close_timeout = Some maximum;
+                heartbeat_timeout = Some maximum;
+              };
+        }
+    | _ -> failwith "fixture did not build a start task"
+  in
+  enqueue supervisor task;
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  begin
+    match Worker.poll worker with
+    | Ok (Raw_adapter.Completed { kind = Raw_adapter.Succeeded; _ }) -> ()
+    | _ -> failwith "maximum-timeout async activity did not complete"
+  end;
+  let module Info = Temporal.Activity.Info in
+  let expected = Some 315_576_000_000_999L in
+  let ms = Option.map Temporal.Duration.to_ms in
+  match !observed with
+  | None -> failwith "maximum-timeout async callback did not run"
+  | Some (Error error) ->
+      failwith ("async context info failed: " ^ Temporal.Error.message error)
+  | Some (Ok info) ->
+      if ms (Info.schedule_to_close_timeout info) <> expected then
+        failwith "maximum schedule-to-close timeout was not clamped";
+      if ms (Info.start_to_close_timeout info) <> expected then
+        failwith "maximum start-to-close timeout was not clamped";
+      if ms (Info.heartbeat_timeout info) <> expected then
+        failwith "maximum heartbeat timeout was not clamped"
+
 (** [drain] refuses to claim shutdown while an async capability remains, while
     [discard] closes the retained handle only after terminal native cleanup. *)
 let test_async_drain_and_discard () =
@@ -1136,6 +1507,227 @@ let test_async_drain_and_discard () =
     | Ok () -> failwith "discarded async handle remained usable"
   end
 
+(** Builds a remote start task carrying explicit server timeouts, given in
+    whole seconds; [None] leaves a timeout unset. *)
+let start_task_with_timeouts ?start_to_close ?schedule_to_close ?heartbeat
+    ~token ~activity_type () : Protocol.task =
+  let duration seconds = { Protocol.seconds = Int64.of_int seconds; nanoseconds = 0 } in
+  match
+    start_task ~token ~activity_type ~input:[ encode_input Temporal.Codec.unit () ]
+  with
+  | { variant = Protocol.Start start; _ } as task ->
+      {
+        task with
+        variant =
+          Protocol.Start
+            {
+              start with
+              start_to_close_timeout = Option.map duration start_to_close;
+              schedule_to_close_timeout = Option.map duration schedule_to_close;
+              heartbeat_timeout = Option.map duration heartbeat;
+            };
+      }
+  | _ -> assert false
+
+(** An async activity whose callback hands its handle to [retained] and
+    never finishes it, like the leaking completer described in #1043. *)
+let leaked_async_activity retained =
+  Temporal.Activity.define_async ~name:"leaked_async" ~input:Temporal.Codec.unit
+    ~output:Temporal.Codec.unit (fun context () ->
+      let handle = Temporal.Activity.Async_context.handle context in
+      retained := Some handle;
+      Temporal.Activity.Will_complete_async handle)
+
+(** Requires [drain] to report the retryable outstanding-lease diagnostic. *)
+let expect_outstanding label worker =
+  match Worker.drain worker with
+  | Error { code = "outstanding_async_leases"; retryable = true; _ } -> ()
+  | Ok () -> failwith (label ^ ": a live async lease was expired early")
+  | Error error -> failwith (label ^ ": unexpected drain error " ^ error.code)
+
+(** An admitted async lease that application code never finishes expires
+    once the server must have timed its attempt out (#1043): after the
+    shorter close timeout, or twice the heartbeat timeout since the last
+    async heartbeat (a throttled heartbeat's trailing send follows within
+    one throttle interval, #1025), plus a few seconds of slack, all measured
+    from admission on
+    the worker's clock. An expired lease no longer holds [drain] (and so
+    shutdown), is not counted as outstanding, closes its handle with a
+    non-retryable error, and sends nothing to the server. A lease whose task
+    reports no timeout never expires, and admitting a new lease retires
+    expired ones so a leaking worker does not accumulate them. *)
+let test_async_lease_expiry () =
+  let clock = ref 1_000. in
+  let make_worker supervisor activities =
+    match
+      Worker.create_with_clock
+        ~now:(fun () -> !clock)
+        ~supervisor ~activities
+        ~worker_shutting_down:(fun () -> false)
+    with
+    | Ok worker -> worker
+    | Error (error : Raw_adapter.error_view) -> failwith error.message
+  in
+  let expect_closed label handle =
+    match Temporal.Activity.Async_handle.complete handle () with
+    | Error error when (Temporal.Error.view error).non_retryable -> ()
+    | Error _ -> failwith (label ^ ": an expired handle returned a retryable error")
+    | Ok () -> failwith (label ^ ": an expired handle still completed")
+  in
+  (* The shorter close timeout bounds the attempt; slack is respected. *)
+  List.iter
+    (fun (label, task) ->
+      clock := 1_000.;
+      let supervisor = fake_supervisor () and retained = ref None in
+      enqueue supervisor task;
+      let worker =
+        make_worker supervisor [ Adapter.register_async (leaked_async_activity retained) ]
+      in
+      expect_deferred (Worker.poll worker);
+      clock := 1_000. +. 30. +. 4.;
+      expect_outstanding label worker;
+      if Worker.outstanding_async_leases worker <> Some 1 then
+        failwith (label ^ ": the live lease was not counted");
+      clock := 1_000. +. 30. +. 6.;
+      if Worker.outstanding_async_leases worker <> Some 0 then
+        failwith (label ^ ": an expired lease was still counted");
+      (match Worker.drain worker with
+      | Ok () -> ()
+      | Error error -> failwith (label ^ ": an expired lease held drain: " ^ error.code));
+      expect_closed label (Option.get !retained);
+      if !(supervisor.async_completion_calls) <> 0 then
+        failwith (label ^ ": expiry contacted the server"))
+    [
+      ( "start-to-close",
+        start_task_with_timeouts ~start_to_close:30 ~schedule_to_close:600
+          ~token:(Bytes.of_string "expiry-stc") ~activity_type:"leaked_async" () );
+      ( "schedule-to-close",
+        start_task_with_timeouts ~start_to_close:600 ~schedule_to_close:30
+          ~token:(Bytes.of_string "expiry-s2c") ~activity_type:"leaked_async" () );
+    ];
+  (* A successful async heartbeat restarts the heartbeat window. *)
+  clock := 0.;
+  let supervisor = fake_supervisor () and retained = ref None in
+  enqueue supervisor
+    (start_task_with_timeouts ~start_to_close:3_600 ~heartbeat:10
+       ~token:(Bytes.of_string "expiry-heartbeat") ~activity_type:"leaked_async" ());
+  let worker =
+    make_worker supervisor [ Adapter.register_async (leaked_async_activity retained) ]
+  in
+  expect_deferred (Worker.poll worker);
+  let handle = Option.get !retained in
+  clock := 8.;
+  (match Temporal.Activity.Async_handle.heartbeat handle [] with
+  | Ok () -> ()
+  | Error error -> failwith ("async heartbeat failed: " ^ Temporal.Error.message error));
+  (* The heartbeat at 8 s defers expiry to 8 + 2 * 10 + 5 s of slack. *)
+  clock := 32.;
+  expect_outstanding "heartbeat" worker;
+  clock := 34.;
+  (match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("a heartbeat-expired lease held drain: " ^ error.code));
+  expect_closed "heartbeat" handle;
+  (* Without any reported timeout the lease is kept indefinitely. *)
+  clock := 0.;
+  let supervisor = fake_supervisor () and retained = ref None in
+  enqueue supervisor
+    (start_task_with_timeouts ~token:(Bytes.of_string "expiry-none")
+       ~activity_type:"leaked_async" ());
+  let worker =
+    make_worker supervisor [ Adapter.register_async (leaked_async_activity retained) ]
+  in
+  expect_deferred (Worker.poll worker);
+  clock := 1e9;
+  expect_outstanding "no timeout" worker;
+  (match Temporal.Activity.Async_handle.complete (Option.get !retained) () with
+  | Ok () -> ()
+  | Error error -> failwith ("an unexpired handle failed: " ^ Temporal.Error.message error));
+  (* Admission retires expired leases, bounding a leaking worker. *)
+  clock := 0.;
+  let supervisor = fake_supervisor () and retained = ref None in
+  enqueue supervisor
+    (start_task_with_timeouts ~start_to_close:10
+       ~token:(Bytes.of_string "expiry-first") ~activity_type:"leaked_async" ());
+  let worker =
+    make_worker supervisor [ Adapter.register_async (leaked_async_activity retained) ]
+  in
+  expect_deferred (Worker.poll worker);
+  let first = Option.get !retained in
+  clock := 100.;
+  enqueue supervisor
+    (start_task_with_timeouts ~start_to_close:10
+       ~token:(Bytes.of_string "expiry-second") ~activity_type:"leaked_async" ());
+  expect_deferred (Worker.poll worker);
+  expect_closed "admission" first;
+  if Worker.outstanding_async_leases worker <> Some 1 then
+    failwith "admitting a lease did not retire the expired one"
+
+(** An async heartbeat carries its attempt's exact heartbeat timeout, from
+    which the bridge derives its throttle interval (#1025). A cancellation,
+    pause, or reset the bridge reports (from the token's latest send, which
+    may precede a throttled call) is returned as a typed [`Cancelled] error,
+    a pause or reset with the [error_type] a running attempt's failure uses;
+    the heartbeat was recorded, so it still
+    renews the lease's heartbeat window, and the handle stays live for the
+    terminal operation that must follow. *)
+let test_async_heartbeat_carries_timeout_and_activity_state () =
+  let clock = ref 0. in
+  let supervisor = fake_supervisor () and retained = ref None in
+  enqueue supervisor
+    (start_task_with_timeouts ~start_to_close:3_600 ~heartbeat:10
+       ~token:(Bytes.of_string "heartbeat-state") ~activity_type:"leaked_async" ());
+  let worker =
+    match
+      Worker.create_with_clock
+        ~now:(fun () -> !clock)
+        ~supervisor
+        ~activities:[ Adapter.register_async (leaked_async_activity retained) ]
+        ~worker_shutting_down:(fun () -> false)
+    with
+    | Ok worker -> worker
+    | Error (error : Raw_adapter.error_view) -> failwith error.message
+  in
+  expect_deferred (Worker.poll worker);
+  let handle = Option.get !retained in
+  (match Temporal.Activity.Async_handle.heartbeat handle [] with
+  | Ok () -> ()
+  | Error error -> failwith ("async heartbeat failed: " ^ Temporal.Error.message error));
+  (match !(supervisor.async_heartbeat_timeouts) with
+  | [ Some { Protocol.seconds = 10L; nanoseconds = 0 } ] -> ()
+  | _ -> failwith "async heartbeat did not carry the attempt's heartbeat timeout");
+  List.iteri
+    (fun index (label, response, error_type, non_retryable) ->
+      supervisor.async_heartbeat_response := response;
+      clock := float_of_int (20 * (index + 1));
+      match Temporal.Activity.Async_handle.heartbeat handle [] with
+      | Ok () -> failwith (label ^ ": the activity state was not reported")
+      | Error error ->
+          let view = Temporal.Error.view error in
+          if view.category <> `Cancelled then
+            failwith (label ^ ": wrong error category");
+          if view.error_type <> error_type then
+            failwith (label ^ ": wrong error type");
+          if view.non_retryable <> non_retryable then
+            failwith (label ^ ": wrong retryability"))
+    [
+      ("cancel", Protocol.Heartbeat_cancel_requested, None, true);
+      ("pause", Protocol.Heartbeat_paused, Some "ActivityPause", false);
+      ("reset", Protocol.Heartbeat_reset, Some "ActivityReset", false);
+    ];
+  (* The last heartbeat, at 60 s, renewed the window to 60 + 2 * 10 + 5 s. *)
+  clock := 84.;
+  expect_outstanding "activity state" worker;
+  supervisor.async_heartbeat_response := Protocol.Heartbeat_recorded;
+  (match Temporal.Activity.Async_handle.cancel handle [] with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("a handle that reported cancellation could not cancel: "
+        ^ Temporal.Error.message error));
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("the cancelled lease held drain: " ^ error.code)
+
 (** A handle retained from a synchronously completed attempt must not be
     attachable to the next attempt. Its submit callback still captures the old
     token, so accepting it would orphan the current asynchronous lease. *)
@@ -1193,10 +1785,38 @@ let test_base_state_machine () =
   in
   begin
     match Base_async.complete handle () with
-    | Error _ -> ()
+    | Error error when not (Temporal_base.Error.view error).non_retryable -> ()
+    | Error _ -> failwith "dormant base async handle rejected permanently (#766)"
     | Ok () -> failwith "dormant base async handle submitted an operation"
   end;
   if !submitted <> 0 then failwith "dormant base handle entered its submit callback";
+  begin
+    match Base_async.prepare_handoff ~expected:handle handle with
+    | Ok () -> ()
+    | Error _ -> failwith "dormant base async handle could not reserve a handoff"
+  end;
+  (* A reserved handoff is not dormant, so the adapter's cleanup leaves it
+     usable for activation. *)
+  Base_async.close_if_dormant handle;
+  begin
+    match Base_async.complete handle () with
+    | Error error when not (Temporal_base.Error.view error).non_retryable -> ()
+    | Error _ -> failwith "handoff-pending base handle rejected permanently (#766)"
+    | Ok () -> failwith "handoff-pending base handle submitted an operation"
+  end;
+  let abandoned =
+    Base_async.create
+      ~submit:(fun _operation -> incr submitted; Ok ())
+      ~encode_output:(fun _ -> Ok payload)
+  in
+  Base_async.close_if_dormant abandoned;
+  begin
+    match Base_async.complete abandoned () with
+    | Error error when (Temporal_base.Error.view error).non_retryable -> ()
+    | Error _ -> failwith "closed dormant base handle remained retryable"
+    | Ok () -> failwith "closed dormant base handle submitted an operation"
+  end;
+  if !submitted <> 0 then failwith "inactive base handle entered its submit callback";
   begin
     match Base_async.activate handle with
     | Ok () -> ()
@@ -1276,12 +1896,13 @@ let test_local_rejection_preserves_earlier_uncertainty () =
   | Ok () when !attempts = 3 -> ()
   | _ -> failwith "original uncertain request could not be retried"
 
-(** A definitive rejection on an exact retry cannot erase uncertainty from the
-    earlier attempt. The handle still blocks different requests until the
-    original heartbeat receives an accepted result. *)
-let test_native_rejection_preserves_earlier_uncertainty () =
+(** A definitive native rejection of the exact retry answers the earlier
+    uncertain terminal request too, so it releases the key: the handle stays
+    live and a different terminal operation may run (#821). Before that
+    answer, a different operation stays blocked. *)
+let test_native_rejection_releases_earlier_uncertainty () =
   let attempts = ref 0 in
-  let error = Temporal_base.Error.make ~category:`Bridge ~message:"heartbeat failed" () in
+  let error = Temporal_base.Error.make ~category:`Bridge ~message:"completion failed" () in
   let handle = Base_async.create
       ~encode_output:(fun text -> Ok Temporal_base.Payload.
         { metadata = []; data = Bytes.of_string text })
@@ -1291,47 +1912,648 @@ let test_native_rejection_preserves_earlier_uncertainty () =
         | 1 -> Error (Base_async.Retryable_submission error)
         | 2 -> Error (Base_async.Rejected_submission error)
         | _ -> Ok ()) in
+  ignore (Base_async.activate handle);
+  (match Base_async.complete handle "rejected" with
+  | Error _ -> ()
+  | Ok () -> failwith "uncertain completion was accepted");
+  (match Base_async.fail handle error with
+  | Error _ -> ()
+  | Ok () -> failwith "different operation ran before uncertainty settled");
+  if !attempts <> 1 then failwith "conflicting request crossed the submit boundary";
+  (match Base_async.complete handle "rejected" with
+  | Error _ -> ()
+  | Ok () -> failwith "rejected exact retry was accepted");
+  (match Base_async.fail handle error with
+  | Ok () when !attempts = 3 -> ()
+  | _ -> failwith "definitive rejection left the handle blocked");
+  match Base_async.complete handle "late" with
+  | Error _ when !attempts = 3 -> ()
+  | _ -> failwith "terminal handle accepted another operation"
+
+(** An uncertain heartbeat is reported and forgotten (#836): a newer heartbeat
+    and every terminal operation remain possible, and the same stale heartbeat
+    is never required as a retry. *)
+let test_uncertain_heartbeat_is_not_retained () =
+  let submitted = ref [] in
+  let error = Temporal_base.Error.make ~category:`Bridge ~message:"unavailable" () in
+  let handle = Base_async.create
+      ~encode_output:(fun text -> Ok Temporal_base.Payload.
+        { metadata = []; data = Bytes.of_string text })
+      ~submit:(fun operation ->
+        submitted := operation :: !submitted;
+        match operation with
+        | Base_async.Heartbeat _ when List.length !submitted = 1 ->
+            Error (Base_async.Retryable_submission error)
+        | _ -> Ok ()) in
   let detail text =
     Temporal_base.Payload.{ metadata = []; data = Bytes.of_string text }
   in
   ignore (Base_async.activate handle);
-  (match Base_async.heartbeat handle [ detail "original" ] with
-  | Error _ -> ()
+  (match Base_async.heartbeat handle [ detail "50" ] with
+  | Error error when not (Temporal_base.Error.view error).non_retryable -> ()
+  | Error _ -> failwith "uncertain heartbeat was reported as non-retryable"
   | Ok () -> failwith "uncertain heartbeat was accepted");
-  (match Base_async.heartbeat handle [ detail "original" ] with
-  | Error _ -> ()
-  | Ok () -> failwith "rejected exact retry was accepted");
-  (match Base_async.heartbeat handle [ detail "corrected" ] with
-  | Error _ -> ()
-  | Ok () -> failwith "rejection erased earlier heartbeat uncertainty");
-  (match Base_async.complete handle "early" with
-  | Error _ -> ()
-  | Ok () -> failwith "rejection allowed completion before uncertainty settled");
-  if !attempts <> 2 then failwith "conflicting request crossed the submit boundary";
-  (match Base_async.heartbeat handle [ detail "original" ] with
-  | Ok () when !attempts = 3 -> ()
-  | _ -> failwith "original uncertain heartbeat could not be retried");
+  (match Base_async.heartbeat handle [ detail "60" ] with
+  | Ok () -> ()
+  | Error _ -> failwith "uncertain heartbeat blocked a newer heartbeat");
   (match Base_async.complete handle "done" with
-  | Ok () when !attempts = 4 -> ()
-  | _ -> failwith "completion remained blocked after heartbeat settled")
+  | Ok () -> ()
+  | Error _ -> failwith "uncertain heartbeat blocked completion");
+  match List.rev !submitted with
+  | [ Base_async.Heartbeat _; Base_async.Heartbeat [ newer ]; Base_async.Complete _ ]
+    when Bytes.equal newer.data (Bytes.of_string "60") -> ()
+  | _ -> failwith "heartbeat recovery submitted an unexpected sequence"
+
+(** A request that collides with another Domain's in-flight operation is a
+    transient conflict, so it is reported as retryable rather than as a
+    permanent rejection. The re-entrant submit callback models the second
+    Domain deterministically: it runs while the first request is in flight. *)
+let test_in_flight_conflict_is_retryable () =
+  let handle_ref = ref None in
+  let inner = ref None in
+  let handle = Base_async.create
+      ~encode_output:(fun text -> Ok Temporal_base.Payload.
+        { metadata = []; data = Bytes.of_string text })
+      ~submit:(fun operation ->
+        (match operation, !inner with
+        | Base_async.Heartbeat _, None ->
+            inner := Some (Base_async.complete (Option.get !handle_ref) "done")
+        | _ -> ());
+        Ok ()) in
+  handle_ref := Some handle;
+  ignore (Base_async.activate handle);
+  (match Base_async.heartbeat handle [] with
+  | Ok () -> ()
+  | Error _ -> failwith "in-flight heartbeat failed");
+  (match !inner with
+  | Some (Error error) when not (Temporal_base.Error.view error).non_retryable -> ()
+  | Some (Error _) -> failwith "in-flight conflict was reported as permanent"
+  | Some (Ok ()) -> failwith "concurrent operation bypassed the in-flight request"
+  | None -> failwith "conflicting operation was not attempted");
+  match Base_async.complete handle "done" with
+  | Ok () -> ()
+  | Error _ -> failwith "completion after the in-flight heartbeat failed"
+
+(** Asserts that an async handle operation failed with a retryable error, the
+    signal that a completer racing the handoff must retry rather than drop its
+    result (#766). *)
+let expect_retryable_not_active label = function
+  | Error error when not (Temporal.Error.view error).non_retryable -> ()
+  | Error error ->
+      failwith
+        (Printf.sprintf "%s: not-yet-active handle returned a permanent error: %s"
+           label (Temporal.Error.message error))
+  | Ok () -> failwith (label ^ ": inactive async handle submitted an operation")
+
+(** Asserts that a handle which can never become active reports a
+    non-retryable error, so a retry loop around it terminates. *)
+let expect_permanently_closed label = function
+  | Error error when (Temporal.Error.view error).non_retryable -> ()
+  | Error _ -> failwith (label ^ ": unusable async handle remained retryable")
+  | Ok () -> failwith (label ^ ": unusable async handle submitted an operation")
+
+(** Regression for #766. A completer that runs before the callback returns, or
+    while the worker handoff is still unacknowledged, receives a retryable
+    error and no request reaches the client. Once the handoff is accepted the
+    same call succeeds exactly once, without rerunning the callback. *)
+let test_completion_racing_handoff_is_retryable () =
+  let supervisor = fake_supervisor () in
+  let calls = ref 0 and retained = ref None and early = ref None in
+  let activity =
+    Temporal.Activity.define_async ~name:"async_handoff_race"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        incr calls;
+        let handle = Temporal.Activity.Async_context.handle context in
+        (* Models a completer on another Domain that finishes before this
+           callback has returned [Will_complete_async]. *)
+        early := Some (Temporal.Activity.Async_handle.complete handle "early");
+        retained := Some handle;
+        Temporal.Activity.Will_complete_async handle)
+  in
+  let token = Bytes.of_string "async-handoff-race" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"async_handoff_race"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  supervisor.reject_next_worker_completion := true;
+  begin
+    match Worker.poll worker with
+    | Error { retryable = true; _ } -> ()
+    | _ -> failwith "uncertain handoff did not retain the worker lease"
+  end;
+  expect_retryable_not_active "dormant" (Option.get !early);
+  let handle = Option.get !retained in
+  (* The callback has returned, but Core has not accepted the handoff. *)
+  expect_retryable_not_active "handoff pending"
+    (Temporal.Activity.Async_handle.complete handle "finished");
+  expect_retryable_not_active "handoff pending heartbeat"
+    (Temporal.Activity.Async_handle.heartbeat handle []);
+  if !(supervisor.async_completion_calls) <> 0
+     || !(supervisor.async_heartbeat_calls) <> 0 then
+    failwith "inactive async handle reached the client";
+  expect_deferred (Worker.poll worker);
+  if !calls <> 1 then failwith "handoff retry reran the async callback";
+  begin
+    match Temporal.Activity.Async_handle.complete handle "finished" with
+    | Ok () -> ()
+    | Error error ->
+        failwith ("retried completion after handoff failed: "
+                  ^ Temporal.Error.message error)
+  end;
+  if !(supervisor.async_completion_calls) <> 1 then
+    failwith "retried completion was not submitted exactly once";
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("completed handoff blocked drain: " ^ error.message)
+
+(** The documented pattern from #766 with a real second Domain: the callback
+    hands its handle to a Domain that retries the retryable not-yet-active
+    error. The first worker handoff is uncertain, so the Domain must keep
+    retrying until the next poll accepts the handoff; its result is delivered
+    exactly once instead of being lost. *)
+let test_completer_domain_retries_until_handoff () =
+  let supervisor = fake_supervisor () in
+  let completer = ref None in
+  let activity =
+    Temporal.Activity.define_async ~name:"async_handoff_domain"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        let handle = Temporal.Activity.Async_context.handle context in
+        let rec deliver attempts =
+          match Temporal.Activity.Async_handle.complete handle "from-domain" with
+          | Error error
+            when (not (Temporal.Error.view error).non_retryable)
+                 && attempts < 10_000_000 ->
+              Domain.cpu_relax ();
+              deliver (attempts + 1)
+          | result -> result
+        in
+        completer := Some (Domain.spawn (fun () -> deliver 0));
+        Temporal.Activity.Will_complete_async handle)
+  in
+  let token = Bytes.of_string "async-handoff-domain" in
+  enqueue supervisor
+    (start_task ~token ~activity_type:"async_handoff_domain"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  supervisor.reject_next_worker_completion := true;
+  begin
+    match Worker.poll worker with
+    | Error { retryable = true; _ } -> ()
+    | _ -> failwith "uncertain handoff did not retain the worker lease"
+  end;
+  expect_deferred (Worker.poll worker);
+  begin
+    match Domain.join (Option.get !completer) with
+    | Ok () -> ()
+    | Error error ->
+        failwith ("completer Domain lost its result: " ^ Temporal.Error.message error)
+  end;
+  begin
+    match !(supervisor.async_completions) with
+    | [ { Protocol.result = Protocol.Completed payload; task_token } ]
+      when Bytes.equal task_token token
+           && decode_output Temporal.Codec.string payload = "from-domain" -> ()
+    | _ -> failwith "completer Domain did not complete exactly once"
+  end;
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("completed handoff blocked drain: " ^ error.message)
+
+(** A handle that will never be activated must stop being retryable: after a
+    synchronous callback result, and after a reserved handoff is discarded by
+    terminal native cleanup. Otherwise a completer following the retry
+    contract from #766 would spin forever. *)
+let test_unactivated_handles_close () =
+  let supervisor = fake_supervisor () in
+  let calls = ref 0 and retained = ref [] in
+  let activity =
+    Temporal.Activity.define_async ~name:"async_never_active"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        incr calls;
+        let handle = Temporal.Activity.Async_context.handle context in
+        retained := handle :: !retained;
+        match !calls with
+        | 1 -> Temporal.Activity.Completed "sync"
+        | 2 -> Temporal.Activity.Failed
+                 (Temporal.Error.make ~category:`Activity ~message:"sync failure" ())
+        | 3 -> raise Exit
+        | _ -> Temporal.Activity.Will_complete_async handle)
+  in
+  let input = [ encode_input Temporal.Codec.unit () ] in
+  List.iter
+    (fun name ->
+      enqueue supervisor
+        (start_task ~token:(Bytes.of_string name)
+           ~activity_type:"async_never_active" ~input))
+    [ "never-1"; "never-2"; "never-3"; "never-4" ];
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  for _ = 1 to 3 do
+    match Worker.poll worker with
+    | Ok (Raw_adapter.Completed _ | Raw_adapter.Rejected _) -> ()
+    | _ -> failwith "synchronous async outcome was not acknowledged"
+  done;
+  List.iter
+    (fun handle ->
+      expect_permanently_closed "synchronous outcome"
+        (Temporal.Activity.Async_handle.complete handle "late"))
+    !retained;
+  supervisor.reject_next_worker_completion := true;
+  begin
+    match Worker.poll worker with
+    | Error { retryable = true; _ } -> ()
+    | _ -> failwith "uncertain handoff did not retain the worker lease"
+  end;
+  let pending = List.hd !retained in
+  expect_retryable_not_active "reserved handoff"
+    (Temporal.Activity.Async_handle.complete pending "late");
+  Worker.discard worker;
+  expect_permanently_closed "discarded handoff"
+    (Temporal.Activity.Async_handle.complete pending "late");
+  if !(supervisor.async_completion_calls) <> 0 then
+    failwith "unactivated async handle reached the client"
+
+(** #495 review: an admitted async lease must stay visible to bounded
+    shutdown while an unrelated synchronous callback holds the adapter lock.
+    [try_drain] reports the adapter busy without waiting, and
+    [outstanding_async_leases] still counts the lease through the separate
+    async lock, so shutdown cannot attribute it to the abandoned callback. *)
+let test_async_lease_visible_while_callback_runs () =
+  let supervisor = fake_supervisor () in
+  let async_activity =
+    Temporal.Activity.define_async ~name:"async_lease_visibility"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        Temporal.Activity.Will_complete_async
+          (Temporal.Activity.Async_context.handle context))
+  in
+  let entered = Atomic.make false in
+  let release = Atomic.make false in
+  let blocking =
+    Temporal_base.Definition.make ~name:"sync_blocking_callback"
+      ~input:(base_codec Temporal.Codec.unit)
+      ~output:(base_codec Temporal.Codec.string)
+      ~implementation:
+        (Some
+           (fun _context () ->
+             Atomic.set entered true;
+             while not (Atomic.get release) do
+               Thread.delay 0.005
+             done;
+             Ok "late"))
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "async-visible-token")
+       ~activity_type:"async_lease_visibility"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker =
+    worker supervisor
+      [ Adapter.register_async async_activity; Raw_adapter.register blocking ]
+  in
+  expect_deferred (Worker.poll worker);
+  if Worker.outstanding_async_leases worker <> Some 1 then
+    failwith "the admitted async lease was not counted";
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "sync-blocking-token")
+       ~activity_type:"sync_blocking_callback"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let lane = Domain.spawn (fun () -> Worker.poll worker) in
+  let deadline = Unix.gettimeofday () +. 5. in
+  while not (Atomic.get entered) do
+    if Unix.gettimeofday () > deadline then failwith "callback never entered";
+    Thread.delay 0.005
+  done;
+  if not (Worker.callback_running worker) then
+    failwith "the running callback was not reported";
+  if Worker.try_drain worker <> None then
+    failwith "try_drain did not report the held adapter as busy";
+  if Worker.try_discard worker then
+    failwith "try_discard discarded under a held adapter lock";
+  if Worker.outstanding_async_leases worker <> Some 1 then
+    failwith "the async lease was hidden by the busy adapter";
+  Atomic.set release true;
+  ignore (Domain.join lane);
+  if Worker.callback_running worker then
+    failwith "a returned callback was still reported running";
+  if not (Worker.try_discard worker) then
+    failwith "try_discard failed on an idle adapter";
+  if Worker.outstanding_async_leases worker <> Some 0 then
+    failwith "discard did not close the async lease"
+
+(** Waits for a cross-Domain observation, failing after five seconds. *)
+let await_flag label flag =
+  let deadline = Unix.gettimeofday () +. 5. in
+  while not (Atomic.get flag) do
+    if Unix.gettimeofday () > deadline then failwith ("timed out: " ^ label);
+    Thread.delay 0.005
+  done
+
+(** #1023: an asynchronous callback that is still running when the grace
+    period ends is abandoned user code, exactly like a synchronous one, so
+    the shutdown probe must report it. Only synchronous starts used to set
+    the running state, so an abandoned [define_async] callback was reported
+    as a native call. *)
+let test_async_callback_reported_running () =
+  let supervisor = fake_supervisor () in
+  let entered = Atomic.make false and release = Atomic.make false in
+  let activity =
+    Temporal.Activity.define_async ~name:"async_callback_running"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string
+      (fun context () ->
+        Atomic.set entered true;
+        while not (Atomic.get release) do
+          Thread.delay 0.005
+        done;
+        Temporal.Activity.Will_complete_async
+          (Temporal.Activity.Async_context.handle context))
+  in
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "async-running-token")
+       ~activity_type:"async_callback_running"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let worker = worker supervisor [ Adapter.register_async activity ] in
+  if Worker.callback_running worker then
+    failwith "an idle adapter reported a running callback";
+  let lane = Domain.spawn (fun () -> Worker.poll worker) in
+  await_flag "async callback entered" entered;
+  if not (Worker.callback_running worker) then
+    failwith "a running asynchronous callback was not reported";
+  Atomic.set release true;
+  expect_deferred (Domain.join lane);
+  (* After the handoff the work belongs to external code: it is an async
+     lease, not a running callback. *)
+  if Worker.callback_running worker then
+    failwith "a returned asynchronous callback was still reported running";
+  if Worker.outstanding_async_leases worker <> Some 1 then
+    failwith "the handed-off lease was not counted"
+
+(** #1025: the namespace-bound RPC of an async heartbeat runs without the
+    adapter's async lock. While one handle's heartbeat waits for the server,
+    the shutdown probe still reads the lease count and the activity lane
+    still admits another handoff; before, both waited for the RPC. *)
+let test_async_rpc_runs_without_async_lock () =
+  let token = Bytes.of_string "async-unlocked-rpc-token" in
+  let supervisor, worker, handle, _ =
+    heartbeat_status_fixture ~name:"async_unlocked_rpc" ~token
+  in
+  let entered = Atomic.make false and release = Atomic.make false in
+  supervisor.async_heartbeat_hook :=
+    (fun () ->
+      Atomic.set entered true;
+      while not (Atomic.get release) do
+        Thread.delay 0.005
+      done);
+  let heartbeat =
+    Domain.spawn (fun () -> Temporal.Activity.Async_handle.heartbeat handle [])
+  in
+  await_flag "async heartbeat in flight" entered;
+  if Worker.outstanding_async_leases worker <> Some 1 then
+    failwith "the lease probe waited for, or was hidden by, an in-flight RPC";
+  (* A second attempt of the same registered type is handed off meanwhile;
+     its admission takes the same async lock. *)
+  enqueue supervisor
+    (start_task ~token:(Bytes.of_string "async-unlocked-second-token")
+       ~activity_type:"async_unlocked_rpc"
+       ~input:[ encode_input Temporal.Codec.unit () ]);
+  let admitted = Atomic.make false in
+  let lane =
+    Domain.spawn (fun () ->
+        let result = Worker.poll worker in
+        Atomic.set admitted true;
+        result)
+  in
+  await_flag "second handoff admitted during the RPC" admitted;
+  expect_deferred (Domain.join lane);
+  if Worker.outstanding_async_leases worker <> Some 2 then
+    failwith "the second lease was not admitted";
+  Atomic.set release true;
+  (match Domain.join heartbeat with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("in-flight heartbeat failed: " ^ Temporal.Error.message error));
+  if List.length !(supervisor.async_heartbeats) <> 1 then
+    failwith "the in-flight heartbeat was not recorded"
+
+(** Contains-substring check for diagnostics; the standard library has no
+    substring search on every supported compiler. *)
+let contains ~needle haystack =
+  let n = String.length haystack and m = String.length needle in
+  let rec loop i =
+    i + m <= n && (String.sub haystack i m = needle || loop (i + 1))
+  in
+  loop 0
+
+(** Requires a full client-call registry's refusal (#1104): a retryable
+    [`Bridge] error naming [resource_exhausted]. *)
+let expect_registry_refusal label = function
+  | Error error ->
+      let view = Temporal.Error.view error in
+      if view.non_retryable then
+        failwith (label ^ ": a full client-call registry was reported as terminal");
+      if view.category <> `Bridge then
+        failwith (label ^ ": a full client-call registry was not a bridge error");
+      if not (contains ~needle:"resource_exhausted" view.message) then
+        failwith (label ^ ": the refusal did not name resource_exhausted")
+  | Ok () -> failwith (label ^ ": a refused call was reported as accepted")
+
+(** A full client-call registry is transient back-pressure, not a terminal
+    outcome (#1104). For complete, fail, and cancel alike the refused call
+    returns a retryable error, sends nothing, and keeps both the handle and
+    the adapter lease live; once capacity frees, the same call succeeds and
+    retires the lease. *)
+let test_async_full_registry_terminal_operations_keep_handle () =
+  let failure =
+    Temporal.Error.make ~category:`Activity ~message:"external work failed" ()
+  in
+  List.iter
+    (fun (label, finish, expected) ->
+      let token = Bytes.of_string ("registry-full-" ^ label) in
+      let supervisor, worker, handle, calls =
+        heartbeat_status_fixture ~name:("registry_full_" ^ label) ~token
+      in
+      supervisor.free_client_call_slots := 0;
+      expect_registry_refusal label (finish handle);
+      if !(supervisor.refused_client_calls) <> 1
+         || !(supervisor.async_completion_calls) <> 0 then
+        failwith (label ^ ": the refused call was not stopped at admission");
+      if !calls <> 1 || !(supervisor.async_leased) <> [ token ] then
+        failwith (label ^ ": the refusal retired the live async activity");
+      if Worker.outstanding_async_leases worker <> Some 1 then
+        failwith (label ^ ": the refusal dropped the adapter async lease");
+      expect_outstanding label worker;
+      (* A second refusal is still retryable and still keeps the handle. *)
+      expect_registry_refusal label (finish handle);
+      supervisor.free_client_call_slots := 1;
+      (match finish handle with
+      | Ok () -> ()
+      | Error error ->
+          failwith (label ^ ": the retry after capacity freed failed: "
+            ^ Temporal.Error.message error));
+      (match !(supervisor.async_completions) with
+      | [ { Protocol.result; _ } ] when expected result -> ()
+      | _ -> failwith (label ^ ": the retry did not submit one expected result"));
+      if !calls <> 1 || !(supervisor.async_completion_calls) <> 1
+         || !(supervisor.async_leased) <> [] then
+        failwith (label ^ ": the retry did not retire exactly one lease");
+      (match Worker.drain worker with
+      | Ok () -> ()
+      | Error error -> failwith (label ^ ": finished handle held drain: " ^ error.code));
+      match finish handle with
+      | Error _ -> ()
+      | Ok () -> failwith (label ^ ": a finished handle accepted another call"))
+    [
+      ( "complete",
+        (fun handle -> Temporal.Activity.Async_handle.complete handle "done"),
+        function Protocol.Completed _ -> true | _ -> false );
+      ( "fail",
+        (fun handle -> Temporal.Activity.Async_handle.fail handle failure),
+        function Protocol.Failed _ -> true | _ -> false );
+      ( "cancel",
+        (fun handle -> Temporal.Activity.Async_handle.cancel handle []),
+        function Protocol.Cancelled _ -> true | _ -> false );
+    ]
+
+(** An async heartbeat refused by a full client-call registry (#1104)
+    returns a retryable error, records nothing, and neither retains the
+    heartbeat nor blocks the handle: a heartbeat and a completion succeed
+    once capacity frees. *)
+let test_async_full_registry_heartbeat_keeps_handle () =
+  let token = Bytes.of_string "registry-full-heartbeat" in
+  let supervisor, worker, handle, calls =
+    heartbeat_status_fixture ~name:"registry_full_heartbeat" ~token
+  in
+  supervisor.free_client_call_slots := 0;
+  expect_registry_refusal "heartbeat" (Temporal.Activity.Async_handle.heartbeat handle []);
+  if !(supervisor.async_heartbeat_calls) <> 0
+     || !(supervisor.refused_client_calls) <> 1
+     || !(supervisor.async_leased) <> [ token ] then
+    failwith "a refused heartbeat was submitted or retired the activity";
+  expect_outstanding "heartbeat" worker;
+  supervisor.free_client_call_slots := 1;
+  (match Temporal.Activity.Async_handle.heartbeat handle [] with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("heartbeat after capacity freed failed: " ^ Temporal.Error.message error));
+  (match Temporal.Activity.Async_handle.complete handle "done" with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("completion after a refused heartbeat failed: "
+        ^ Temporal.Error.message error));
+  if !calls <> 1 || List.length !(supervisor.async_heartbeats) <> 1
+     || List.length !(supervisor.async_completions) <> 1
+     || !(supervisor.async_leased) <> [] then
+    failwith "heartbeat refusal recovery submitted an unexpected sequence"
+
+(** A refused retry cannot erase an earlier uncertain terminal submission
+    (#1104): the server may already have applied that request, so only the
+    byte-identical retry may follow, and once capacity frees it resends the
+    bytes retained for the first attempt. *)
+let test_async_full_registry_preserves_uncertain_completion () =
+  let token = Bytes.of_string "registry-full-uncertain" in
+  let supervisor, worker, handle, _calls =
+    heartbeat_status_fixture ~name:"registry_full_uncertain" ~token
+  in
+  supervisor.reject_next_async_completion := true;
+  (match Temporal.Activity.Async_handle.complete handle "once" with
+  | Error error when not (Temporal.Error.view error).non_retryable -> ()
+  | _ -> failwith "uncertain completion was not reported as retryable");
+  supervisor.free_client_call_slots := 0;
+  expect_registry_refusal "uncertain retry"
+    (Temporal.Activity.Async_handle.complete handle "once");
+  (match Temporal.Activity.Async_handle.complete handle "different" with
+  | Error _ -> ()
+  | Ok () -> failwith "a refused retry released the uncertain completion");
+  if !(supervisor.refused_client_calls) <> 1
+     || !(supervisor.async_completion_calls) <> 1 then
+    failwith "a conflicting completion reached the client-call registry";
+  supervisor.free_client_call_slots := 1;
+  (match Temporal.Activity.Async_handle.complete handle "once" with
+  | Ok () -> ()
+  | Error error ->
+      failwith ("exact retry after capacity freed failed: "
+        ^ Temporal.Error.message error));
+  (match !(supervisor.async_completion_documents) with
+  | [ retry; first ] when retry == first -> ()
+  | _ -> failwith "the retry did not resend the retained completion bytes");
+  match Worker.drain worker with
+  | Ok () -> ()
+  | Error error -> failwith ("completed handle held drain: " ^ error.code)
+
+(** Retryable registry refusals do not keep a handle alive forever (#1043):
+    a lease whose every call is refused still expires once the server must
+    have timed its attempt out, after which the handle reports a
+    non-retryable error and nothing is sent. *)
+let test_async_full_registry_lease_still_expires () =
+  let clock = ref 0. in
+  let supervisor = fake_supervisor () and retained = ref None in
+  enqueue supervisor
+    (start_task_with_timeouts ~start_to_close:30
+       ~token:(Bytes.of_string "registry-full-expiry") ~activity_type:"leaked_async" ());
+  let worker =
+    match
+      Worker.create_with_clock ~now:(fun () -> !clock) ~supervisor
+        ~activities:[ Adapter.register_async (leaked_async_activity retained) ]
+        ~worker_shutting_down:(fun () -> false)
+    with
+    | Ok worker -> worker
+    | Error (error : Raw_adapter.error_view) -> failwith error.message
+  in
+  expect_deferred (Worker.poll worker);
+  let handle = Option.get !retained in
+  supervisor.free_client_call_slots := 0;
+  clock := 10.;
+  expect_registry_refusal "expiry" (Temporal.Activity.Async_handle.complete handle ());
+  expect_registry_refusal "expiry heartbeat"
+    (Temporal.Activity.Async_handle.heartbeat handle []);
+  clock := 30. +. 6.;
+  if Worker.outstanding_async_leases worker <> Some 0 then
+    failwith "a refused lease outlived its attempt timeout";
+  supervisor.free_client_call_slots := 1;
+  (match Temporal.Activity.Async_handle.complete handle () with
+  | Error error when (Temporal.Error.view error).non_retryable -> ()
+  | Error _ -> failwith "an expired handle still reported a retryable error"
+  | Ok () -> failwith "an expired handle still completed");
+  if !(supervisor.async_completion_calls) <> 0 then
+    failwith "an expired handle contacted the server"
 
 (** Runs the isolated async lifecycle assertions. *)
 let () =
   test_base_state_machine ();
   test_operation_key_boundaries ();
   test_local_rejection_preserves_earlier_uncertainty ();
-  test_native_rejection_preserves_earlier_uncertainty ();
+  test_native_rejection_releases_earlier_uncertainty ();
+  test_uncertain_heartbeat_is_not_retained ();
+  test_in_flight_conflict_is_retryable ();
   test_local_deferred_failure_keeps_worker_progress ();
   test_deferred_lifecycle ();
   test_invalid_async_payload_preserves_handle ();
   test_async_codec_error_preserves_handle ();
-  test_async_invalid_encoding_preserves_handle ();
+  test_async_binary_encoding_is_submitted ();
   test_async_completion_retry ();
+  test_async_heartbeat_single_encode ();
+  test_async_retry_reuses_bytes_for_equal_request_key ();
   test_async_terminal_rejection_closes_lease ();
   test_async_connection_heartbeat_keeps_handle ();
+  test_async_rejected_completion_keeps_live_handle ();
   test_async_rejected_heartbeat_keeps_live_handle ();
   test_async_not_found_heartbeat_closes_handle ();
   test_async_heartbeat_and_cancel ();
   test_async_failure ();
+  test_async_context_info ();
+  test_async_context_info_maximum_timeouts ();
   test_async_drain_and_discard ();
-  test_stale_handle_rejected ()
+  test_async_lease_expiry ();
+  test_async_heartbeat_carries_timeout_and_activity_state ();
+  test_stale_handle_rejected ();
+  test_completion_racing_handoff_is_retryable ();
+  test_completer_domain_retries_until_handoff ();
+  test_unactivated_handles_close ();
+  test_async_lease_visible_while_callback_runs ();
+  test_async_callback_reported_running ();
+  test_async_rpc_runs_without_async_lock ();
+  test_async_full_registry_terminal_operations_keep_handle ();
+  test_async_full_registry_heartbeat_keeps_handle ();
+  test_async_full_registry_preserves_uncertain_completion ();
+  test_async_full_registry_lease_still_expires ()

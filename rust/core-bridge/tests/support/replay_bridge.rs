@@ -222,6 +222,73 @@ fn replay_config() -> WorkerConfig {
         .expect("replay test worker configuration should be valid")
 }
 
+/// Wall-clock budget for one Core-driving replay test that waits for the
+/// replay worker's natural shutdown.
+///
+/// A healthy run finishes in well under a second. The budget is far below a
+/// CI job timeout, so a regression of issue #965 fails with the step it was
+/// stuck in instead of consuming the whole job.
+const REPLAY_TEST_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Records the step a deadline-bound replay test last entered, so a missed
+/// deadline can name the wait that never returned.
+#[derive(Clone)]
+struct Progress(Arc<std::sync::Mutex<&'static str>>);
+
+impl Progress {
+    /// Starts tracking with a placeholder step.
+    fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new("starting")))
+    }
+
+    /// Records that the test body is entering `step`.
+    fn enter(&self, step: &'static str) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = step;
+    }
+
+    /// Returns the step most recently entered.
+    fn current(&self) -> &'static str {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+/// Runs a replay test body on its own thread and fails the test if it does not
+/// finish within [`REPLAY_TEST_DEADLINE`].
+///
+/// A panic in the body is re-raised unchanged on the libtest thread. On a
+/// missed deadline the body's thread is left detached: it may be blocked in
+/// native Core code that cannot be cancelled from outside, and the test
+/// process exits once libtest has reported every result.
+fn run_within_deadline<F>(test: &'static str, body: F)
+where
+    F: FnOnce(&Progress) + Send + 'static,
+{
+    let progress = Progress::new();
+    let body_progress = progress.clone();
+    let (done_sender, done_receiver) = std::sync::mpsc::channel();
+    let runner = std::thread::Builder::new()
+        .name(test.to_owned())
+        .spawn(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(|| body(&body_progress)));
+            let _ = done_sender.send(outcome);
+        })
+        .expect("replay test thread should start");
+    match done_receiver.recv_timeout(REPLAY_TEST_DEADLINE) {
+        Ok(Ok(())) => runner
+            .join()
+            .expect("finished replay test thread should join"),
+        Ok(Err(panic)) => {
+            let _ = runner.join();
+            std::panic::resume_unwind(panic);
+        }
+        Err(_) => panic!(
+            "{test} did not finish within {REPLAY_TEST_DEADLINE:?}; it was blocked in step \
+             `{}` (issue #965)",
+            progress.current()
+        ),
+    }
+}
+
 /// Creates the local Core runtime used by the construction test.
 fn core_runtime() -> CoreRuntime {
     let options = RuntimeOptions::builder()
@@ -272,6 +339,115 @@ fn history_document_rejects_encoding_and_history_errors() {
         decode_history_document(invalid_history),
         Err(ReplayInputError::InvalidProtobuf)
     ));
+}
+
+/// Wraps `history` in a replay document for `workflow_id` without going
+/// through [`encode_history_document`], which itself validates and would
+/// reject the deliberately invalid histories below before decoding.
+fn raw_history_document(workflow_id: &str, history: &History) -> String {
+    serde_json::json!({
+        "workflow_id": workflow_id,
+        "history": {"encoding": "base64", "data": STANDARD.encode(history.encode_to_vec())},
+    })
+    .to_string()
+}
+
+/// Applies `edit` to the fixture's start-event attributes.
+fn with_started_attributes(
+    edit: impl FnOnce(&mut WorkflowExecutionStartedEventAttributes),
+) -> History {
+    let mut history = complete_history();
+    let Some(history_event::Attributes::WorkflowExecutionStartedEventAttributes(started)) =
+        history.events[0].attributes.as_mut()
+    else {
+        panic!("fixture must begin with a workflow start event");
+    };
+    edit(started);
+    history
+}
+
+/// A recorded workflow ID must equal the supplied one (issue #1046); an
+/// empty recorded ID, as written by servers before 1.21, accepts any ID.
+#[test]
+fn history_document_checks_the_recorded_workflow_id() {
+    let recorded = with_started_attributes(|started| {
+        started.workflow_id = "recorded-id".to_owned();
+    });
+    decode_history_document(&raw_history_document("recorded-id", &recorded))
+        .expect("the recorded workflow ID should be accepted");
+    assert_eq!(
+        decode_history_document(&raw_history_document("other-id", &recorded)).err(),
+        Some(ReplayInputError::WorkflowIdMismatch)
+    );
+    assert_eq!(
+        encode_history_document("other-id", &recorded).err(),
+        Some(ReplayInputError::WorkflowIdMismatch)
+    );
+    decode_history_document(&raw_history_document("any-id", &complete_history()))
+        .expect("a history without a recorded workflow ID accepts any ID");
+}
+
+/// A start event without a task queue is rejected at admission instead of
+/// panicking Core's replay poll inside a Tokio task (issue #1047).
+#[test]
+fn history_document_requires_a_task_queue() {
+    let history = with_started_attributes(|started| started.task_queue = None);
+    assert_eq!(
+        decode_history_document(&raw_history_document("run", &history)).err(),
+        Some(ReplayInputError::MissingTaskQueue)
+    );
+}
+
+/// Event-ID gaps and a timestamp-free `WorkflowTaskStarted` pass Core's
+/// structural gate but are fatal inside Core's first workflow task, so the
+/// bridge rejects them before Core can auto-fail the task (issue #1045).
+#[test]
+fn history_document_rejects_core_fatal_event_shapes() {
+    let mut gap = complete_history();
+    for event in gap.events.iter_mut().skip(2) {
+        event.event_id += 1;
+    }
+    assert_eq!(
+        decode_history_document(&raw_history_document("run", &gap)).err(),
+        Some(ReplayInputError::NonContiguousEventIds)
+    );
+
+    let mut not_from_one = complete_history();
+    for event in &mut not_from_one.events {
+        event.event_id += 10;
+    }
+    assert_eq!(
+        decode_history_document(&raw_history_document("run", &not_from_one)).err(),
+        Some(ReplayInputError::NonContiguousEventIds)
+    );
+
+    let mut scrubbed = complete_history();
+    for event in &mut scrubbed.events {
+        event.event_time = None;
+    }
+    assert_eq!(
+        decode_history_document(&raw_history_document("run", &scrubbed)).err(),
+        Some(ReplayInputError::MissingWorkflowTaskTimestamp)
+    );
+}
+
+/// The ABI message for each category a caller can act on is distinct and
+/// static, while malformed input keeps the shared generic sentence.
+#[test]
+fn replay_input_errors_have_static_abi_messages() {
+    let actionable = [
+        ReplayInputError::WorkflowIdMismatch,
+        ReplayInputError::MissingTaskQueue,
+        ReplayInputError::NonContiguousEventIds,
+        ReplayInputError::MissingWorkflowTaskTimestamp,
+    ];
+    let generic = ReplayInputError::InvalidProtobuf.abi_message();
+    let mut seen = std::collections::HashSet::new();
+    for error in actionable {
+        assert_ne!(error.abi_message(), generic);
+        assert!(seen.insert(error.abi_message()));
+    }
+    assert_eq!(ReplayInputError::InvalidDocument.abi_message(), generic);
 }
 
 /// Core can construct and shut down a workflow-only replay worker with no
@@ -339,14 +515,30 @@ fn dispose_or_panic(worker: ReplayWorker, handle: &tokio::runtime::Handle) {
 
 /// A valid history is admitted to the one-slot feeder before shutdown,
 /// exercising the same path used by a future OCaml replay driver.
+///
+/// The final eviction acknowledgement races Core's natural replay shutdown,
+/// which is the interleaving that stranded the completion forever in issue
+/// #965. The body runs under [`run_within_deadline`] so a regression fails
+/// fast with the blocked step named.
 #[test]
 fn replay_worker_accepts_one_history_document() {
+    run_within_deadline(
+        "replay_worker_accepts_one_history_document",
+        replay_one_history_document,
+    );
+}
+
+/// Body of [`replay_worker_accepts_one_history_document`], recording each
+/// potentially blocking step in `progress`.
+fn replay_one_history_document(progress: &Progress) {
+    progress.enter("start replay worker");
     let core = core_runtime();
     let handle = core.tokio_handle().clone();
     let mut worker =
         ReplayWorker::start(&core, replay_config()).expect("replay worker should construct");
     let document = encode_history_document("workflow-replay-test", &complete_history())
         .expect("history should encode");
+    progress.enter("feed history");
     worker
         .feed_json(&handle, &document)
         .expect("bounded feeder should accept one history");
@@ -354,6 +546,7 @@ fn replay_worker_accepts_one_history_document() {
     // at the bridge's 100 ms supervisor bound; retrying a finite number of
     // times proves eventual publication without making the test depend on a
     // scheduler-specific handoff delay.
+    progress.enter("wait for first activation");
     let mut activation_ready = false;
     for _ in 0..20 {
         match worker.wait_workflow() {
@@ -387,6 +580,7 @@ fn replay_worker_accepts_one_history_document() {
         "first replay activation should initialize the workflow, got {:?}",
         activation.jobs
     );
+    progress.enter("complete first activation");
     handle
         .block_on(worker.complete_workflow(WorkflowActivationCompletion::empty(&activation.run_id)))
         .expect("replay activation should accept an empty deterministic completion");
@@ -395,8 +589,11 @@ fn replay_worker_accepts_one_history_document() {
     // completion is a replay nondeterminism: Core responds with a cache
     // eviction that must be acknowledged with an empty completion before the
     // lane can reach its terminal shutdown.
+    progress.enter("acknowledge evictions until shutdown");
     drain_replay_evictions_until_shutdown(&mut worker, &handle);
+    progress.enter("finalize");
     finalize_or_panic(worker, &handle);
+    progress.enter("drop Core runtime");
 }
 
 /// Reports whether an activation's jobs initialize a workflow rather than only
@@ -563,6 +760,64 @@ fn replay_dispose_retains_worker_when_core_is_still_shared() {
     dispose_or_panic(worker, &handle);
 }
 
+/// A replay lane join that hits its bound must never lead into Core's
+/// unbounded finalizer (PR #966 review).
+///
+/// The workflow lane is replaced by a task that never finishes, and the join
+/// bound is shortened to 200 ms. The first disposal must time out, abort the
+/// lane, and return a typed lane error with the worker retained. Finalization
+/// of that worker must refuse rather than claim success. A retried disposal,
+/// which is also what `drop_runtime_graph` does, must release the worker by
+/// the documented leak instead of calling Core's finalizer. The whole sequence
+/// runs under [`run_within_deadline`], so a regression fails fast.
+#[test]
+fn replay_dispose_after_join_timeout_leaks_instead_of_finalizing() {
+    run_within_deadline(
+        "replay_dispose_after_join_timeout_leaks_instead_of_finalizing",
+        |progress| {
+            progress.enter("start replay worker");
+            let core = core_runtime();
+            let handle = core.tokio_handle().clone();
+            let mut worker = ReplayWorker::start(&core, replay_config())
+                .expect("replay worker should construct without a client");
+            handle
+                .block_on(worker.install_stuck_workflow_lane_for_test(Duration::from_millis(200)));
+
+            progress.enter("first dispose (join times out)");
+            let (worker, error) = match handle.block_on(worker.dispose(&handle)) {
+                Ok(()) => panic!("disposal must report the lane that never stopped"),
+                Err(result) => result,
+            };
+            assert!(
+                matches!(&error, ReplayWorkerError::PollLane(PollLaneError::Core(message))
+                    if message.contains("within its bound")),
+                "unexpected disposal error: {error:?}"
+            );
+
+            progress.enter("finalize after join timeout");
+            let worker = match handle.block_on(worker.finalize(&handle)) {
+                Ok(()) => panic!("finalization must not claim success after a join timeout"),
+                Err((worker, error)) => {
+                    assert!(
+                        matches!(error, ReplayWorkerError::PollLane(_)),
+                        "unexpected finalization error: {error:?}"
+                    );
+                    worker
+                }
+            };
+
+            progress.enter("retry dispose (leaks)");
+            let leaked_before = crate::worker_bridge::replay_workers_leaked();
+            dispose_or_panic(worker, &handle);
+            assert!(
+                crate::worker_bridge::replay_workers_leaked() > leaked_before,
+                "the retried disposal must release the worker through the leak path"
+            );
+            progress.enter("drop Core runtime");
+        },
+    );
+}
+
 /// Disposal reports a poll-task join failure while retaining the worker for a
 /// retry after every producer handle has been consumed.
 #[test]
@@ -706,4 +961,47 @@ fn replay_complete_retires_lease_before_core_completion() {
     // history, leaving a follow-up eviction in flight; disposal abandons it
     // and releases every native resource so the test cannot leak a worker.
     dispose_or_panic(worker, &handle);
+}
+
+/// Regression guard for issue #814: rejecting the delivery of a pure cache
+/// eviction must acknowledge it with an empty completion, never fail it.
+///
+/// An eviction owns no workflow task. Failing one leaves it outstanding in
+/// release Core and trips Core's debug-build "no workflow task" panic, so the
+/// replay could never drain. This test obtains a real Core eviction (an empty
+/// completion of the initialization activation is a replay nondeterminism),
+/// rejects its delivery through the same path used when conversion or OCaml
+/// decoding fails, and then requires the replay to drain and finalize with no
+/// outstanding completion debt.
+#[test]
+fn replay_reject_of_eviction_acknowledges_it_empty() {
+    let core = core_runtime();
+    let handle = core.tokio_handle().clone();
+    let mut worker =
+        ReplayWorker::start(&core, replay_config()).expect("replay worker should construct");
+    let document = encode_history_document("workflow-replay-test", &complete_history())
+        .expect("history should encode");
+    worker
+        .feed_json(&handle, &document)
+        .expect("bounded feeder should accept one history");
+
+    let activation = wait_and_lease_activation(&mut worker, &handle);
+    assert!(activation_is_initialize_workflow(&activation));
+    handle
+        .block_on(worker.complete_workflow(WorkflowActivationCompletion::empty(&activation.run_id)))
+        .expect("replay activation should accept an empty completion");
+
+    let eviction = wait_and_lease_activation(&mut worker, &handle);
+    assert!(
+        eviction.is_only_eviction(),
+        "nondeterministic replay should be followed by a pure eviction, got {:?}",
+        eviction.jobs
+    );
+    handle
+        .block_on(worker.reject_workflow_delivery(&eviction.run_id, "test eviction rejection"))
+        .expect("rejecting a leased eviction should be accepted by Core");
+
+    worker.finish_input();
+    drain_replay_evictions_until_shutdown(&mut worker, &handle);
+    finalize_or_panic(worker, &handle);
 }

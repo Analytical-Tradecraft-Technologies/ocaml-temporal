@@ -9,6 +9,9 @@ set -eu
 
 root=$(CDPATH='' cd -- "$(dirname "$0")/../../../.." && pwd)
 fixture="$root/test/integration/temporal"
+# The digest-pinned base image (docker/ocaml-<series>/Dockerfile). Make passes
+# an already resolved reference; a direct run defaults to the 5.2 series.
+ocaml_image=$(sh "$root/scripts/ocaml-image.sh" "${OCAML_IMAGE:-ocaml-5.2}")
 compose_file="$fixture/compose.yaml"
 project=${TEMPORAL_COMPOSE_PROJECT:-ocaml-temporal-integration}
 parent_workflow_id=two-binary-parent-child-failure-replay
@@ -57,7 +60,7 @@ producer_status=0
 # Normalizes every Compose invocation so the bind-mounted build tree has one
 # numeric owner and every process joins the same isolated Temporal project.
 compose() {
-  OCAML_IMAGE=${OCAML_IMAGE:-ocaml/opam:debian-12-ocaml-5.2} \
+  OCAML_IMAGE=$ocaml_image \
     HOST_UID=${HOST_UID:-$(id -u)} HOST_GID=${HOST_GID:-$(id -g)} \
     SMOKE_PARENT_CHILD_RESTART_TIMEOUT_SECONDS=${SMOKE_PARENT_CHILD_RESTART_TIMEOUT_SECONDS:-900} \
     SMOKE_PARENT_CHILD_REPLAY_SCENARIO=failure \

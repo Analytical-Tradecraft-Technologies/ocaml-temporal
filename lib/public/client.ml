@@ -19,7 +19,8 @@ type t = {
   mutable shutdown_result : (unit, Error.t) result option;
 }
 
-(** A handle retains the definition codecs and exact execution identity. *)
+(** A handle retains the definition codecs and the execution it addresses:
+    one exact run, or the workflow's current run. *)
 type ('input, 'output) handle = {
   (* The owning client keeps the backend alive for all operations on this
      handle; shutdown is still explicit and invalidates future calls. *)
@@ -29,10 +30,25 @@ type ('input, 'output) handle = {
   workflow : ('input, 'output) Workflow.t;
   (* The durable ID selected by the caller and echoed by the start response. *)
   workflow_id : string;
-  (* The exact server run ID returned by Temporal; waits never follow a
-     continued-as-new successor implicitly. *)
-  run_id : string;
+  (* [Some] exact server run ID: every operation targets that run and [wait]
+     never follows a successor implicitly. [None] (only from [get_handle]):
+     every operation sends an empty run ID so Temporal resolves the current
+     run, and [wait] follows the run chain to its last run. *)
+  run_id : string option;
+  (* [true] only when [start] created this run; [false] for a run returned
+     by a [`Use_existing] start and for every handle built by [follow] or
+     [get_handle]. *)
+  started : bool;
 }
+
+(** Temporal's workflow ID conflict policy, applied when a start names a
+    workflow ID whose current run is still open. *)
+type id_conflict_policy = [ `Fail | `Use_existing | `Terminate_existing ]
+
+(** Temporal's workflow ID reuse policy, applied when a start names a
+    workflow ID whose latest run has already closed. *)
+type id_reuse_policy =
+  [ `Allow_duplicate | `Allow_duplicate_failed_only | `Reject_duplicate ]
 
 (** A client-side handle for one admitted workflow update. It retains the
     update definition and encoded input so completion polls cannot be confused
@@ -43,14 +59,14 @@ type ('input, 'output) update_handle = {
   workflow_id : string;
   run_id : string;
   update_id : string;
-  input : Payload.t;
+  input : Payload.t list;
   (* A completed admission outcome can be decoded without looking up a server
      record that may no longer exist. Immutable across caller Domains. *)
   outcome : Backend.update_outcome option;
 }
 
-(** Identifies a successor execution returned after a failed, timed-out, or
-    continued-as-new run. The identity is intentionally kept separate from a
+(** Identifies a successor execution returned after a completed, failed,
+    timed-out, or continued-as-new run. The identity is intentionally kept separate from a
     typed [handle]: callers must supply the workflow definition when they turn
     it back into a handle, so the output codec is never guessed from a run ID. *)
 type execution = {
@@ -65,8 +81,9 @@ type execution = {
 (** Terminal outcomes mirror the backend while replacing payload bytes with the
     definition's typed output. *)
 type 'output terminal_result =
-  (* The terminal payload decoded with the workflow definition's output codec. *)
-  | Completed of 'output
+  (* The terminal payload decoded with the workflow definition's output codec,
+     and the cron or retry successor the completed run started, if any. *)
+  | Completed of { output : 'output; successor : execution option }
   (* Failure and its optional successor run, which callers may follow explicitly. *)
   | Failed of { error : Error.t; successor : execution option }
   (* The exact run accepted a cancellation request and reached cancellation. *)
@@ -78,13 +95,26 @@ type 'output terminal_result =
   (* The run continued as a new execution; callers choose whether to follow it. *)
   | Continued_as_new of execution
 
+(** Visibility status; the same closed polymorphic variant as the private
+    protocol's, so rows pass through without conversion. *)
+type execution_status =
+  [ `Running
+  | `Completed
+  | `Failed
+  | `Canceled
+  | `Terminated
+  | `Continued_as_new
+  | `Timed_out
+  | `Paused
+  | `Unknown of int ]
+
 (** One execution row returned by the Temporal visibility service. *)
 type visibility_execution = {
   workflow_id : string;
   run_id : string;
   workflow_type : string;
   task_queue : string;
-  status : string;
+  status : execution_status;
 }
 
 (** A bounded visibility page and its opaque continuation token. *)
@@ -92,10 +122,6 @@ type visibility_page = {
   executions : visibility_execution list;
   next_page_token : string option;
 }
-
-(** The default identity is stable and descriptive without using process-global
-    randomness, which keeps client construction straightforward in tests. *)
-let default_identity = "ocaml-temporal-client"
 
 (** Rejects empty, oversized, malformed UTF-8, or NUL-containing identifiers
     before they can enter a backend request. The UTF-8 and 65,536-byte bounds
@@ -115,9 +141,42 @@ let validate_name field value =
     Error (Error.defect ~message:(field ^ " must not contain NUL"))
   else Ok ()
 
+(** Validates optional free text, such as an operator reason or a visibility
+    query, before it enters a backend request. Unlike {!validate_name}, the
+    empty string is allowed. The bounds are the ones the native JSON encoder
+    enforces on the owner Domain: there, invalid UTF-8 surfaced only as a
+    retryable [Bridge] protocol error while [mock://] accepted the same text
+    (#1014). Checking here makes both backends return the same
+    non-retryable defect, since such input can never succeed on retry. *)
+let validate_text field value =
+  if String.length value > 65_536 then
+    Error
+      (Error.defect
+         ~message:(field ^ " exceeds the protocol safety limit"))
+  else if String.contains value '\000' then
+    Error (Error.defect ~message:(field ^ " must not contain NUL"))
+  else if not (Temporal_base.Codec.valid_utf_8 value) then
+    Error (Error.defect ~message:(field ^ " must be valid UTF-8"))
+  else Ok ()
+
 (** Builds the private backend configuration after checking every user-facing
-    connection field. Routine configuration failures remain [result] values. *)
-let create ?(identity = default_identity) ~target_url ~namespace () =
+    connection field. Routine configuration failures remain [result] values.
+    An omitted identity is derived once here as [<pid>@<hostname>]; this runs
+    outside workflow code, so reading process state is replay-safe. The
+    optional admission limits (#796) are validated by [Backend.client_create]
+    for every target before anything is allocated. *)
+let create ?identity ?io_threads ?runtime ?max_pending_waits
+    ?max_pending_starts ?max_in_flight_calls ~target_url ~namespace () =
+  let limits : Temporal_sdk_kernel.Bridge.client_limits =
+    { max_pending_waits; max_pending_starts; max_in_flight_calls }
+  in
+  let identity = Temporal_base.Process_identity.resolve identity in
+  match Backend.validate_io_threads io_threads with
+  | Error error -> Error error
+  | Ok () ->
+  match Backend.validate_runtime_source ~io_threads ~runtime with
+  | Error error -> Error error
+  | Ok () ->
   match validate_name "namespace" namespace with
   | Error error -> Error error
   | Ok () -> (
@@ -136,7 +195,7 @@ let create ?(identity = default_identity) ~target_url ~namespace () =
                 shutdown_mutex = Mutex.create ();
                 shutdown_result = None;
               })
-            (Backend.client_create config))
+            (Backend.client_create ?io_threads ?runtime ~limits config))
 
 (** Validates the optional Temporal idempotency key, workflow type, durable
     workflow ID, and task queue before encoding input or constructing a native
@@ -210,11 +269,127 @@ let validate_start_metadata ~memo ~search_attributes =
   Result.bind (validate "memo" memo) (fun () ->
       validate "search attribute" search_attributes)
 
+(** The private protocol's bounds and deadline representation, shared so the
+    mock and the native bridge reject the same values at the public
+    boundary. *)
+module Client_protocol = Temporal_sdk_kernel.Client_protocol
+
+(** Validates an optional caller RPC timeout and turns it into an absolute
+    deadline on the process's monotonic clock, read now, at the public entry
+    point. The timeout bounds the whole client call, including the time the
+    request waits in the supervisor's FIFO mailbox behind earlier calls on
+    the same client (#807): the owner Domain sends only the budget that
+    remains when it dispatches the request, and fails the call with the typed
+    [Deadline_exceeded] error without sending it if none remains. The timeout
+    must be at least 1 ms and at most one minute, because control RPCs hold
+    the owner Domain for their whole budget. Violations are typed defects,
+    so every backend (including the mock, which ignores the deadline) rejects
+    the same values before any request is sent. *)
+let rpc_deadline = function
+  | None -> Ok None
+  | Some timeout ->
+      let milliseconds = Duration.to_ms timeout in
+      if
+        Int64.compare milliseconds 1L < 0
+        || Int64.compare milliseconds Client_protocol.max_rpc_timeout_ms > 0
+      then
+        Error
+          (Error.defect
+             ~message:"rpc_timeout must be between 1 ms and 60 seconds")
+      else
+        Ok
+          (Some
+             (Client_protocol.rpc_deadline
+                ~now_ns:(Temporal_sdk_kernel.Bridge.monotonic_now_ns ())
+                ~timeout_ms:milliseconds))
+
+(** Validated server-side execution policies of one start, in the
+    millisecond form the backend carries. *)
+type start_policies = {
+  execution_timeout_ms : int64 option;
+  run_timeout_ms : int64 option;
+  task_timeout_ms : int64 option;
+  start_rpc_deadline : Client_protocol.rpc_deadline option;
+}
+
+(** Validates a start's workflow timeouts and RPC deadline before encoding
+    input, mirroring the protocol encoder and the
+    Rust bridge so the mock rejects the same requests. A zero timeout is
+    rejected because Temporal reads zero as "unset" and would silently apply
+    its default; a task timeout above 120 seconds or above the run timeout
+    (the execution timeout when there is no run timeout) and a run timeout
+    above the execution timeout are rejected because Temporal would silently
+    lower them. Every combination of the reuse and conflict policies is
+    valid. Negative and overflowing values cannot be built as [Duration.t]. *)
+let validate_start_policies ~execution_timeout ~run_timeout ~task_timeout
+    ~rpc_timeout =
+  let timeout label maximum = function
+    | None -> Ok None
+    | Some duration ->
+        let milliseconds = Duration.to_ms duration in
+        if Int64.compare milliseconds 0L <= 0 then
+          Error (Error.defect ~message:(label ^ " must be positive"))
+        else if Int64.compare milliseconds maximum > 0 then
+          Error (Error.defect ~message:(label ^ " exceeds its maximum"))
+        else Ok (Some milliseconds)
+  in
+  let ( let* ) = Result.bind in
+  let* execution_timeout_ms =
+    timeout "execution_timeout" Client_protocol.max_workflow_timeout_ms
+      execution_timeout
+  in
+  let* run_timeout_ms =
+    timeout "run_timeout" Client_protocol.max_workflow_timeout_ms run_timeout
+  in
+  let* task_timeout_ms =
+    timeout "task_timeout (at most 120 seconds)"
+      Client_protocol.max_workflow_task_timeout_ms task_timeout
+  in
+  let* () =
+    match (execution_timeout_ms, run_timeout_ms) with
+    | Some execution, Some run when Int64.compare run execution > 0 ->
+        Error
+          (Error.defect ~message:"run_timeout exceeds execution_timeout")
+    | _ -> Ok ()
+  in
+  let* () =
+    (* A run without its own timeout is bounded by the execution timeout. *)
+    let run =
+      match run_timeout_ms with Some _ -> run_timeout_ms | None -> execution_timeout_ms
+    in
+    match (task_timeout_ms, run) with
+    | Some task, Some run when Int64.compare task run > 0 ->
+        Error
+          (Error.defect
+             ~message:"task_timeout exceeds the run (or execution) timeout")
+    | _ -> Ok ()
+  in
+  let* start_rpc_deadline = rpc_deadline rpc_timeout in
+  Ok
+    {
+      execution_timeout_ms;
+      run_timeout_ms;
+      task_timeout_ms;
+      start_rpc_deadline;
+    }
+
+(** Encodes one typed workflow, signal, or update input as the argument list
+    sent to Temporal, in the public payload and error vocabulary: zero payloads
+    for [Codec.unit] and one payload for any other codec, so an option's [None]
+    reaches a foreign handler as one [null] argument (#1012). *)
+let encode_arguments codec value =
+  match Codec_private.encode_arguments codec value with
+  | Ok arguments -> Ok (List.map Payload_private.of_base arguments)
+  | Error error -> Error (Error_private.of_base error)
+
 (** Starts a workflow after encoding its typed input and checking the backend's
     response still refers to the request. The response check prevents an
     adapter bug from creating a handle for a different execution. *)
-let start client ?request_id ?(memo = []) ?(search_attributes = []) ~workflow
-    ~task_queue ~id ~input () =
+let start client ?request_id ?(memo = []) ?(search_attributes = [])
+    ?(id_conflict_policy : id_conflict_policy = `Fail)
+    ?(id_reuse_policy : id_reuse_policy = `Allow_duplicate) ?execution_timeout
+    ?run_timeout ?task_timeout ?retry_policy ?rpc_timeout ~workflow ~task_queue
+    ~id ~input () =
   if Atomic.get client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
@@ -225,10 +400,15 @@ let start client ?request_id ?(memo = []) ?(search_attributes = []) ~workflow
     with
     | Error error -> Error error
     | Ok () -> (
-        match validate_start_metadata ~memo ~search_attributes with
+        match
+          Result.bind (validate_start_metadata ~memo ~search_attributes)
+            (fun () ->
+              validate_start_policies ~execution_timeout ~run_timeout
+                ~task_timeout ~rpc_timeout)
+        with
         | Error error -> Error error
-        | Ok () -> (
-            match Codec.encode (Workflow.input workflow) input with
+        | Ok policies -> (
+            match encode_arguments (Workflow.input workflow) input with
         | Error error -> Error error
         | Ok encoded_input ->
             let request : Backend.start_request =
@@ -240,6 +420,14 @@ let start client ?request_id ?(memo = []) ?(search_attributes = []) ~workflow
                 input = encoded_input;
                 memo;
                 search_attributes;
+                id_conflict_policy;
+                id_reuse_policy;
+                execution_timeout_ms = policies.execution_timeout_ms;
+                run_timeout_ms = policies.run_timeout_ms;
+                task_timeout_ms = policies.task_timeout_ms;
+                retry_policy =
+                  Option.map Retry_policy_private.to_runtime retry_policy;
+                rpc_deadline = policies.start_rpc_deadline;
               }
             in
             Result.bind (Backend.client_start client.backend request) (fun response ->
@@ -257,7 +445,8 @@ let start client ?request_id ?(memo = []) ?(search_attributes = []) ~workflow
                       client;
                       workflow;
                       workflow_id = id;
-                      run_id = response.run_id;
+                      run_id = Some response.run_id;
+                      started = response.started;
                     })))
 
 (** Rebuilds a typed handle for a successor run without starting another
@@ -286,7 +475,84 @@ let follow client ~workflow ({ namespace; workflow_id; run_id } : execution) =
           | Ok () -> (
               match validate_name "successor run id" run_id with
               | Error error -> Error error
-              | Ok () -> Ok { client; workflow; workflow_id; run_id }))
+              | Ok () ->
+                  Ok
+                    {
+                      client;
+                      workflow;
+                      workflow_id;
+                      run_id = Some run_id;
+                      started = false;
+                    }))
+
+(** Builds a handle from a workflow ID the caller already knows, without any
+    server round trip. The identifiers are validated at the same boundary as
+    [start] so a malformed value is a typed defect rather than a protocol
+    error. An omitted [run_id] yields a current-run handle; see the interface
+    for the semantics of each operation on it. *)
+let get_handle client ?run_id ~workflow ~id () =
+  if Atomic.get client.closed then
+    Error
+      (Error.make ~category:`Bridge ~message:"client is shut down" ())
+  else
+    match validate_name "workflow id" id with
+    | Error error -> Error error
+    | Ok () -> (
+        let run_result =
+          match run_id with
+          | None -> Ok ()
+          | Some run_id -> validate_name "run id" run_id
+        in
+        match run_result with
+        | Error error -> Error error
+        | Ok () ->
+            Ok { client; workflow; workflow_id = id; run_id; started = false })
+
+(** The run selector sent to the backend: the exact run ID, or the empty
+    string that asks Temporal to resolve the workflow's current run. Exact run
+    IDs are validated non-empty, so the two cases cannot be confused. *)
+let run_selector (handle : ('input, 'output) handle) =
+  Option.value handle.run_id ~default:""
+
+(** Returns the next run a current-run wait must observe: the successor that
+    a continued-as-new, cron, or retry close event started, or [None] when the
+    observed run ended the chain. This mirrors the official SDKs' default
+    run-following result for a handle obtained by workflow ID. *)
+let chain_successor = function
+  | Backend.Continued_as_new successor
+  | Backend.Completed { successor = Some successor; _ }
+  | Backend.Failed { successor = Some successor; _ }
+  | Backend.Timed_out { successor = Some successor; _ } ->
+      Some successor
+  | Backend.Completed { successor = None; _ }
+  | Backend.Failed { successor = None; _ }
+  | Backend.Timed_out { successor = None; _ }
+  | Backend.Cancelled _ | Backend.Terminated _ ->
+      None
+
+(** Waits for one backend terminal result. A current-run handle starts from
+    the run Temporal resolves for an empty run ID and then waits on each
+    successor by its exact run ID until a run closes without one, so the
+    result is the last run's outcome and never [Continued_as_new]. Each step is
+    a separate bounded backend wait, so client shutdown still interrupts the
+    chain between and during steps. *)
+let wait_backend (handle : ('input, 'output) handle) =
+  let wait_run run_id =
+    Backend.client_wait handle.client.backend
+      ({ workflow_id = handle.workflow_id; run_id } : Backend.wait_request)
+  in
+  match handle.run_id with
+  | Some run_id -> wait_run run_id
+  | None ->
+      let rec follow_chain run_id =
+        match wait_run run_id with
+        | Error _ as error -> error
+        | Ok terminal -> (
+            match chain_successor terminal with
+            | None -> Ok terminal
+            | Some (successor : Backend.successor) -> follow_chain successor.run_id)
+      in
+      follow_chain ""
 
 (** Decodes a completed payload and maps terminal failures without exposing the
     private backend constructors. Each successor gains this client's namespace
@@ -296,9 +562,6 @@ let wait (handle : ('input, 'output) handle) =
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    let request : Backend.wait_request =
-      { workflow_id = handle.workflow_id; run_id = handle.run_id }
-    in
     (* The backend keeps the validated run pair; the owning client supplies
        the namespace needed by [follow]. *)
     let public_successor =
@@ -309,10 +572,11 @@ let wait (handle : ('input, 'output) handle) =
             run_id = value.run_id;
           })
     in
-    Result.bind (Backend.client_wait handle.client.backend request) (function
-      | Backend.Completed payload ->
+    Result.bind (wait_backend handle) (function
+      | Backend.Completed { payload; successor } ->
           Result.map
-            (fun output -> Completed output)
+            (fun output ->
+              Completed { output; successor = public_successor successor })
             (Codec.decode (Workflow.output handle.workflow) payload)
       | Backend.Failed { error; successor } ->
           Ok (Failed { error; successor = public_successor successor })
@@ -327,7 +591,8 @@ let wait (handle : ('input, 'output) handle) =
 
 (** Validates cancellation metadata before it reaches the backend. The length
     limit protects the JSON bridge and matches the Rust-side bound; NUL is
-    rejected because it cannot be represented safely by the C ABI contract. *)
+    rejected because it cannot be represented safely by the C ABI contract,
+    and invalid UTF-8 because the JSON request encoder cannot carry it. *)
 let validate_cancel_fields ~request_id ~reason =
   let request_result =
     match request_id with
@@ -336,13 +601,7 @@ let validate_cancel_fields ~request_id ~reason =
   in
   match request_result with
   | Error _ as error -> error
-  | Ok () when String.length reason > 65_536 ->
-      Error
-        (Error.defect
-           ~message:"cancellation reason exceeds the protocol safety limit")
-  | Ok () when String.contains reason '\000' ->
-      Error (Error.defect ~message:"cancellation reason must not contain NUL")
-  | Ok () -> Ok ()
+  | Ok () -> validate_text "cancellation reason" reason
 
 (** Validates signal metadata before encoding input or entering the backend.
     Signal names are validated when their definitions are built; the request
@@ -356,26 +615,31 @@ let validate_signal_fields ~request_id =
   request_result
 
 (** Allocates a stable request ID for a cancellation call whose caller did not
-    provide one. Hashing the exact execution identity makes repeated calls on
-    the same handle represent one idempotent control operation without keeping
-    another mutable counter in the client state. *)
+    provide one. Hashing the handle's execution selector makes repeated calls
+    on the same handle represent one idempotent control operation without
+    keeping another mutable counter in the client state. A current-run handle
+    hashes the empty selector; Temporal deduplicates cancellation request IDs
+    per run, so the same key still cancels a later run of the workflow. *)
 let generated_cancel_request_id (handle : ('input, 'output) handle) =
   "ocaml-client-cancel-"
   ^ Digest.to_hex
-      (Digest.string (handle.workflow_id ^ "\000" ^ handle.run_id))
+      (Digest.string (handle.workflow_id ^ "\000" ^ run_selector handle))
 
-(** Sends a cancellation request for one exact run and returns only after the
+(** Sends a cancellation request for the run [handle] addresses and returns only after the
     server acknowledgement has been decoded. This operation is deliberately
     separate from [wait], because Temporal cancellation is asynchronous. *)
-let cancel ?request_id ?(reason = "")
+let cancel ?request_id ?(reason = "") ?rpc_timeout
     (handle : ('workflow_input, 'workflow_output) handle) =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    match validate_cancel_fields ~request_id ~reason with
+    match
+      Result.bind (validate_cancel_fields ~request_id ~reason) (fun () ->
+          rpc_deadline rpc_timeout)
+    with
     | Error error -> Error error
-    | Ok () ->
+    | Ok rpc_deadline ->
         let request_id =
           match request_id with
           | Some request_id -> request_id
@@ -384,39 +648,37 @@ let cancel ?request_id ?(reason = "")
         let request : Backend.cancel_request =
           {
             workflow_id = handle.workflow_id;
-            run_id = handle.run_id;
+            run_id = run_selector handle;
             request_id;
             reason;
+            rpc_deadline;
           }
         in
         Backend.client_cancel handle.client.backend request
 
 (** Validates operator reason text before it crosses either the deterministic
     mock or native JSON bridge. *)
-let validate_terminate_reason reason =
-  if String.length reason > 65_536 then
-    Error
-      (Error.defect
-         ~message:"termination reason exceeds the protocol safety limit")
-  else if String.contains reason '\000' then
-    Error (Error.defect ~message:"termination reason must not contain NUL")
-  else Ok ()
+let validate_terminate_reason reason = validate_text "termination reason" reason
 
-(** Terminates one exact run. The acknowledgement is deliberately separate
+(** Terminates the run [handle] addresses. The acknowledgement is deliberately separate
     from [wait], which observes the server's terminal history event. *)
-let terminate ?(reason = "") (handle : ('input, 'output) handle) =
+let terminate ?(reason = "") ?rpc_timeout (handle : ('input, 'output) handle) =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    match validate_terminate_reason reason with
+    match
+      Result.bind (validate_terminate_reason reason) (fun () ->
+          rpc_deadline rpc_timeout)
+    with
     | Error error -> Error error
-    | Ok () ->
+    | Ok rpc_deadline ->
         let request : Backend.terminate_request =
           {
             workflow_id = handle.workflow_id;
-            run_id = handle.run_id;
+            run_id = run_selector handle;
             reason;
+            rpc_deadline;
           }
         in
         Backend.client_terminate handle.client.backend request
@@ -435,55 +697,46 @@ let validate_reset_fields ~request_id ~reason ~workflow_task_finish_event_id =
       Error
         (Error.defect
            ~message:"reset workflow-task finish event ID must be greater than 1")
-  | Ok () when String.length reason > 65_536 ->
-      Error
-        (Error.defect ~message:"reset reason exceeds the protocol safety limit")
-  | Ok () when String.contains reason '\000' ->
-      Error (Error.defect ~message:"reset reason must not contain NUL")
-  | Ok () -> Ok ()
+  | Ok () -> validate_text "reset reason" reason
 
-(** Derives an idempotency key for an omitted reset request ID from the exact
-    execution identity. Taking copied identity fields rather than a particular
-    public handle keeps this private helper independent of record-label
-    inference: workflow and update handles deliberately share those labels,
-    but only a workflow handle is accepted by [reset]. The run and event
-    boundary make retries of one logical reset stable while distinct reset
-    points cannot alias one another. *)
-let generated_reset_request_id ~workflow_id ~run_id event_id =
-  "ocaml-client-reset-"
-  ^ Digest.to_hex
-      (Digest.string
-         (workflow_id ^ "\000" ^ run_id ^ "\000"
-        ^ Int64.to_string event_id))
+(** Allocates a fresh request ID for a reset whose caller did not supply one.
+    Resetting the same run at the same event again is a legitimate operator
+    action (for example when the first successor also went wrong), so each
+    call must be a distinct server request; a key derived from the run and
+    event would make the server silently return the earlier successor. Callers
+    that need idempotent retries of one logical reset, for example after an
+    uncertain transport result, pass an explicit [request_id]. *)
+let generated_reset_request_id = Temporal_base.Client_request_id.create
 
-(** Resets one exact run and returns the new execution identity. A successful
+(** Resets the run [handle] addresses and returns the new execution identity. A successful
     acknowledgement does not imply the new run has completed; use [follow] and
     [wait] to observe it explicitly. *)
-let reset ?request_id ?(reason = "") ~workflow_task_finish_event_id
+let reset ?request_id ?(reason = "") ?rpc_timeout ~workflow_task_finish_event_id
     (handle : ('input, 'output) handle) =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
     match
-      validate_reset_fields ~request_id ~reason ~workflow_task_finish_event_id
+      Result.bind
+        (validate_reset_fields ~request_id ~reason ~workflow_task_finish_event_id)
+        (fun () -> rpc_deadline rpc_timeout)
     with
     | Error error -> Error error
-    | Ok () ->
+    | Ok rpc_deadline ->
         let request_id =
           match request_id with
           | Some request_id -> request_id
-          | None ->
-              generated_reset_request_id ~workflow_id:handle.workflow_id
-                ~run_id:handle.run_id workflow_task_finish_event_id
+          | None -> generated_reset_request_id ()
         in
         let request : Backend.reset_request =
           {
             workflow_id = handle.workflow_id;
-            run_id = handle.run_id;
+            run_id = run_selector handle;
             request_id;
             reason;
             workflow_task_finish_event_id;
+            rpc_deadline;
           }
         in
         (match Backend.client_reset handle.client.backend request with
@@ -502,20 +755,23 @@ let reset ?request_id ?(reason = "") ~workflow_task_finish_event_id
     explicit ID gives a caller retry-safe idempotency semantics. *)
 let generated_signal_request_id = Temporal_base.Client_request_id.create
 
-(** Sends one typed signal to the exact run retained by [handle]. The input is
+(** Sends one typed signal to the run [handle] addresses. The input is
     encoded before the backend call, and success means only that Temporal
     acknowledged the RPC; workflow code may process it asynchronously. *)
-let signal ?request_id
+let signal ?request_id ?rpc_timeout
     (handle : ('workflow_input, 'workflow_output) handle)
     ~(signal : 'signal Signal.t) ~input =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    match validate_signal_fields ~request_id with
+    match
+      Result.bind (validate_signal_fields ~request_id) (fun () ->
+          rpc_deadline rpc_timeout)
+    with
     | Error error -> Error error
-    | Ok () -> (
-        match Codec.encode (Signal.input signal) input with
+    | Ok rpc_deadline -> (
+        match encode_arguments (Signal.input signal) input with
         | Error error -> Error error
         | Ok encoded_input ->
             let request_id =
@@ -526,40 +782,51 @@ let signal ?request_id
             let request : Backend.signal_request =
               {
                 workflow_id = handle.workflow_id;
-                run_id = handle.run_id;
+                run_id = run_selector handle;
                 signal_name = Signal.name signal;
                 request_id;
                 input = encoded_input;
+                rpc_deadline;
               }
             in
             Backend.client_signal handle.client.backend request)
 
-(** Executes one output-only query against the exact run retained by [handle].
+(** Executes one output-only query against the run [handle] addresses.
     Query arguments are intentionally absent in this first client slice: the
     workflow-side [Query] definition is already output-only, and the result is
     decoded with the definition's codec only after the native bridge has
     validated the response payload. *)
-let query (handle : ('workflow_input, 'workflow_output) handle)
+let query ?rpc_timeout (handle : ('workflow_input, 'workflow_output) handle)
     ~(query : 'query Query.t) =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    let request : Backend.query_request =
-      {
-        workflow_id = handle.workflow_id;
-        run_id = handle.run_id;
-        query_name = Query.name query;
-        input = [];
-      }
-    in
-    Result.bind (Backend.client_query handle.client.backend request) (fun payload ->
-        Codec.decode (Query.output query) payload)
+    match rpc_deadline rpc_timeout with
+    | Error error -> Error error
+    | Ok rpc_deadline ->
+        let request : Backend.query_request =
+          {
+            workflow_id = handle.workflow_id;
+            run_id = run_selector handle;
+            query_name = Query.name query;
+            input = [];
+            rpc_deadline;
+          }
+        in
+        Result.bind (Backend.client_query handle.client.backend request)
+          (fun payload -> Codec.decode (Query.output query) payload)
 
 (** Lists one bounded visibility page through the client's backend. The public
     layer validates caller-controlled query metadata before the request enters
     either the deterministic mock or the native supervisor. *)
-let list_visibility ?(page_size = 100) ?page_token client ~query () =
+let list_visibility ?(page_size = 100) ?page_token ?rpc_timeout client ~query
+    () =
+  (* The deadline is checked before the closed flag, so a malformed deadline
+     is reported as a defect even on a closed client. *)
+  match rpc_deadline rpc_timeout with
+  | Error error -> Error error
+  | Ok rpc_deadline ->
   if Atomic.get client.closed then
     Error (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else if page_size < 1 || page_size > 1_000 then
@@ -567,13 +834,9 @@ let list_visibility ?(page_size = 100) ?page_token client ~query () =
       (Error.defect
          ~message:"visibility page_size must be between 1 and 1000")
   else
-    if String.length query > 65_536 then
-      Error
-        (Error.defect
-           ~message:"visibility query exceeds the protocol safety limit")
-    else if String.contains query '\000' then
-      Error (Error.defect ~message:"visibility query must not contain NUL")
-    else (
+    match validate_text "visibility query" query with
+    | Error _ as error -> error
+    | Ok () -> (
         match page_token with
         | Some token when String.equal token "" ->
             Error
@@ -583,7 +846,12 @@ let list_visibility ?(page_size = 100) ?page_token client ~query () =
             | Error error -> Error error
             | Ok () ->
                 let request : Backend.visibility_request =
-                  { query; page_size; next_page_token = Some token }
+                  {
+                    query;
+                    page_size;
+                    next_page_token = Some token;
+                    rpc_deadline;
+                  }
                 in
                 Result.map
                   (fun (page : Backend.visibility_page) ->
@@ -604,7 +872,7 @@ let list_visibility ?(page_size = 100) ?page_token client ~query () =
                   (Backend.client_list_visibility client.backend request))
         | None ->
             let request : Backend.visibility_request =
-              { query; page_size; next_page_token = None }
+              { query; page_size; next_page_token = None; rpc_deadline }
             in
             Result.map
               (fun (page : Backend.visibility_page) ->
@@ -624,24 +892,30 @@ let list_visibility ?(page_size = 100) ?page_token client ~query () =
                 })
               (Backend.client_list_visibility client.backend request))
 
-(** Executes a one-input typed query against the exact run retained by
-    [handle]. Encoding happens before transport, so invalid input cannot
+(** Executes a one-input typed query against the run [handle] addresses. Encoding happens before transport, so invalid input cannot
     consume a native request or become an ambiguous empty query. *)
-let query_with_input (handle : ('workflow_input, 'workflow_output) handle)
+let query_with_input ?rpc_timeout
+    (handle : ('workflow_input, 'workflow_output) handle)
     ~(query : ('input, 'query) Query.typed) ~input =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    match Codec.encode (Query.input query) input with
+    match
+      Result.bind (rpc_deadline rpc_timeout) (fun rpc_deadline ->
+          Result.map
+            (fun encoded_input -> (rpc_deadline, encoded_input))
+            (Codec.encode (Query.input query) input))
+    with
     | Error error -> Error error
-    | Ok encoded_input ->
+    | Ok (rpc_deadline, encoded_input) ->
         let request : Backend.query_request =
           {
             workflow_id = handle.workflow_id;
-            run_id = handle.run_id;
+            run_id = run_selector handle;
             query_name = Query.name_with_input query;
             input = [ encoded_input ];
+            rpc_deadline;
           }
         in
         Result.bind
@@ -673,7 +947,7 @@ let decode_update_output definition = function
 (** Starts one typed update and returns once Temporal has accepted it. This
     acceptance/completion split lets callers issue several updates before
     waiting, while the supervisor still serializes every native operation. *)
-let start_update ?update_id
+let start_update ?update_id ?rpc_timeout
     (handle : ('workflow_input, 'workflow_output) handle)
     ~(update : ('input, 'output) Update.t) ~input () =
   if Atomic.get handle.client.closed then
@@ -685,19 +959,23 @@ let start_update ?update_id
       | Some update_id -> update_id
       | None -> generated_update_id ()
     in
-    match validate_name "update id" update_id with
+    match
+      Result.bind (validate_name "update id" update_id) (fun () ->
+          rpc_deadline rpc_timeout)
+    with
     | Error error -> Error error
-    | Ok () -> (
-        match Codec.encode (Update.input update) input with
+    | Ok rpc_deadline -> (
+        match encode_arguments (Update.input update) input with
         | Error error -> Error error
         | Ok encoded_input ->
             let request : Backend.update_request =
               {
                 workflow_id = handle.workflow_id;
-                run_id = handle.run_id;
+                run_id = run_selector handle;
                 update_id;
                 update_name = Update.name update;
                 input = encoded_input;
+                rpc_deadline;
               }
             in
             Result.bind
@@ -736,6 +1014,9 @@ let wait_update handle =
             update_id = handle.update_id;
             update_name = Update.name handle.definition;
             input = handle.input;
+            (* Completion polls keep their own bounded window; see
+               [Client.wait_update]. *)
+            rpc_deadline = None;
           }
         in
         let rec poll () =
@@ -755,8 +1036,47 @@ let update_id (handle : ('input, 'output) update_handle) = handle.update_id
 (** Returns the durable workflow identity retained by a handle. *)
 let workflow_id (handle : ('input, 'output) handle) = handle.workflow_id
 
-(** Returns the exact server run identity retained by a handle. *)
+(** Returns the exact server run identity retained by a handle, or [None]
+    for a current-run handle. *)
 let run_id (handle : ('input, 'output) handle) = handle.run_id
+
+(** Reports whether the [start] that produced [handle] created its run. *)
+let started (handle : ('input, 'output) handle) = handle.started
+
+(** Exposes the conflicting run attached by the backend as a public
+    [execution]. The backend owns the detail encoding so the mock and native
+    transports cannot drift apart. *)
+let already_started error =
+  Option.map
+    (fun (namespace, workflow_id, run_id) -> { namespace; workflow_id; run_id })
+    (Backend.already_started_execution error)
+
+(** Recognizes the uncertain-start error by its structural fields rather than
+    its diagnostic message. *)
+let is_start_outcome_uncertain error =
+  let view = Error.view error in
+  view.category = `Bridge && view.non_retryable
+  && view.error_type = Some Backend.start_outcome_uncertain_error_type
+
+(** Recognizes the backend's capacity rejection by its structural fields
+    rather than its diagnostic message, so wording changes cannot alter the
+    classification. *)
+let is_at_capacity error =
+  let view = Error.view error in
+  view.category = `Bridge
+  && (not view.non_retryable)
+  && view.error_type = Some Backend.client_at_capacity_error_type
+
+(** The public RPC classification; structurally identical to
+    [Backend.rpc_status], which owns the code table. *)
+type rpc_status = Backend.rpc_status
+
+(** Delegates to the backend, which builds these errors, so the
+    classification cannot drift from their construction. *)
+let rpc_status = Backend.rpc_status
+
+(** Delegates to the backend's structural query-failure check. *)
+let is_query_failed = Backend.is_query_failed
 
 (** Closes backend resources once and returns the same cached result to later
     shutdown callers.
@@ -775,7 +1095,9 @@ let shutdown client =
       | None ->
           (* Close admission before entering native teardown. Concurrent starts
              that already passed their check are ordered by the supervisor; later
-             callers observe the closed bit and cannot enqueue new work. *)
+             callers observe the closed bit and cannot enqueue new work. A
+             native start already holding a ticket is aborted by teardown and
+             reports an uncertain outcome instead of failing this shutdown. *)
           Atomic.set client.closed true;
           let result =
             try Backend.client_shutdown client.backend with

@@ -117,7 +117,10 @@ module Source = struct
       Ok (Some activation)
 
   (** A rejected completion leaves its lease available for the retained retry. *)
-  let complete_workflow source (completion : Protocol.completion) =
+  let complete_workflow source ~(completion : Protocol.completion) _encoded =
+    (* This in-memory source has no native peer to receive the canonical
+       bytes; it inspects the typed completion the adapter passes beside
+       them. *)
     if source.reject_next then begin
       source.reject_next <- false;
       Error "retry"
@@ -135,6 +138,14 @@ module Source = struct
 
   (** Returns the fixture's fixed diagnostic. *)
   let error_message error = error
+
+  (** Only the fixture's injected transient rejection is retryable, so the
+      retained-completion retry it exercises is still attempted; every other
+      failure is fail-closed like the production workflow source. *)
+  let error_is_retryable error = String.equal error "retry"
+
+  (** A raised completion is equally fail-closed. *)
+  let exception_is_retryable _ = false
 end
 
 module Worker = Adapter.Make (Source)

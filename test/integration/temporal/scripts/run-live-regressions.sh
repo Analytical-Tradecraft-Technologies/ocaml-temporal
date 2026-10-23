@@ -1,0 +1,188 @@
+#!/bin/sh
+set -eu
+
+# Runs the live regressions for fixed bugs, features and recovery paths against
+# the already-started Compose Temporal/PostgreSQL stack (#795). The caller owns
+# the server lifecycle; each regression executable owns its worker processes,
+# uses a unique task queue, and terminates the workflow executions it creates.
+#
+# Arguments are repository-relative executables. Each must already exist under
+# _build/default: the Makefile target compiles them locally, and CI unpacks the
+# verified smoke artifact (TEMPORAL_PREBUILT_SMOKE=1). Running the binaries
+# directly avoids a `dune exec` rebuild in CI and a held Dune lock locally.
+#
+# Every executable needs an explicit invocation below. An unknown executable is
+# a configuration error rather than a silently skipped suite, and
+# test/smoke/test_live_regressions_contract.sh requires the same membership.
+root=$(CDPATH='' cd -- "$(dirname "$0")/../../../.." && pwd)
+fixture="$root/test/integration/temporal"
+# The digest-pinned base image (docker/ocaml-<series>/Dockerfile). Make passes
+# an already resolved reference; a direct run defaults to the 5.2 series.
+ocaml_image=$(sh "$root/scripts/ocaml-image.sh" "${OCAML_IMAGE:-ocaml-5.2}")
+compose_file="$fixture/compose.yaml"
+project=${TEMPORAL_COMPOSE_PROJECT:-ocaml-temporal-integration}
+# Seconds for one regression process, including its fresh-worker replays. The
+# local-activity fixture also arms its own 120-second alarm; this outer bound
+# guarantees no regression can hang the shared CI job.
+limit=${LIVE_REGRESSION_TIMEOUT_SECONDS:-180}
+address=http://temporal:7233
+evidence="$root/_build/live-regressions"
+# The same bind-mounted file seen from the development container.
+container_cli=/workspace/_build/live-regressions/temporal
+
+[ "$#" -gt 0 ] || { echo "usage: $0 test/integration/<suite>/regression.exe..." >&2; exit 2; }
+for executable in "$@"; do
+  case "$executable" in
+    test/integration/*.exe) ;;
+    *) echo "invalid live regression executable: $executable" >&2; exit 2 ;;
+  esac
+  case "$executable" in *..*) echo "invalid live regression path: $executable" >&2; exit 2 ;; esac
+  test -x "$root/_build/default/$executable" || {
+    echo "missing compiled live regression executable: $executable" >&2
+    exit 1
+  }
+done
+
+# Applies one normalized Compose invocation, matching the other controllers so
+# the existing development image and network are reused rather than rebuilt.
+compose() {
+  OCAML_IMAGE=$ocaml_image \
+    HOST_UID=${HOST_UID:-$(id -u)} HOST_GID=${HOST_GID:-$(id -g)} \
+    docker compose --project-directory "$fixture" --file "$compose_file" \
+      --project-name "$project" --profile temporal "$@"
+}
+
+# Runs one bounded command in the development image on the Compose network as
+# the invoking user, so bind-mounted outputs keep host ownership. HOME points
+# at a writable directory because the numeric user has no passwd entry, and
+# OPAMROOT stays pinned to the image's switch because the image entrypoint
+# (`opam exec --`) would otherwise look for an uninitialised root under HOME.
+in_dev() {
+  seconds=$1
+  shift
+  compose run --rm --no-deps -T \
+    --user "${HOST_UID:-$(id -u)}:${HOST_GID:-$(id -g)}" --env HOME=/tmp \
+    --env OPAMROOT=/home/opam/.opam \
+    dev timeout --signal=TERM --kill-after=10s "$seconds" "$@"
+}
+
+rm -rf "$evidence"
+mkdir -p "$evidence"
+
+# Several fixtures use the `default` namespace, which the plain server image
+# does not create (temporal-start registers only temporal-sdk-test, the
+# namespace the remaining fixtures default to). Reuse the bounded
+# health/namespace probe so registration is idempotent and propagation is
+# awaited.
+compose run --rm --no-deps -T --env TEMPORAL_NAMESPACE=default \
+  --entrypoint /bin/sh temporal-admin-tools /scripts/check-temporal-stack.sh
+
+# Some fixtures inspect or delete only their own executions through the
+# official CLI (those dispatched with cli_argument below). Copy the pinned admin-tools binary into the ignored build tree
+# instead of installing another CLI into the development image, then prove it
+# runs there before any regression depends on it.
+# The single quotes are deliberate: the substitution runs in the container.
+# shellcheck disable=SC2016
+compose run --rm --no-deps -T --entrypoint /bin/sh temporal-admin-tools \
+  -c 'exec cat "$(command -v temporal)"' >"$evidence/temporal.partial"
+mv "$evidence/temporal.partial" "$evidence/temporal"
+chmod 0755 "$evidence/temporal"
+in_dev 60 "$container_cli" --version
+
+# The official-SDK interoperability suite (#517) has a second process in a
+# different image. The OCaml executable hosts the workflow worker and publishes
+# its task queues in ready.json under the shared evidence directory; the
+# pinned `sdk-interop-python` service then runs the official Python SDK driver,
+# which writes python-report.json. This function records the driver's exit
+# status in driver-exit (through a rename, so it is never read half-written),
+# after which the OCaml process checks the reported exact runs through its own
+# client. Both statuses must be zero. The driver's container is bounded by the
+# ordinary per-suite limit; the OCaml process gets one more minute because it
+# outlives the driver to verify its report.
+run_sdk_interop() {
+  interop_evidence="$evidence/sdk_interop"
+  mkdir -p "$interop_evidence"
+  in_dev "$((limit + 60))" "/workspace/_build/default/$1" check "$address" \
+    /workspace/_build/live-regressions/sdk_interop </dev/null &
+  ocaml_pid=$!
+  # Interpolated by compose.yaml into the driver's environment and timeout.
+  OCAML_SDK_VERSION=$ocaml_sdk_version
+  SDK_INTEROP_TIMEOUT_SECONDS=$limit
+  export OCAML_SDK_VERSION SDK_INTEROP_TIMEOUT_SECONDS
+  driver_status=0
+  compose run --rm --no-deps -T sdk-interop-python </dev/null || driver_status=$?
+  printf '%s\n' "$driver_status" >"$interop_evidence/driver-exit.partial"
+  mv "$interop_evidence/driver-exit.partial" "$interop_evidence/driver-exit"
+  ocaml_status=0
+  wait "$ocaml_pid" || ocaml_status=$?
+  printf 'official SDK driver status %s, OCaml check status %s\n' \
+    "$driver_status" "$ocaml_status"
+  [ "$driver_status" -eq 0 ] || return "$driver_status"
+  return "$ocaml_status"
+}
+
+# The OCaml SDK identity recorded in workflow-task history is the package
+# version in SemVer spelling, as rust/core-bridge/src/abi.rs reports it.
+ocaml_sdk_version=$(tr '~' '-' <"$root/.release-version" | tr -d '[:space:]')
+
+failed=''
+for executable in "$@"; do
+  case "$executable" in
+    test/integration/activity_cancellation/regression.exe|\
+    test/integration/bounded_shutdown/regression.exe|\
+    test/integration/client_request_ids/regression.exe|\
+    test/integration/completed_queries/regression.exe|\
+    test/integration/concurrent_client/regression.exe|\
+    test/integration/split_worker_task_types/regression.exe|\
+    test/integration/worker_metrics/regression.exe|\
+    test/integration/worker_resource_options/regression.exe|\
+    test/integration/workflow_start_info/regression.exe)
+      cli_argument='' ;;
+    test/integration/client_policies/regression.exe|\
+    test/integration/interaction_recovery/regression.exe|\
+    test/integration/local_activity_cancellation/regression.exe|\
+    test/integration/non_yielding_workflow/regression.exe|\
+    test/integration/transport_interruption/regression.exe|\
+    test/integration/update_outcomes/regression.exe|\
+    test/integration/update_run_close/regression.exe)
+      cli_argument=$container_cli ;;
+    test/integration/activity_worker_crash/regression.exe)
+      # The CLI path, then the suite's evidence directory (#519) for its
+      # describe snapshots, exact-run history and worker generation logs.
+      cli_argument="$container_cli /workspace/_build/live-regressions/activity_worker_crash" ;;
+    test/integration/sdk_interop/regression.exe)
+      cli_argument='' ;;
+    *)
+      echo "no live regression invocation is defined for $executable" >&2
+      exit 2 ;;
+  esac
+  suite=${executable#test/integration/}
+  suite=${suite%%/*}
+  log="$evidence/$suite.log"
+  printf 'live regression %s: begin\n' "$suite"
+  status=0
+  if [ "$suite" = sdk_interop ]; then
+    run_sdk_interop "$executable" >"$log" 2>&1 || status=$?
+  else
+    # cli_argument is empty or a few paths, none containing whitespace, so
+    # word splitting yields one argument per path.
+    # shellcheck disable=SC2086
+    in_dev "$limit" "/workspace/_build/default/$executable" check "$address" $cli_argument \
+      >"$log" 2>&1 || status=$?
+  fi
+  cat "$log"
+  case "$status" in
+    0) outcome=ok ;;
+    124|137) outcome=timeout ;;
+    *) outcome=failed ;;
+  esac
+  printf 'live regression %s: %s\n' "$suite" "$outcome"
+  # Run every suite so one failure reports all regressions in a single job.
+  [ "$status" -eq 0 ] || failed="$failed $suite"
+done
+
+if [ -n "$failed" ]; then
+  echo "live regressions failed:$failed" >&2
+  exit 1
+fi
+printf 'Live regressions passed. Logs: %s\n' "$evidence"

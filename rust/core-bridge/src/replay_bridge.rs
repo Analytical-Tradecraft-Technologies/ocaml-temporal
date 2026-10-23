@@ -23,7 +23,10 @@ use temporalio_common::protos::{
     coresdk::{
         workflow_activation::WorkflowActivation, workflow_completion::WorkflowActivationCompletion,
     },
-    temporal::api::history::v1::History,
+    temporal::api::{
+        enums::v1::EventType,
+        history::v1::{History, history_event},
+    },
 };
 use temporalio_sdk_core::replay::{
     HistoryFeeder, HistoryForReplay, HistoryInfo, ReplayWorkerInput,
@@ -33,7 +36,8 @@ use tokio::runtime::Handle;
 
 use crate::protocol::{self, MAX_PAYLOAD_BYTES, MAX_STRING_BYTES};
 use crate::worker_bridge::{
-    AdmitError, PollLaneError, PollLanes, ReadinessWait, ReadyTask, WorkerBridgeError,
+    AdmitError, PollLaneError, PollLanes, REPLAY_CORE_WAIT_TIMEOUT, ReadinessWait, ReadyTask,
+    WorkerBridgeError,
 };
 
 /// Closed validation categories used internally before a history can reach
@@ -51,6 +55,20 @@ pub(crate) enum ReplayInputError {
     InvalidProtobuf,
     /// Core's history invariant checks rejected the event sequence.
     InvalidHistory,
+    /// The start event records a workflow ID that differs from the one the
+    /// caller supplied. Replaying under another ID would make
+    /// `Workflow.info` and every ID-derived command differ from the
+    /// recorded execution, producing a false verdict (issue #1046).
+    WorkflowIdMismatch,
+    /// The start event has no task queue. Core's replay poll unwraps it and
+    /// would panic inside a Tokio task, stalling the replay (issue #1047).
+    MissingTaskQueue,
+    /// Event IDs do not run 1, 2, 3, ... without gaps. Core would raise
+    /// "History is out of order" while applying a workflow task.
+    NonContiguousEventIds,
+    /// A `WorkflowTaskStarted` event has no `event_time`. Core would raise a
+    /// fatal machines error while applying that workflow task.
+    MissingWorkflowTaskTimestamp,
 }
 
 impl fmt::Display for ReplayInputError {
@@ -62,6 +80,14 @@ impl fmt::Display for ReplayInputError {
             Self::InvalidEncoding => "replay history payload is not canonical base64",
             Self::InvalidProtobuf => "replay history is not a valid Temporal protobuf",
             Self::InvalidHistory => "replay history failed Core invariant validation",
+            Self::WorkflowIdMismatch => {
+                "replay history records a different workflow ID than the one supplied"
+            }
+            Self::MissingTaskQueue => "replay history start event has no task queue",
+            Self::NonContiguousEventIds => "replay history event IDs are not contiguous from 1",
+            Self::MissingWorkflowTaskTimestamp => {
+                "replay history has a WorkflowTaskStarted event without an event time"
+            }
         };
         formatter.write_str(message)
     }
@@ -69,12 +95,44 @@ impl fmt::Display for ReplayInputError {
 
 impl std::error::Error for ReplayInputError {}
 
+impl ReplayInputError {
+    /// Returns the constant diagnostic that crosses the C ABI for this
+    /// category. Every string is static and input-free, so a hostile history
+    /// or workflow ID can never be echoed through the bridge's error channel.
+    /// The categories a caller can act on get their own sentence; malformed
+    /// documents and Core's own invariant failures share one.
+    pub(crate) fn abi_message(self) -> &'static str {
+        match self {
+            Self::WorkflowIdMismatch => {
+                "Temporal replay history records a different workflow ID than the one supplied"
+            }
+            Self::MissingTaskQueue => "Temporal replay history start event has no task queue",
+            Self::NonContiguousEventIds => {
+                "Temporal replay history event IDs are not contiguous from 1"
+            }
+            Self::MissingWorkflowTaskTimestamp => {
+                "Temporal replay history has a WorkflowTaskStarted event without an event time"
+            }
+            Self::InvalidDocument
+            | Self::InvalidWorkflowId
+            | Self::InvalidEncoding
+            | Self::InvalidProtobuf
+            | Self::InvalidHistory => "Temporal replay history failed strict validation",
+        }
+    }
+}
+
 /// Strict wire representation of one replay history document.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ReplayHistoryDocument {
-    /// Workflow identity is absent from Temporal's History protobuf and must
-    /// be attached by the caller before Core can construct a replay task.
+    /// The execution's workflow ID. Core's replay worker takes it from the
+    /// caller rather than from the history. Since Temporal Server 1.21 the
+    /// start event also records it
+    /// (`WorkflowExecutionStartedEventAttributes.workflow_id`); when that
+    /// field is non-empty the two must match, see
+    /// [`validate_replay_preconditions`]. Older histories leave it empty, so
+    /// the caller's value is then the only source.
     workflow_id: String,
     /// The history's protobuf bytes wrapped in the bridge's binary-safe form.
     history: ReplayPayload,
@@ -125,6 +183,63 @@ fn decode_wire(input: &str) -> Result<ReplayHistoryDocument, ReplayInputError> {
     serde_json::from_str(input).map_err(|_| ReplayInputError::InvalidDocument)
 }
 
+/// Checks the history properties that Core's `HistoryInfo` gate does not
+/// check but that Core relies on later, after the history has left the
+/// bridge's control. Runs after `HistoryInfo::new_from_history` has accepted
+/// `history`, which guarantees a non-empty event list whose first event
+/// carries `WorkflowExecutionStartedEventAttributes`.
+///
+/// Each check turns a failure that Core would otherwise report late, or not
+/// at all, into an invalid-history verdict at admission:
+///
+/// - A start event without a task queue makes Core's replay mock poll
+///   (`HistoryInfo::as_poll_wft_response` at the pinned revision) unwrap
+///   `None` inside a Tokio task. The panic stalls the replay until the
+///   OCaml idle bound reports an unknown verdict (issue #1047). The history
+///   is rejected rather than normalized: a server never records a start
+///   without a task queue, so such input is not a faithful export.
+/// - A recorded workflow ID that differs from the supplied one would replay
+///   the run under the wrong identity (issue #1046). An empty recorded ID,
+///   as in histories from servers before 1.21, is accepted.
+/// - Missing or reordered event IDs, and a `WorkflowTaskStarted` event
+///   without a timestamp, are fatal machine errors in Core. Inside a run's
+///   first workflow task Core auto-fails such a task with eviction reason
+///   `Unspecified` instead of reporting it through a language completion
+///   (issue #1045). The OCaml replay runner classifies that eviction as an
+///   invalid history too, but rejecting the known cases here gives a precise
+///   message and keeps Core's autonomous failure path out of the common
+///   scrubbed-history case. Core numbers events from 1 (its
+///   `last_processed_event` starts at 0), so the expected sequence is 1..n.
+fn validate_replay_preconditions(
+    history: &History,
+    workflow_id: &str,
+) -> Result<(), ReplayInputError> {
+    let Some(history_event::Attributes::WorkflowExecutionStartedEventAttributes(started)) = history
+        .events
+        .first()
+        .and_then(|event| event.attributes.as_ref())
+    else {
+        return Err(ReplayInputError::InvalidHistory);
+    };
+    if !started.workflow_id.is_empty() && started.workflow_id != workflow_id {
+        return Err(ReplayInputError::WorkflowIdMismatch);
+    }
+    if started.task_queue.is_none() {
+        return Err(ReplayInputError::MissingTaskQueue);
+    }
+    for (expected, event) in (1_i64..).zip(history.events.iter()) {
+        if event.event_id != expected {
+            return Err(ReplayInputError::NonContiguousEventIds);
+        }
+        if event.event_type == i32::from(EventType::WorkflowTaskStarted)
+            && event.event_time.is_none()
+        {
+            return Err(ReplayInputError::MissingWorkflowTaskTimestamp);
+        }
+    }
+    Ok(())
+}
+
 /// Converts one validated JSON replay document into Core's replay input.
 ///
 /// `HistoryInfo::new_from_history` is the same invariant gate used by Core's
@@ -132,6 +247,7 @@ fn decode_wire(input: &str) -> Result<ReplayHistoryDocument, ReplayInputError> {
 /// workflow-task boundaries are valid before the history enters the
 /// `HistoryFeeder`; this prevents Core's later history stream assertion from
 /// becoming a panic caused by untrusted bridge input.
+/// [`validate_replay_preconditions`] then adds the checks Core's gate lacks.
 pub(crate) fn decode_history_document(input: &str) -> Result<HistoryForReplay, ReplayInputError> {
     let document = decode_wire(input)?;
     validate_workflow_id(&document.workflow_id)?;
@@ -146,6 +262,7 @@ pub(crate) fn decode_history_document(input: &str) -> Result<HistoryForReplay, R
     if info.orig_run_id().is_empty() {
         return Err(ReplayInputError::InvalidHistory);
     }
+    validate_replay_preconditions(&history, &document.workflow_id)?;
     Ok(HistoryForReplay::new(info, document.workflow_id))
 }
 
@@ -210,6 +327,9 @@ pub(crate) enum ReplayWorkerError {
     PollLane(PollLaneError),
     /// Core could not finalize after all lanes were joined.
     Finalization(WorkerBridgeError),
+    /// A bounded wait on Core elapsed. The payload names the operation with a
+    /// static, input-free label so diagnostics never echo history data.
+    TimedOut(&'static str),
 }
 
 impl fmt::Display for ReplayWorkerError {
@@ -249,8 +369,18 @@ impl fmt::Display for ReplayWorkerError {
                     WorkerBridgeError::OutstandingTasks(_) => "worker has outstanding tasks",
                     WorkerBridgeError::LostPollLease => "worker has an uncompleted poll lease",
                     WorkerBridgeError::WorkerStillShared => "worker ownership was not released",
+                    WorkerBridgeError::CompletionStranded => {
+                        "workflow completion was not processed before Core shut down"
+                    }
+                    WorkerBridgeError::CoreWaitTimedOut => "Core did not respond within its bound",
                 };
                 formatter.write_str(category)
+            }
+            Self::TimedOut(operation) => {
+                write!(
+                    formatter,
+                    "replay {operation} did not finish within its bound"
+                )
             }
         }
     }
@@ -313,7 +443,10 @@ impl ReplayWorker {
     /// The bounded `HistoryFeeder::feed` future is driven on Core's runtime;
     /// no Tokio task retains an OCaml pointer or mutates this owner. The
     /// future may wait for the one-slot queue to drain, which is intentional
-    /// backpressure rather than an unbounded allocation path.
+    /// backpressure rather than an unbounded allocation path. That wait is
+    /// capped by [`REPLAY_CORE_WAIT_TIMEOUT`]: a feeder that Core never drains
+    /// returns [`ReplayWorkerError::TimedOut`] and the history is dropped
+    /// unsent, instead of blocking the supervisor Domain forever.
     pub(crate) fn feed_json(
         &mut self,
         handle: &Handle,
@@ -324,9 +457,13 @@ impl ReplayWorker {
             .feeder
             .as_ref()
             .ok_or(ReplayWorkerError::FeederClosed)?;
-        handle
-            .block_on(feeder.feed(history))
-            .map_err(|_| ReplayWorkerError::FeederClosed)
+        match handle.block_on(async {
+            tokio::time::timeout(REPLAY_CORE_WAIT_TIMEOUT, feeder.feed(history)).await
+        }) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(ReplayWorkerError::FeederClosed),
+            Err(_elapsed) => Err(ReplayWorkerError::TimedOut("history feed")),
+        }
     }
 
     /// Closes the history stream. Core will finish queued histories and then
@@ -358,18 +495,26 @@ impl ReplayWorker {
     }
 
     /// Completes one activation and retires its Core completion debt.
+    ///
+    /// Core's reply is awaited through the bounded replay path (see
+    /// `worker_bridge::complete_workflow_unless_stranded`). An empty
+    /// acknowledgement that Core's terminating replay stream stranded is
+    /// success; any other stranded or overdue completion is a typed
+    /// [`ReplayWorkerError::Finalization`] error rather than a hang
+    /// (issue #965).
     pub(crate) async fn complete_workflow(
         &self,
         completion: WorkflowActivationCompletion,
     ) -> Result<(), ReplayWorkerError> {
         self.lanes
-            .complete_workflow(completion)
+            .complete_replay_workflow(completion)
             .await
             .map_err(ReplayWorkerError::Finalization)
     }
 
     /// Fails one activation that was leased by the replay poll lane but could
-    /// not be represented by the semantic OCaml document.
+    /// not be represented by the semantic OCaml document. A pure cache
+    /// eviction owns no workflow task and is acknowledged empty instead.
     ///
     /// Replay uses the same one-shot completion debt as a live worker. Keeping
     /// this recovery operation on the Rust-owned worker means a malformed
@@ -382,7 +527,7 @@ impl ReplayWorker {
         reason: &'static str,
     ) -> Result<(), ReplayWorkerError> {
         self.lanes
-            .reject_workflow_delivery_with_reason(run_id, reason)
+            .reject_replay_workflow_delivery(run_id, reason)
             .await
             .map_err(ReplayWorkerError::Finalization)
     }
@@ -400,10 +545,25 @@ impl ReplayWorker {
     /// 1. `finish_input` has closed the feeder;
     /// 2. `wait_workflow` has returned `Shutdown`; and
     /// 3. the bridge ledger has no outstanding completion debt.
+    // The error deliberately returns the worker itself so ownership is never
+    // lost on failure; boxing it would only move the same value to the heap.
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn finalize(
         mut self,
         handle: &Handle,
     ) -> Result<(), (Self, ReplayWorkerError)> {
+        if self.lanes.replay_join_timed_out() {
+            // An earlier join timed out, so Core never confirmed shutdown and
+            // its finalizer may block forever. Finalization is success
+            // evidence and cannot be claimed; the caller must dispose, which
+            // releases the worker without Core's finalizer.
+            return Err((
+                self,
+                ReplayWorkerError::PollLane(PollLaneError::Core(
+                    "workflow poll lane did not stop within its bound".to_owned(),
+                )),
+            ));
+        }
         let input_finished = self.feeder.is_none();
         let workflow_shutdown_observed = self.workflow_shutdown_observed;
         let outstanding_tasks = self.lanes.has_outstanding_tasks();
@@ -422,10 +582,15 @@ impl ReplayWorker {
         // replay work. `mark_natural_shutdown` deliberately does not call
         // Core's shutdown token a second time.
         self.lanes.mark_natural_shutdown();
-        let join_result = self.lanes.join_poll_lanes().await;
+        // The lane has already returned after Core's `ShutDown`, so this join
+        // normally completes at once. The replay-aware join is still used for
+        // its bound: a lane that unexpectedly keeps running is aborted and
+        // reported instead of blocking finalization forever.
+        let join_result = self.lanes.join_replay_poll_lane().await;
         if let Err(error) = join_result {
-            // `join_poll_lanes` has already awaited every producer, so no
-            // Tokio task can publish another activation. The lane error still
+            // `join_replay_poll_lane` has consumed the lane handle (aborting
+            // it if it overran its bound), so no Tokio task can publish
+            // another activation. The lane error still
             // requires an explicit disposal sequence: initiate Core shutdown
             // and retire any ledger debt, then return the intact owner to the
             // caller instead of dropping an unfinalized native graph.
@@ -439,6 +604,13 @@ impl ReplayWorker {
             self.lanes.abandon_replay_for_dispose().await;
             return Err((self, ReplayWorkerError::PollLane(error)));
         }
+        // Core's terminal finalizer is awaited without a timeout because the
+        // bound would have to drop the consumed Core worker mid-finalization.
+        // It terminates on this path: Core's workflow processing thread has
+        // left its stream loop (the lane observed `ShutDown`), the replay
+        // worker has no activity or local-activity work, Core's own
+        // `ShutdownWorker` RPC goes to the in-process mock client, and Core
+        // caps its final slot-permit wait at five seconds.
         self.lanes.finalize().await.map_err(|(lanes, error)| {
             (
                 Self {
@@ -465,11 +637,31 @@ impl ReplayWorker {
     /// worker is returned with the typed error instead of being dropped; the
     /// caller must retry disposal or take another explicit ownership-preserving
     /// recovery action.
+    ///
+    /// One case never reaches Core's finalizer. If a lane join hit its bound
+    /// (see `PollLanes::join_replay_poll_lane`), that attempt returns the
+    /// typed lane error, and the next `dispose` releases the graph by
+    /// deliberately leaking the Core worker and returns `Ok`. The leak is
+    /// bounded and documented on `PollLanes::leak_after_replay_join_timeout`.
+    /// The alternative, running Core's unbounded finalizer for a worker whose
+    /// workflow thread did not stop, could block the supervisor or
+    /// `drop_runtime_graph` forever.
+    // The error deliberately returns the worker itself so ownership is never
+    // lost on failure; boxing it would only move the same value to the heap.
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn dispose(
         mut self,
         handle: &Handle,
     ) -> Result<(), (Self, ReplayWorkerError)> {
         self.finish_input();
+        if self.lanes.replay_join_timed_out() {
+            // A previous attempt's lane join hit its bound. Core's finalizer
+            // could block forever, so release the graph by leaking the Core
+            // worker instead (see `PollLanes::leak_after_replay_join_timeout`).
+            // That earlier attempt already returned the typed lane error.
+            self.lanes.leak_after_replay_join_timeout();
+            return Ok(());
+        }
         self.lanes.abandon_replay_for_dispose().await;
         {
             let _runtime_guard = handle.enter();
@@ -528,6 +720,17 @@ impl ReplayWorker {
     #[cfg(test)]
     pub(crate) async fn abort_workflow_lane_for_test(&mut self) {
         self.lanes.abort_workflow_lane_for_test().await;
+    }
+
+    /// Installs a workflow lane that never finishes and shortens the replay
+    /// join bound to `bound`, forcing disposal down its join-timeout path.
+    #[cfg(test)]
+    pub(crate) async fn install_stuck_workflow_lane_for_test(
+        &mut self,
+        bound: std::time::Duration,
+    ) {
+        self.lanes.install_stuck_workflow_lane_for_test().await;
+        self.lanes.set_replay_join_bound_for_test(bound);
     }
 
     /// Exposes the ledger's reject-completion ordering probes so a test can

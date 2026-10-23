@@ -23,12 +23,115 @@ module Options = struct
         default_versioning_behavior : [ `Auto_upgrade | `Pinned ] option;
       }
 
+  type activation_deadline = [ `After of Duration.t | `Disabled ]
+
+  type workflow_task_pollers =
+    | Fixed of int
+    | Autoscaling of { minimum : int; maximum : int; initial : int }
+
+  (* Resource settings (#498) are [None] when the caller left them unset, so
+     the native layer can omit them from the bridge document and keep the
+     exact pre-#498 encoding for a default worker. The accessors below
+     report the effective value, filling in each documented default. *)
   type t = {
     versioning : versioning;
     max_cached_workflows : int option;
+    workflow_activation_deadline : activation_deadline;
+    max_concurrent_workflow_tasks : int option;
+    workflow_task_pollers : workflow_task_pollers option;
+    sticky_queue_schedule_to_start_timeout : Duration.t option;
+    graceful_shutdown_period : Duration.t option;
+    shutdown_teardown_timeout : Duration.t option;
+    max_heartbeat_throttle_interval : Duration.t option;
+    default_heartbeat_throttle_interval : Duration.t option;
+    max_worker_activities_per_second : float option;
+    max_task_queue_activities_per_second : float option;
   }
 
-  let default = { versioning = No_versioning; max_cached_workflows = None }
+  (** Two seconds matches the Python SDK's deadlock-detection timeout and is
+      above Go's one-second default. An activation is one workflow task's
+      worth of work (Core splits a replay into one activation per historical
+      task), so legitimate activations finish far sooner. *)
+  let default_workflow_activation_deadline = `After (Duration.of_ms 2_000L)
+
+  (** Sticky-cache bound used when [max_cached_workflows] is omitted; the
+      private native worker applies the same value. *)
+  let default_max_cached_workflows = 1_000
+
+  (** Workflow-task admission limit used when the option is omitted. *)
+  let default_max_concurrent_workflow_tasks = 1_000
+
+  (** Workflow poller behavior used when the option is omitted: the minimum
+      Core accepts for a caching worker. *)
+  let default_workflow_task_pollers = Fixed 2
+
+  (** Temporal Core's default sticky-queue schedule-to-start timeout,
+      restated so the effective configuration is inspectable. *)
+  let default_sticky_queue_schedule_to_start_timeout = Duration.of_ms 10_000L
+
+  (** Grace period the native worker has always passed to Core. *)
+  let default_graceful_shutdown_period = Duration.of_ms 30_000L
+
+  (** How long shutdown waits for native teardown after the grace period
+      (#495). It covers an ordinary teardown, including one server long poll;
+      the private native worker applies the same value. *)
+  let default_shutdown_teardown_timeout = Duration.of_ms 60_000L
+
+  (** Temporal Core's default longest heartbeat throttle interval. *)
+  let default_max_heartbeat_throttle_interval = Duration.of_ms 60_000L
+
+  (** Temporal Core's default heartbeat throttle interval for activities
+      without a heartbeat timeout. *)
+  let default_default_heartbeat_throttle_interval = Duration.of_ms 30_000L
+
+  let default =
+    {
+      versioning = No_versioning;
+      max_cached_workflows = None;
+      workflow_activation_deadline = default_workflow_activation_deadline;
+      max_concurrent_workflow_tasks = None;
+      workflow_task_pollers = None;
+      sticky_queue_schedule_to_start_timeout = None;
+      graceful_shutdown_period = None;
+      shutdown_teardown_timeout = None;
+      max_heartbeat_throttle_interval = None;
+      default_heartbeat_throttle_interval = None;
+      max_worker_activities_per_second = None;
+      max_task_queue_activities_per_second = None;
+    }
+
+  (** Largest accepted deadline: one hour. A longer stall is indistinguishable
+      from a hung process for any practical liveness probe, and the bound keeps
+      the millisecond value well inside a native [int]. *)
+  let max_workflow_activation_deadline_ms = 3_600_000L
+
+  (** Largest accepted count for any worker resource setting, mirroring the
+      private bridge's allocation guard. *)
+  let max_count = 1_000_000
+
+  (** Largest accepted resource duration: one day, mirroring the bridge. A
+      longer sticky timeout, heartbeat throttle or grace period is far more
+      likely to be a unit mistake than a deliberate policy. *)
+  let max_resource_duration_ms = 86_400_000L
+
+  (** Rejects a zero or over-long watchdog deadline. *)
+  let validate_activation_deadline = function
+    | `Disabled -> Ok ()
+    | `After duration ->
+        let milliseconds = Duration.to_ms duration in
+        if Int64.compare milliseconds 0L <= 0 then
+          Error
+            (Error.defect
+               ~message:
+                 "workflow_activation_deadline must be positive; use \
+                  `Disabled to turn the watchdog off")
+        else if
+          Int64.compare milliseconds max_workflow_activation_deadline_ms > 0
+        then
+          Error
+            (Error.defect
+               ~message:"workflow_activation_deadline exceeds one hour")
+        else Ok ()
 
   (** Checks the bridge's transport-level identifier invariants before an
       option value can be retained by a caller. *)
@@ -54,55 +157,387 @@ module Options = struct
              ~message:
                "max_cached_workflows must be between 0 and 1000000")
 
+  (** Rejects a count below one or above [max_count]. *)
+  let validate_count field value =
+    if value >= 1 && value <= max_count then Ok ()
+    else
+      Error
+        (Error.defect
+           ~message:
+             (Printf.sprintf "%s must be between 1 and %d" field max_count))
+
+  (** Checks the workflow-task resource settings against each other and
+      against Core's rule that a caching worker needs at least two workflow
+      task slots and two workflow pollers: one for its sticky queue and one
+      for the normal queue, so a busy sticky queue cannot starve discovery of
+      new workflows. *)
+  let validate_workflow_resources ~max_cached_workflows
+      ~max_concurrent_workflow_tasks ~workflow_task_pollers =
+    let ( let* ) = Result.bind in
+    let caching =
+      Option.value max_cached_workflows ~default:default_max_cached_workflows
+      > 0
+    in
+    let* () =
+      match max_concurrent_workflow_tasks with
+      | None -> Ok ()
+      | Some value ->
+          let* () = validate_count "max_concurrent_workflow_tasks" value in
+          if caching && value < 2 then
+            Error
+              (Error.defect
+                 ~message:
+                   "max_concurrent_workflow_tasks must be at least 2 when \
+                    max_cached_workflows is greater than zero")
+          else Ok ()
+    in
+    match workflow_task_pollers with
+    | None -> Ok ()
+    | Some (Fixed count) ->
+        let* () = validate_count "workflow_task_pollers" count in
+        if caching && count < 2 then
+          Error
+            (Error.defect
+               ~message:
+                 "workflow_task_pollers must be at least 2 when \
+                  max_cached_workflows is greater than zero")
+        else Ok ()
+    | Some (Autoscaling { minimum; maximum; initial }) ->
+        let* () = validate_count "workflow_task_pollers minimum" minimum in
+        let* () = validate_count "workflow_task_pollers maximum" maximum in
+        if maximum < minimum then
+          Error
+            (Error.defect
+               ~message:"workflow_task_pollers maximum must be at least minimum")
+        else if initial < minimum || initial > maximum then
+          Error
+            (Error.defect
+               ~message:
+                 "workflow_task_pollers initial must be between minimum and \
+                  maximum")
+        else
+          (* Core applies autoscaling bounds to each poll queue separately,
+             so a caching worker always has at least one sticky and one
+             normal poll and needs no extra two-poller rule here. *)
+          Ok ()
+
+  (** Rejects an optional duration outside [minimum_ms] to one day. *)
+  let validate_duration ~minimum_ms field = function
+    | None -> Ok ()
+    | Some duration ->
+        let milliseconds = Duration.to_ms duration in
+        if
+          Int64.compare milliseconds minimum_ms >= 0
+          && Int64.compare milliseconds max_resource_duration_ms <= 0
+        then Ok ()
+        else
+          Error
+            (Error.defect
+               ~message:
+                 (Printf.sprintf "%s must be between %Ld ms and one day" field
+                    minimum_ms))
+
+  (** Smallest per-worker activity rate: one poll per day, matching the
+      other resource bounds. *)
+  let min_worker_rate = 1.0 /. 86_400.0
+
+  (** Rejects a rate that Core or the server would refuse or misread: zero,
+      negative, NaN, infinite or subnormal. *)
+  let validate_rate field = function
+    | None -> Ok ()
+    | Some value when Float.classify_float value = FP_normal && value > 0.0 ->
+        Ok ()
+    | Some _ ->
+        Error (Error.defect ~message:(field ^ " must be a positive finite number"))
+
+  (** Validates the per-worker rate. Core turns it into a poll interval with
+      [Duration::from_secs_f64 (1 / rate)], which panics during worker
+      construction when the reciprocal does not fit a [Duration], so a rate
+      below one poll per day is rejected here instead. *)
+  let validate_worker_rate field value =
+    let ( let* ) = Result.bind in
+    let* () = validate_rate field value in
+    match value with
+    | Some rate when rate < min_worker_rate ->
+        Error
+          (Error.defect
+             ~message:(field ^ " must be at least one per day (1/86400)"))
+    | _ -> Ok ()
+
+  (** Validates every timing and rate setting. Core clips the default
+      heartbeat throttle interval to the maximum, so an explicit default above
+      an explicit maximum is a contradiction reported rather than hidden. *)
+  let validate_timing ~sticky_queue_schedule_to_start_timeout
+      ~graceful_shutdown_period ~shutdown_teardown_timeout
+      ~max_heartbeat_throttle_interval
+      ~default_heartbeat_throttle_interval ~max_worker_activities_per_second
+      ~max_task_queue_activities_per_second =
+    let ( let* ) = Result.bind in
+    let* () =
+      validate_duration ~minimum_ms:1L "sticky_queue_schedule_to_start_timeout"
+        sticky_queue_schedule_to_start_timeout
+    in
+    let* () =
+      validate_duration ~minimum_ms:0L "graceful_shutdown_period"
+        graceful_shutdown_period
+    in
+    let* () =
+      validate_duration ~minimum_ms:0L "shutdown_teardown_timeout"
+        shutdown_teardown_timeout
+    in
+    let* () =
+      validate_duration ~minimum_ms:1L "max_heartbeat_throttle_interval"
+        max_heartbeat_throttle_interval
+    in
+    let* () =
+      validate_duration ~minimum_ms:1L "default_heartbeat_throttle_interval"
+        default_heartbeat_throttle_interval
+    in
+    let* () =
+      match
+        (default_heartbeat_throttle_interval, max_heartbeat_throttle_interval)
+      with
+      | Some default, Some maximum
+        when Int64.compare (Duration.to_ms default) (Duration.to_ms maximum) > 0
+        ->
+          Error
+            (Error.defect
+               ~message:
+                 "default_heartbeat_throttle_interval must not exceed \
+                  max_heartbeat_throttle_interval")
+      | _ -> Ok ()
+    in
+    let* () =
+      validate_worker_rate "max_worker_activities_per_second"
+        max_worker_activities_per_second
+    in
+    validate_rate "max_task_queue_activities_per_second"
+      max_task_queue_activities_per_second
+
+  (** Validates the routing mode's identifiers and its behavior pairing. *)
+  let validate_versioning = function
+    | No_versioning -> Ok ()
+    | Legacy_build_id build_id -> validate_build_id build_id
+    | Deployment_based
+        {
+          deployment_name;
+          build_id;
+          use_worker_versioning;
+          default_versioning_behavior;
+        } -> (
+        let validate_name field value =
+          if String.equal value "" then
+            Error (Error.defect ~message:(field ^ " must not be empty"))
+          else if String.contains value '\000' then
+            Error (Error.defect ~message:(field ^ " must not contain NUL"))
+          else if String.length value > 65_536 then
+            Error (Error.defect ~message:(field ^ " exceeds 65536 bytes"))
+          else Ok ()
+        in
+        match validate_name "deployment_name" deployment_name with
+        | Error _ as error -> error
+        | Ok () -> (
+            match validate_build_id build_id with
+            | Error _ as error -> error
+            | Ok () -> (
+                (* The SDK has no per-workflow behavior API, so every
+                   completion leaves the behavior unspecified and Core
+                   substitutes only a configured worker default. A
+                   versioned worker therefore needs a default; otherwise
+                   every completion would declare the workflow unversioned
+                   (issue #817). *)
+                match (use_worker_versioning, default_versioning_behavior) with
+                | true, Some _ | false, None -> Ok ()
+                | true, None ->
+                    Error
+                      (Error.defect
+                         ~message:
+                           "use_worker_versioning requires \
+                            default_versioning_behavior")
+                | false, Some _ ->
+                    Error
+                      (Error.defect
+                         ~message:
+                           "default_versioning_behavior requires \
+                            use_worker_versioning"))))
+
   (** Builds an immutable option value after validating every user-supplied
       field. Rust repeats these checks because JSON is an independent trust
       boundary, not because callers should normally see duplicate failures. *)
-  let make ?(versioning = No_versioning) ?max_cached_workflows () =
-    let build_id_validation =
-      match versioning with
-      | No_versioning -> Ok ()
-      | Legacy_build_id build_id -> validate_build_id build_id
-      | Deployment_based
-          {
-            deployment_name;
-            build_id;
-            use_worker_versioning;
-            default_versioning_behavior;
-          } ->
-          let validate_name field value =
-            if String.equal value "" then
-              Error (Error.defect ~message:(field ^ " must not be empty"))
-            else if String.contains value '\000' then
-              Error (Error.defect ~message:(field ^ " must not contain NUL"))
-            else if String.length value > 65_536 then
-              Error (Error.defect ~message:(field ^ " exceeds 65536 bytes"))
-            else Ok ()
-          in
-          (match validate_name "deployment_name" deployment_name with
-          | Error _ as error -> error
-          | Ok () -> (
-              match validate_build_id build_id with
-              | Error _ as error -> error
-              | Ok () ->
-                  if use_worker_versioning then Ok ()
-                  else
-                    match default_versioning_behavior with
-                    | None -> Ok ()
-                    | Some _ ->
-                        Error
-                          (Error.defect
-                             ~message:
-                               "default_versioning_behavior requires use_worker_versioning")))
+  let make ?(versioning = No_versioning) ?max_cached_workflows
+      ?(workflow_activation_deadline = default_workflow_activation_deadline)
+      ?max_concurrent_workflow_tasks ?workflow_task_pollers
+      ?sticky_queue_schedule_to_start_timeout ?graceful_shutdown_period
+      ?shutdown_teardown_timeout ?max_heartbeat_throttle_interval
+      ?default_heartbeat_throttle_interval
+      ?max_worker_activities_per_second ?max_task_queue_activities_per_second
+      () =
+    let ( let* ) = Result.bind in
+    let* () = validate_versioning versioning in
+    let* () = validate_cache max_cached_workflows in
+    let* () = validate_activation_deadline workflow_activation_deadline in
+    let* () =
+      validate_workflow_resources ~max_cached_workflows
+        ~max_concurrent_workflow_tasks ~workflow_task_pollers
     in
-    match build_id_validation with
-    | Error _ as error -> error
-    | Ok () ->
-        Result.map
-          (fun () -> { versioning; max_cached_workflows })
-          (validate_cache max_cached_workflows)
+    let* () =
+      validate_timing ~sticky_queue_schedule_to_start_timeout
+        ~graceful_shutdown_period ~shutdown_teardown_timeout
+        ~max_heartbeat_throttle_interval ~default_heartbeat_throttle_interval
+        ~max_worker_activities_per_second ~max_task_queue_activities_per_second
+    in
+    Ok
+      {
+        versioning;
+        max_cached_workflows;
+        workflow_activation_deadline;
+        max_concurrent_workflow_tasks;
+        workflow_task_pollers;
+        sticky_queue_schedule_to_start_timeout;
+        graceful_shutdown_period;
+        shutdown_teardown_timeout;
+        max_heartbeat_throttle_interval;
+        default_heartbeat_throttle_interval;
+        max_worker_activities_per_second;
+        max_task_queue_activities_per_second;
+      }
 
   let versioning options = options.versioning
   let max_cached_workflows options = options.max_cached_workflows
+
+  let workflow_activation_deadline options =
+    options.workflow_activation_deadline
+
+  let max_concurrent_workflow_tasks options =
+    Option.value options.max_concurrent_workflow_tasks
+      ~default:default_max_concurrent_workflow_tasks
+
+  let workflow_task_pollers options =
+    Option.value options.workflow_task_pollers
+      ~default:default_workflow_task_pollers
+
+  let sticky_queue_schedule_to_start_timeout options =
+    Option.value options.sticky_queue_schedule_to_start_timeout
+      ~default:default_sticky_queue_schedule_to_start_timeout
+
+  let graceful_shutdown_period options =
+    Option.value options.graceful_shutdown_period
+      ~default:default_graceful_shutdown_period
+
+  let shutdown_teardown_timeout options =
+    Option.value options.shutdown_teardown_timeout
+      ~default:default_shutdown_teardown_timeout
+
+  let max_heartbeat_throttle_interval options =
+    Option.value options.max_heartbeat_throttle_interval
+      ~default:default_max_heartbeat_throttle_interval
+
+  (* Core applies [min default maximum], so report that effective value. *)
+  let default_heartbeat_throttle_interval options =
+    let default =
+      Option.value options.default_heartbeat_throttle_interval
+        ~default:default_default_heartbeat_throttle_interval
+    in
+    let maximum = max_heartbeat_throttle_interval options in
+    if Int64.compare (Duration.to_ms default) (Duration.to_ms maximum) > 0 then
+      maximum
+    else default
+
+  let max_worker_activities_per_second options =
+    options.max_worker_activities_per_second
+
+  let max_task_queue_activities_per_second options =
+    options.max_task_queue_activities_per_second
+
+  (** Converts the explicit resource settings into the private bridge's
+      tuning record. Unset settings stay [None] so the bridge omits them. *)
+  let native_tuning options : Temporal_sdk_kernel.Bridge.worker_tuning =
+    let milliseconds = Option.map Duration.to_ms in
+    {
+      workflow_task_poller_autoscaling =
+        (match options.workflow_task_pollers with
+        | Some (Autoscaling { minimum; maximum; initial }) ->
+            Some { minimum; maximum; initial }
+        | Some (Fixed _) | None -> None);
+      sticky_queue_schedule_to_start_timeout_ms =
+        milliseconds options.sticky_queue_schedule_to_start_timeout;
+      max_heartbeat_throttle_interval_ms =
+        milliseconds options.max_heartbeat_throttle_interval;
+      default_heartbeat_throttle_interval_ms =
+        milliseconds options.default_heartbeat_throttle_interval;
+      max_worker_activities_per_second =
+        options.max_worker_activities_per_second;
+      max_task_queue_activities_per_second =
+        options.max_task_queue_activities_per_second;
+    }
+
+  (** The workflow poller maximum Core receives: the fixed count, or the
+      autoscaling maximum that the bridge requires to match it. *)
+  let native_workflow_task_polls options =
+    match workflow_task_pollers options with
+    | Fixed count -> count
+    | Autoscaling { maximum; _ } -> maximum
+end
+
+(** Worker liveness as observed by the workflow activation watchdog. *)
+module Health = struct
+  type abandonment =
+    [ `Task_failed | `Queries_failed | `Eviction_acknowledged | `Not_acknowledged ]
+
+  type stuck_workflow_activation = {
+    workflow_type : string option;
+    workflow_id : string option;
+    run_id : string;
+    is_replaying : bool;
+    elapsed : Duration.t;
+    abandoned : abandonment;
+  }
+
+  type t = Healthy | Stuck_workflow_activation of stuck_workflow_activation
+end
+
+(** What a bounded worker shutdown abandoned (#495). *)
+module Shutdown_report = struct
+  type teardown = [ `Completed | `Detached ]
+
+  type t = {
+    elapsed : Duration.t;
+    lanes_stopped : bool;
+    abandoned_activity_callbacks : int;
+    abandoned_workflow_activations : int;
+    native_teardown : teardown;
+  }
+
+  (** The report of a backend with nothing to abandon, such as the mock. *)
+  let clean ~elapsed =
+    {
+      elapsed;
+      lanes_stopped = true;
+      abandoned_activity_callbacks = 0;
+      abandoned_workflow_activations = 0;
+      native_teardown = `Completed;
+    }
+
+  let is_clean report =
+    report.lanes_stopped
+    && report.abandoned_activity_callbacks = 0
+    && report.abandoned_workflow_activations = 0
+    && report.native_teardown = `Completed
+
+  (** Converts the private orchestration report. Elapsed time is rounded up
+      to whole milliseconds so a non-zero wait never reads as zero. *)
+  let of_native (report : Temporal_sdk_kernel.Native_worker_shutdown.report) =
+    {
+      elapsed =
+        Duration.of_ms (Int64.of_float (Float.ceil (report.elapsed_s *. 1_000.)));
+      lanes_stopped = report.lanes_stopped;
+      abandoned_activity_callbacks = report.abandoned_activity_callbacks;
+      abandoned_workflow_activations = report.abandoned_workflow_activations;
+      native_teardown =
+        (match report.teardown with
+        | Temporal_sdk_kernel.Native_worker_shutdown.Completed -> `Completed
+        | Temporal_sdk_kernel.Native_worker_shutdown.Detached -> `Detached);
+    }
 end
 
 (** Heterogeneous activity registration package. *)
@@ -182,19 +617,25 @@ type t = {
   workflows : workflow_entry Name_map.t;
   (* Activity definitions follow the same immutable name-based lookup rule. *)
   activities : activity_entry Name_map.t;
+  (* The validated options this worker was created with, retained only so
+     [options] can report the effective configuration (#498). *)
+  options : Options.t;
   (* This atomic gate records shutdown admission without holding a lock while
      backend polling blocks, allowing repeated shutdown calls to be harmless. *)
   closed : bool Atomic.t;
+  (* Sticky, non-blocking stop request posted by [request_shutdown] (#830).
+     Unlike [closed] it does not admit teardown; it only makes [run] return so
+     the caller can then run [shutdown]. Written only by one [Atomic.set], so it
+     is safe from a signal handler on any Domain. *)
+  stop_requested : bool Atomic.t;
   (* Serializes the first teardown with later callers that need the cached
      result, matching [Client.shutdown]. *)
   shutdown_mutex : Mutex.t;
   (* The first terminal shutdown outcome is retained so every caller observes
-     the same result, including a permanent native teardown error. *)
-  mutable shutdown_result : (unit, Error.t) result option;
+     the same result, including a permanent native teardown error and the
+     report of what a bounded shutdown abandoned (#495). *)
+  mutable shutdown_result : (Shutdown_report.t, Error.t) result option;
 }
-
-(** Stable default identity for worker diagnostics. *)
-let default_identity = "ocaml-temporal-worker"
 
 (** Rejects empty or NUL-containing worker settings before backend allocation. *)
 let validate_name field value =
@@ -277,24 +718,15 @@ let collect_activities definitions =
 
 (** Creates the private backend only after all local registration invariants are
     proven. This ordering prevents leaked graphs on invalid definitions. *)
-let resolve_options options max_cached_workflows =
-  match (options, max_cached_workflows) with
-  | Some _, Some _ ->
-      Error
-        (Error.defect
-           ~message:
-             "Worker.create accepts either ~options or ~max_cached_workflows, not both")
-  | Some options, None -> Ok options
-  | None, Some max_cached_workflows ->
-      Options.make ~max_cached_workflows ()
-  | None, None -> Ok Options.default
-
-let create ?(identity = default_identity) ?options ?max_cached_workflows
+let create ?identity ?(options = Options.default) ?io_threads ?runtime
     ~target_url
     ~namespace ~task_queue ~workflows ~activities () =
-  match resolve_options options max_cached_workflows with
+  match Backend.validate_io_threads io_threads with
   | Error error -> Error error
-  | Ok options ->
+  | Ok () ->
+  match Backend.validate_runtime_source ~io_threads ~runtime with
+  | Error error -> Error error
+  | Ok () ->
     let effective_max_cached_workflows =
       Options.max_cached_workflows options
     in
@@ -322,6 +754,10 @@ let create ?(identity = default_identity) ?options ?max_cached_workflows
                   default_versioning_behavior;
             }
     in
+  (* An omitted identity is derived once per worker as [<pid>@<hostname>] so
+     pollers from different processes are distinguishable in Temporal. This
+     is worker construction, not workflow code, so process state is safe. *)
+  let identity = Temporal_base.Process_identity.resolve identity in
   match validate_name "namespace" namespace with
   | Error error -> Error error
   | Ok () -> (
@@ -346,19 +782,40 @@ let create ?(identity = default_identity) ?options ?max_cached_workflows
                       let activity_names =
                         Name_map.bindings activities |> List.map fst
                       in
-                      if String.starts_with ~prefix:"mock://" target_url then
+                      let async_activity =
+                        Name_map.bindings activities
+                        |> List.find_map
+                             (fun (name, Activity_entry { async_implementation; _ }) ->
+                               Option.map (fun _ -> name) async_implementation)
+                      in
+                      (* The mock backend has no Temporal task token to retain
+                         for a later asynchronous completion, so reject such a
+                         registration at construction rather than failing each
+                         task during [run]. *)
+                      if String.starts_with ~prefix:"mock://" target_url
+                         && Option.is_some async_activity
+                      then
+                        Error
+                          (Error.defect
+                             ~message:
+                               ("asynchronous activity "
+                               ^ Option.get async_activity
+                               ^ " requires the native worker backend"))
+                      else if String.starts_with ~prefix:"mock://" target_url then
                         Result.map
                           (fun backend ->
                             {
                               backend = Mock_backend backend;
                               workflows;
                               activities;
+                              options;
                               closed = Atomic.make false;
+                              stop_requested = Atomic.make false;
                               shutdown_mutex = Mutex.create ();
                               shutdown_result = None;
                             })
-                          (Backend.worker_create config ~workflow_names
-                             ~activity_names)
+                          (Backend.worker_create ?runtime config
+                             ~workflow_names ~activity_names)
                       else
                         let native_workflows =
                           Name_map.bindings workflows
@@ -384,9 +841,28 @@ let create ?(identity = default_identity) ?options ?max_cached_workflows
                                      Native_worker.register_activity
                                        (Activity_private.to_base definition))
                         in
+                        let activation_deadline_ms =
+                          match Options.workflow_activation_deadline options with
+                          | `Disabled -> None
+                          | `After duration ->
+                              (* Validated to at most one hour by [Options]. *)
+                              Some (Int64.to_int (Duration.to_ms duration))
+                        in
                         let native_result =
                           Native_worker.create
                             ?max_cached_workflows:effective_max_cached_workflows
+                            ~max_outstanding_workflow_tasks:
+                              (Options.max_concurrent_workflow_tasks options)
+                            ~max_concurrent_workflow_task_polls:
+                              (Options.native_workflow_task_polls options)
+                            ~graceful_shutdown_timeout_ms:
+                              (Duration.to_ms
+                                 (Options.graceful_shutdown_period options))
+                            ~shutdown_teardown_timeout_ms:
+                              (Duration.to_ms
+                                 (Options.shutdown_teardown_timeout options))
+                            ~tuning:(Options.native_tuning options)
+                            ?io_threads ?runtime ?activation_deadline_ms
                             ~versioning:native_versioning ~target_url
                             ~namespace ~identity
                             ~task_queue ~workflows:native_workflows
@@ -399,7 +875,9 @@ let create ?(identity = default_identity) ?options ?max_cached_workflows
                               backend = Native_backend backend;
                               workflows;
                               activities;
+                              options;
                               closed = Atomic.make false;
+                              stop_requested = Atomic.make false;
                               shutdown_mutex = Mutex.create ();
                               shutdown_result = None;
                             })
@@ -457,6 +935,9 @@ let dispatch_activity worker task =
           let result =
             match async_implementation with
             | Some _ ->
+                (* Unreachable through [create], which rejects asynchronous
+                   registrations for the mock backend; kept so dispatch never
+                   invokes a callback without a native completion lease. *)
                 Error
                   (Error.make ~non_retryable:true ~category:`Activity
                      ~message:
@@ -536,6 +1017,10 @@ let run_mock worker backend =
        so observing shutdown on one stream cannot discard work on the other. *)
     let rec loop workflow_shutdown activity_shutdown =
       if workflow_shutdown && activity_shutdown then Ok ()
+      else if Atomic.get worker.stop_requested then
+        (* A stop request ends polling between tasks, like the native loop's
+           stop check; every task taken so far has already been completed. *)
+        Ok ()
       else
         let workflow_result =
           if workflow_shutdown then Ok Backend.Shutdown
@@ -584,17 +1069,78 @@ let run worker =
     | Native_backend backend ->
         Native_worker.run backend |> Result.map_error Error_private.of_base
 
-(** Shuts down the backend once and remembers that no new poll may be admitted. *)
-let shutdown worker =
+(** Returns the immutable options value retained at construction. *)
+let options worker = worker.options
+
+(** Reads the sticky watchdog report without taking any lock, so a liveness
+    probe can call it while the workflow lane is stuck. The mock backend runs
+    no watchdog and is always healthy. *)
+let health worker =
+  match worker.backend with
+  | Mock_backend _ -> Health.Healthy
+  | Native_backend backend -> (
+      match Native_worker.stuck_activation backend with
+      | None -> Health.Healthy
+      | Some
+          {
+            run_id;
+            workflow_id;
+            workflow_type;
+            is_replaying;
+            elapsed_ms;
+            abandoned;
+          } ->
+          Health.Stuck_workflow_activation
+            {
+              workflow_type;
+              workflow_id;
+              run_id;
+              is_replaying;
+              elapsed = Duration.of_ms (Int64.of_int (Int.max 0 elapsed_ms));
+              abandoned;
+            })
+
+(** Asks [run] to return without waiting for it (#830). The function performs
+    only atomic writes to cells allocated with the worker: no lock, I/O,
+    logging, or supervisor message. That makes it safe to call from an OCaml
+    signal handler, which runs at a safe point of whichever thread the runtime
+    picks, possibly the run loop's own thread inside a workflow activation. *)
+let request_shutdown worker =
+  Atomic.set worker.stop_requested true;
+  match worker.backend with
+  | Native_backend backend -> Native_worker.request_stop backend
+  | Mock_backend _ -> ()
+
+(** Shuts down the backend once and remembers that no new poll may be admitted.
+
+    The execution-thread check deliberately precedes [shutdown_mutex] (#764).
+    A concurrent external caller may hold that mutex while it waits for the
+    native run loop to exit; a workflow or activity callback on that loop which
+    then blocked on the same mutex would never return to let the loop exit. The
+    check is per system thread rather than per Domain (#763), so a sibling
+    thread of the run loop's Domain proceeds and waits like any other caller.
+    Callers that pass the check are serialized by the mutex: the first one
+    performs teardown and later ones return its cached terminal result. The
+    native teardown is bounded (#495), so the mutex is never held longer than
+    the worker's grace period plus its teardown timeout. *)
+let shutdown_with_report worker =
   if
     match worker.backend with
-    | Native_backend backend -> Native_worker.is_execution_domain backend
+    | Native_backend backend -> Native_worker.is_execution_thread backend
     | Mock_backend _ -> false
-  then
+  then begin
+    (* This thread cannot wait for its own loop, but it can ask that loop to
+       return. An OCaml signal handler that runs on the run loop's thread lands
+       here too, so posting the request lets a natural SIGTERM handler stop the
+       worker (#830); the caller completes teardown after [run] returns. *)
+    request_shutdown worker;
     Error
       (Error.defect
          ~message:
-           "cannot shut down a worker from one of its execution Domains")
+           "cannot shut down a worker from inside its own workflow or activity \
+            execution thread; a stop was requested instead, so call shutdown \
+            again after run returns")
+  end
   else begin
   Mutex.lock worker.shutdown_mutex;
   Fun.protect
@@ -608,7 +1154,7 @@ let shutdown worker =
             match worker.backend with
             | Mock_backend backend -> (
                 match Backend.worker_shutdown backend with
-                | Ok () as result -> result
+                | Ok () -> Ok (Shutdown_report.clean ~elapsed:(Duration.of_ms 0L))
                 | Error _ as error ->
                     (* The mock backend can retry a failed shutdown admission. *)
                     Atomic.set worker.closed false;
@@ -616,13 +1162,15 @@ let shutdown worker =
             | Native_backend backend -> (
                 let result =
                   Native_worker.shutdown backend
+                  |> Result.map Shutdown_report.of_native
                   |> Result.map_error Error_private.of_base
                 in
                 match result with
-                | Ok () as result -> result
+                | Ok _ as result -> result
                 | Error _ as error ->
-                    (* Native adapter-drain failures are retryable only when the
-                       private supervisor explicitly says teardown did not begin. *)
+                    (* Only the execution-thread admission defect is
+                       retryable: every admitted bounded shutdown is
+                       terminal. *)
                     if Native_worker.shutdown_retryable backend then
                       Atomic.set worker.closed false;
                     error)
@@ -632,3 +1180,7 @@ let shutdown worker =
           if Atomic.get worker.closed then worker.shutdown_result <- Some result;
           result)
   end
+
+(** The report-free form of {!shutdown_with_report}, sharing its cached
+    terminal result. *)
+let shutdown worker = Result.map ignore (shutdown_with_report worker)

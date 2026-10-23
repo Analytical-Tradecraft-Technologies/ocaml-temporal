@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/acceptance/patch-replay-controller.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/acceptance/patch-replay-controller.schema.json",
   "title": "Workflow-patch replay controller evidence",
   "description": "A payload-free, ordered account of three live source-replacement scenarios. They prove marker-free patch-in replay, active-marker deprecation replay, and deprecated-marker replay after all patch calls are removed. The shell validator also compares every root identity, exact marker state, and cross-event relationship that JSON Schema cannot express alone.",
   "type": "object",

@@ -10,6 +10,15 @@
 
 module Protocol = Temporal_protocol.Workflow_protocol
 module Failure_diagnostic = Temporal_protocol.Failure_diagnostic
+module Encoded_completion = Temporal_protocol.Encoded_workflow_completion
+
+(** See the interface. The wrapper is the single place the adapter invokes
+    the completion encoder, so live codec attribution counts every pass. *)
+let encode_completion completion =
+  Temporal_base.Observability.debug_timed
+    ~src:Temporal_base.Observability.Source.bridge
+    ~operation:"workflow_completion_encode" (fun () ->
+      Encoded_completion.encode completion)
 
 (** Result-bind notation keeps every boundary conversion on the typed error
     path; no protocol or runtime input is handled with an exception. *)
@@ -49,8 +58,21 @@ type translated_activation = {
   cancellation_reason : string option;
   cache_removal : cache_removal option;
   jobs : Activation.job list;
+  source : Protocol.activation;
 }
-(** A protocol activation after its jobs have been converted to runtime jobs. *)
+(** A protocol activation after its jobs have been converted to runtime jobs.
+    [source] is the validated activation the record was built from; it is kept
+    by reference (no copy) so [activate_translated] can check query answers
+    against it without translating or validating the activation again. *)
+
+type encoded_completion = {
+  completion : Protocol.completion;
+  encoded : Encoded_completion.t;
+}
+(** A checked completion together with the canonical bytes its single encoder
+    pass produced. [completion] still aliases payload buffers owned by the
+    execution; [encoded] is an immutable snapshot and is what a worker submits
+    and retains. *)
 
 (** Copies a translation error into its stable public diagnostic shape. *)
 let error_view (error : error) : error_view =
@@ -63,10 +85,6 @@ let make_error code path message : error = { code; path; message }
 (** Errors caused by a malformed value constructed by the caller or decoded by a
     peer. The protocol validator supplies the same code for JSON failures. *)
 let invalid path message = make_error "invalid_message" path message
-
-(** Errors caused by a value that is valid in one layer but has no exact
-    representation in the other layer. *)
-let unsupported path message = make_error "unsupported" path message
 
 (** Converts the protocol module's privacy-safe diagnostic without exposing any
     of its internal error representation. *)
@@ -95,6 +113,20 @@ let validate_identifier path value : (unit, error) result =
     Error (invalid path "identifier exceeds 65536 bytes")
   else if not (Temporal_base.Codec.valid_utf_8 value) then
     Error (invalid path "identifier must be valid UTF-8")
+  else Ok ()
+
+(** Validates an outbound payload metadata key against the bridge protocol's
+    own rule: non-empty, valid UTF-8 and at most 65536 bytes. Unlike a
+    Temporal identifier, a key may contain NUL, because the inbound
+    conversion carries keys written by other SDKs unchanged (#1048) and such
+    a payload must be returnable, heartbeated or reused without rejection. *)
+let validate_metadata_key path value : (unit, error) result =
+  if String.length value = 0 then
+    Error (invalid path "metadata key must not be empty")
+  else if String.length value > 65_536 then
+    Error (invalid path "metadata key exceeds 65536 bytes")
+  else if not (Temporal_base.Codec.valid_utf_8 value) then
+    Error (invalid path "metadata key must be valid UTF-8")
   else Ok ()
 
 (** Validates a bounded text field whose empty value is meaningful.  Signal
@@ -172,9 +204,15 @@ let rec copy_failure (value : Protocol.failure) : Protocol.failure =
     | Protocol.Timeout_failure ({ last_heartbeat_details; _ } as info) ->
         Protocol.Timeout_failure
           { info with last_heartbeat_details = copy_payloads last_heartbeat_details }
+    | Protocol.Reset_workflow { last_heartbeat_details } ->
+        Protocol.Reset_workflow
+          { last_heartbeat_details = copy_payloads last_heartbeat_details }
     | Protocol.Activity _ as info -> info
     | Protocol.Terminated _ as info -> info
     | Protocol.Child_workflow _ as info -> info
+    | ( Protocol.Server _ | Protocol.Nexus_operation _ | Protocol.Nexus_handler _
+      | Protocol.Absent ) as info ->
+        info
   in
   Protocol.
     {
@@ -213,40 +251,33 @@ let copy_initialize_context (value : Protocol.initialize_context) =
       continuation = Option.map copy_continuation value.continuation;
     }
 
-(** Converts one protocol payload into the runtime payload type. Runtime codecs
-    intentionally expose metadata values as strings; a binary metadata value
-    therefore cannot be represented losslessly and is reported as an explicit
-    unsupported boundary instead of being silently decoded with a replacement
-    character. *)
-let runtime_payload path (value : Protocol.payload) =
-  let rec metadata_loop reversed = function
-    | [] -> Ok (List.rev reversed)
-    | (key, bytes) :: rest ->
-        let* () = validate_identifier (path ^ ".metadata.key") key in
-        let value = Bytes.to_string bytes in
-        if not (Temporal_base.Codec.valid_utf_8 value) then
-          Error
-            (unsupported
-               (path ^ ".metadata." ^ key)
-               "binary metadata is not representable by the runtime string \
-                metadata type")
-        else metadata_loop ((key, value) :: reversed) rest
+(** Converts one protocol payload into the runtime payload type.
+
+    Temporal payload metadata values are arbitrary bytes, and an OCaml
+    [string] is a byte string, so every value is carried losslessly (#1048).
+    Keys are copied as the protocol decoder accepted them: it has already
+    bounded their length, and a key written by another SDK may legitimately
+    contain bytes the outbound identifier rule forbids. Rejecting such a
+    payload here would fail every workflow task of the run, because the same
+    immutable history is replayed on each retry, so inbound conversion never
+    fails. *)
+let runtime_payload _path (value : Protocol.payload) =
+  let metadata =
+    List.map (fun (key, bytes) -> (key, Bytes.to_string bytes)) value.metadata
   in
-  let* metadata = metadata_loop [] value.metadata in
   Ok { Temporal_base.Payload.metadata; data = Bytes.copy value.data }
 
 (** Converts a runtime payload back to the protocol's binary-safe payload.
     Copying both metadata bytes and the body makes ownership independent of the
-    mutable [bytes] values held by workflow code. *)
+    mutable [bytes] values held by workflow code. Keys keep the strict
+    identifier rule for values the SDK sends; values may be any bytes, so a
+    payload received from Temporal can be returned or forwarded unchanged. *)
 let protocol_payload path (value : Temporal_base.Codec.payload) =
   let rec metadata_loop reversed = function
     | [] -> Ok (List.rev reversed)
     | (key, text) :: rest ->
-        let* () = validate_identifier (path ^ ".metadata.key") key in
-        if not (Temporal_base.Codec.valid_utf_8 text) then
-          Error
-            (invalid (path ^ ".metadata." ^ key) "metadata must be valid UTF-8")
-        else metadata_loop ((key, Bytes.of_string text) :: reversed) rest
+        let* () = validate_metadata_key (path ^ ".metadata.key") key in
+        metadata_loop ((key, Bytes.of_string text) :: reversed) rest
   in
   let* metadata = metadata_loop [] value.metadata in
   Ok { Protocol.metadata; data = Bytes.copy value.data }
@@ -259,6 +290,22 @@ let null_runtime_payload : Temporal_base.Codec.payload =
     Temporal_base.Payload.metadata = [ ("encoding", "binary/null") ];
     data = Bytes.empty;
   }
+
+(** Converts the argument list of a child-workflow or continue-as-new command
+    into Core's repeated input payloads, validating each one. The public layer
+    has already applied the codec-decided rule: a [Codec.unit] input is zero
+    payloads, matching other SDKs, and any other input (an option's [None]
+    included) is one payload (#1012). OCaml workflow starts decode [[]] back
+    to the unit payload. Core compares only the workflow type when replaying
+    these commands, so histories recorded under either rule still replay. *)
+let protocol_input path input =
+  let rec loop reversed = function
+    | [] -> Ok (List.rev reversed)
+    | payload :: rest ->
+        let* payload = protocol_payload path payload in
+        loop (payload :: reversed) rest
+  in
+  loop [] input
 
 (** Recognizes the same canonical null marker after conversion to protocol
     payload bytes. *)
@@ -281,9 +328,13 @@ let failure_details (failure : Protocol.failure) =
       | Protocol.Application { details; _ } | Protocol.Canceled { details; _ }
         ->
           List.rev_append details reversed
-      | Protocol.Timeout_failure { last_heartbeat_details; _ } ->
+      | Protocol.Timeout_failure { last_heartbeat_details; _ }
+      | Protocol.Reset_workflow { last_heartbeat_details } ->
           List.rev_append last_heartbeat_details reversed
-      | Protocol.Activity _ | Protocol.Child_workflow _ | Protocol.Terminated _ -> reversed
+      | Protocol.Activity _ | Protocol.Child_workflow _ | Protocol.Terminated _
+      | Protocol.Server _ | Protocol.Nexus_operation _ | Protocol.Nexus_handler _
+      | Protocol.Absent ->
+          reversed
     in
     match value.cause with
     | Some cause when depth < 128 -> loop (depth + 1) reversed cause
@@ -292,8 +343,10 @@ let failure_details (failure : Protocol.failure) =
   loop 0 [] failure
 
 (** Converts one protocol failure to the broad typed error used by workflow
-    futures. The error view retains the primary category and details, while the
-    protocol's richer recursive fields are included in its diagnostic. *)
+    futures. The error view retains the primary category, details, and the
+    innermost application failure type (so OCaml code can branch on a business
+    error type raised by an activity or child in any SDK), while the protocol's
+    richer recursive fields are included in its diagnostic. *)
 let runtime_error_of_failure path ~category (failure : Protocol.failure) =
   let rec details_loop reversed = function
     | [] -> Ok (List.rev reversed)
@@ -304,8 +357,9 @@ let runtime_error_of_failure path ~category (failure : Protocol.failure) =
   let details = failure_details failure in
   let* details = details_loop [] details in
   let non_retryable = Protocol.failure_non_retryable failure in
+  let error_type = Failure_diagnostic.application_failure_type failure in
   Ok
-    (Temporal_base.Error.make ~non_retryable ~details ~category
+    (Temporal_base.Error.make ~non_retryable ?error_type ~details ~category
        ~message:(Failure_diagnostic.failure_diagnostic failure)
        ())
 
@@ -646,7 +700,9 @@ let runtime_job path = function
 
 (** Validates one activation through the canonical semantic codec. This keeps
     direct OCaml construction subject to the same closed-object, payload-size,
-    timestamp, and ordering rules as Rust input. *)
+    timestamp, and ordering rules as Rust input. It runs once per
+    [translate_activation] call, and the worker translates each activation
+    once. *)
 let validate_activation value =
   match Protocol.encode_activation value with
   | Ok _ -> Ok ()
@@ -678,6 +734,7 @@ let translate_activation (value : Protocol.activation) =
             cancellation_reason = !cancellation_reason;
             cache_removal = !cache_removal;
             jobs = List.rev reversed;
+            source = value;
           }
     | job :: rest ->
         let path = Printf.sprintf "$.jobs[%d]" index in
@@ -765,8 +822,11 @@ let protocol_child_cancellation_type = function
       Protocol.Child_wait_cancellation_requested
 
 (** Converts the broad runtime error into the protocol's structured failure
-    shape. Category and retryability remain explicit in the application-info
-    variant, while details are copied as binary-safe protocol payloads. *)
+    shape. Retryability remains explicit in the application-info variant, and
+    its [type] is the error's explicit application type or, when absent, the
+    category label, so untyped errors keep their historical wire type. Details
+    are copied as binary-safe protocol payloads. [source] is the SDK-wide
+    ["ocaml-temporal"] marker shared with activity failures. *)
 let protocol_failure path (error : Temporal_base.Error.t) =
   let view = Temporal_base.Error.view error in
   let rec details_loop reversed = function
@@ -782,7 +842,7 @@ let protocol_failure path (error : Temporal_base.Error.t) =
     | _ ->
         Protocol.Application
           {
-            type_name = Temporal_base.Error.kind error;
+            type_name = Temporal_base.Error.application_failure_type error;
             non_retryable = view.non_retryable;
             details;
             category = Protocol.Application_category_unspecified;
@@ -793,7 +853,7 @@ let protocol_failure path (error : Temporal_base.Error.t) =
     Protocol.
       {
         message = bounded_protocol_message view.message;
-        source = "ocaml";
+        source = "ocaml-temporal";
         stack_trace = "";
         encoded_attributes = None;
         cause = None;
@@ -1036,7 +1096,7 @@ let command_to_protocol command =
         | Activation.Parent_terminate -> Protocol.Parent_terminate
         | Activation.Parent_abandon -> Protocol.Parent_abandon
         | Activation.Parent_request_cancel -> Protocol.Parent_request_cancel) parent_close_policy in
-      let* input = protocol_payload "$.command.input" input in
+      let* input = protocol_input "$.command.input" input in
       let* retry_policy =
         match retry_policy with
         | None -> Ok None
@@ -1075,7 +1135,7 @@ let command_to_protocol command =
              workflow_id = id;
              workflow_type = name;
              task_queue; parent_close_policy;
-             input = [ input ];
+             input;
              retry_policy;
              cancellation_type = protocol_child_cancellation_type cancellation_type;
            })
@@ -1197,15 +1257,17 @@ let command_to_protocol command =
       Ok (Protocol.Fail_workflow { failure })
   | Activation.Continue_as_new { workflow_type; input } ->
       let* () = validate_identifier "$.command.workflow_type" workflow_type in
-      let* input = protocol_payload "$.command.input" input in
-      Ok (Protocol.Continue_as_new { workflow_type; input = [ input ] })
+      let* input = protocol_input "$.command.input" input in
+      Ok (Protocol.Continue_as_new { workflow_type; input })
   | Activation.Cancel_workflow_execution ->
       Ok Protocol.Cancel_workflow_execution
 
-(** Converts an ordered command list and lets the canonical protocol encoder
-    re-check terminal ordering, run-id bounds, payload limits, and all nested
-    fields before returning it to the bridge. *)
-let completion_of_commands ~run_id commands =
+(** Converts an ordered command list into a completion and runs the canonical
+    protocol encoder over it exactly once. The encoder re-checks terminal
+    ordering, run-id bounds, payload limits, and all nested fields; its output
+    is kept so the worker can submit those same bytes instead of encoding the
+    completion a second time in the supervisor (issue #846). *)
+let encoded_completion_of_commands ~run_id commands =
   let rec loop reversed = function
     | [] -> Ok (List.rev reversed)
     | command :: rest ->
@@ -1214,9 +1276,17 @@ let completion_of_commands ~run_id commands =
   in
   let* commands = loop [] commands in
   let completion = Protocol.{ run_id; task_failure = None; commands } in
-  match Protocol.encode_completion completion with
-  | Ok _ -> Ok completion
+  match encode_completion completion with
+  | Ok encoded -> Ok { completion; encoded }
   | Error error -> Error (protocol_error error)
+
+(** Typed projection of [encoded_completion_of_commands] for callers that do
+    not submit the bytes. The validation is identical; only the canonical
+    document is dropped. *)
+let completion_of_commands ~run_id commands =
+  Result.map
+    (fun (checked : encoded_completion) -> checked.completion)
+    (encoded_completion_of_commands ~run_id commands)
 
 (** Checks that query answers belong to the activation being acknowledged.
 
@@ -1271,12 +1341,18 @@ let validate_completion_for_activation activation completion =
          "query completion identifiers must exactly match the activation")
   else Ok ()
 
-(** Applies one protocol activation to a pre-created deterministic execution.
-    Initialization data remains available from [translate_activation] for the
-    caller that constructs the typed [Execution.t]; this function only feeds the
-    runtime jobs and translates its resulting command batch. *)
-let activate execution activation =
-  let* translated = translate_activation activation in
+(** Applies one already translated activation to a pre-created deterministic
+    execution. Initialization data remains available from [translate_activation]
+    for the caller that constructs the typed [Execution.t]; this function only
+    feeds the runtime jobs and translates its resulting command batch.
+
+    Taking the translation rather than the protocol value is what lets the
+    native worker translate (and therefore validate) each activation once: it
+    already needs the translation for registry lookup and observer metadata
+    before it can choose an execution (issue #846). [translated_activation] is
+    private, so the argument can only have come from [translate_activation]. *)
+let activate_translated execution (translated : translated_activation) =
+  let activation = translated.source in
   let* () =
     match translated.initialization with
     | None -> Ok ()
@@ -1300,6 +1376,63 @@ let activate execution activation =
                 execution_expiration_time = context.workflow_execution_expiration_time })
         in
         Execution.set_start_metadata execution metadata;
+        let context = initialization.context in
+        Execution.set_run_info execution
+          (Some
+             Workflow_context_store.
+               {
+                 workflow_id = initialization.workflow_id;
+                 run_id = translated.run_id;
+                 workflow_type = initialization.workflow_type;
+                 attempt = initialization.attempt;
+                 first_execution_run_id =
+                   Option.fold ~none:"" context
+                     ~some:(fun (context : Protocol.initialize_context) ->
+                       context.first_execution_run_id);
+                 parent =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.parent_workflow);
+                 start_time =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.start_time);
+                 execution_timeout =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.workflow_execution_timeout);
+                 run_timeout =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.workflow_run_timeout);
+                 task_timeout =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.workflow_task_timeout);
+                 retry_policy =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.retry_policy);
+                 (* Only provenance is retained: the predecessor's failure and
+                    completion payloads are not part of the public run info,
+                    so their mutable payload bytes are never shared here. A
+                    Temporal Schedule action carries the previous action's
+                    result or failure with an empty run ID (#1015); it has no
+                    predecessor run, so it is stored as [None] to keep the
+                    store's "[None] for a first run" invariant. *)
+                 continued_from =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       Option.bind context.continuation
+                         (fun (continuation : Protocol.continuation) ->
+                           if String.equal
+                                continuation.continued_from_execution_run_id ""
+                           then None
+                           else
+                             Some
+                               ( continuation.continued_from_execution_run_id,
+                                 continuation.initiator )));
+               });
         Ok ()
   in
   (* Install the activation's deterministic clock before entering user code.
@@ -1316,23 +1449,78 @@ let activate execution activation =
   in
   Execution.set_activation_deployment_version execution deployment_version;
   Execution.set_activation_is_replaying execution translated.is_replaying;
+  (* History facts are task-local like the replay flag: a synthetic activation
+     without metadata clears continue-as-new advice and its reasons instead of
+     keeping the previous task's value. The unspecified reason is Core's
+     protobuf zero value and names no cause, so it is not reported. The
+     decoder bounds the length to uint32, which fits [int] on supported 64-bit
+     targets, and the size to uint64; a size beyond OCaml's native [int] range
+     is reported as absent rather than wrapped. *)
+  Execution.set_activation_history execution
+    Workflow_context_store.
+      {
+        history_length = Int64.to_int translated.history_length;
+        history_size_bytes =
+          Option.bind translated.metadata
+            (fun (metadata : Protocol.activation_metadata) ->
+              int_of_string_opt metadata.history_size_bytes);
+        continue_as_new_suggested =
+          Option.fold ~none:false translated.metadata
+            ~some:(fun (metadata : Protocol.activation_metadata) ->
+              metadata.continue_as_new_suggested);
+        continue_as_new_reasons =
+          Option.fold ~none:[] translated.metadata
+            ~some:(fun (metadata : Protocol.activation_metadata) ->
+              List.filter
+                (function
+                  | Protocol.Suggest_unspecified -> false
+                  | Protocol.History_size_too_large
+                  | Protocol.Too_many_history_events
+                  | Protocol.Too_many_updates -> true)
+                metadata.suggest_continue_as_new_reasons);
+      };
   let commands = Execution.activate execution translated.jobs in
-  let* completion =
-    match Execution.task_failure execution with
-    | None -> completion_of_commands ~run_id:translated.run_id commands
-    | Some error ->
+  (* The single canonical encoder pass for this completion. Its checks run
+     before the query and eviction checks below, in the same order as before
+     the encoded bytes were retained. *)
+  let* checked =
+    match (translated.cache_removal, Execution.task_failure execution) with
+    | None, None ->
+        encoded_completion_of_commands ~run_id:translated.run_id commands
+    | Some _, _ ->
+        (* A pure cache eviction is always acknowledged with an empty
+           completion: Core rejects anything else, and because workflow
+           completions are not retried, a failure here would stop the worker
+           with the eviction lease outstanding (#1021). The execution already
+           drops errors raised while evicted fibers unwind; ignoring
+           [task_failure] here keeps that rule even for a failure recorded
+           earlier, and the commands check below rejects anything else. *)
+        encoded_completion_of_commands ~run_id:translated.run_id commands
+    | None, Some error ->
         let* failure = protocol_failure "$.task_failure" error in
         let completion = Protocol.{
           run_id = translated.run_id; commands = []; task_failure = Some failure
         } in
-        let* _ = Protocol.encode_completion completion |> Result.map_error protocol_error in
-        Ok completion
+        let* encoded =
+          encode_completion completion |> Result.map_error protocol_error
+        in
+        Ok { completion; encoded }
   in
-  let* () = validate_completion_for_activation activation completion in
+  let* () = validate_completion_for_activation activation checked.completion in
   match translated.cache_removal with
-  | Some _ when completion.commands <> [] ->
+  | Some _ when checked.completion.commands <> [] ->
       Error
         (invalid "$.commands"
            "cache eviction must acknowledge the activation with no workflow \
             commands")
-  | _ -> Ok completion
+  | _ -> Ok checked
+
+(** Translates and applies one protocol activation, returning only the typed
+    completion. This is the convenience form for callers that hold a protocol
+    value and do not submit bytes; it performs exactly one translation and one
+    completion encode, like the worker path. *)
+let activate execution activation =
+  let* translated = translate_activation activation in
+  Result.map
+    (fun (checked : encoded_completion) -> checked.completion)
+    (activate_translated execution translated)

@@ -1,9 +1,16 @@
 (** The private transport boundary used by the public client and worker.
 
     [mock://] targets use the deterministic in-memory records below for unit
-    tests. HTTP(S) targets are routed through the private supervisor and its
-    Rust/Core protocol; that path uses separate activation/completion semantic
-    values and an explicit native lifecycle. Keeping those representations
+    tests of client and worker plumbing. The mock is not a workflow test
+    environment: a client wait echoes the start input as the completed output
+    without running a workflow, and worker tasks carry an empty [binary/null]
+    input unrelated to any client start. A worker task still invokes a
+    registered implementation whose input codec accepts that payload (for
+    example [Codec.unit]), outside any workflow scheduler context, so callback
+    side effects can occur during mock runs. HTTP(S) targets are
+    routed through the private supervisor and its Rust/Core protocol; that
+    path uses separate activation/completion semantic values and an explicit
+    native lifecycle. Keeping those representations
     private lets the installed [Temporal] API avoid Rust handles, JSON bytes,
     and transport-specific ownership rules. *)
 
@@ -23,18 +30,44 @@ type start_request = {
   workflow_name : string;
   workflow_id : string;
   task_queue : string;
-  input : Payload.t;
+  input : Payload.t list;
+      (** Encoded argument payloads exactly as sent to Temporal: empty for a
+          [Codec.unit] input, otherwise one payload (#1012). *)
   memo : (string * Payload.t) list;
   search_attributes : (string * Payload.t) list;
+  (* What to do when [workflow_id] already has an open run; see
+     [Client.id_conflict_policy]. Part of the mock's request-ID fingerprint. *)
+  id_conflict_policy : [ `Fail | `Use_existing | `Terminate_existing ];
+  (* What to do when [workflow_id]'s latest run is closed; see
+     [Client.id_reuse_policy]. Part of the mock's request-ID fingerprint. *)
+  id_reuse_policy :
+    [ `Allow_duplicate | `Allow_duplicate_failed_only | `Reject_duplicate ];
+  (* Server-side workflow timeouts in milliseconds, already validated by
+     [Client.start]; [None] keeps Temporal's default. *)
+  execution_timeout_ms : int64 option;
+  run_timeout_ms : int64 option;
+  task_timeout_ms : int64 option;
+  (* Server-side workflow retry policy; [None] means no retry. *)
+  retry_policy : Temporal_sdk_kernel.Activation.retry_policy option;
+  (* Caller deadline of the start RPC, fixed on the monotonic clock when the
+     call began. It bounds one call, not the workflow, so it is not part of
+     the request-ID fingerprint. *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
 }
 
-(** The server-issued identity returned by a successful start. *)
+(** The server-issued identity returned by a successful start. [started] is
+    [false] only when a [`Use_existing] start returned a run that another
+    request created; [run_id] then names that existing run. *)
 type start_response = {
   workflow_id : string;
   run_id : string;
+  started : bool;
 }
 
-(** The exact execution selected by a client wait. *)
+(** The execution selected by a client wait. In this and every request type
+    below that carries a [run_id] after start, an empty [run_id] selects the
+    workflow's current run (#791), which Temporal (or the mock ledger)
+    resolves when it handles the request. *)
 type wait_request = {
   workflow_id : string;
   run_id : string;
@@ -48,6 +81,13 @@ type cancel_request = {
   run_id : string;
   request_id : string;
   reason : string;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run pair and operator metadata for immediate termination. *)
@@ -55,6 +95,13 @@ type terminate_request = {
   workflow_id : string;
   run_id : string;
   reason : string;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run pair and event boundary for a reset request. *)
@@ -64,6 +111,13 @@ type reset_request = {
   request_id : string;
   reason : string;
   workflow_task_finish_event_id : int64;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** New run identity returned by a successful reset. *)
@@ -77,7 +131,16 @@ type signal_request = {
   run_id : string;
   signal_name : string;
   request_id : string;
-  input : Payload.t;
+  input : Payload.t list;
+      (** Encoded argument payloads exactly as sent to Temporal: empty for a
+          [Codec.unit] input, otherwise one payload (#1012). *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Exact workflow/run identity and encoded query arguments. Output-only
@@ -89,6 +152,13 @@ type query_request = {
   run_id : string;
   query_name : string;
   input : Payload.t list;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** One bounded visibility query. The continuation token is opaque to callers
@@ -97,6 +167,13 @@ type visibility_request = {
   query : string;
   page_size : int;
   next_page_token : string option;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Stable visibility metadata returned for one execution. *)
@@ -105,7 +182,7 @@ type visibility_execution = {
   run_id : string;
   workflow_type : string;
   task_queue : string;
-  status : string;
+  status : Temporal_sdk_kernel.Client_protocol.visibility_status;
 }
 
 (** One visibility page and its optional opaque continuation token. *)
@@ -114,13 +191,22 @@ type visibility_page = {
   next_page_token : string option;
 }
 
-(** Request to admit one named workflow update on an exact run. *)
+(** Request to admit one named workflow update on a run selector. *)
 type update_request = {
   workflow_id : string;
   run_id : string;
   update_id : string;
   update_name : string;
-  input : Payload.t;
+  input : Payload.t list;
+      (** Encoded argument payloads exactly as sent to Temporal: empty for a
+          [Codec.unit] input, otherwise one payload (#1012). *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of this RPC, validated by the public client and
+          fixed on the monotonic clock when the call began; the native
+          supervisor sends only the budget left at dispatch and fails an
+          expired request without sending it. [None] keeps the operation's
+          default budget. The mock ledger answers immediately and ignores
+          it. *)
 }
 
 (** Terminal update outcome returned by the native protocol. *)
@@ -144,10 +230,11 @@ type poll_update_response = { outcome : update_outcome option }
 type successor = { workflow_id : string; run_id : string }
 
 (** Terminal outcomes are kept separate from bridge transport errors so a
-    completed Temporal failure remains an ordinary typed value. Failure and
-    timeout outcomes retain any server-supplied successor for explicit follow. *)
+    completed Temporal failure remains an ordinary typed value. Completion,
+    failure, and timeout outcomes retain any server-supplied successor (a cron
+    or retry run) for explicit follow. *)
 type terminal_result =
-  | Completed of Payload.t
+  | Completed of { payload : Payload.t; successor : successor option }
   | Failed of { error : Error.t; successor : successor option }
   | Cancelled of Error.t
   | Terminated of Error.t
@@ -210,10 +297,47 @@ type client
 (** An opaque worker backend instance owned by one public [Worker.t]. *)
 type worker
 
+(** Returns a defect unless an explicit [io_threads] bound is between [1]
+    and the bridge maximum; [None] is always valid. *)
+val validate_io_threads : int option -> (unit, Error.t) result
+
+(** Returns a defect naming the first client admission limit (#796) outside
+    its accepted range; all-[None] limits are always valid. *)
+val validate_client_limits :
+  Temporal_sdk_kernel.Bridge.client_limits -> (unit, Error.t) result
+
+(** Returns a defect when both [io_threads] and [runtime] are given (#832);
+    the shared runtime already fixes its own thread bound. *)
+val validate_runtime_source :
+  io_threads:int option ->
+  runtime:Temporal_sdk_kernel.Shared_runtime.t option ->
+  (unit, Error.t) result
+
+(** Reserves one attachment on an optional shared runtime, or returns a
+    defect if it was shut down. The caller must hand the lease to exactly one
+    owner ([Native.create], which then releases it, or a mock value) or
+    release it itself. *)
+val acquire_runtime_lease :
+  Temporal_sdk_kernel.Shared_runtime.t option ->
+  (Temporal_sdk_kernel.Shared_runtime.lease option, Error.t) result
+
 (** Creates a client transport after validating its configuration. The
     deterministic [mock://] ledger is test-only; HTTP(S) creates and connects
-    one private supervisor graph before publishing the client value. *)
-val client_create : config -> (client, Error.t) result
+    one private supervisor graph before publishing the client value.
+    [io_threads] is the public network-thread bound; the native backend
+    maps it to the private runtime's Tokio worker pool. It is validated for
+    every target. With [runtime] (exclusive with [io_threads]) the client is
+    attached to that shared runtime until [client_shutdown]: a native
+    client's supervisor owns the lease, a mock client holds it itself.
+    [limits] (#796) is validated for every target and enforced only by the
+    native client, whose bridge refuses admissions beyond it as
+    [Resource_exhausted]; it defaults to the bridge defaults. *)
+val client_create :
+  ?io_threads:int ->
+  ?runtime:Temporal_sdk_kernel.Shared_runtime.t ->
+  ?limits:Temporal_sdk_kernel.Bridge.client_limits ->
+  config ->
+  (client, Error.t) result
 
 (** Starts one workflow after validating the request in the backend boundary. *)
 val client_start : client -> start_request -> (start_response, Error.t) result
@@ -221,9 +345,81 @@ val client_start : client -> start_request -> (start_response, Error.t) result
 (** Waits for the exact workflow/run pair and returns its terminal outcome. *)
 val client_wait : client -> wait_request -> (terminal_result, Error.t) result
 
-(** Scripts a failed or timed-out exact run in the deterministic mock for the
-    public [Client.wait] to [Client.follow] regression. This private test seam
-    rejects native clients and does not create successor runs. *)
+(** The [Error.error_type] of a retryable [`Bridge] error returned when the
+    native client's bounded pending-start or pending-wait registry is full.
+    [Client.is_at_capacity] recognizes it. *)
+val client_at_capacity_error_type : string
+
+(** The [Error.error_type] (["WorkflowExecutionAlreadyStarted"]) of the
+    non-retryable [`Workflow] error returned when a [`Fail] start finds an open
+    run with the same workflow ID. *)
+val already_started_error_type : string
+
+(** The [Error.error_type] (["StartOutcomeUncertain"]) of the non-retryable
+    [`Bridge] error returned when Temporal did not prove whether a native
+    start was accepted, for example because the start's RPC deadline expired
+    or the client shut down while the request was in flight.
+    [Client.is_start_outcome_uncertain] recognizes it. *)
+val start_outcome_uncertain_error_type : string
+
+(** Typed classification of a client RPC failure; see [Client.rpc_status]. *)
+type rpc_status =
+  [ `Cancelled
+  | `Unknown
+  | `Invalid_argument
+  | `Deadline_exceeded
+  | `Not_found
+  | `Already_exists
+  | `Permission_denied
+  | `Resource_exhausted
+  | `Failed_precondition
+  | `Aborted
+  | `Out_of_range
+  | `Unimplemented
+  | `Internal
+  | `Unavailable
+  | `Data_loss
+  | `Unauthenticated
+  | `Termination_outcome_uncertain ]
+
+(** Converts one structured native client failure into the public error.
+    [Rpc] codes become [`Bridge] errors with a stable PascalCase
+    [Error.error_type] naming the gRPC status (for example ["NotFound"]) and
+    [non_retryable] set exactly for permanent statuses; [Query_failed]
+    becomes a non-retryable [`Workflow] error with [query_failed_error_type]
+    and the handler's message; [Already_started] becomes the typed
+    already-started error for [namespace]. Exposed so tests can check the
+    classification table without a server. *)
+val native_client_error :
+  namespace:string -> Temporal_sdk_kernel.Client_protocol.client_error -> Error.t
+
+(** Recovers the classification attached by [native_client_error] to an RPC
+    failure (or by the mock's not-found errors) from the error's category and
+    type, or [None] for any other error. *)
+val rpc_status : Error.t -> rpc_status option
+
+(** The [Error.error_type] (["QueryFailed"]) of a failed query handler. *)
+val query_failed_error_type : string
+
+(** Recognizes a failed query handler error by its structural fields. *)
+val is_query_failed : Error.t -> bool
+
+(** Returns the [(namespace, workflow_id, run_id)] of the open run attached to
+    an already-started error by either transport, or [None] for any other
+    error or when Temporal did not report the existing run. *)
+val already_started_execution : Error.t -> (string * string * string) option
+
+(** Converts a private supervisor failure into the public error vocabulary.
+    Exposed in this private interface so bridge tests can verify that a full
+    native registry ([Resource_exhausted]) stays distinct from a closed client
+    ([Invalid_state]) without saturating a live Temporal connection. *)
+val native_supervisor_error : Temporal_sdk_kernel.Supervisor.error -> Error.t
+
+(** Scripts the close event of an exact run in the deterministic mock for the
+    public [Client.wait] to [Client.follow] regressions: a failed or timed-out
+    outcome, a completed outcome that carries a successor (the mock still
+    echoes the start input as its output), or continued-as-new. This private
+    test seam rejects native clients and does not create successor runs. *)
 val mock_set_wait_outcome_for_test :
   client -> wait_request -> terminal_result -> (unit, Error.t) result
 
@@ -234,17 +430,17 @@ val native_terminal_result :
   Temporal_sdk_kernel.Client_protocol.wait_response ->
   (terminal_result, Error.t) result
 
-(** Requests cancellation of one exact workflow run. Success acknowledges the
+(** Requests cancellation of one workflow run (exact or current). Success acknowledges the
     server RPC; a later [client_wait] observes the terminal cancellation. *)
 val client_cancel : client -> cancel_request -> (unit, Error.t) result
 
-(** Resets one exact workflow run and returns its new run identity. *)
+(** Resets one workflow run (exact or current) and returns its new run identity. *)
 val client_reset : client -> reset_request -> (reset_response, Error.t) result
 
-(** Terminates one exact workflow run immediately. *)
+(** Terminates one workflow run (exact or current) immediately. *)
 val client_terminate : client -> terminate_request -> (unit, Error.t) result
 
-(** Sends one signal to one exact workflow run. Success acknowledges the
+(** Sends one signal to one workflow run (exact or current). Success acknowledges the
     server RPC; it does not wait for workflow code to process the message. *)
 val client_signal : client -> signal_request -> (unit, Error.t) result
 
@@ -272,8 +468,12 @@ val client_shutdown : client -> (unit, Error.t) result
 (** Creates a deterministic worker test seam and records the task queue and
     names registered by the OCaml registry. The queue and names are retained
     here so tests exercise the same admission inputs that the native adapter
-    will validate, even though its activation protocol is different. *)
+    will validate, even though its activation protocol is different. With
+    [runtime], the mock worker holds an attachment lease on it (released by
+    its first [worker_shutdown]) so runtime ordering behaves as for a native
+    worker; a shut-down runtime is a defect. *)
 val worker_create :
+  ?runtime:Temporal_sdk_kernel.Shared_runtime.t ->
   config ->
   workflow_names:string list ->
   activity_names:string list ->

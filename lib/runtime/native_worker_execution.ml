@@ -3,15 +3,17 @@
 
     Rust/Core ownership and semantic JSON validation live below this module in
     the supervisor. This module therefore receives typed activations, resolves
-    each run ID to an existentially typed [Execution.t], and sends typed
-    completions back through the same supervisor. The registry is mutable only
-    behind one mutex; it is never shared with workflow fibers or native code. *)
+    each run ID to an existentially typed [Execution.t], and sends each
+    completion back through the same supervisor as the canonical bytes from
+    its single encoder pass. The registry is mutable only behind one mutex; it
+    is never shared with workflow fibers or native code. *)
 
 module Protocol = Temporal_protocol.Workflow_protocol
 module Definition = Temporal_base.Definition
 module Codec = Temporal_base.Codec
 module Base_error = Temporal_base.Error
 module Observability = Temporal_base.Observability
+module Encoded_completion = Temporal_protocol.Encoded_workflow_completion
 
 (** Result-bind notation keeps all expected boundary failures on typed paths. *)
 let ( let* ) = Result.bind
@@ -26,11 +28,24 @@ module type SUPERVISOR = sig
   val try_poll_workflow :
     t -> (Protocol.activation option, error) result
 
+  (* [completion] is the read-only typed source of the encoded bytes, for
+     inspection by test sources; the bytes are authoritative. *)
   val complete_workflow :
-    t -> Protocol.completion -> (unit, error) result
+    t -> completion:Protocol.completion -> Encoded_completion.t ->
+    (unit, error) result
 
   val error_code : error -> string
   val error_message : error -> string
+
+  (* Returns [true] only when the source can prove that a failed completion
+     left the exact native lease outstanding, so resubmitting the same retained
+     completion cannot duplicate it. Every other failure is fail-closed. *)
+  val error_is_retryable : error -> bool
+
+  (* The same proof for an exception raised by [complete_workflow]. An
+     exception is normally an uncertain acknowledgement and must return
+     [false]. *)
+  val exception_is_retryable : exn -> bool
 end
 
 (** Stable diagnostics deliberately contain no payload bytes or native values. *)
@@ -44,6 +59,58 @@ type activation_info = {
   is_replaying : bool;
   history_length : int64;
   cache_removal_reason : string option;
+}
+
+(** What the watchdog's replacement completion was and whether the supervisor
+    acknowledged it. The kind mirrors [failure_completion]: an ordinary
+    activation fails its workflow task ([`Task_failed]); a query-only
+    activation answers every query with a failure and leaves the task itself
+    untouched ([`Queries_failed]); an eviction-only activation is acknowledged
+    with an empty completion ([`Eviction_acknowledged]). [`Not_acknowledged]
+    means encoding or submission failed, so Core never received a completion
+    for the lease and the task, query, or eviction is left to time out. *)
+type abandonment =
+  [ `Task_failed | `Queries_failed | `Eviction_acknowledged | `Not_acknowledged ]
+
+(** Diagnostic identity of a workflow activation abandoned by the
+    non-yielding-code watchdog (#493). It carries only identifiers, the replay
+    flag, and the observed duration: never payloads, task tokens, or
+    continuation state. [elapsed_ms] is the watchdog's own lower bound on how
+    long the activation had been running without returning to the adapter.
+    [abandoned] records what the watchdog submitted in place of the lane's
+    completion and whether the supervisor acknowledged it; see
+    {!abandonment}. *)
+type stuck_activation = {
+  run_id : string;
+  workflow_id : string option;
+  workflow_type : string option;
+  is_replaying : bool;
+  elapsed_ms : int;
+  abandoned : abandonment;
+}
+
+(** Single-owner claim on the native lease of the activation currently inside
+    workflow code. Exactly one party moves it out of [Unclaimed]: the workflow
+    lane before it submits its own completion, or the watchdog before it
+    submits a task failure. The loser never submits a completion for that
+    lease. *)
+type lease_claim = Unclaimed | Lane_claimed | Watchdog_claimed
+
+(** The activation the workflow lane is processing, published atomically so
+    the watchdog thread can observe it without the adapter mutex (which the
+    lane holds for the whole activation). [epoch] distinguishes successive
+    activations, including two activations of the same run. Every field except
+    the two atomics is immutable after publication. *)
+type in_flight = {
+  epoch : int;
+  activation : Protocol.activation;
+  flight_workflow_id : string option;
+  flight_workflow_type : string option;
+  claim : lease_claim Atomic.t;
+  (* Written once by the watchdog after its failure submission returns, so a
+     lane that later loses the claim can report whether the lease was
+     retired. *)
+  watchdog_outcome : (unit, error_view) result option Atomic.t;
 }
 
 (** Runtime signal and query handler aliases kept private to this adapter. *)
@@ -112,6 +179,9 @@ type run =
            'input -> ('output, Base_error.t) result)
           Definition.t;
         execution : ('input, 'output) Execution.t;
+        (* Retained from initialization so watchdog diagnostics for later
+           activations of the run can name the workflow execution. *)
+        workflow_id : string;
       }
       -> run
 
@@ -136,14 +206,37 @@ type pending_result =
   | Pending_rejected of {
       error : error_view;
       remove_run : bool;
+      (* Correlation for the [workflow_activation_rejected] record (#500),
+         captured when the rejection is built: an initial activation can be
+         rejected before its run is ever cached, and a cached run may be
+         dropped before the rejection is accepted. *)
+      workflow_id : string option;
+      replaying : bool;
     }
 
-(** The protocol value is owned by this adapter until the supervisor accepts
-    it. Its binary payloads are copied before the value enters mutable state. *)
+(** The completion is owned by this adapter until the supervisor accepts it.
+
+    [submission] holds the canonical bytes from the completion's single
+    encoder pass (issue #846). They are an immutable snapshot, so retaining
+    them needs no payload copy and a retry resubmits exactly the same bytes.
+    The typed completion is kept beside them only so the source can inspect
+    it without decoding; it is never encoded again.
+    [Error] records a completion the encoder rejected: it can never be
+    submitted, so its first attempt fails closed exactly as a non-retryable
+    supervisor rejection did when the supervisor ran the encoder.
+
+    [retry_refusal] records the first submission failure that the source did
+    not explicitly classify as retryable. Once it is [Some], the completion is
+    never submitted again: the failure may have consumed the native lease (or
+    Core may already have accepted the value), so a second attempt could
+    duplicate the completion or attach it to a later activation of the same
+    run. Later polls and drains return the recorded error unchanged, and only
+    terminal [discard] releases the entry (issue #843). *)
 type pending_completion = {
   run_id : string;
-  completion : Protocol.completion;
+  submission : (Native_execution.encoded_completion, error_view) result;
   result : pending_result;
+  mutable retry_refusal : error_view option;
 }
 
 (** One worker-loop result. *)
@@ -258,30 +351,18 @@ let failure_of_error (error : error_view) : Protocol.failure =
           };
     }
 
-(** Converts one protocol payload into the runtime payload representation. The
-    runtime stores metadata as strings, so binary metadata is rejected rather
-    than decoded with replacement characters. Both metadata and body bytes are
-    copied before a workflow execution can retain them. *)
-let runtime_payload path (payload : Protocol.payload) =
-  (* Validate metadata in input order while accumulating it backwards; the
-     final reversal restores the protocol's declared ordering without a
-     quadratic append. *)
-  let rec metadata_loop reversed = function
-    | [] -> Ok (List.rev reversed)
-    | (key, bytes) :: rest ->
-        if String.length key = 0 || String.contains key '\000' then
-          Error
-            (make_error ~path:(path ^ ".metadata") "invalid_message"
-               "metadata key must be non-empty and must not contain NUL")
-        else
-          let value = Bytes.to_string bytes in
-          if not (Codec.valid_utf_8 value) then
-            Error
-              (make_error ~path:(path ^ ".metadata." ^ key) "unsupported"
-                 "binary metadata cannot be represented by the runtime")
-          else metadata_loop ((key, value) :: reversed) rest
+(** Converts one protocol payload into the runtime payload representation.
+    Metadata values are arbitrary bytes in Temporal's protocol and an OCaml
+    [string] holds bytes, so values and keys are carried losslessly rather
+    than rejected (#1048): the input is replayed from immutable history, so a
+    rejection would fail every workflow task of the run. Both metadata and
+    body bytes are copied before a workflow execution can retain them. *)
+let runtime_payload _path (payload : Protocol.payload) =
+  let metadata =
+    List.map
+      (fun (key, bytes) -> (key, Bytes.to_string bytes))
+      payload.metadata
   in
-  let* metadata = metadata_loop [] payload.metadata in
   Ok
     {
       Temporal_base.Payload.metadata;
@@ -375,10 +456,15 @@ let is_terminal completion =
     completion.Protocol.commands
 
 (** Reports one bounded lifecycle message without allowing a reporter defect to
-    affect worker progress. *)
-let report level ~operation ?error_kind () =
+    affect worker progress. Lease outcomes pass the run's correlation
+    identifiers (#500) so an operator can join a log record to the workflow
+    history; they are bounded tag values, never metric labels. *)
+let report level ~operation ?error_kind ?workflow_id ?run_id ?replaying () =
   try
-    let tags = Observability.tags ~operation ?error_kind () in
+    let tags =
+      Observability.tags ~operation ?error_kind ?workflow_id ?run_id ?replaying
+        ()
+    in
     Observability.report ~src:Observability.Source.lifecycle level ~tags
       "native workflow worker adapter event"
   with _ -> ()
@@ -464,6 +550,16 @@ let validate_task_queue task_queue =
       Error
         (make_error ~path:"$.task_queue" "invalid_configuration" message)
 
+(** Validates the worker namespace with the same predicate as
+    [Workflow_context_store.create], for the same reason as
+    [validate_task_queue]: an invalid value is reported at worker
+    construction rather than as an activation-time [Invalid_argument]. *)
+let validate_namespace namespace =
+  match Workflow_context_store.validate_namespace namespace with
+  | Ok () -> Ok ()
+  | Error message ->
+      Error (make_error ~path:"$.namespace" "invalid_configuration" message)
+
 (** Finds one registered workflow by its Temporal type name. *)
 let find_definition definitions workflow_type =
   match Run_map.find_opt workflow_type definitions with
@@ -479,7 +575,7 @@ let find_definition definitions workflow_type =
     invariant that all calls pass through the adapter mutex. *)
 module Make (Supervisor : SUPERVISOR) = struct
   (** Mutable state owned by one adapter instance. [supervisor], [task_queue],
-      and [definitions] are immutable after construction; [runs] and
+      [namespace], and [definitions] are immutable after construction; [runs] and
       [pending] are changed only while [mutex] is held, so workflow execution
       state cannot race with completion retries or shutdown draining. *)
   type adapter_state = {
@@ -489,6 +585,9 @@ module Make (Supervisor : SUPERVISOR) = struct
     (* Validated default activity queue copied into each new execution context;
        it is immutable for the lifetime of this worker. *)
     task_queue : string;
+    (* Validated worker namespace copied into each new execution context so
+       [Temporal.Workflow.info] can report it; activations do not carry it. *)
+    namespace : string;
     (* Existential workflow definitions, built and validated before the state
        record is published. *)
     definitions : registered_definition Run_map.t;
@@ -497,8 +596,8 @@ module Make (Supervisor : SUPERVISOR) = struct
        continuations are already shut down. Adapter failures also remove runs
        after their failure completion is acknowledged. *)
     mutable runs : run Run_map.t;
-    (* Owned copies of completions whose source acknowledgement failed. The
-       value remains here until the exact same completion is accepted. *)
+    (* Canonical bytes of completions whose source acknowledgement failed. The
+       value remains here until the exact same bytes are accepted. *)
     mutable pending : pending_completion Run_map.t;
     (* Serializes all access to [runs], [pending], and the source operation so
        another Domain cannot overtake an activation or retry a completion. *)
@@ -514,6 +613,16 @@ module Make (Supervisor : SUPERVISOR) = struct
        admission barrier without inferring completion from an earlier
        activation callback. *)
     on_completion : (activation_info -> unit) option;
+    (* The activation currently between poll and completion on the workflow
+       lane. Written only by the lane (while it holds [mutex]); read by the
+       watchdog thread without [mutex]. *)
+    in_flight : in_flight option Atomic.t;
+    (* Next activation epoch. Changed only while [mutex] is held. *)
+    mutable next_epoch : int;
+    (* The first activation abandoned by the watchdog. Sticky: once set, the
+       worker stays unhealthy until the process is replaced, because the code
+       that failed to yield may have left process state inconsistent. *)
+    stuck : stuck_activation option Atomic.t;
   }
 
   (** The public worker handle is the mutex-confined state above. *)
@@ -524,164 +633,54 @@ module Make (Supervisor : SUPERVISOR) = struct
       empty, NUL-containing, oversized, or non-UTF-8 defaults fail as a typed
       configuration result rather than breaking the first workflow activation.
       No supervisor operation or workflow implementation runs on this path. *)
-  let create ?on_activation ?on_completion ?(task_queue = "default") ~supervisor
-      ~workflows () =
+  let create ?on_activation ?on_completion ?(task_queue = "default")
+      ?(namespace = "default") ~supervisor ~workflows () =
     let* () = validate_task_queue task_queue in
+    let* () = validate_namespace namespace in
     let* definitions = build_definitions workflows in
     Ok
       {
         supervisor;
         task_queue;
+        namespace;
         definitions;
         runs = Run_map.empty;
         pending = Run_map.empty;
         mutex = Mutex.create ();
         on_activation;
         on_completion;
+        in_flight = Atomic.make None;
+        next_epoch = 0;
+        stuck = Atomic.make None;
       }
 
-  (** Copies a payload without retaining a mutable buffer owned by an earlier
-      execution step. Metadata keys are immutable strings; metadata and body
-      bytes are the only mutable protocol values. *)
-  let copy_payload (payload : Protocol.payload) : Protocol.payload =
-    {
-      metadata =
-        List.map (fun (key, value) -> (key, Bytes.copy value)) payload.metadata;
-      data = Bytes.copy payload.data;
-    }
-
-  (** Copies a failure recursively, including nested causes and detail
-      payloads. Failure text is immutable, while every payload buffer is owned
-      by the retained completion. *)
-  let rec copy_failure (failure : Protocol.failure) : Protocol.failure =
-    let info =
-      match failure.info with
-      | Protocol.Application
-          { type_name; non_retryable; details; category; next_retry_delay } ->
-          Protocol.Application
-            {
-              type_name;
-              non_retryable;
-              details = List.map copy_payload details;
-              category;
-              next_retry_delay;
-            }
-      | Protocol.Canceled { details; identity } ->
-          Protocol.Canceled
-            { details = List.map copy_payload details; identity }
-      | Protocol.Activity _ as info -> info
-      | Protocol.Terminated _ as info -> info
-      | Protocol.Child_workflow _ as info -> info
-      | Protocol.Timeout_failure { timeout_type; last_heartbeat_details } ->
-          Protocol.Timeout_failure
-            {
-              timeout_type;
-              last_heartbeat_details = List.map copy_payload last_heartbeat_details;
-            }
-    in
-    {
-      message = failure.message;
-      source = failure.source;
-      stack_trace = failure.stack_trace;
-      encoded_attributes = Option.map copy_payload failure.encoded_attributes;
-      cause = Option.map copy_failure failure.cause;
-      info;
-    }
-
-  (** Copies every payload-bearing command in a workflow completion. Keeping
-      this operation explicit makes the ownership boundary auditable without a
-      JSON round trip or an alias to a workflow implementation's buffer. *)
-  let copy_completion (completion : Protocol.completion) : Protocol.completion =
-    (* Commands without payload-bearing fields are returned unchanged; every
-       command that can retain mutable bytes is copied before it enters
-       [pending]. *)
-    let copy_command = function
-      | Protocol.Schedule_activity command ->
-          Protocol.Schedule_activity
-            {
-              command with
-              arguments = List.map copy_payload command.arguments;
-            }
-      | Protocol.Schedule_local_activity command ->
-          Protocol.Schedule_local_activity
-            {
-              command with
-              arguments = List.map copy_payload command.arguments;
-            }
-      | Protocol.Complete_workflow { result } ->
-          Protocol.Complete_workflow { result = Option.map copy_payload result }
-      | Protocol.Fail_workflow { failure } ->
-          Protocol.Fail_workflow { failure = copy_failure failure }
-      | Protocol.Continue_as_new command ->
-          Protocol.Continue_as_new
-            { command with input = List.map copy_payload command.input }
-      | Protocol.Start_child_workflow command ->
-          Protocol.Start_child_workflow
-            { command with input = List.map copy_payload command.input }
-      | Protocol.Signal_external_workflow command ->
-          Protocol.Signal_external_workflow
-            {
-              command with
-              input = List.map copy_payload command.input;
-              headers =
-                List.map (fun (key, payload) -> (key, copy_payload payload))
-                  command.headers;
-            }
-      | Protocol.Query_result { query_id; result } ->
-          let result =
-            match result with
-            | Protocol.Query_succeeded payload ->
-                Protocol.Query_succeeded (copy_payload payload)
-            | Protocol.Query_failed failure -> Protocol.Query_failed (copy_failure failure)
-          in
-          Protocol.Query_result { query_id; result }
-      | Protocol.Update_response { protocol_instance_id; response } ->
-          let response =
-            match response with
-            | Protocol.Update_accepted -> Protocol.Update_accepted
-            | Protocol.Update_rejected failure ->
-                Protocol.Update_rejected (copy_failure failure)
-            | Protocol.Update_completed payload ->
-                Protocol.Update_completed (copy_payload payload)
-          in
-          Protocol.Update_response { protocol_instance_id; response }
-      | Protocol.Cancel_child_workflow _ as command -> command
-      | Protocol.Request_cancel_external_workflow _ as command -> command
-      | Protocol.Request_cancel_activity _ as command -> command
-      | Protocol.Request_cancel_local_activity _ as command -> command
-      | Protocol.Start_timer _ as command -> command
-      | Protocol.Cancel_timer _ as command -> command
-      | Protocol.Set_patch_marker _ as command -> command
-      | Protocol.Upsert_search_attributes { search_attributes } ->
-          Protocol.Upsert_search_attributes
-            {
-              search_attributes =
-                List.map
-                  (fun (key, payload) -> (key, copy_payload payload))
-                  search_attributes;
-            }
-      | Protocol.Cancel_workflow_execution as command -> command
-    in
-    {
-      run_id = completion.run_id;
-      task_failure = Option.map copy_failure completion.task_failure;
-      commands = List.map copy_command completion.commands;
-    }
-
   (** Distinguishes source rejection from an uncertain raised acknowledgement.
-      Both preserve the exact pending completion for retry; neither permits
-      replacement commands or re-execution of workflow code. *)
+      Both preserve the exact pending completion; neither permits replacement
+      commands or re-execution of workflow code. [retryable] carries the
+      source's explicit proof that the lease is still outstanding, without
+      which the retained completion is never resubmitted. *)
   type completion_attempt =
     | Accepted
-    | Rejected_by_supervisor of error_view
-    | Raised_by_supervisor of exn
+    | Rejected_by_supervisor of { error : error_view; retryable : bool }
+    | Raised_by_supervisor of { exception_ : exn; retryable : bool }
+
+  (** A faulty source classifier must not turn a diagnostic defect into a
+      duplicate submission. Only an explicit [true] authorizes a retry. *)
+  let source_error_is_retryable source_error =
+    try Supervisor.error_is_retryable source_error with _ -> false
+
+  (** Exception classification is equally conservative: an exception is an
+      uncertain acknowledgement unless the source explicitly proves otherwise. *)
+  let completion_exception_is_retryable exception_ =
+    try Supervisor.exception_is_retryable exception_ with _ -> false
 
   (** Calls the supervisor completion operation without losing whether an
       exception occurred. A returned source error still means that the
       supervisor completed the call normally but did not acknowledge it. *)
-  let attempt_completion supervisor completion =
+  let attempt_completion supervisor
+      ({ completion; encoded } : Native_execution.encoded_completion) =
     try
-      match Supervisor.complete_workflow supervisor completion with
+      match Supervisor.complete_workflow supervisor ~completion encoded with
       | Ok () -> Accepted
       | Error source_error ->
           let source =
@@ -690,10 +689,16 @@ module Make (Supervisor : SUPERVISOR) = struct
               ~error_message:Supervisor.error_message source_error
           in
           Rejected_by_supervisor
-            (make_error ~path:"$.completion" "completion_failed"
-               (Printf.sprintf "supervisor rejected completion (%s): %s"
-                  source.code source.message))
-    with exception_ -> Raised_by_supervisor exception_
+            {
+              error =
+                make_error ~path:"$.completion" "completion_failed"
+                  (Printf.sprintf "supervisor rejected completion (%s): %s"
+                     source.code source.message);
+              retryable = source_error_is_retryable source_error;
+            }
+    with exception_ ->
+      Raised_by_supervisor
+        { exception_; retryable = completion_exception_is_retryable exception_ }
 
   (** Converts a completion exception to the stable typed error used when a
       failure-completion attempt itself cannot be acknowledged. *)
@@ -727,17 +732,33 @@ module Make (Supervisor : SUPERVISOR) = struct
         (try callback info with _ ->
           report Logs.Warning ~operation:"workflow_completion_diagnostic_failed" ())
 
+  (** The workflow ID of a cached run, for log correlation (#500). Only the
+      initializing activation carries the ID itself, so later activations
+      read it from the run registry. Must be called before [drop_run]. *)
+  let cached_workflow_id adapter run_id =
+    match Run_map.find_opt run_id adapter.runs with
+    | Some (Run { workflow_id; _ }) -> Some workflow_id
+    | None -> None
+
   (** Applies bookkeeping only after the supervisor acknowledges a retained
-      completion. The copied completion is released here, while a successfully
-      completed run keeps its final query state until Core eviction. *)
+      completion. The retained completion bytes are released here, while a
+      successfully completed run keeps its final query state until Core
+      eviction. *)
   let accepted_pending adapter pending =
     adapter.pending <- Run_map.remove pending.run_id adapter.pending;
     match pending.result with
     | Pending_completed
         { command_count; terminal; evicted; activation_info } ->
+        let workflow_id =
+          match activation_info.workflow_id with
+          | Some _ as workflow_id -> workflow_id
+          | None -> cached_workflow_id adapter pending.run_id
+        in
         if evicted then drop_run adapter pending.run_id;
         notify_completion adapter activation_info;
-        report Logs.Debug ~operation:"workflow_activation_completed" ();
+        report Logs.Debug ~operation:"workflow_activation_completed"
+          ?workflow_id ~run_id:activation_info.run_id
+          ~replaying:activation_info.is_replaying ();
         Ok
           (Completed
              {
@@ -745,10 +766,11 @@ module Make (Supervisor : SUPERVISOR) = struct
                command_count;
                terminal;
              })
-    | Pending_rejected { error; remove_run } ->
+    | Pending_rejected { error; remove_run; workflow_id; replaying } ->
         if remove_run then drop_run adapter pending.run_id;
         report Logs.Warning ~operation:"workflow_activation_rejected"
-          ~error_kind:error.code ();
+          ~error_kind:error.code ?workflow_id ~run_id:pending.run_id ~replaying
+          ();
         Ok
           (Rejected
              {
@@ -758,25 +780,38 @@ module Make (Supervisor : SUPERVISOR) = struct
              })
 
   (** Attempts one retained completion. A rejected or raised native call leaves
-      the same value in [pending], preserving the only safe retry path. *)
+      the same value in [pending]. A failure the source did not explicitly
+      classify as retryable sets [retry_refusal]; from then on this function
+      returns that recorded error without calling the supervisor, so neither a
+      later poll nor a shutdown drain can submit the completion a second time
+      (issue #843). *)
   let finish_pending adapter pending =
-    match attempt_completion adapter.supervisor pending.completion with
-    | Accepted -> accepted_pending adapter pending
-    | Rejected_by_supervisor error -> Error error
-    | Raised_by_supervisor exception_ ->
-        Error (completion_exception_error exception_)
-
-  (** Records a completion before its first native attempt. This ordering is
-      intentional: even an exception from the native binding leaves an exact
-      owned completion available for a later poll or shutdown drain. *)
-  let enqueue_pending adapter pending =
-    if Run_map.mem pending.run_id adapter.pending then
-      Error
-        (make_error ~path:"$.run_id" "duplicate_pending_completion"
-           "a workflow run already has an unacknowledged completion")
-    else (
-      adapter.pending <- Run_map.add pending.run_id pending adapter.pending;
-      finish_pending adapter pending)
+    match pending.retry_refusal with
+    | Some error -> Error error
+    | None -> (
+        (* Records a fail-closed refusal before reporting the failure, so the
+           entry is never resubmitted even if the caller retries [poll]. *)
+        let refuse_unless retryable error =
+          if not retryable then pending.retry_refusal <- Some error;
+          Error error
+        in
+        match pending.submission with
+        | Error error ->
+            (* The encoder rejected this completion, so no bytes exist to
+               submit. Nothing reached the supervisor and the native lease is
+               still held; failing closed matches the earlier behavior, when
+               the supervisor's own encode rejected it non-retryably. *)
+            refuse_unless false error
+        | Ok submission ->
+        match attempt_completion adapter.supervisor submission with
+        | Accepted -> accepted_pending adapter pending
+        | Rejected_by_supervisor { error; retryable } ->
+            refuse_unless retryable error
+        | Raised_by_supervisor { exception_; retryable } ->
+            (* Core may already have accepted this exact value. Never replace
+               it with a task failure or rerun workflow code after an
+               uncertain acknowledgement. *)
+            refuse_unless retryable (completion_exception_error exception_))
 
   (** Returns query IDs only when an activation consists solely of workflow
       queries. Query-only activations are read-only leases: adapter-level
@@ -794,6 +829,79 @@ module Make (Supervisor : SUPERVISOR) = struct
     then Some query_ids
     else None
 
+  (** The diagnostic a lane reports for an activation the watchdog failed. *)
+  let deadline_exceeded_error () =
+    make_error ~path:"$.workflow_execution" "activation_deadline_exceeded"
+      "workflow activation exceeded the worker's activation deadline without \
+       yielding; the watchdog released its lease with a failure completion"
+
+  (** Waits for the watchdog to publish the result of the failure submission
+      it started after winning the lease claim. The wait is bounded by one
+      supervisor completion call, which the watchdog has already begun. *)
+  let rec await_watchdog_outcome flight =
+    match Atomic.get flight.watchdog_outcome with
+    | Some outcome -> outcome
+    | None ->
+        Thread.delay 0.001;
+        await_watchdog_outcome flight
+
+  (** Handles a lane that returned from workflow code after the watchdog had
+      already failed its workflow task. The lane's own completion is dropped
+      without a native call, because the lease belongs to the watchdog's
+      submission. Unless the activation was a read-only query, the run is
+      shut down and removed: Core evicts a run whose task failed, and its
+      eviction activation is then acknowledged by the [Some _, None] path. A
+      watchdog submission that was not acknowledged leaves the lease state
+      unknown, which is returned as an [Error] so the worker loop stops. *)
+  let abandoned_by_watchdog adapter flight =
+    let activation = flight.activation in
+    if Option.is_none (query_only_ids activation) then
+      drop_run adapter activation.run_id;
+    match await_watchdog_outcome flight with
+    | Ok () ->
+        report Logs.Warning ~operation:"workflow_activation_late_completion_dropped"
+          ~error_kind:"activation_deadline_exceeded" ();
+        Ok
+          (Rejected
+             {
+               run_id = Some activation.run_id;
+               error = deadline_exceeded_error ();
+               lease_retired = true;
+             })
+    | Error error -> Error error
+
+  (** Claims the lease of the in-flight activation for the lane. Returns
+      [Some flight] only when the watchdog claimed it first. A completion for a
+      run other than the in-flight activation (none is produced today) is not
+      subject to the watchdog. *)
+  let lane_lost_claim adapter run_id =
+    match Atomic.get adapter.in_flight with
+    | Some flight when String.equal flight.activation.Protocol.run_id run_id ->
+        if Atomic.compare_and_set flight.claim Unclaimed Lane_claimed then None
+        else (
+          match Atomic.get flight.claim with
+          | Watchdog_claimed -> Some flight
+          | Unclaimed | Lane_claimed -> None)
+    | _ -> None
+
+  (** Records a completion before its first native attempt. This ordering is
+      intentional: even an exception from the native binding leaves an exact
+      owned completion in [pending], where it either awaits an explicitly
+      retryable later attempt or blocks the run until terminal [discard].
+      Every lane submission first claims the in-flight lease; if the watchdog
+      already failed the task, the completion is dropped instead (#493). *)
+  let enqueue_pending adapter pending =
+    match lane_lost_claim adapter pending.run_id with
+    | Some flight -> abandoned_by_watchdog adapter flight
+    | None ->
+    if Run_map.mem pending.run_id adapter.pending then
+      Error
+        (make_error ~path:"$.run_id" "duplicate_pending_completion"
+           "a workflow run already has an unacknowledged completion")
+    else (
+      adapter.pending <- Run_map.add pending.run_id pending adapter.pending;
+      finish_pending adapter pending)
+
   (** Query failures answer their request IDs. Other adapter defects fail the
       workflow task with no commands, preserving its durable execution. Eviction
       is an empty acknowledgement even if a diagnostic callback failed. *)
@@ -810,6 +918,21 @@ module Make (Supervisor : SUPERVISOR) = struct
     | None ->
         Protocol.{ run_id = activation.run_id; commands = []; task_failure = Some failure }
 
+  (** Runs the canonical encoder once over a completion built by this adapter
+      (a failure or an eviction acknowledgement). An encoder rejection becomes
+      the same [completion_failed] diagnostic, at the same path, that a
+      non-retryable supervisor rejection produced when the supervisor ran the
+      encoder; [finish_pending] fails it closed without a native call. *)
+  let encode_submission completion =
+    match Native_execution.encode_completion completion with
+    | Ok encoded -> Ok { Native_execution.completion; encoded }
+    | Error error ->
+        let view = Protocol.error_view error in
+        Error
+          (make_error ~path:"$.completion" "completion_failed"
+             (Printf.sprintf "workflow completion encoding failed: %s at %s: %s"
+                view.code view.path view.message))
+
   (** Encodes and submits an adapter-level failure. A successful submission is
       the lease-retirement proof for the activation; a failed submission
       preserves a source error rather than claiming the lease was retired.
@@ -825,11 +948,33 @@ module Make (Supervisor : SUPERVISOR) = struct
       match Run_map.find_opt activation.run_id adapter.runs with
       | Some (Run { execution; _ }) -> (try Execution.shutdown execution with _ -> ())
       | None -> ());
+    (* The initializing job names the workflow even when the run never
+       reached the registry (unknown type, undecodable input); later
+       activations read it from the registry before any removal. *)
+    let workflow_id =
+      match
+        List.find_map
+          (function
+            | Protocol.Initialize_workflow { workflow_id; _ } -> Some workflow_id
+            | _ -> None)
+          activation.jobs
+      with
+      | Some _ as workflow_id -> workflow_id
+      | None -> cached_workflow_id adapter activation.run_id
+    in
     let pending =
       {
         run_id = activation.run_id;
-        completion = copy_completion completion;
-        result = Pending_rejected { error; remove_run };
+        submission = encode_submission completion;
+        result =
+          Pending_rejected
+            {
+              error;
+              remove_run;
+              workflow_id;
+              replaying = activation.is_replaying;
+            };
+        retry_refusal = None;
       }
     in
     enqueue_pending adapter pending
@@ -869,13 +1014,20 @@ module Make (Supervisor : SUPERVISOR) = struct
           translated.cache_removal;
     }
 
-  (** Produces a typed completion for a successfully executed activation and
-      updates the registry only after the supervisor confirms retirement. *)
-  let submit_completion adapter activation completion ~run_id ~activation_info =
+  (** Submits the checked completion of a successfully executed activation and
+      updates the registry only after the supervisor confirms retirement. The
+      bytes produced by [Native_execution]'s single encoder pass are retained
+      and submitted as they are; the typed value is read only for bookkeeping.
+      A failed or raised submission keeps the exact bytes pending; Core may
+      already have accepted them, so they are never replaced by a task
+      failure. *)
+  let submit_completion adapter activation
+      (checked : Native_execution.encoded_completion) ~run_id ~activation_info =
+    let completion = checked.completion in
     let pending =
       {
         run_id;
-        completion = copy_completion completion;
+        submission = Ok checked;
         result =
           Pending_completed
             {
@@ -887,29 +1039,18 @@ module Make (Supervisor : SUPERVISOR) = struct
                   activation.Protocol.jobs;
               activation_info;
             };
+        retry_refusal = None;
       }
     in
-    if Run_map.mem pending.run_id adapter.pending then
-      Error
-        (make_error ~path:"$.run_id" "duplicate_pending_completion"
-           "a workflow run already has an unacknowledged completion")
-    else begin
-      adapter.pending <- Run_map.add pending.run_id pending adapter.pending;
-      match attempt_completion adapter.supervisor pending.completion with
-      | Accepted -> accepted_pending adapter pending
-      | Rejected_by_supervisor error -> Error error
-      | Raised_by_supervisor exception_ ->
-          (* Core may already have accepted this exact value. Never replace it
-             with a task failure or rerun workflow code after an uncertain ack. *)
-          Error (completion_exception_error exception_)
-    end
+    enqueue_pending adapter pending
 
   (** A cache-eviction activation is acknowledged with a successful empty
       completion even when its workflow run has already been removed after an
-      adapter failure. This uses the retained-completion path rather than
-      the ordinary submission path: if the native completion call raises, the
-      exact empty acknowledgement remains pending for a later retry and is
-      never replaced by an invalid failure command. *)
+      adapter failure. Like every submission it uses the retained-completion
+      path: if the native completion call raises, the exact empty
+      acknowledgement remains pending (resubmitted only after an explicitly
+      retryable failure) and is never replaced by an invalid failure
+      command. *)
   let submit_eviction_acknowledgement adapter (activation : Protocol.activation)
       ~activation_info =
     let completion =
@@ -918,7 +1059,7 @@ module Make (Supervisor : SUPERVISOR) = struct
     let pending =
       {
         run_id = activation.run_id;
-        completion = copy_completion completion;
+        submission = encode_submission completion;
         result =
           Pending_completed
             {
@@ -927,6 +1068,7 @@ module Make (Supervisor : SUPERVISOR) = struct
               evicted = true;
               activation_info;
             };
+        retry_refusal = None;
       }
     in
     enqueue_pending adapter pending
@@ -996,16 +1138,20 @@ module Make (Supervisor : SUPERVISOR) = struct
                               | Ok input ->
                                   let execution =
                                     Execution.start ~task_queue:adapter.task_queue
+                                      ~namespace:adapter.namespace
                                       ~randomness_seed:init.randomness_seed
                                       ~signal_handlers ~query_handlers
                                       ~update_handlers definition input
                                   in
-                                  let run = Run { definition; execution } in
+                                  let run =
+                                    Run { definition; execution; workflow_id = init.workflow_id }
+                                  in
                                   adapter.runs <-
                                     Run_map.add activation.run_id run adapter.runs;
                                   begin
                                     match
-                                      Native_execution.activate execution activation
+                                      Native_execution.activate_translated execution
+                                        translated
                                     with
                                     | Error error ->
                                         retire_with_failure ~remove_run:true adapter
@@ -1023,7 +1169,9 @@ module Make (Supervisor : SUPERVISOR) = struct
                           (make_error ~path:"$.run_id" "unknown_run_id"
                              "activation does not identify a registered running workflow")
                     | Some (Run { execution; _ }) ->
-                        (match Native_execution.activate execution activation with
+                        (match
+                           Native_execution.activate_translated execution translated
+                         with
                         | Error error ->
                             let remove_run =
                               Option.is_none (query_only_ids activation)
@@ -1046,48 +1194,212 @@ module Make (Supervisor : SUPERVISOR) = struct
         ~remove_run:(Run_map.mem activation.run_id adapter.runs)
         adapter activation error
 
-  (** Retries every retained workflow completion while the adapter mutex is
-      held. Shutdown uses this operation before closing Rust so an
-      acknowledged lease is never left behind by a prior transport failure. *)
+  (** Names the workflow execution an activation belongs to for watchdog
+      diagnostics: from its initialization job when it starts a run, otherwise
+      from the cached run. Called while [mutex] is held. *)
+  let activation_identity adapter (activation : Protocol.activation) =
+    match
+      List.find_map
+        (function
+          | Protocol.Initialize_workflow { workflow_id; workflow_type; _ } ->
+              Some (workflow_id, workflow_type)
+          | _ -> None)
+        activation.jobs
+    with
+    | Some (workflow_id, workflow_type) -> (Some workflow_id, Some workflow_type)
+    | None -> (
+        match Run_map.find_opt activation.run_id adapter.runs with
+        | Some (Run { definition; workflow_id; _ }) ->
+            (Some workflow_id, Some (Definition.name definition))
+        | None -> (None, None))
+
+  (** Publishes the activation for the watchdog, processes it, and withdraws
+      it. The publication happens before any user code (codecs, observers, or
+      workflow fibers) runs, and withdrawal happens only after the completion
+      was submitted or dropped, so the watchdog can never claim a lease the
+      lane has already completed. *)
+  let process_tracked adapter (activation : Protocol.activation) =
+    let flight_workflow_id, flight_workflow_type =
+      activation_identity adapter activation
+    in
+    let epoch = adapter.next_epoch in
+    adapter.next_epoch <- epoch + 1;
+    let flight =
+      {
+        epoch;
+        activation;
+        flight_workflow_id;
+        flight_workflow_type;
+        claim = Atomic.make Unclaimed;
+        watchdog_outcome = Atomic.make None;
+      }
+    in
+    Atomic.set adapter.in_flight (Some flight);
+    Fun.protect
+      ~finally:(fun () -> Atomic.set adapter.in_flight None)
+      (fun () -> process_one adapter activation)
+
+  (** Returns the epoch of the activation currently running workflow code, or
+      [None] when the lane is polling, idle, or already submitting a
+      completion. Safe to call from any Domain without the adapter mutex. *)
+  let running_epoch adapter =
+    match Atomic.get adapter.in_flight with
+    | Some flight when Atomic.get flight.claim = Unclaimed -> Some flight.epoch
+    | _ -> None
+
+  (** Logs the bounded watchdog diagnostic. Identifiers are bounded by the
+      observability layer; no payload or failure text is included. *)
+  let report_stuck (stuck : stuck_activation) =
+    try
+      let tags =
+        Observability.tags ~operation:"workflow_activation_deadline_exceeded"
+          ~duration_ms:(Float.of_int stuck.elapsed_ms)
+          ?workflow_type:stuck.workflow_type ?workflow_id:stuck.workflow_id
+          ~run_id:stuck.run_id
+          ~error_kind:
+            (match stuck.abandoned with
+             | `Task_failed -> "workflow_task_failed"
+             | `Queries_failed -> "workflow_queries_failed"
+             | `Eviction_acknowledged -> "eviction_acknowledged"
+             | `Not_acknowledged -> "completion_unacknowledged")
+          ()
+      in
+      Observability.report ~src:Observability.Source.workflow Logs.Error ~tags
+        "workflow activation did not yield before its deadline; the worker \
+         is unhealthy and must be restarted"
+    with _ -> ()
+
+  (** Classifies the watchdog's replacement [completion], as built by
+      [failure_completion], together with its submission [outcome]. Only an
+      acknowledged completion carrying [task_failure] is reported as a failed
+      workflow task; failed query answers and an empty eviction acknowledgement
+      leave the workflow task itself unfailed. *)
+  let abandonment_of (completion : Protocol.completion) outcome : abandonment =
+    match (outcome, completion) with
+    | Error _, _ -> `Not_acknowledged
+    | Ok (), { task_failure = Some _; _ } -> `Task_failed
+    | Ok (), { task_failure = None; commands = _ :: _; _ } -> `Queries_failed
+    | Ok (), { task_failure = None; commands = []; _ } -> `Eviction_acknowledged
+
+  (** Called by the watchdog when activation [epoch] has run workflow code for
+      at least [elapsed_ms]. If that activation is still unclaimed, the
+      watchdog takes its lease, submits the [failure_completion] for it
+      through the supervisor without the adapter mutex (the lane still holds
+      it), records the sticky [stuck] report with the resulting
+      {!abandonment}, and logs it. For an ordinary activation Temporal then
+      retries the failed task, normally on another worker. Returns [None] when the lane finished or
+      claimed the lease first; the watchdog never touches workflow state, so
+      the stuck code keeps running until it returns on its own. *)
+  let abandon_activation adapter ~epoch ~elapsed_ms =
+    match Atomic.get adapter.in_flight with
+    | Some flight
+      when flight.epoch = epoch
+           && Atomic.compare_and_set flight.claim Unclaimed Watchdog_claimed ->
+        let completion =
+          failure_completion flight.activation (deadline_exceeded_error ())
+        in
+        let outcome =
+          match encode_submission completion with
+          | Error error -> Error error
+          | Ok submission -> (
+              match attempt_completion adapter.supervisor submission with
+              | Accepted -> Ok ()
+              | Rejected_by_supervisor { error; _ } -> Error error
+              | Raised_by_supervisor { exception_; _ } ->
+                  Error (completion_exception_error exception_))
+        in
+        Atomic.set flight.watchdog_outcome (Some outcome);
+        let stuck =
+          {
+            run_id = flight.activation.run_id;
+            workflow_id = flight.flight_workflow_id;
+            workflow_type = flight.flight_workflow_type;
+            is_replaying = flight.activation.is_replaying;
+            elapsed_ms;
+            abandoned = abandonment_of completion outcome;
+          }
+        in
+        ignore (Atomic.compare_and_set adapter.stuck None (Some stuck));
+        report_stuck stuck;
+        Some stuck
+    | _ -> None
+
+  (** The first activation the watchdog abandoned, if any. *)
+  let stuck adapter = Atomic.get adapter.stuck
+
+  (** Retries retained workflow completions while the adapter mutex is held.
+      Shutdown uses this operation before closing Rust so an explicitly
+      retryable transport failure never leaves a lease behind. A completion
+      whose earlier failure was not classified retryable is not resubmitted:
+      [finish_pending] returns its recorded error, which the worker treats as a
+      terminal drain failure before force-releasing the native graph. *)
+  let drain_locked adapter : (unit, error_view) result =
+    (* [min_binding_opt] gives retries a stable order. The loop stops on the
+       first error, retaining that completion and every later one; a
+       fail-closed entry stops it without any native call. *)
+    let rec loop () =
+      match Run_map.min_binding_opt adapter.pending with
+      | None -> Ok ()
+      | Some (_, pending) -> (
+          match finish_pending adapter pending with
+          | Ok _ -> loop ()
+          | Error error -> Error error)
+    in
+    loop ()
+
+  (** Takes the adapter mutex for [drain_locked]. *)
   let drain adapter : (unit, error_view) result =
     Mutex.lock adapter.mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.mutex)
-      (fun () ->
-        (* [min_binding_opt] gives retries a stable order. The loop stops on
-           the first source error, retaining that completion and every later
-           one for a subsequent drain attempt. *)
-        let rec loop () =
-          match Run_map.min_binding_opt adapter.pending with
-          | None -> Ok ()
-          | Some (_, pending) -> (
-              match finish_pending adapter pending with
-              | Ok _ -> loop ()
-              | Error error -> Error error)
-        in
-        loop ())
+      (fun () -> drain_locked adapter)
 
   (** Discards OCaml-owned executions and retained completion bytes after the
       native graph has been force-released by terminal worker shutdown. This
       path never calls the supervisor: the Rust runtime has already retired its
-      leases, and retrying a copied completion would risk a duplicate. Each
+      leases, and retrying a retained completion would risk a duplicate. Each
       execution is explicitly shut down so paused workflow continuations and
       scheduler state do not wait for a later garbage collection cycle. *)
+  let discard_locked adapter =
+    Run_map.iter
+      (fun _ (Run { execution; _ }) ->
+        (try Execution.shutdown execution with _ -> ()))
+      adapter.runs;
+    adapter.runs <- Run_map.empty;
+    adapter.pending <- Run_map.empty
+
+  (** Takes the adapter mutex for [discard_locked]. *)
   let discard adapter =
     Mutex.lock adapter.mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.mutex)
-      (fun () ->
-        Run_map.iter
-          (fun _ (Run { execution; _ }) ->
-            (try Execution.shutdown execution with _ -> ()))
-          adapter.runs;
-        adapter.runs <- Run_map.empty;
-        adapter.pending <- Run_map.empty)
+      (fun () -> discard_locked adapter)
+
+  (** Runs [f] with the adapter mutex only if it is free right now. The
+      workflow lane holds that mutex from poll through completion, so [None]
+      is the non-blocking signal that an activation is still in progress. *)
+  let if_idle adapter f =
+    if Mutex.try_lock adapter.mutex then
+      Some (Fun.protect ~finally:(fun () -> Mutex.unlock adapter.mutex) f)
+    else None
+
+  (** Non-blocking [drain] for bounded shutdown (#495). *)
+  let try_drain adapter = if_idle adapter (fun () -> drain_locked adapter)
+
+  (** Non-blocking [discard] for bounded shutdown (#495). *)
+  let try_discard adapter =
+    Option.is_some (if_idle adapter (fun () -> discard_locked adapter))
+
+  (** Lock-free read of the lane's in-flight slot, set from poll until the
+      completion is submitted, whether or not the watchdog has already
+      claimed the activation's lease. *)
+  let activation_in_flight adapter = Option.is_some (Atomic.get adapter.in_flight)
 
   (** Serializes one poll/execute/complete transaction. A mutex is required in
       addition to supervisor serialization because the run map and scheduler
-      state are OCaml values owned by this adapter, not by Rust. *)
+      state are OCaml values owned by this adapter, not by Rust. A retained
+      completion blocks new activations: it is retried only when its failure
+      was explicitly retryable, and otherwise reported again unchanged. *)
   let poll adapter =
     Mutex.lock adapter.mutex;
     Fun.protect
@@ -1114,7 +1426,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                 report Logs.Debug ~operation:"workflow_poll_not_ready" ();
                 Ok Not_ready
             | Ok (Some activation) ->
-                process_one adapter activation)
+                process_tracked adapter activation)
 end
 
 (** Exposes registration without exposing its existential constructor. *)

@@ -27,6 +27,7 @@ let update_request : Protocol.update_request =
     update_id = "update-1";
     update_name = "set_state";
     input = [ payload (Bytes.of_string "input") ];
+    rpc_deadline = None;
   }
 
 let poll_request : Protocol.poll_update_request =
@@ -74,7 +75,7 @@ let test_update_protocol () =
     [
       { update_request with update_id = "" };
       { update_request with update_name = "contains\000nul" };
-      { update_request with execution = { execution with run_id = "" } };
+      { update_request with execution = { execution with workflow_id = "" } };
     ];
   List.iter
     (fun request -> require_error (Protocol.encode_poll_update_request request))

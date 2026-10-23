@@ -1,6 +1,21 @@
 #!/bin/sh
 set -eu
 
+# Runs `opam exec -- dune SUBCOMMAND ARGS...` and adds an explicit `-j` when
+# DUNE_JOBS is non-empty. Make exports the limit (#851), but Dune reads the
+# DUNE_JOBS environment variable only from 3.22, and the SDK supports 3.18, so
+# the flag keeps this nested build bounded on every supported release.
+# test/smoke/test_build_jobs_contract.sh runs this function with a stub Dune.
+opam_dune() {
+  dune_subcommand=$1
+  shift
+  if [ -n "${DUNE_JOBS:-}" ]; then
+    opam exec -- dune "$dune_subcommand" -j "$DUNE_JOBS" "$@"
+  else
+    opam exec -- dune "$dune_subcommand" "$@"
+  fi
+}
+
 root=$(pwd)
 install_root="$root/_build/install/default/lib"
 package_root="$install_root/temporal-sdk"
@@ -20,7 +35,7 @@ case "$(uname -s)" in
     ;;
 esac
 
-opam exec -- dune build @install
+opam_dune build @install
 
 # The wrapped [Temporal] root is the installed package's explicit public
 # module allow-list. Keep this check next to the consumer compilation so a
@@ -28,7 +43,7 @@ opam exec -- dune build @install
 # module fails the package-boundary gate before publication. The comparison is
 # intentionally source-based: the installed tree contains generated aliases,
 # while the checked-in root is the maintainer-owned list.
-expected_public_modules='Activity Child_workflow Client Codec Condition Duration Error Future Interaction Payload Query Result_syntax Runtime_info Scope Time Signal Update Worker Workflow Workflow_context'
+expected_public_modules='Activity Child_workflow Client Codec Condition Duration Error Future Interaction Payload Query Replay Result_syntax Retry_policy Runtime Runtime_info Scope Time Signal Testing Update Worker Workflow Workflow_context'
 actual_public_modules=$(sed -n 's/^module \([A-Za-z0-9_]*\) = .*/\1/p' \
   "$root/lib/public/temporal.ml" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 if [ "$actual_public_modules" != "$expected_public_modules" ]; then
@@ -116,15 +131,38 @@ cp "$root/test/fixtures/install-consumer/dune" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/main.ml" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/public_api.ml" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/worker_environment.ml" "$output_dir/"
+cp "$root/test/fixtures/install-consumer/installed_replay.ml" "$output_dir/"
+# The installed replay check reuses a frozen history-corpus capture (#497).
+cp "$root/test/fixtures/history-corpus/histories/live-2026-10-08-timer.pb" \
+  "$output_dir/timer-history.pb"
 cp "$root/test/fixtures/install-consumer/negative-dune" "$output_dir/dune-negative"
 cp "$root/test/fixtures/install-consumer/negative/forbidden_"*.ml "$output_dir/"
 consumer_ocamlpath=$dune_install_root
 if [ -n "${OCAMLPATH:-}" ]; then
   consumer_ocamlpath="${dune_install_root}${path_separator}${OCAMLPATH}"
 fi
-OCAMLPATH="$consumer_ocamlpath" opam exec -- \
-  dune build --root "$dune_output_dir" ./main.exe ./worker_environment.exe
+# The subshell confines the consumer OCAMLPATH to the Dune build.
+(
+  OCAMLPATH=$consumer_ocamlpath
+  export OCAMLPATH
+  opam_dune build --root "$dune_output_dir" ./main.exe ./main.bc ./worker_environment.exe \
+    ./installed_replay.exe
+)
 "$output_dir/_build/default/main.exe"
+# The same consumer as a Dune (modes byte) executable, built in its own Dune
+# root without the SDK's dune-workspace (#1020). The installed bridge archive
+# forces a custom runtime, so this must link the static archives and run
+# without looking for a dllocaml_temporal_core_bridge shared library.
+"$output_dir/_build/default/main.bc"
+
+# Offline replay through the installed package: the recorded code must pass and
+# the same workflow type without its timer must be nondeterministic (#497).
+# The history is passed as a relative path from the consumer directory: the
+# executable is native, so on Windows it cannot open a Cygwin /cygdrive path.
+(
+  cd "$output_dir"
+  ./_build/default/installed_replay.exe timer-history.pb
+)
 
 # Malformed legacy settings used to fail before native client configuration.
 # The installed worker now reaches the same native path with either namespace
@@ -163,9 +201,11 @@ for forbidden_target in \
   forbidden_future_kernel \
   forbidden_worker_observer \
   forbidden_acceptance_observer; do
-  if OCAMLPATH="$consumer_ocamlpath" opam exec -- \
-    dune build --root "$dune_output_dir" \
-      "./$forbidden_target.exe" >"$output_dir/$forbidden_target.log" 2>&1; then
+  if (
+    OCAMLPATH=$consumer_ocamlpath
+    export OCAMLPATH
+    opam_dune build --root "$dune_output_dir" "./$forbidden_target.exe"
+  ) >"$output_dir/$forbidden_target.log" 2>&1; then
     echo "$forbidden_target unexpectedly compiled from the public package" >&2
     cat "$output_dir/$forbidden_target.log" >&2
     exit 1

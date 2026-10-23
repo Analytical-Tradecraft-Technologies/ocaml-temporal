@@ -1,3 +1,9 @@
+;; Every path in this rule is relative to this dune file, never to Dune's
+;; workspace-root variable. When the SDK is vendored (for example under
+;; [vendor/temporal] with [(vendored_dirs vendor)]), the workspace root is the
+;; consumer's project, which contains neither the bridge scripts nor the Rust
+;; sources. Dune runs the action from this directory, so [../..] is always the
+;; SDK root, whether it is the workspace itself or a vendored subdirectory.
 (rule
  (targets
   libocaml_temporal_core_bridge.a
@@ -9,7 +15,6 @@
   (env_var TEMPORAL_RUST_BRIDGE_DIR)
   (env_var TEMPORAL_RUST_BRIDGE_KEY)
   (source_tree ../../rust)
-  ../../scripts/build-rust-bridge.sh
   ../../scripts/rust-bridge-artifact.sh
   ../../scripts/copy-rust-bridge-artifacts.sh
   ../../scripts/render-rust-link-flags.sh)
@@ -18,23 +23,34 @@
   ;; Cargo's target directory is mutable, so advertise a writable sibling as a
   ;; fallback for the bridge script. An explicitly configured
   ;; [CARGO_TARGET_DIR] remains authoritative; this fallback must not make the
-  ;; Docker or native Makefile workflows build the Rust graph twice.
+  ;; Docker or native Makefile workflows build the Rust graph twice. The
+  ;; fallback stays inside the SDK's own build directory so a vendored SDK
+  ;; never writes Cargo output into the consumer's build root.
+  ;;
+  ;; [%{profile}] selects the Cargo profile (#779). [opam install] and
+  ;; [dune build -p] use Dune's release profile, so installed and opam builds
+  ;; link Cargo's optimized [profile.release]; Dune's default dev profile keeps
+  ;; Cargo's fast, unoptimized dev profile. Expanding the variable in the
+  ;; action makes Dune rerun this rule whenever the profile changes.
   (setenv
-   OCAML_TEMPORAL_RUST_TARGET_FALLBACK
-   %{workspace_root}/rust-target
+   OCAML_TEMPORAL_BUILD_PROFILE
+   %{profile}
    (setenv
-    TEMPORAL_OCAML_IMPORT_DIR
-    rust-imports
+    OCAML_TEMPORAL_RUST_TARGET_FALLBACK
+    ../../rust-target
     (setenv
-     TEMPORAL_OCAML_LINK_FLAGS
-     rust_ocaml_link_flags.sexp
-     (run
-      sh
-      %{workspace_root}/scripts/build-rust-bridge.sh
-      %{workspace_root}
-      libocaml_temporal_core_bridge.a
-      dllocaml_temporal_core_bridge%{ext_dll}
-      rust_static_link_flags.sexp))))))
+     TEMPORAL_OCAML_IMPORT_DIR
+     rust-imports
+     (setenv
+      TEMPORAL_OCAML_LINK_FLAGS
+      rust_ocaml_link_flags.sexp
+      (run
+       sh
+       %{dep:../../scripts/build-rust-bridge.sh}
+       ../..
+       libocaml_temporal_core_bridge.a
+       dllocaml_temporal_core_bridge%{ext_dll}
+       rust_static_link_flags.sexp)))))))
 
 (include install-rust-imports.inc)
 
@@ -43,7 +59,16 @@
  (language c)
  (names native_stubs)
  (include_dirs ../../rust/core-bridge/include)
- (flags :standard -Wall -Wextra -Werror))
+ (flags :standard -Wall -Wextra))
+
+;; Warnings are fatal only in the development profile used by CI and local
+;; builds. [opam install] builds with [-p], which selects the release profile,
+;; so a new warning from a user's newer or different C compiler cannot turn
+;; installation into a hard failure.
+(env
+ (dev
+  (c_flags
+   (:standard -Werror))))
 
 (library
  (name temporal_core_bridge)
@@ -52,6 +77,19 @@
  (modules native_bridge)
  (libraries temporal_base temporal_protocol yojson)
  (foreign_archives temporal_native_stubs ocaml_temporal_core_bridge)
+ ;; Only the static stub and Rust archives are installed, yet ocamlc records
+ ;; them in the .cma as -dllib entries too. Outside a workspace that disables
+ ;; dynamically linked foreign archives, a plain bytecode link would then look
+ ;; for dllocaml_temporal_core_bridge and fail (#1020). [ocamlc -a -custom]
+ ;; stores "force custom" in the .cma, so every bytecode executable that links
+ ;; the SDK (Dune [(modes byte)], [ocamlfind ocamlc -linkpkg]) is built with a
+ ;; custom runtime that embeds the static archives and never loads a DLL. A
+ ;; custom link does not search the library's own directory, so the -L, which
+ ;; OCaml relocates through $CAMLORIGIN, points the C linker at the installed
+ ;; archives. These are [ocamlc_flags], not [library_flags], because ocamlopt
+ ;; rejects -custom; native archives already find the stubs through -I.
+ (ocamlc_flags
+  (:standard -custom -ccopt "-L\"$CAMLORIGIN\""))
  (library_flags (:include rust_ocaml_link_flags.sexp))
  (c_library_flags
   (:include rust_static_link_flags.sexp)))

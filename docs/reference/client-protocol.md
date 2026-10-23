@@ -8,9 +8,10 @@ decision about how a workflow result is exposed.
 
 The public `Temporal.Client` module does not expose these JSON documents,
 start tickets, or native status codes. On an HTTP(S) client, `start` returns a
-typed exact-run handle, `wait` hides the bounded polling loop and returns a
-typed terminal value, and the exact-run control operations (`cancel`,
-`terminate`, `reset`, `signal`, `query`, and `query_with_input`) expose typed
+typed exact-run handle, `get_handle` builds a handle from a workflow ID with or
+without a run ID, `wait` hides the bounded polling loop and returns a typed
+terminal value, and the control operations (`cancel`, `terminate`, `reset`,
+`signal`, `query`, `query_with_input`, and `start_update`) expose typed
 results.
 `list_visibility` returns one bounded page. The sections below describe the
 private steps that make those public operations safe.
@@ -27,9 +28,11 @@ Every operation copies input bytes before Rust releases the OCaml runtime lock.
 Rust copies its output into an owned result buffer. The OCaml C stub copies that
 buffer into an OCaml `bytes` value and frees the native result in a protected
 cleanup path. Synchronous operations do not retain a JSON string or payload
-pointer after the call. The asynchronous start operation retains only a
-Rust-owned typed request inside its bounded Tokio task; its ticket and final
-outcome cross the same copied JSON result boundary.
+pointer after the call. Submitted calls (the path the public client uses for
+every RPC, see [Submitted client calls](#submitted-client-calls-807)) and the
+asynchronous start ticket retain only a Rust-owned typed request inside their
+Tokio task; the call identifier or ticket and the final outcome cross the same
+copied JSON result boundary.
 
 ## Start a workflow
 
@@ -55,7 +58,12 @@ The OCaml side sends one closed object:
         "data": "eyJ0ZXh0IjoiSGkifQ=="
       }
     }
-  ]
+  ],
+  "id_conflict_policy": "fail",
+  "id_reuse_policy": "allow_duplicate",
+  "execution_timeout_ms": 86400000,
+  "task_timeout_ms": 10000,
+  "rpc_timeout_ms": 5000
 }
 ```
 
@@ -64,11 +72,68 @@ base64 without whitespace. `input` is ordered and may be empty. Payload
 metadata and bytes use the shared workflow payload codec, so binary values are
 never treated as UTF-8 text.
 
+Start, signal, and update requests carry one encoded typed value, with one
+exception (#819): when the definition's input codec is `Codec.unit`, `input`
+is the empty list. The Temporal CLI, Web UI, and other SDKs send zero payloads
+for a no-argument call, and an SDK that binds payloads positionally (Python,
+for example) would reject a surplus `null` argument. OCaml workers decode an
+empty list back to the canonical unit payload, so OCaml-to-OCaml calls are
+unchanged.
+
+The rule is decided by the codec, not by the payload's bytes (#1012).
+`Codec.option`'s `None` encodes to the same `binary/null` payload as `()`, but
+it is a real argument: Go, Java, and Python send one `binary/null` payload
+for a nil argument (TypeScript for `undefined`), so a foreign handler with one
+optional parameter must receive it. Every codec other than `Codec.unit`
+therefore sends exactly one payload. OCaml receivers decode either zero
+payloads or one `binary/null` payload as `None`, so OCaml senders built before
+this change remain compatible. The same codec-decided rule
+(`Codec_private.encode_arguments`) is applied to workflow commands that carry
+input: activities, local activities, child workflows, continue-as-new, and
+external signals.
+
 Rust validates every identifier, rejects NUL bytes, rejects duplicate or
 unknown members, validates payloads, and then calls Core's raw
-`WorkflowService::start_workflow_execution`. The first slice deliberately
-uses Temporal Server's documented defaults for optional start policies; it does
-not invent OCaml-side defaults. The public `Temporal.Client.start` function
+`WorkflowService::start_workflow_execution`. Both workflow ID policies are
+always sent as explicit enum values, never `UNSPECIFIED`:
+
+- `id_conflict_policy` (`fail`, `use_existing`, or `terminate_existing`)
+  applies when the workflow ID has an open run. The OCaml encoder always emits
+  it from `Client.start ?id_conflict_policy` (default `` `Fail ``); Rust
+  treats an omitted member as `fail`.
+- `id_reuse_policy` (`allow_duplicate`, `allow_duplicate_failed_only`, or
+  `reject_duplicate`, #499) applies when the latest run has closed. The OCaml
+  encoder always emits it from `Client.start ?id_reuse_policy` (default
+  `` `Allow_duplicate ``, Temporal's default); Rust treats an omitted member
+  as `allow_duplicate`. Temporal's deprecated `TERMINATE_IF_RUNNING` has no
+  spelling, because `terminate_existing` replaces it and Temporal rejects it
+  next to an explicit conflict policy. Every pairing of the two policies is
+  accepted; Temporal 1.32 accepts `reject_duplicate` with `use_existing`.
+
+The server-side execution policies (#499) are optional members that are
+omitted when absent, so Temporal applies its defaults:
+
+| Member | `Client.start` argument | Bound | Absent |
+| --- | --- | --- | --- |
+| `execution_timeout_ms` | `?execution_timeout` | 1 ms to 315,576,000,000,999 ms | unlimited |
+| `run_timeout_ms` | `?run_timeout` | as above, and at most `execution_timeout_ms` | the execution timeout |
+| `task_timeout_ms` | `?task_timeout` | 1 ms to 120,000 ms, and at most the run (or execution) timeout | 10 seconds |
+| `retry_policy` | `?retry_policy` | the activity retry-policy shape and invariants | no retry |
+
+Temporal reads a zero timeout as "unset" and silently lowers a task timeout
+above 120 seconds or above the run timeout, and a run timeout above the
+execution timeout. The OCaml encoder, the public client (for every backend,
+including `mock://`), and Rust all reject those values instead, so a caller
+never believes a bound is in force that the server does not apply. Rust
+converts each millisecond count into a protobuf `Duration` with checked
+`try_from` conversions and copies the retry policy through the same
+lossless converter as activity and child-workflow commands.
+
+The policies and both workflow ID policies are part of the pending-request
+equality check, so retrying a pending `request_id` with a different policy is
+rejected. Temporal's request-ID deduplication runs before the conflict and
+reuse policies, so a retry of the start that created a run returns that run.
+The public `Temporal.Client.start` function
 accepts an optional `request_id`. When it is supplied, that caller-owned value
 is sent unchanged to Temporal; callers should reuse it when retrying a start
 whose outcome is uncertain. When it is omitted, the adapter allocates one fresh
@@ -85,16 +150,76 @@ reused for unrelated workflow starts.
 The deterministic `mock://` backend retains successful explicit start IDs
 with their request fields and original run identity. An identical retry
 returns that run before workflow-ID conflict checks; changed request data
-under the same ID is rejected. For a new request ID, the mock rejects a start
-while that workflow ID has a running execution and accepts a new run after the
-current execution closes. Old exact-run handles remain addressable through
-the mock's retained run history.
+under the same ID (including a different conflict policy, reuse policy,
+workflow timeout, or retry policy) is rejected; a different RPC deadline is
+not part of the request. For a new request ID facing a running execution, the
+mock follows the conflict policy: `` `Fail `` returns the same typed
+already-started error as the native client, `` `Use_existing `` returns the
+running execution with `started = false`, and `` `Terminate_existing `` marks
+the running execution terminated before starting a new run. After the current
+execution closes, the mock follows the reuse policy: `` `Reject_duplicate ``
+always refuses, `` `Allow_duplicate_failed_only `` refuses a successfully
+completed run, and the refusal is the already-started error naming the closed
+run, as Temporal reports it. The mock runs no workflow code, so it accepts but
+does not enforce workflow timeouts or retry policies. Old exact-run handles
+remain addressable through the mock's retained run history.
+
+## RPC deadlines (#499)
+
+Every bounded client request (start, cancel, terminate, reset, signal, query,
+update admission, and visibility) accepts an optional `rpc_timeout_ms`
+member between 1 and 60,000. When present it replaces the operation's
+built-in budget, both as the outer `tokio::time::timeout` and as Core's retry
+window and per-attempt gRPC deadline (see `budgeted_request`). When absent,
+the defaults are unchanged: 10 seconds for start and visibility, 3 seconds
+for cancel, terminate, reset, and signal, and 30 seconds for queries and
+update acceptance. The one-minute ceiling bounds how long one caller can hold
+a task and a connection clone for one call; since #807 no deadline occupies
+the supervisor's owner Domain, because every RPC runs as a submitted call.
+Exact-run waits and update completion polls keep their own bounded internal
+polls and accept no deadline.
+
+The deadline covers the whole client call, including the time the request
+waits in the supervisor's FIFO mailbox. Since #807 that queue holds only
+submissions, which never wait for the network, so the wait is short, but the
+deadline still counts it. The public client turns `?rpc_timeout` into an
+`Client_protocol.rpc_deadline`: the budget plus an absolute expiry on a
+monotonic clock (a private C stub over `CLOCK_MONOTONIC`, or the performance
+counter on Windows), read before the request is enqueued. When the owner
+Domain dispatches the request,
+`Sdk_supervisor.Native.Protocol_adapter.with_rpc_deadline` lowers the budget
+to what remains, rounded up to whole milliseconds and never above the
+original, and that is the `rpc_timeout_ms` sent to Rust. If nothing remains,
+the request is not encoded or sent: the supervisor feeds the same
+`{"kind":"rpc","code":"deadline_exceeded"}` failure Rust would return to the
+operation's result decoder, so the caller sees the typed
+`deadline_exceeded` error. An asynchronous start that expires before
+admission returns a `deadline_exceeded` rejection, not the uncertain
+outcome, because nothing was sent. The absolute expiry never crosses the
+bridge, so the JSON documents and the ABI are unchanged. Visibility errors
+with the closed `rpc` document are now decoded too, so `Client.rpc_status`
+classifies them like the other operations.
+
+An RPC deadline bounds the client call only; it is not a workflow timeout and
+never changes the workflow. An expired deadline is reported as the typed
+`deadline_exceeded` RPC error. The transport reports its own expiry of a
+per-attempt deadline as `cancelled`, so once the budget has elapsed the bridge
+maps `cancelled` and `deadline_exceeded` to `deadline_exceeded` whichever
+timer fired first. Terminate keeps its `termination_outcome_uncertain`
+classification. A start whose deadline expired produces the `unknown`
+outcome, which the OCaml client reports as the non-retryable `` `Bridge ``
+error with `Error.error_type` `StartOutcomeUncertain`, recognized by
+`Client.is_start_outcome_uncertain`. The deadline is excluded from the
+pending-start equality check, so a reconciling retry with the same
+`request_id` may use a different deadline.
 
 The direct `start_workflow_json` ABI can return the successful response shown
-above, but the public HTTP(S) client uses the asynchronous ticket path. It
-begins the request, waits for the ticket to become terminal, and converts the
+above, but the public HTTP(S) client submits the start as a
+[submitted call](#submitted-client-calls-807) whose outcome is the closed
+accepted/rejected/unknown document of the ticket path below. It converts the
 accepted execution into the typed handle; rejected and unknown outcomes become
-typed `Error.t` results. The ticket never leaves the private supervisor.
+typed `Error.t` results. The call identifier never leaves the private
+supervisor and backend.
 
 On success Rust returns:
 
@@ -104,10 +229,18 @@ On success Rust returns:
     "namespace": "default",
     "workflow_id": "summarize-1",
     "run_id": "server-assigned-run-id"
-  }
+  },
+  "started": true
 }
 ```
 
+`started` mirrors `StartWorkflowExecutionResponse.started`. It is `false` only
+when a `use_existing` start returned the running execution created by another
+request; the execution then names that existing run, which becomes the
+handle's run ID and `Client.started` value. Servers that predate the field
+leave it false, so Rust reports `true` for every successful `fail` or
+`terminate_existing` start (their success proves this request created the run),
+and OCaml rejects `started: false` for those policies as a protocol defect.
 OCaml checks that the returned namespace and workflow ID still match the
 request before exposing the run ID. The complete shape is documented by
 [`client-start-request.schema.json`](../schemas/bridge/client-start-request.schema.json)
@@ -123,6 +256,15 @@ messages while Temporal performs the RPC. Rust returns an opaque ticket:
 {"ticket":"4a7c3e0e-3e3d-4b9f-9df2-6e55d3b2b4b7"}
 ```
 
+At most `max_pending_starts` tickets (64 unless the connection configures
+another value; see [client admission limits](#client-admission-limits-796))
+may be outstanding per runtime. A begin request whose
+`request_id` is already pending with identical fields returns the existing
+ticket without using another slot; any other request at capacity is rejected
+with status `15` (`RESOURCE_EXHAUSTED`) before a Tokio task or RPC is created.
+The client remains connected, and the public adapter reports this as a
+retryable `bridge` error recognized by `Client.is_at_capacity`.
+
 The supervisor supplies that object to either `poll_start_workflow_json` or
 `wait_start_workflow_json`. Poll returns immediately; wait blocks for at most
 the bridge's short bounded interval and then returns `STATUS_NOT_READY`, so a
@@ -131,7 +273,7 @@ When the RPC is terminal, the ticket is retired and Rust returns one of these
 closed values:
 
 ```json
-{"kind":"accepted","execution":{"namespace":"default","workflow_id":"summarize-1","run_id":"run-1"}}
+{"kind":"accepted","execution":{"namespace":"default","workflow_id":"summarize-1","run_id":"run-1"},"started":true}
 ```
 
 ```json
@@ -163,6 +305,171 @@ an absent caller. This is the cancellation boundary for asynchronous starts:
 Rust tasks never call OCaml, and no task is detached while it retains a Core
 connection clone.
 
+## Submitted client calls (#807)
+
+One `Client.t` used to serve every call on its supervisor Domain one at a
+time, and that Domain waited for the network inside each call: a pending
+exact-run wait held it for 100 ms per turn, and a query, update admission, or
+update poll for up to 30 seconds. Every other call on the client, including
+shutdown, queued behind them. The public client now performs every RPC
+(start, wait, cancel, terminate, reset, signal, query, update admission,
+update poll, and visibility) as a submitted call:
+
+1. The caller sends a `Client_submit` message to the supervisor. The owner
+   Domain resolves the request's RPC deadline (an expired one completes the
+   call at once and nothing is sent), encodes the request, and calls
+   `ocaml_temporal_core_v4_client_submit_json` with a closed operation
+   selector (`1` start, `2` wait, `3` cancel, `4` terminate, `5` reset,
+   `6` signal, `7` query, `8` update, `9` update poll, `10` visibility) and
+   the operation's usual request document.
+2. Rust validates the document, checks capacity, registers one completion
+   cell under a fresh numeric call identifier bound to the runtime graph's
+   owner identity, spawns one Tokio task that owns a connection clone and
+   the validated request, and returns the handle `<owner>.<call>` as ASCII
+   decimal digits. The owner returns at once.
+3. The caller waits on its own Domain with
+   `ocaml_temporal_core_v4_client_await_call(owner, call, timeout_ms)`. That
+   symbol takes no runtime pointer: the pair names a cell in a process-wide
+   registry, so the wait never touches the owner's graph. The C stub releases
+   the OCaml runtime lock for the whole wait, which ends as soon as the
+   task publishes its outcome. `NOT_READY` means the bounded interval (at
+   most one minute; the OCaml client uses one second) elapsed and the caller
+   waits again.
+
+The terminal result retires the call and is exactly what the operation's
+synchronous symbol returns, with one exception: a start yields the closed
+`accepted`/`rejected`/`unknown` outcome of the ticket path. A task never calls
+OCaml and never touches the runtime; it only writes its own cell. A task that
+panics or is dropped without an outcome settles its cell with `PANIC` or the
+closed status, so no waiter is stranded.
+
+The two long-lived kinds keep their own limits: at most `max_pending_waits`
+distinct runs being waited on and `max_pending_starts` distinct start request
+IDs in flight (64 each by default), where repeats of an in-flight run or
+request ID share a slot (Temporal deduplicates the request ID, so concurrent
+identical starts report the same run). A start whose request ID is in flight
+for a different request is rejected with `PROTOCOL`. All submitted calls of
+one runtime together are capped at `max_in_flight_calls` (4,096 by default).
+The [client admission limits](#client-admission-limits-796) section describes
+how a connection configures the three values.
+A call counts from submission until its completion cell is retired, not
+merely until its RPC finishes: a finished but unread outcome keeps its slot,
+so callers that abandon calls cannot grow the process-wide registry without
+bound. A cell is retired by the caller's terminal read, by
+`ocaml_temporal_core_v4_client_release_call(owner, call)`, or by disconnect
+or close. The OCaml await loop calls the release symbol from a
+`Fun.protect` finalizer whenever it is left without a terminal read (an
+exception, including an asynchronous one), so in practice only a caller that
+never awaits at all holds a slot until shutdown; there is no time-based
+reclaim of such cells. Releasing drops any published outcome, frees the
+slot, and aborts a still-running task through its Tokio abort handle, so an
+abandoned exact-run wait stops long-polling at once instead of running
+until the run closes (#1019). From that moment the call no longer counts
+against the wait, start, or in-flight limits, even before the aborted task
+has finished unwinding; the owner keeps the task's join handle so
+disconnect and close still join it. Submission joins released tasks
+whenever the owner's task map has reached `max_in_flight_calls`, so a burst
+of release-and-resubmit never retains more handles than that ceiling. Release, like await, takes no runtime,
+and a mismatched owner or unknown call is a silent no-op.
+Admission beyond a bound returns `RESOURCE_EXHAUSTED` (status `15`) before
+any task exists, which the public client reports as `Client.is_at_capacity`.
+
+Client disconnect and runtime close (including the garbage-collector
+fallback) release every call of that runtime: they first close each pending
+cell, which wakes its waiter with `INVALID_STATE` (status `5`), then abort the
+tasks and join them before the connection and Core are dropped. An await on a
+retired or unknown identifier also reports `INVALID_STATE`; no submitted
+operation produces that status from inside its task.
+
+A call is reachable only through the graph that submitted it. Each runtime
+graph draws a random 62-bit owner identity when it is created; the registry
+records it with every call, and an await whose owner does not match is
+answered exactly like an unknown identifier (`INVALID_STATE`, same message)
+without waiting on, settling, or retiring the call. A caller therefore cannot
+read or consume another client's outcome, nor learn whether another
+client's call exists, by guessing identifiers. The handle stays inside the
+private supervisor and backend; public callers never see it. The OCaml supervisor maps
+it to its typed `Closed` error, which the public client reports as the
+ordinary closed-client error, or as an uncertain start when the request may
+already have been sent.
+
+The synchronous symbols and the start ticket symbols remain in ABI version 4
+for direct bridge callers and tests. The three new symbols are additive: an
+older OCaml object never calls them, so the ABI version is unchanged.
+
+## Client admission limits (#796)
+
+`Client.create ?max_pending_waits ?max_pending_starts ?max_in_flight_calls`
+sets three per-client counts. The private client connect document
+([schema](../schemas/bridge/client-config.schema.json)) carries each explicit
+value as an optional integer after `identity`:
+
+```json
+{"target_url":"http://127.0.0.1:7233","identity":"1234@host","max_pending_waits":256,"max_in_flight_calls":8192}
+```
+
+| Field | Default | Accepted | Bounds |
+| --- | --- | --- | --- |
+| `max_pending_waits` | 64 | 1 to 4,096 | Distinct exact runs being waited on; repeated waits on one run share a slot. |
+| `max_pending_starts` | 64 | 1 to 4,096 | Distinct start request IDs in flight, on the submitted-call path and the ticket path alike; a retry with the same request ID shares its slot. |
+| `max_in_flight_calls` | 4,096 | 1 to 65,536 | Submitted calls of every kind, each counted until its completion cell is retired. Applies on top of the two limits above. |
+
+The OCaml encoder omits a limit left at its default, so a client created
+without limits sends exactly the two-field document used before #796, byte
+for byte. OCaml rejects an out-of-range value as a typed defect before
+anything is allocated, for every target including `mock://`; Rust decodes the
+fields strictly (an unknown field, a non-integer, or a value outside `u32` is
+a `CONFIGURATION` failure) and checks the same ranges again in
+`connect_client` before any network access. The connection keeps the
+validated values for its lifetime; a runtime without a connection uses the
+defaults.
+
+Admission beyond any limit returns `RESOURCE_EXHAUSTED` (status `15`) before
+a task, ticket, or RPC exists, and the message names the configured limit,
+for example `too many Temporal workflow waits are pending (limit 2)`. The
+public client reports it as a retryable `bridge` error with `error_type`
+`resource_exhausted`, recognized by `Client.is_at_capacity`; the client stays
+connected. Each waited run keeps one history long poll open against the
+server, so a larger wait limit also raises the long polls one client can hold.
+
+The fields are additive optional members of an existing document, so ABI
+version 4 is unchanged: an older OCaml object never sends them, and a bridge
+built before #796 rejects them under `deny_unknown_fields` only if a newer
+OCaml object sets one explicitly.
+
+## Address the current run of a workflow
+
+Every request after start names its execution with `namespace`,
+`workflow_id`, and `run_id`. A non-empty `run_id` names one exact run. An empty
+`run_id` selects the workflow's current run (#791): the bridge forwards the
+empty value unchanged and Temporal resolves the latest run of that workflow ID
+when it handles the RPC, exactly as for an official SDK handle obtained by
+workflow ID alone. Both sides accept the empty selector in the wait, cancel,
+terminate, reset, signal, query, update, and poll-update requests; namespace
+and workflow ID stay mandatory, and a non-empty run ID keeps the usual
+identifier rules. Start requests have no run ID, and every run reported by
+Temporal (start, reset, and update responses, visibility rows, and
+successors) is still a non-empty identifier.
+
+Two responses depend on the selector:
+
+- a wait response echoes the request's execution exactly, so its `run_id` is
+  empty for a current-run wait. Temporal's history response does not name the
+  run it resolved, so neither side invents one; and
+- an update response for a current-run request names the concrete run that
+  accepted the update. Rust rejects a response without one, and OCaml accepts
+  any concrete run of the requested workflow for such a request while still
+  requiring an exact match for an exact-run request. The public update handle
+  keeps that run, so later polls cannot drift to a newer run.
+
+The public `Temporal.Client.get_handle client ~workflow ~id ()` builds a
+current-run handle without contacting Temporal; with `~run_id` it builds an
+exact-run handle like `follow`. `Temporal.Client.run_id` returns `None` for a
+current-run handle. Its `wait` is the only operation that adds behavior in
+OCaml: it sends a current-run wait and then follows each successor by its
+exact run ID until a run closes without one; see
+[Wait for one run](#wait-for-one-run).
+
 ## Request cancellation of one exact run
 
 The public `Temporal.Client.cancel` operation sends a control-plane request for
@@ -179,14 +486,17 @@ client namespace and these five fields to Rust:
 }
 ```
 
-`run_id` is required. There is no implicit “latest run” form, so a cancellation
-cannot accidentally target a continued-as-new successor or another execution
-with the same workflow ID. `request_id` is the Temporal idempotency key for the
+`run_id` is required in the document. A handle from `start`, `follow`, or
+`get_handle ~run_id` always sends its exact run, so its cancellation cannot
+accidentally target a continued-as-new successor or another execution with the
+same workflow ID; only a current-run handle sends the empty selector described
+above. `request_id` is the Temporal idempotency key for the
 logical cancellation operation. If a transport timeout leaves the outcome
 uncertain, the caller should retry with the same request ID and exact handle.
 If the public `Temporal.Client.cancel` caller omits `request_id`, OCaml derives
-a deterministic ID from that handle's workflow ID and run ID, so repeated
-attempts for the same exact handle still identify one logical cancellation.
+a deterministic ID from that handle's workflow ID and run ID (an empty run ID
+for a current-run handle), so repeated attempts for the same handle still
+identify one logical cancellation.
 The optional `reason` is copied as operator context and may be empty; it is
 bounded and NUL-free like all bridge strings.
 
@@ -214,18 +524,18 @@ Both OCaml and Rust validate every field, reject unknown/duplicate members,
 and validate the positive acknowledgement before it crosses the FFI boundary.
 The exact-run cancellation path is covered by local mock, supervisor, OCaml
 bridge, and Rust protocol tests. The live driver contains the same scenario,
-and the complete [PR #289 run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368)
+and the complete [PR #289 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368)
 verified exact-run cancellation, the eventual typed cancelled result, and
 graceful shutdown with outstanding work against a real Temporal Server as part
 of the recorded seventeen-result baseline. The [PR #302
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29351689638) first
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29351689638) first
 verifies the later long-backoff extension, and the complete [PR #439
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29824441578) retains
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29824441578) retains
 exact-run cancellation and graceful shutdown in its historical baseline.
 The [current evidence audit](live-acceptance-coverage.md) records the later
-successful source snapshot. The earlier [PR #277 run](https://github.com/mfow/ocaml-temporal/actions/runs/29318684069)
-remains evidence for the prior fifteen-result slice, [PR #253 run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471)
-for the prior twelve-result slice, and [PR #210](https://github.com/mfow/ocaml-temporal/actions/runs/29221151859)
+successful source snapshot. The earlier [PR #277 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29318684069)
+remains evidence for the prior fifteen-result slice, [PR #253 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471)
+for the prior twelve-result slice, and [PR #210](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29221151859)
 for the original nine-workflow slice. See the [live acceptance coverage](live-acceptance-coverage.md)
 
 ## Terminate one exact run
@@ -244,11 +554,20 @@ workflow ID, run ID, and bounded reason text. It deliberately has no
 `request_id`: Temporal's terminate RPC has no idempotency-key field. The
 deterministic mock preserves this exact-run and terminal-history contract.
 
-The native call has a bounded control-plane deadline so a stalled server cannot
-hold the supervisor owner indefinitely. If that deadline expires, the server
-may already have accepted the command, so the bridge returns the explicit
-`rpc` code `termination_outcome_uncertain` rather than pretending that the
-termination was rejected or that a retry is safe. Reconcile this result by
+The native call has the three-second control-plane deadline so a stalled
+server cannot hold the supervisor owner indefinitely. Within it, Core re-sends
+the request only after `resource_exhausted`, which Temporal returns before
+processing the command. Every other failure is returned on its first
+occurrence, because a blind re-send of a termination the server already
+applied would report `not_found` for the run it just terminated. `unavailable`
+is such an ambiguous failure: besides a refused connection, it is what the
+transport reports when the connection drops after the server applied the
+termination but before the acknowledgement arrived. The bridge therefore
+reports `unavailable`, a per-attempt `deadline_exceeded` or `cancelled`, and an
+expired overall deadline as the explicit `rpc` code
+`termination_outcome_uncertain` rather than pretending that the termination
+was rejected or that a retry is safe. Other ambiguous statuses such as
+`unknown` or `internal` keep their own code and are likewise not retried. Reconcile this result by
 calling `wait handle` (or by checking visibility) before deciding what to do;
 there is no idempotency key that can make a blind retry equivalent to the first
 request.
@@ -260,8 +579,10 @@ and
 Both OCaml and Rust reject unknown or duplicate fields and validate the
 acknowledgement before it crosses the FFI boundary. Focused mock, supervisor,
 OCaml bridge, and Rust protocol tests cover the exact-run request, terminal
-mapping, and validation failures; live acceptance of this operator path remains
-the next evidence boundary.
+mapping, and validation failures. The live baseline driver terminates a
+readiness-marked exact run and requires `wait` to report `Terminated` with the
+expected terminal metadata; termination reason and race coverage remain
+incomplete.
 
 ## Reset one exact run from a workflow-task boundary
 
@@ -294,9 +615,10 @@ The event ID is serialized as a JSON integer literal and remains a signed
 64-bit value in OCaml, Rust, and the Temporal protobuf request. This avoids
 loss of precision for histories whose event IDs exceed the exact integer range
 of a JavaScript number. `request_id` is the idempotency key for one logical
-reset; if the caller omits it, OCaml derives a deterministic value from the
-exact run and event boundary. Retrying an uncertain transport result with the
-same request ID is therefore safe. Temporal scopes reset deduplication to the
+reset; if the caller omits it, OCaml allocates a fresh value for each call,
+so resetting the same run at the same event twice creates two successors (a
+legitimate operator action when the first successor also fails). Retrying an
+uncertain transport result is safe only with the same explicit request ID. Temporal scopes reset deduplication to the
 workflow: distinct workflow IDs may use the same explicit request ID without
 colliding, while a retry for one workflow must retain the original reset data.
 
@@ -371,7 +693,17 @@ OCaml validates the signal name when `Temporal.Signal.define` constructs the
 definition and encodes the input before transport. Rust validates the exact
 identifiers, request ID, signal name, payload conversions, and closed JSON
 shape again before constructing Temporal's official
-`SignalWorkflowExecutionRequest` protobuf. The connected client's identity is
+`SignalWorkflowExecutionRequest` protobuf.
+
+Signal, query, and update requests use the same payload-aware decoder as
+workflow start input. Each decoded payload byte field may hold up to 128 MiB
+within the 192 MiB whole-document limit described in
+[the Core protocol limits](core-protocol.md), while identifiers, handler names,
+and payload metadata keys keep the 65,536-byte text limit. Rust enforces both
+bounds before the connection lookup, so an oversized request fails as a
+protocol error without issuing an RPC. Temporal Server's own blob-size limits,
+which are usually much smaller and namespace-configurable, still apply to
+requests the bridge accepts. The connected client's identity is
 used for the RPC; callers cannot provide a second identity or redirect the
 request to another namespace.
 
@@ -395,20 +727,27 @@ workflow task may process it later or the run may already be closing. Signal
 failures use the closed `rpc` and `protocol` client error documents, while the
 start-only `already_started` category is rejected as impossible. Both sides
 reject unknown or duplicate members and validate the positive acknowledgement.
-The bridge bounds this control-plane RPC to one second, matching cancellation:
-an unavailable server cannot hold the supervisor's single owner Domain
-indefinitely, and a timeout is returned as a typed `deadline_exceeded` error.
+The bridge bounds this control-plane RPC to three seconds, matching
+cancellation: an unavailable server cannot hold the supervisor's single owner
+Domain indefinitely. Core retries transient transport failures within that
+budget with the identical request. The budget is three seconds rather than one
+because Core waits a separate throttle backoff of 1 s +/-20% before re-sending
+after `resource_exhausted`; one such throttled re-send fits, a second
+consecutive one (a further 2 s +/-20%) does not. When the budget ends, the
+last transport status (such as `unavailable`) is returned, or a typed
+`deadline_exceeded` error when an attempt is still in flight or Core is still
+waiting out a throttle backoff.
 Callers that retry an uncertain result should reuse the same `request_id`.
 The request and response shapes are defined by
 [`client-signal-request.schema.json`](../schemas/bridge/client-signal-request.schema.json)
 and
 [`client-signal-response.schema.json`](../schemas/bridge/client-signal-response.schema.json).
 
-The first focused [PR #266 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247)
+The first focused [PR #266 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29311239247)
 live-verified the signal path against Temporal Server: the driver waited for
 the worker-visible readiness marker before sending the typed signal, then
 observed the handler's value after the condition resumed. The recorded
-seventeen-result baseline is covered by the [PR #289 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368),
+seventeen-result baseline is covered by the [PR #289 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368),
 which includes the same signal/condition path. The acknowledgement therefore
 remains distinct from handler execution, while the two runs together preserve
 the focused and complete live evidence for this client operation.
@@ -435,8 +774,9 @@ The private request is a closed JSON object:
 }
 ```
 
-`run_id` is mandatory, so a query cannot accidentally inspect a different
-execution after continued-as-new. OCaml and Rust validate every identifier,
+`run_id` is mandatory in the document, so an exact-run query cannot
+accidentally inspect a different execution after continued-as-new; a
+current-run handle sends the empty selector and queries the latest run. OCaml and Rust validate every identifier,
 reject unknown and duplicate members, and validate each payload in `input`
 before entering the FFI; output-only queries send an empty list and typed
 queries send exactly one payload. Rust wraps the list in Temporal's
@@ -450,9 +790,30 @@ On success Rust returns:
 ```
 
 The result list is preserved through the bridge and the public adapter accepts
-exactly one payload for the output codec. A server-side `query_rejected` value,
-an RPC failure, or a malformed response is returned as a typed client error;
-server diagnostic text does not cross the JSON boundary. The request and
+exactly one payload for the output codec. The request sets
+`query_reject_condition` to `NONE`, so Temporal answers queries against a closed
+run (a worker replays it) instead of rejecting them; a server-side
+`query_rejected` value, which that condition should never produce, is still
+mapped to the `rpc` code `failed_precondition`; an RPC failure or
+a malformed response is likewise a typed client error, and server diagnostic
+text does not cross the JSON boundary. The one exception is a failed query
+handler (issue #823). Temporal reports it, and a query name the worker has no
+handler for, as `InvalidArgument` with a `QueryFailedFailure` status detail.
+Rust recognizes that detail by its exact `Any` type URL (Core's generic detail
+decoder ignores the URL, and an unrelated detail could otherwise decode) and
+returns the query-only document
+
+```json
+{"kind":"query_failed","message":"unknown query state"}
+```
+
+whose `message` is the detail's failure message, or the status message when
+an older SDK left the failure empty. It is the application's own answer to its
+caller rather than server prose, so it is kept, truncated at a character
+boundary to 4,096 UTF-8 bytes with NUL replaced by U+FFFD; OCaml rejects a
+longer, non-UTF-8, or NUL-bearing message. The document travels with the RPC
+native status, and only the query decoder accepts it. A server too old to send
+the detail produces a plain `invalid_argument` instead. The request and
 response schemas are
 [`client-query-request.schema.json`](../schemas/bridge/client-query-request.schema.json)
 and
@@ -460,7 +821,7 @@ and
 
 The deterministic mock transport validates the exact execution identity but
 does not run workflow code, so mock queries fail with a typed workflow error.
-The complete [PR #434 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29684113836)
+The complete [PR #434 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29684113836)
 live-verifies both the output-only and exactly-one-input query handlers against
 parked exact runs, including the missing-handler rejection. This slice also
 proves the public API, strict protocol, supervisor serialization, ABI state
@@ -503,28 +864,56 @@ The corresponding heartbeat request is non-terminal:
 ```
 
 Heartbeat details use the same ordered binary payload representation as task
-inputs and completions. A successful heartbeat only acknowledges submission;
-it does not retire the activity or report cancellation, pause, or reset flags.
-Those Core outcomes remain asynchronous and are not synthesized into this
-client response.
+inputs and completions. A successful heartbeat through this synchronous
+endpoint only acknowledges submission; it does not retire the activity or
+report cancellation, pause, or reset flags, and every call is one RPC.
+
+The OCaml worker does not use that endpoint. It submits the
+`ASYNC_ACTIVITY_HEARTBEAT` client call (#1025), whose document adds the
+attempt's heartbeat timeout as a required, nullable member:
+
+```json
+{
+  "task_token": "AAEC/v8=",
+  "details": [],
+  "heartbeat_timeout": {"seconds": 10, "nanoseconds": 0}
+}
+```
+
+The bridge throttles these heartbeats per task token exactly as Core
+throttles a running activity's heartbeats: the first is sent at once,
+later ones within the throttle interval only replace the pending details,
+and a trailing send carries the latest details when the interval expires.
+The interval is 80% of the heartbeat timeout, or the worker's
+`default_heartbeat_throttle_interval` without one, capped by
+`max_heartbeat_throttle_interval`. The call's outcome is empty, or the
+fixed value `cancel_requested`, `reset`, or `paused` when the token's latest
+send reported that state; see
+[native activity execution](native-activity-execution.md#asynchronous-completion)
+for the full semantics.
 
 Neither endpoint reads or retires the worker's activity-task ledger. The
 worker lease was already handed off, and the OCaml async-activity state machine
 keeps its copied token while a client operation is in flight. A successful
-terminal request retires that lease; a terminal non-retryable bridge failure
-closes the handle and removes the lease. A `NotFound` response is treated as a
-terminal inactive-handle condition because retrying cannot make that token
-valid again. Other async-client RPC failures are returned as generic
-`Connection` bridge errors. The current public worker policy is deliberately
-fail-closed: only the explicit bilateral `Retryable` status authorizes replay,
-and these async-client endpoints do not produce that status, so callers must
-not issue a different operation for the same handle after a generic RPC
-failure.
+terminal request retires that lease. A `NotFound` response maps to
+`Invalid_state`, a terminal inactive-handle condition that closes the handle
+and removes the lease, because retrying cannot make that token valid again.
+`InvalidArgument`, `PermissionDenied`, `FailedPrecondition`, `OutOfRange`,
+`Unimplemented`, and `Unauthenticated` map to `Async_heartbeat_rejected` for
+heartbeats and terminal operations alike: the request was not applied, and the
+handle and lease stay live for a corrected or different request. Every other
+RPC failure is ambiguous and maps to `Connection`; the handle and lease stay
+live, a terminal operation may be retried only with the identical request,
+and a heartbeat is dropped. These by-token RPCs are safe to repeat because the
+server accepts at most one terminal response per activity, unlike Core worker
+completions, which keep the fail-closed `Retryable`-only replay policy.
 
 The request shapes are defined by
 [`activity-async-completion.schema.json`](../schemas/bridge/activity-async-completion.schema.json)
 and
-[`activity-heartbeat.schema.json`](../schemas/bridge/activity-heartbeat.schema.json).
+[`activity-heartbeat.schema.json`](../schemas/bridge/activity-heartbeat.schema.json),
+or, for the submitted heartbeat call,
+[`activity-async-heartbeat.schema.json`](../schemas/bridge/activity-async-heartbeat.schema.json).
 The shared task-token, payload, and failure constraints are documented in the
 [activity protocol reference](activity-protocol.md); the worker-only
 completion schema intentionally remains broader because it includes the
@@ -546,7 +935,11 @@ with that transition but have already entered the supervisor are allowed to
 finish in supervisor mailbox order. Calls that have not entered it fail with
 the typed bridge error `client is shut down`; this applies to `start`, `wait`,
 `cancel`, `signal`, and `follow`, including calls made through handles retained
-before shutdown.
+before shutdown. Calls already submitted and still in flight are not waited
+for: closing the graph closes their completion cells (see
+[Submitted client calls](#submitted-client-calls-807)), so a pending `wait`,
+query, or update poll returns `client is shut down` at once, and a start that
+may have been sent returns the uncertain-start error.
 
 For an HTTP(S) client, the supervisor admits one terminal shutdown request,
 waits for earlier admitted operations, and joins its owner Domain. The native
@@ -561,9 +954,10 @@ deterministic `mock://` transport follows the same public closed-state and
 idempotency contract, although its cleanup only releases the in-memory
 service.
 
-## Wait for one exact run
+## Wait for one run
 
-The wait request contains exactly the three identity fields:
+The wait request contains exactly the three identity fields (an empty
+`run_id` waits for whichever run is current when Temporal handles the poll):
 
 ```json
 {
@@ -578,14 +972,37 @@ history long poll with the equivalent of `follow_runs = false`, bounded to
 100 ms per native call. When the run is still open, the call returns
 `STATUS_NOT_READY` and no response object; the caller or a later orchestration
 loop can retry the same request through its mailbox. A timeout is therefore a
-pending observation, not a workflow failure. A terminal response always names
-the exact run requested.
+pending observation, not a workflow failure. A terminal response always echoes
+the requested execution unchanged. Transient transport failures of the long poll (for
+example a Temporal Server restart) are retried by Core inside the pending
+observation, up to thirty consecutive attempts per long poll, so they do not
+end the wait (#820); a definitive status such as `not_found` still does.
 
-The public `Temporal.Client.wait handle` performs that retry loop internally:
-it resubmits the same exact-run request after each bounded `NOT_READY` result
-and yields the calling Domain between attempts. Code using the private bridge
-directly may handle the status itself, but ordinary client callers receive only
-a terminal `Ok` value or an outer typed `Error.t`.
+Every history poll carries the gRPC metadata `supported-features:
+follows-next-run-id`, Temporal Server's flag for a client that follows the
+`new_execution_run_id` of a completed, failed, or timed-out close event
+(#971). Without it the server, for compatibility with SDKs from before 2021,
+rewrites such a close event in a close-event-only history response into a
+synthetic `WorkflowExecutionContinuedAsNew` event. A run retried by its
+workflow retry policy would then be reported as `continued_as_new` and lose
+the failure that caused the retry. With the flag the response carries the
+real close event: a retried failure is `failed` with its failure and
+successor, a retried timeout is `timed_out` with its successor, a cron
+completion is `completed` with its successor, and only an explicit
+continue-as-new is `continued_as_new`. The official SDKs do not send this
+header because their result methods follow every successor link anyway; this
+SDK's exact-run wait reports the link to the caller instead, so it needs the
+true close event. The header is per request and does not change the ABI.
+
+The bounded `NOT_READY` loop belongs to the synchronous
+`client_wait_workflow_json` symbol. The public `Temporal.Client.wait handle`
+instead submits the same request document as a
+[submitted call](#submitted-client-calls-807) (#807): one Tokio task performs
+the close-event long poll, including pagination and the transient-failure
+retries above, for as long as the run stays open, while the caller waits on
+the call's completion cell and the supervisor owner stays free for other
+calls. Ordinary client callers receive only a terminal `Ok` value or an outer
+typed `Error.t`.
 
 For example, a terminal response has this shape:
 
@@ -622,11 +1039,29 @@ Whenever a successor is present, both sides enforce the same three invariants:
 3. successor run ID differs from the waited run ID.
 
 This prevents a malformed response from changing which execution a caller is
-observing. The public OCaml terminal result retains an optional
-`Temporal.Client.execution` successor in `Failed { error; successor }` and
-`Timed_out { error; successor }`, and a required one in `Continued_as_new`.
-`Client.wait` still returns the outcome of the requested exact run; it never
-follows a successor implicitly. See
+observing. For a current-run wait the waited run ID is empty, so the third
+invariant holds for every concrete successor. The public OCaml terminal result
+retains an optional `Temporal.Client.execution` successor in
+`Completed { output; successor }` (a run started by a cron schedule or retry
+policy when this run completed, from
+`WorkflowExecutionCompletedEventAttributes.new_execution_run_id`, #837),
+`Failed { error; successor }`, and `Timed_out { error; successor }`, and a
+required one in `Continued_as_new`. On an exact-run handle `Client.wait`
+returns the outcome of the requested run and never follows a successor
+implicitly.
+
+On a current-run handle `Client.wait` follows the chain in OCaml, matching
+the run-following default of the official SDKs' result methods (Go
+`GetWorkflow(id, "").Get`, TypeScript `getHandle(id).result()`, Python
+`get_workflow_handle(id).result()`): it sends one current-run wait, then an
+exact-run wait for each successor, until a run closes without a successor. The
+result is that last run's outcome, so it is never `Continued_as_new` and its
+successor fields are `None`. Each step is an ordinary bounded native wait, so
+shutdown interrupts the chain and the pending-wait capacity applies per step.
+If a long poll ends with neither a close event nor a continuation token, the
+bridge resolves the current run again on the next poll; that can only skip a
+run which has already been superseded, so the following wait reaches the
+same final run. See
 [`client-wait-request.schema.json`](../schemas/bridge/client-wait-request.schema.json)
 and [`client-wait-response.schema.json`](../schemas/bridge/client-wait-response.schema.json).
 
@@ -659,8 +1094,11 @@ shutdown still invalidates all handles.
 
 Acceptance and completion are deliberately separate: an accepted update may
 still be waiting behind workflow code, and a pending poll is not a failure.
-The OCaml supervisor serializes both requests through the one native owner;
-Rust owns the Temporal protobuf and gRPC state and returns only copied JSON.
+Both requests are [submitted calls](#submitted-client-calls-807): the
+supervisor owner only submits them, and the caller waits for the admission or
+poll outcome on its own Domain, so a long acceptance wait or completion poll
+never delays other calls on the client (#807). Rust owns the Temporal
+protobuf and gRPC state and returns only copied JSON.
 No Rust task calls an OCaml closure, and update failures are typed `Error.t`
 values rather than exceptions.
 
@@ -679,12 +1117,33 @@ The start request uses this closed object:
 
 Rust validates every identity, update ID/name, payload, and duplicate/unknown
 member before invoking Temporal's `UpdateWorkflowExecution` RPC. The response
-echoes the update ID and exact execution. Its `outcome` is `null` while the
+echoes the update ID and exact execution (for a current-run request, the run
+Temporal resolved; see
+[Address the current run of a workflow](#address-the-current-run-of-a-workflow)). Its `outcome` is `null` while the
 update is accepted but not yet complete, or a closed `completed`/`failed`
 object when Core already has a terminal result. Poll requests contain only the
 namespace, exact execution, and update ID; poll responses contain only the
 optional outcome. OCaml rejects an outcome or execution that does not match the
 handle, so a response for another update cannot be mistaken for success.
+
+Rust asks Temporal to wait for the `Accepted` stage. When the server's long
+poll expires before a worker processes the update, Temporal answers with stage
+`Admitted` and no outcome; an admitted update is not durable and may still be
+rejected, so Rust never turns that answer into a handle. Like the Go and
+Python SDKs, it re-issues the same update ID (Temporal deduplicates it) until
+the server reports `Accepted` or a terminal outcome, pausing at least 100 ms
+between attempts. Every attempt carries the remaining budget as its gRPC
+deadline, and the whole loop is bounded by 30 seconds; when the budget expires
+first, `start_update` returns the typed `deadline_exceeded` RPC error and the
+caller may retry with the same update ID (#772). A `Completed` stage without an
+outcome fails closed as a Core protocol error. A lifecycle stage this bridge
+does not know, as a newer server might add, never fails the call (#1078): with
+an outcome the outcome is returned, because a server attaches one only to a
+completed or rejected update; without one the stage is read as "not yet
+accepted" and the update is re-issued like `Admitted`, so it becomes a handle
+only after a known `Accepted` stage. `wait_update` polls do not interpret the
+stage at all; they return the outcome when present and otherwise report the
+update as still pending.
 
 The normative schemas are
 [`client-update-request.schema.json`](../schemas/bridge/client-update-request.schema.json),
@@ -705,9 +1164,11 @@ one of these closed error documents in the native result's error buffer:
 ```
 
 `already_started` is used only for a start operation rejected by Temporal's
-AlreadyExists status. Other gRPC failures contain only one stable status code,
-such as `deadline_exceeded`, `unavailable`, or `permission_denied`; server text
-is intentionally discarded because it may contain user data. Core conversion
+AlreadyExists status, and `query_failed` only for a query whose handler failed
+(see [Query one exact run](#query-one-exact-run)). Other gRPC failures contain
+only one stable status code, such as `deadline_exceeded`, `unavailable`, or
+`permission_denied`; server text is intentionally discarded because it may
+contain user data. Core conversion
 failures use `{"kind":"protocol","code":"core_invalid"}` or
 `core_unsupported`. The complete code vocabulary is enumerated in the JSON
 schema and checked by both Rust and OCaml decoders.
@@ -718,6 +1179,32 @@ If the optional detail is malformed, the error remains `already_started` but
 its `existing_run_id` is `null`. This keeps the status category and JSON body
 consistent with the same identifier validation used for OCaml-originated
 requests.
+
+The public adapter turns `already_started` into a non-retryable `workflow`
+`Error.t` whose `error_type` is `WorkflowExecutionAlreadyStarted`. When
+`existing_run_id` is present, the error carries one JSON detail payload
+(`encoding` = `json/plain`, `ocaml-temporal-detail` = `already_started`) with
+the client namespace, workflow ID, and run ID, which
+`Client.already_started` returns as a typed `Client.execution` for
+`Client.follow` (#837). The mock backend builds the same error.
+
+Every `rpc` code becomes a `bridge` `Error.t` whose message is
+`Temporal client RPC failed: <code>` and whose fields classify it without
+parsing that message (issue #823). `error_type` is the code's canonical gRPC
+name in PascalCase (`NotFound`, `Unavailable`, ...;
+`termination_outcome_uncertain` becomes `TerminationOutcomeUncertain`), and
+`Client.rpc_status` returns the matching variant. `non_retryable` is `true`
+exactly for permanent conditions: `invalid_argument`, `not_found`,
+`already_exists`, `failed_precondition`, `permission_denied`,
+`unauthenticated`, `unimplemented`, and `termination_outcome_uncertain` (which
+must be reconciled with `Client.wait`, not repeated). The remaining codes
+follow Temporal Core's retryable set plus `deadline_exceeded` and `cancelled`.
+These types never equal the lowercase `resource_exhausted` of a local
+capacity refusal (`Client.is_at_capacity`). `query_failed` becomes a
+non-retryable `workflow` error with `error_type` `QueryFailed` and the
+handler's message, recognized by `Client.is_query_failed`. The mock backend
+reports an unknown workflow, a mismatched run, and a signal to a closed run as
+the same non-retryable `NotFound` classification.
 
 The OCaml protocol exposes an abstract `error` and a small `error_view` with a
 code, JSON path, and safe message. Payload bytes and raw input documents never
@@ -757,16 +1244,16 @@ The current milestone wires these messages through private OCaml/C/Rust
 bindings and the single-owner supervisor. Public `Temporal.Client` uses this
 native path for `http://` and `https://` targets, including asynchronous start
 and exact-run wait. The deterministic `mock://` transport remains available
-only as a private unit-test seam. The complete [PR #277 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29318684069)
+only as a private unit-test seam. The complete [PR #277 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29318684069)
 live-verified native client starts and exact-run waits alongside the current
 heartbeat-detail retry and exact-run cancellation assertions against a public
 worker and real Temporal Server. The signal-specific readiness and handler
-assertion is documented above with the focused [PR #266](https://github.com/mfow/ocaml-temporal/actions/runs/29311239247)
-run; the complete recorded seventeen-result signal evidence is in [PR #289](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368).
-The later complete [PR #279 Actions run](https://github.com/mfow/ocaml-temporal/actions/runs/29331237061)
+assertion is documented above with the focused [PR #266](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29311239247)
+run; the complete recorded seventeen-result signal evidence is in [PR #289](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368).
+The later complete [PR #279 Actions run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29331237061)
 re-verified the client start, exact-run wait, cancellation, and graceful
 shutdown paths in the prior sixteen-result gate. The complete [PR #289 Actions
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368) is the
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368) is the
 recorded seventeen-result baseline evidence for those paths.
 The boundary and remaining cases are tracked in the
 [`two-OCaml-binary acceptance design`](two-ocaml-binary-e2e-acceptance.md).
@@ -786,9 +1273,20 @@ size from 1 through 1,000, and an optional opaque continuation token. OCaml
 validates the query and token metadata, then serializes one closed JSON object;
 Rust validates it again, decodes the token as base64 protobuf bytes, and calls
 the official Temporal visibility RPC. Rust reduces each server row to workflow
-ID, run ID, workflow type, task queue, and a closed status string before
-encoding the response. OCaml strictly rejects unknown fields, missing row
-fields, empty identifiers, malformed tokens, and unexpected status values.
+ID, run ID, workflow type, task queue, and a status string before encoding
+the response. Known statuses use the fixed names `running`, `completed`,
+`failed`, `canceled`, `terminated`, `continued_as_new`, `timed_out`, and
+`paused`. A status value a newer server adds is reported as `unknown_<n>`,
+where `<n>` is the canonical decimal wire value (for example `unknown_9`),
+instead of failing the whole page (#1078); a row whose status is unspecified
+(`0`) is still a malformed response. OCaml strictly rejects unknown fields,
+missing row fields, empty identifiers, malformed tokens, and status strings
+outside that vocabulary, including non-canonical `unknown_` spellings and
+`unknown_<n>` for a value that has a fixed name. The decoder turns each
+accepted name into the closed polymorphic variant exposed as
+`Client.execution_status`: a fixed name becomes its constructor (for example
+`` `Running ``), and `unknown_<n>` or the legacy `unspecified` name becomes
+`` `Unknown n `` with the wire value (`0` for `unspecified`).
 
 The token is never interpreted by OCaml and must be passed unchanged to fetch
 the next page. The private request and response shapes are defined by

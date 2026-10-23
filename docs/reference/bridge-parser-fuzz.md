@@ -62,5 +62,8 @@ libFuzzer/AFL fuzzing. The normal Rust test profile provides debug assertions
 and panic detection but no sanitizer or coverage instrumentation. It does not
 instrument the C stubs, OCaml runtime, or the pinned Temporal Core dependency
 as a whole. The separate `test/bridge/test_abi.sh` harness uses ASan/UBSan for
-its C ABI scope. The broader lifecycle and long-run qualification remains
-under [#506](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/506).
+its C ABI scope. Lifecycle operation sequences are covered by the separate
+[lifecycle stress](bridge-lifecycle-stress.md). The remaining Rust and OCaml
+decoders are covered by the [decoder fuzz](bridge-decoder-fuzz.md), and the
+weekly [scheduled qualification](bridge-decoder-fuzz.md#scheduled-qualification)
+runs this harness at 20,000 cases per parser.

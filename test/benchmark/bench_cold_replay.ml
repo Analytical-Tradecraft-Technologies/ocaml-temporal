@@ -23,7 +23,8 @@ let require_native = function
   | Ok value -> value
   | Error (Native.Backend { message; _ }) -> failwith message
   | Error Native.Closed -> failwith "replay supervisor closed early"
-  | Error (Native.Supervisor_failed exn) -> raise exn
+  | Error (Native.Supervisor_failed exn | Native.Owner_unavailable exn) ->
+      raise exn
 
 (** Preserves the original sample failure when best-effort cleanup also fails. A
     cleanup failure following a successful sample remains a sample failure. *)
@@ -83,11 +84,14 @@ module Source = struct
 
   (** Rejects workflow/task failures and retains the terminal result only after
       Core accepted the completion for its exact leased run. *)
-  let complete_workflow source (completion : Protocol.completion) =
+  let complete_workflow source ~(completion : Protocol.completion) encoded =
+    (* The adapter passes the typed completion beside the canonical bytes it
+       was encoded into, so commands are inspected without parsing JSON;
+       only the bytes are submitted. *)
     if completion.task_failure <> None then
       failwith "cold replay failed its workflow task";
     let result =
-      Native.perform source.native (Native.Complete_replay_workflow completion)
+      Native.perform source.native (Native.Complete_replay_workflow encoded)
     in
     Result.iter
       (fun () ->
@@ -110,6 +114,14 @@ module Source = struct
     | Native.Backend { message; _ } -> message
     | Native.Closed -> "replay supervisor closed"
     | Native.Supervisor_failed _ -> "replay supervisor failed"
+    | Native.Owner_unavailable _ -> "replay supervisor could not start"
+
+  (** Replay completions are never resubmitted after a failure: the source
+      cannot prove the replay lease is still outstanding. *)
+  let error_is_retryable _ = false
+
+  (** A raised replay completion is equally fail-closed. *)
+  let exception_is_retryable _ = false
 end
 
 module Replay = Worker.Make (Source)

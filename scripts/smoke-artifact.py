@@ -22,7 +22,7 @@ def targets(root: Path) -> list[str]:
     if not names or len(names) != len(set(names)):
         raise ValueError("empty or duplicate smoke executable list")
     for name in names:
-        if not re.fullmatch(r"test/integration/[a-zA-Z0-9_/]+\.exe", name):
+        if not re.fullmatch(r"(?:test/integration|examples)/[a-zA-Z0-9_/]+\.exe", name):
             raise ValueError(f"invalid executable path: {name}")
     return names
 
@@ -86,8 +86,13 @@ def unpack(root: Path, directory: Path, commit: str, ocaml: str) -> None:
         path = destination / name
         # Checkout is trusted, but never follow a pre-existing symlink in the
         # extraction tree (including _build itself) on a reused local runner.
-        if any(parent.is_symlink() for parent in (path, *path.parents) if parent != root.parent):
-            raise ValueError(f"symlink in smoke destination: {path}")
+        # Only components below the checkout root are checked: the root's own
+        # ancestors may legitimately be symlinks, such as macOS /var and /tmp.
+        current = root
+        for part in path.relative_to(root).parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(f"symlink in smoke destination: {path}")
     for name, content in verified.items():
         path = destination / name
         path.parent.mkdir(parents=True, exist_ok=True)

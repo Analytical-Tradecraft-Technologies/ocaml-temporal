@@ -6,12 +6,14 @@
 #include <caml/fail.h>
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
+#include <caml/signals.h>
 #include <caml/threads.h>
 
 #if defined(_WIN32)
 #include <windows.h>
 #else
 #include <sched.h>
+#include <time.h>
 #endif
 
 #include <stdint.h>
@@ -97,6 +99,25 @@ static void runtime_thread_yield(void) {
 #endif
 }
 
+/* Release the OCaml runtime lock for a native call without running pending
+ * OCaml signal handlers first (#1018). Every stub below enters its blocking
+ * section while it already holds an unmanaged resource: a counted runtime or
+ * shared-runtime borrow, a detached native pointer, or a malloc'd input copy.
+ * Plain [caml_enter_blocking_section] runs pending handlers and re-raises
+ * their exceptions, so a handler that raises (for example [Sys.Break] after
+ * [Sys.catch_break true]) would unwind the stub and leak that resource: close
+ * would then spin forever on the leaked borrow, or the detached Core graph
+ * would never be freed. The [_no_pending] variant, available in every
+ * supported OCaml 5 series, only releases the lock. A signal that was
+ * pending stays recorded and [caml_leave_blocking_section] re-arms the
+ * pending-action check, so the handler still runs at the first OCaml poll
+ * point after the stub has returned and released everything it owns. Every
+ * stub therefore uses this helper, never the plain function, so no blocking
+ * section in this file can raise. */
+static void bridge_enter_blocking_section(void) {
+  caml_enter_blocking_section_no_pending();
+}
+
 /* Wait for every operation that was admitted before close to finish. The
  * function touches only C atomics and yields the OS thread; callers that can
  * block must invoke it only from a path which is already outside the OCaml
@@ -163,7 +184,7 @@ static void release_response_read(owned_response *response) {
 static void release_response(owned_response *response) {
   if (response_borrow_gate_close_and_wait(&response->gate,
                                           runtime_thread_yield)) {
-    (void)ocaml_temporal_core_v2_result_free(&response->result);
+    (void)ocaml_temporal_core_v4_result_free(&response->result);
   }
 }
 
@@ -190,13 +211,15 @@ static void finalize_runtime(value runtime) {
   /* Custom-block finalizers have a deliberately tiny contract: they may
    * inspect their C payload and release foreign resources, but they must not
    * call OCaml runtime operations such as [caml_enter_blocking_section]. The
-   * runtime value is rooted by every admitted C primitive, so an ordinary
-   * finalizer cannot overlap an active call; retain the atomic wait as a
-   * defensive barrier for unusual shutdown/GC ordering without releasing or
-   * reacquiring the OCaml lock here. */
+   * runtime value is rooted by every admitted C primitive, and no primitive
+   * can unwind between its acquire and release because its blocking section
+   * never runs signal handlers ([bridge_enter_blocking_section]), so an
+   * ordinary finalizer cannot overlap an active call; retain the atomic wait
+   * as a defensive barrier for unusual shutdown/GC ordering without releasing
+   * or reacquiring the OCaml lock here. */
   wait_for_runtime_calls(owned);
   if (native_runtime != NULL) {
-    (void)ocaml_temporal_core_v2_runtime_dispose(&native_runtime);
+    (void)ocaml_temporal_core_v4_runtime_dispose(&native_runtime);
   }
   free(owned);
 }
@@ -299,7 +322,7 @@ static value invoke_runtime_json(value runtime, value input,
   }
 
   admitted = acquire_runtime(owned, &native_runtime);
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)operation(native_runtime, input_copy, input_length, &native_result);
   if (admitted) {
     /* Release the C borrow while the OCaml lock is still released. A
@@ -327,7 +350,7 @@ static value invoke_runtime(value runtime, runtime_operation operation) {
 
   response = alloc_response();
   admitted = acquire_runtime(owned, &native_runtime);
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   (void)operation(native_runtime, &native_result);
   if (admitted) {
     /* See [invoke_runtime_json]: the borrow is independent of the OCaml
@@ -394,7 +417,7 @@ CAMLprim value ocaml_temporal_check_abi_version(value requested_version) {
 
   response = alloc_response();
   owned = Response_val(response);
-  (void)ocaml_temporal_core_v2_check_abi_version(
+  (void)ocaml_temporal_core_v4_check_abi_version(
       (uint32_t)Int32_val(requested_version), &owned->result);
   CAMLreturn(response);
 }
@@ -421,8 +444,8 @@ CAMLprim value ocaml_temporal_echo(value input) {
     memcpy(input_copy, Bytes_val(input), input_length);
   }
 
-  caml_enter_blocking_section();
-  (void)ocaml_temporal_core_v2_echo(input_copy, input_length, &native_result);
+  bridge_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_echo(input_copy, input_length, &native_result);
   caml_leave_blocking_section();
   free(input_copy);
   /* Re-resolve after reacquiring the runtime lock: a concurrent minor GC may
@@ -430,6 +453,35 @@ CAMLprim value ocaml_temporal_echo(value input) {
   Response_val(response)->result = native_result;
 
   CAMLreturn(response);
+}
+
+/* Read a monotonic clock in nanoseconds for client RPC deadlines (#499).
+ * The value has an arbitrary origin and is only compared with other readings
+ * in the same process, so wall-clock adjustments cannot lengthen or shorten a
+ * deadline. Windows uses the performance counter, split into whole seconds
+ * and a remainder so the scaling to nanoseconds cannot overflow; Unix-like
+ * targets use CLOCK_MONOTONIC from libc. No Rust code is involved, so the
+ * bridge ABI is unchanged. The stub touches no OCaml heap value before it
+ * allocates the boxed result. */
+CAMLprim value ocaml_temporal_monotonic_now_ns(value unit) {
+  int64_t nanoseconds;
+  (void)unit;
+#if defined(_WIN32)
+  LARGE_INTEGER counter;
+  LARGE_INTEGER frequency;
+  (void)QueryPerformanceFrequency(&frequency);
+  (void)QueryPerformanceCounter(&counter);
+  nanoseconds = (counter.QuadPart / frequency.QuadPart) * INT64_C(1000000000) +
+                (counter.QuadPart % frequency.QuadPart) * INT64_C(1000000000) /
+                    frequency.QuadPart;
+#else
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+    caml_failwith("monotonic clock is unavailable");
+  }
+  nanoseconds = (int64_t)now.tv_sec * INT64_C(1000000000) + (int64_t)now.tv_nsec;
+#endif
+  return caml_copy_int64(nanoseconds);
 }
 
 /* Exercise a blocking Rust call with the OCaml runtime lock released. The
@@ -448,30 +500,65 @@ CAMLprim value ocaml_temporal_conformance_wait_ms(value milliseconds) {
                                                        : (uint32_t)requested;
 
   response = alloc_response();
-  caml_enter_blocking_section();
-  (void)ocaml_temporal_core_v2_conformance_wait_ms(bounded_request,
+  bridge_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_conformance_wait_ms(bounded_request,
                                                    &native_result);
   caml_leave_blocking_section();
   Response_val(response)->result = native_result;
   CAMLreturn(response);
 }
 
+/* Sleep [seconds] for worker idle pacing (#1008) with the OCaml runtime lock
+ * released, so other Domains and threads keep running. Rust implements the
+ * sleep with a per-timer high-resolution waitable timer on Windows, where
+ * [Thread.delay] rounds a sub-tick request up to the 15.6 ms system timer
+ * tick; elsewhere it is [nanosleep]. A request that is not positive (or NaN)
+ * returns without entering the blocking section, and longer requests are
+ * clamped to OCAML_TEMPORAL_CORE_MAX_PACING_SLEEP_NS before conversion, so the
+ * double-to-integer cast is always in range. [seconds] is read before the
+ * lock is released and never touched afterwards, and the stub allocates
+ * nothing, so it needs no GC roots. A contained Rust panic only shortens the
+ * sleep, which callers already tolerate, so its status is ignored. */
+CAMLprim value ocaml_temporal_pacing_sleep(value seconds) {
+  double requested = Double_val(seconds);
+  uint64_t nanoseconds;
+
+  if (!(requested > 0.0)) {
+    return Val_unit;
+  }
+  nanoseconds = requested * 1e9 >= (double)OCAML_TEMPORAL_CORE_MAX_PACING_SLEEP_NS
+                    ? OCAML_TEMPORAL_CORE_MAX_PACING_SLEEP_NS
+                    : (uint64_t)(requested * 1e9);
+  bridge_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_pacing_sleep_ns(nanoseconds);
+  caml_leave_blocking_section();
+  return Val_unit;
+}
+
 /* Create Core/Tokio while the OCaml runtime lock is released. Rust writes only
  * C-stack storage during the blocking section; the opaque pointer and result
- * are copied into rooted custom blocks after reacquiring the lock. */
-CAMLprim value ocaml_temporal_runtime_create(value unit) {
-  CAMLparam1(unit);
+ * are copied into rooted custom blocks after reacquiring the lock.
+ * [worker_threads] is 0 for the bridge default or an explicit Tokio worker
+ * count (#832). OCaml validates the range first; a negative or oversized
+ * value still maps to UINT32_MAX so Rust rejects it instead of truncating. */
+CAMLprim value ocaml_temporal_runtime_create(value worker_threads) {
+  CAMLparam1(worker_threads);
   CAMLlocal3(runtime, response, pair);
   ocaml_temporal_core_runtime *native_runtime = NULL;
   ocaml_temporal_core_result native_result = {0};
   owned_runtime *runtime_owner;
   owned_response *response_owner;
+  intnat requested = Long_val(worker_threads);
+  uint32_t bounded_request =
+      requested < 0 || (uintnat)requested > UINT32_MAX ? UINT32_MAX
+                                                       : (uint32_t)requested;
 
   runtime = alloc_runtime();
   response = alloc_response();
 
-  caml_enter_blocking_section();
-  (void)ocaml_temporal_core_v2_runtime_new(&native_runtime, &native_result);
+  bridge_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_runtime_new_with_worker_threads(
+      bounded_request, &native_runtime, &native_result);
   caml_leave_blocking_section();
 
   runtime_owner = Runtime_val(runtime);
@@ -486,11 +573,353 @@ CAMLprim value ocaml_temporal_runtime_create(value unit) {
   CAMLreturn(pair);
 }
 
+/* Owner of one shared Core runtime handle (#832). It has the same counted
+ * borrow protocol and the same malloc'd, non-relocatable layout as
+ * [owned_runtime], for the same reasons: attaching a graph borrows the
+ * pointer across a released-lock window, and close must not free it under
+ * that borrow. The OCaml layer already refuses to close while any graph is
+ * attached; this gate is the defensive memory-safety barrier beneath it. */
+typedef struct owned_shared_runtime {
+  _Atomic(ocaml_temporal_core_shared_runtime *) shared;
+  atomic_uint active_calls;
+  atomic_int closing;
+} owned_shared_runtime;
+
+/* Extract the stable owner pointer; see [Runtime_val]. */
+static owned_shared_runtime *Shared_runtime_val(value shared) {
+  return *(owned_shared_runtime **)Data_custom_val(shared);
+}
+
+/* Admit one borrow of the shared pointer, or report it closed; mirrors
+ * [acquire_runtime]. */
+static int acquire_shared_runtime(owned_shared_runtime *owned,
+                                  ocaml_temporal_core_shared_runtime **shared) {
+  atomic_fetch_add_explicit(&owned->active_calls, 1, memory_order_seq_cst);
+  if (atomic_load_explicit(&owned->closing, memory_order_seq_cst) != 0) {
+    atomic_fetch_sub_explicit(&owned->active_calls, 1, memory_order_seq_cst);
+    *shared = NULL;
+    return 0;
+  }
+  *shared = atomic_load_explicit(&owned->shared, memory_order_seq_cst);
+  if (*shared == NULL) {
+    atomic_fetch_sub_explicit(&owned->active_calls, 1, memory_order_seq_cst);
+    return 0;
+  }
+  return 1;
+}
+
+/* Mark the owner closed, detach its pointer, and wait (touching only C
+ * atomics) until every admitted borrow has finished. The caller then owns
+ * the returned pointer exclusively. */
+static ocaml_temporal_core_shared_runtime *
+detach_shared_runtime(owned_shared_runtime *owned) {
+  ocaml_temporal_core_shared_runtime *shared;
+  atomic_store_explicit(&owned->closing, 1, memory_order_seq_cst);
+  shared = atomic_exchange_explicit(&owned->shared, NULL, memory_order_seq_cst);
+  while (atomic_load_explicit(&owned->active_calls, memory_order_seq_cst) != 0) {
+    runtime_thread_yield();
+  }
+  return shared;
+}
+
+/* GC fallback for a shared runtime that was never explicitly shut down. Like
+ * [finalize_runtime] it calls no OCaml runtime API; the Rust dispose hands the
+ * (possibly last) Core reference to a cleanup thread without waiting. Graphs
+ * still attached keep their own Core references, so this never frees Core
+ * under them. */
+static void finalize_shared_runtime(value shared) {
+  owned_shared_runtime *owned = Shared_runtime_val(shared);
+  ocaml_temporal_core_shared_runtime *native_shared;
+
+  if (owned == NULL) {
+    return;
+  }
+  native_shared = detach_shared_runtime(owned);
+  if (native_shared != NULL) {
+    (void)ocaml_temporal_core_v4_shared_runtime_dispose(&native_shared);
+  }
+  free(owned);
+}
+
+/* Shared runtimes are identity resources, like [runtime_operations]. */
+static struct custom_operations shared_runtime_operations = {
+    .identifier = "org.ocaml-temporal.native-shared-runtime.v1",
+    .finalize = finalize_shared_runtime,
+    .compare = custom_compare_default,
+    .hash = custom_hash_default,
+    .serialize = custom_serialize_default,
+    .deserialize = custom_deserialize_default,
+    .compare_ext = custom_compare_ext_default,
+    .fixed_length = NULL,
+};
+
+/* Allocate a null-initialized shared owner before entering native code; see
+ * [alloc_runtime] for the NULL-inner-pointer finalizer contract. */
+static value alloc_shared_runtime(void) {
+  CAMLparam0();
+  CAMLlocal1(shared);
+  owned_shared_runtime *owned;
+
+  shared = caml_alloc_custom(&shared_runtime_operations,
+                             sizeof(owned_shared_runtime *),
+                             sizeof(owned_shared_runtime), 1);
+  *(owned_shared_runtime **)Data_custom_val(shared) = NULL;
+
+  owned = malloc(sizeof(owned_shared_runtime));
+  if (owned == NULL) {
+    caml_raise_out_of_memory();
+  }
+  atomic_init(&owned->shared, NULL);
+  atomic_init(&owned->active_calls, 0);
+  atomic_init(&owned->closing, 0);
+  *(owned_shared_runtime **)Data_custom_val(shared) = owned;
+
+  CAMLreturn(shared);
+}
+
+/* Create a shared Core runtime with the OCaml runtime lock released. The
+ * thread-count mapping is identical to [ocaml_temporal_runtime_create]. */
+CAMLprim value ocaml_temporal_shared_runtime_create(value worker_threads) {
+  CAMLparam1(worker_threads);
+  CAMLlocal3(shared, response, pair);
+  ocaml_temporal_core_shared_runtime *native_shared = NULL;
+  ocaml_temporal_core_result native_result = {0};
+  intnat requested = Long_val(worker_threads);
+  uint32_t bounded_request =
+      requested < 0 || (uintnat)requested > UINT32_MAX ? UINT32_MAX
+                                                       : (uint32_t)requested;
+
+  shared = alloc_shared_runtime();
+  response = alloc_response();
+
+  bridge_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_shared_runtime_new(bounded_request,
+                                                  &native_shared,
+                                                  &native_result);
+  caml_leave_blocking_section();
+
+  atomic_store_explicit(&Shared_runtime_val(shared)->shared, native_shared,
+                        memory_order_release);
+  Response_val(response)->result = native_result;
+
+  pair = caml_alloc_tuple(2);
+  Store_field(pair, 0, shared);
+  Store_field(pair, 1, response);
+  CAMLreturn(pair);
+}
+
+/* Create a shared Core runtime with an opt-in telemetry document (#500).
+ * The thread-count mapping matches [ocaml_temporal_shared_runtime_create].
+ * The JSON bytes are copied to a C allocation before the OCaml runtime lock
+ * is released (the string may move during a GC) and freed after Rust
+ * returns; Rust only borrows the copy for the duration of the call. On
+ * success the response value is the bound metrics address, if any. */
+CAMLprim value ocaml_temporal_shared_runtime_create_with_telemetry(
+    value worker_threads, value telemetry) {
+  CAMLparam2(worker_threads, telemetry);
+  CAMLlocal3(shared, response, pair);
+  ocaml_temporal_core_shared_runtime *native_shared = NULL;
+  ocaml_temporal_core_result native_result = {0};
+  intnat requested = Long_val(worker_threads);
+  uint32_t bounded_request =
+      requested < 0 || (uintnat)requested > UINT32_MAX ? UINT32_MAX
+                                                       : (uint32_t)requested;
+  size_t input_length = caml_string_length(telemetry);
+  uint8_t *input_copy = NULL;
+
+  shared = alloc_shared_runtime();
+  response = alloc_response();
+  if (input_length > 0) {
+    input_copy = malloc(input_length);
+    if (input_copy == NULL) {
+      caml_raise_out_of_memory();
+    }
+    memcpy(input_copy, String_val(telemetry), input_length);
+  }
+
+  bridge_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(
+      bounded_request, input_copy, input_length, &native_shared,
+      &native_result);
+  caml_leave_blocking_section();
+  free(input_copy);
+
+  atomic_store_explicit(&Shared_runtime_val(shared)->shared, native_shared,
+                        memory_order_release);
+  Response_val(response)->result = native_result;
+
+  pair = caml_alloc_tuple(2);
+  Store_field(pair, 0, shared);
+  Store_field(pair, 1, response);
+  CAMLreturn(pair);
+}
+
+/* Create one runtime graph attached to a shared Core runtime. The shared
+ * pointer is borrowed through its gate for the whole native call, so a
+ * concurrent close waits rather than freeing it; a closed owner passes NULL
+ * and Rust returns its typed invalid-argument status. The new graph is an
+ * ordinary [owned_runtime] with the usual finalizer and close path. */
+CAMLprim value ocaml_temporal_runtime_attach(value shared) {
+  CAMLparam1(shared);
+  CAMLlocal3(runtime, response, pair);
+  owned_shared_runtime *shared_owner = Shared_runtime_val(shared);
+  ocaml_temporal_core_shared_runtime *native_shared = NULL;
+  ocaml_temporal_core_runtime *native_runtime = NULL;
+  ocaml_temporal_core_result native_result = {0};
+  int admitted;
+
+  runtime = alloc_runtime();
+  response = alloc_response();
+
+  admitted = acquire_shared_runtime(shared_owner, &native_shared);
+  bridge_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_runtime_new_attached(
+      native_shared, &native_runtime, &native_result);
+  if (admitted) {
+    atomic_fetch_sub_explicit(&shared_owner->active_calls, 1,
+                              memory_order_seq_cst);
+  }
+  caml_leave_blocking_section();
+
+  atomic_store_explicit(&Runtime_val(runtime)->runtime, native_runtime,
+                        memory_order_release);
+  Response_val(response)->result = native_result;
+
+  pair = caml_alloc_tuple(2);
+  Store_field(pair, 0, runtime);
+  Store_field(pair, 1, response);
+  CAMLreturn(pair);
+}
+
+/* Release the shared handle: reject new borrows, detach, wait for admitted
+ * attaches, then let Rust drop the handle's Core reference, all outside the
+ * OCaml runtime lock. A second close observes NULL and is a no-op. */
+CAMLprim value ocaml_temporal_shared_runtime_close(value shared) {
+  CAMLparam1(shared);
+  owned_shared_runtime *owned = Shared_runtime_val(shared);
+  ocaml_temporal_core_shared_runtime *native_shared;
+  ocaml_temporal_core_status status;
+
+  bridge_enter_blocking_section();
+  native_shared = detach_shared_runtime(owned);
+  status = ocaml_temporal_core_v4_shared_runtime_free(&native_shared);
+  caml_leave_blocking_section();
+  CAMLreturn(Val_int(status));
+}
+
+/* SDK metrics recorder (#500). The custom block payload is the Rust handle
+ * pointer itself, possibly NULL when the runtime has no exporter. Unlike a
+ * runtime, a meter is never released explicitly: only this finalizer frees
+ * it, once no OCaml value can reach it, so no borrow gate is needed and
+ * concurrent recorders on several Domains can never observe a freed handle.
+ * Freeing touches only Rust memory (never Core or Tokio), which a finalizer
+ * may do. */
+static ocaml_temporal_core_metric_meter **Metric_meter_slot(value meter) {
+  return (ocaml_temporal_core_metric_meter **)Data_custom_val(meter);
+}
+
+/* GC release of a metric meter; a NULL payload is a no-op in Rust. */
+static void finalize_metric_meter(value meter) {
+  (void)ocaml_temporal_core_v4_metric_meter_free(Metric_meter_slot(meter));
+}
+
+/* Metric meters are identity resources, like [runtime_operations]. */
+static struct custom_operations metric_meter_operations = {
+    .identifier = "org.ocaml-temporal.native-metric-meter.v1",
+    .finalize = finalize_metric_meter,
+    .compare = custom_compare_default,
+    .hash = custom_hash_default,
+    .serialize = custom_serialize_default,
+    .deserialize = custom_deserialize_default,
+    .compare_ext = custom_compare_ext_default,
+    .fixed_length = NULL,
+};
+
+/* Create the SDK metrics recorder of a shared runtime and return
+ * (meter, response). The meter block is allocated, NULL-initialized, before
+ * Rust runs so a later allocation failure cannot orphan the handle. The
+ * shared pointer is borrowed through its gate; a closed owner passes NULL
+ * and Rust reports its typed invalid-argument status. The call is short and
+ * performs no I/O, so the runtime lock is kept. */
+CAMLprim value ocaml_temporal_shared_runtime_metric_meter(value shared) {
+  CAMLparam1(shared);
+  CAMLlocal3(meter, response, pair);
+  owned_shared_runtime *shared_owner = Shared_runtime_val(shared);
+  ocaml_temporal_core_shared_runtime *native_shared = NULL;
+  ocaml_temporal_core_metric_meter *native_meter = NULL;
+  ocaml_temporal_core_result native_result = {0};
+  int admitted;
+
+  meter = caml_alloc_custom(&metric_meter_operations,
+                            sizeof(ocaml_temporal_core_metric_meter *), 0, 1);
+  *Metric_meter_slot(meter) = NULL;
+  response = alloc_response();
+
+  admitted = acquire_shared_runtime(shared_owner, &native_shared);
+  (void)ocaml_temporal_core_v4_shared_runtime_metric_meter(
+      native_shared, &native_meter, &native_result);
+  if (admitted) {
+    atomic_fetch_sub_explicit(&shared_owner->active_calls, 1,
+                              memory_order_seq_cst);
+  }
+
+  *Metric_meter_slot(meter) = native_meter;
+  Response_val(response)->result = native_result;
+
+  pair = caml_alloc_tuple(2);
+  Store_field(pair, 0, meter);
+  Store_field(pair, 1, response);
+  CAMLreturn(pair);
+}
+
+/* Whether a meter block holds a Rust handle; false when the runtime has no
+ * exporter. Allocation-free. */
+CAMLprim value ocaml_temporal_metric_meter_enabled(value meter) {
+  return Val_bool(*Metric_meter_slot(meter) != NULL);
+}
+
+/* Register one series from a strict JSON document and return (id,
+ * response); id is -1 on failure. The string is borrowed in place: the
+ * runtime lock is held for the whole call and Rust neither allocates OCaml
+ * memory nor retains the pointer, so the GC cannot move it meanwhile. */
+CAMLprim value ocaml_temporal_metric_meter_register(value meter, value input) {
+  CAMLparam2(meter, input);
+  CAMLlocal2(response, pair);
+  ocaml_temporal_core_result native_result = {0};
+  uint32_t id = UINT32_MAX;
+
+  response = alloc_response();
+  (void)ocaml_temporal_core_v4_metric_meter_register_json(
+      *Metric_meter_slot(meter), (const uint8_t *)String_val(input),
+      caml_string_length(input), &id, &native_result);
+  Response_val(response)->result = native_result;
+
+  pair = caml_alloc_tuple(2);
+  Store_field(pair, 0, id == UINT32_MAX ? Val_long(-1) : Val_long((intnat)id));
+  Store_field(pair, 1, response);
+  CAMLreturn(pair);
+}
+
+/* Record one value into series [id] and return the bridge status. This is
+ * the SDK's metrics hot path: it allocates nothing on either side of the
+ * boundary and keeps the runtime lock (Rust takes only a read lock and does
+ * no I/O), so the OCaml external is [@@noalloc]. An identifier outside the
+ * u32 range is refused here before reaching Rust. */
+CAMLprim value ocaml_temporal_metric_meter_record(value meter, value id,
+                                                  value amount) {
+  intnat raw_id = Long_val(id);
+  if (raw_id < 0 || (uintnat)raw_id >= UINT32_MAX) {
+    return Val_int(OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT);
+  }
+  return Val_int(ocaml_temporal_core_v4_metric_meter_record(
+      *Metric_meter_slot(meter), (uint32_t)raw_id, (int64_t)Long_val(amount)));
+}
+
 /* Connect the official client using a strict JSON configuration while the
  * OCaml runtime lock is available to other Domains. */
 CAMLprim value ocaml_temporal_client_connect(value runtime, value input) {
   return invoke_runtime_json(runtime, input,
-                             ocaml_temporal_core_v2_client_connect_json);
+                             ocaml_temporal_core_v4_client_connect_json);
 }
 
 /* Start one dynamically named workflow through the connected native client.
@@ -499,7 +928,7 @@ CAMLprim value ocaml_temporal_client_connect(value runtime, value input) {
 CAMLprim value ocaml_temporal_client_start_workflow_json(value runtime,
                                                          value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_start_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_client_start_workflow_json);
 }
 
 /* Request cancellation of one exact workflow run. The JSON input is copied
@@ -509,7 +938,7 @@ CAMLprim value ocaml_temporal_client_start_workflow_json(value runtime,
 CAMLprim value ocaml_temporal_client_cancel_workflow_json(value runtime,
                                                           value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_cancel_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_client_cancel_workflow_json);
 }
 
 /* Reset one exact workflow run. The JSON input is copied before the OCaml
@@ -517,7 +946,7 @@ CAMLprim value ocaml_temporal_client_cancel_workflow_json(value runtime,
 CAMLprim value ocaml_temporal_client_reset_workflow_json(value runtime,
                                                           value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_reset_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_client_reset_workflow_json);
 }
 
 /* Terminate one exact workflow run. The input is copied before releasing the
@@ -525,7 +954,7 @@ CAMLprim value ocaml_temporal_client_reset_workflow_json(value runtime,
 CAMLprim value ocaml_temporal_client_terminate_workflow_json(value runtime,
                                                              value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_terminate_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_client_terminate_workflow_json);
 }
 
 /* Send one signal to one exact workflow run. The JSON input is copied before
@@ -534,7 +963,7 @@ CAMLprim value ocaml_temporal_client_terminate_workflow_json(value runtime,
 CAMLprim value ocaml_temporal_client_signal_workflow_json(value runtime,
                                                           value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_signal_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_client_signal_workflow_json);
 }
 
 /* List one bounded visibility page. The input is copied before the OCaml
@@ -542,7 +971,7 @@ CAMLprim value ocaml_temporal_client_signal_workflow_json(value runtime,
 CAMLprim value ocaml_temporal_client_list_visibility_json(value runtime,
                                                           value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_list_visibility_json);
+      runtime, input, ocaml_temporal_core_v4_client_list_visibility_json);
 }
 
 /* Execute one output-only query against one exact workflow run. The JSON
@@ -551,7 +980,7 @@ CAMLprim value ocaml_temporal_client_list_visibility_json(value runtime,
 CAMLprim value ocaml_temporal_client_query_workflow_json(value runtime,
                                                          value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_query_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_client_query_workflow_json);
 }
 
 /* Admit one workflow update. The shared invoke helper copies the JSON input,
@@ -561,7 +990,7 @@ CAMLprim value ocaml_temporal_client_query_workflow_json(value runtime,
 CAMLprim value ocaml_temporal_client_update_workflow_json(value runtime,
                                                          value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_update_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_client_update_workflow_json);
 }
 
 /* Poll one admitted workflow update. Pending and terminal outcomes use the
@@ -569,7 +998,7 @@ CAMLprim value ocaml_temporal_client_update_workflow_json(value runtime,
 CAMLprim value ocaml_temporal_client_poll_update_workflow_json(value runtime,
                                                                value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_poll_update_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_client_poll_update_workflow_json);
 }
 
 /* Admit one workflow start and return its opaque ticket. The input is copied
@@ -578,7 +1007,7 @@ CAMLprim value ocaml_temporal_client_poll_update_workflow_json(value runtime,
 CAMLprim value ocaml_temporal_client_begin_start_workflow_json(value runtime,
                                                                value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_begin_start_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_client_begin_start_workflow_json);
 }
 
 /* Poll one asynchronous start ticket without blocking. STATUS_NOT_READY is
@@ -587,7 +1016,7 @@ CAMLprim value ocaml_temporal_client_begin_start_workflow_json(value runtime,
 CAMLprim value ocaml_temporal_client_poll_start_workflow_json(value runtime,
                                                               value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_poll_start_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_client_poll_start_workflow_json);
 }
 
 /* Wait one bounded interval for an asynchronous start ticket. The shared
@@ -595,7 +1024,7 @@ CAMLprim value ocaml_temporal_client_poll_start_workflow_json(value runtime,
 CAMLprim value ocaml_temporal_client_wait_start_workflow_json(value runtime,
                                                               value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_wait_start_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_client_wait_start_workflow_json);
 }
 
 /* Wait for one exact run while Rust performs the long poll outside the OCaml
@@ -603,7 +1032,112 @@ CAMLprim value ocaml_temporal_client_wait_start_workflow_json(value runtime,
 CAMLprim value ocaml_temporal_client_wait_workflow_json(value runtime,
                                                         value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_client_wait_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_client_wait_workflow_json);
+}
+
+/* Submit one client RPC (#807). This mirrors [invoke_runtime_json] with the
+ * extra closed operation selector: the input is copied before the lock is
+ * released and the runtime borrow is counted. Rust only validates, registers
+ * a completion cell, and spawns a task, so this returns without waiting for
+ * Temporal. A selector outside uint32_t maps to 0, which Rust rejects. */
+CAMLprim value ocaml_temporal_client_submit_json(value runtime, value kind,
+                                                 value input) {
+  CAMLparam3(runtime, kind, input);
+  CAMLlocal1(response);
+  owned_runtime *owned = Runtime_val(runtime);
+  ocaml_temporal_core_runtime *native_runtime = NULL;
+  size_t input_length = caml_string_length(input);
+  uint8_t *input_copy = NULL;
+  ocaml_temporal_core_result native_result = {0};
+  intnat requested = Long_val(kind);
+  uint32_t native_kind =
+      requested < 0 || (uintnat)requested > UINT32_MAX ? 0 : (uint32_t)requested;
+  int admitted;
+
+  response = alloc_response();
+  if (input_length > 0) {
+    input_copy = malloc(input_length);
+    if (input_copy == NULL) {
+      caml_raise_out_of_memory();
+    }
+    memcpy(input_copy, Bytes_val(input), input_length);
+  }
+
+  admitted = acquire_runtime(owned, &native_runtime);
+  bridge_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_client_submit_json(
+      native_runtime, native_kind, input_copy, input_length, &native_result);
+  if (admitted) {
+    /* As in [invoke_runtime_json], release the borrow before reacquiring
+     * the OCaml lock. */
+    release_runtime(owned);
+  }
+  caml_leave_blocking_section();
+  free(input_copy);
+  Response_val(response)->result = native_result;
+  CAMLreturn(response);
+}
+
+/* Abandon one submitted call without reading it (#807), freeing its slot in
+ * the runtime's call ceiling. Like the await stub it borrows no runtime and
+ * never blocks on the network: Rust unregisters the cell under its registry
+ * mutex, then closes it and aborts a still-running task through its Tokio
+ * abort handle (#1019), so the call stops holding its wait, start, and
+ * in-flight slots at once. Aborting only schedules cancellation; the runtime
+ * owner still joins the task later. Negative values map to UINT64_MAX, which
+ * Rust treats as unknown (a no-op). */
+CAMLprim value ocaml_temporal_client_release_call(value owner, value call) {
+  CAMLparam2(owner, call);
+  CAMLlocal1(response);
+  intnat requested_owner = Long_val(owner);
+  intnat requested_call = Long_val(call);
+  uint64_t native_owner =
+      requested_owner < 0 ? UINT64_MAX : (uint64_t)requested_owner;
+  uint64_t native_call =
+      requested_call < 0 ? UINT64_MAX : (uint64_t)requested_call;
+  ocaml_temporal_core_result native_result = {0};
+
+  response = alloc_response();
+  bridge_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_client_release_call(native_owner, native_call,
+                                                   &native_result);
+  caml_leave_blocking_section();
+  Response_val(response)->result = native_result;
+  CAMLreturn(response);
+}
+
+/* Wait a bounded interval for one submitted call's outcome (#807). No
+ * runtime is borrowed: the (owner, call) pair from the submission handle
+ * names a Rust-owned completion cell, so the submitting caller may wait here
+ * from any Domain or thread while the supervisor owner keeps serving other
+ * requests. Rust answers a mismatched owner like an unknown call. The OCaml
+ * lock is released for the whole wait and only C-stack storage is written
+ * during it. Negative values map to UINT64_MAX, which Rust reports as
+ * unknown; an oversized timeout maps to UINT32_MAX, which Rust rejects. */
+CAMLprim value ocaml_temporal_client_await_call(value owner, value call,
+                                                value timeout_ms) {
+  CAMLparam3(owner, call, timeout_ms);
+  CAMLlocal1(response);
+  intnat requested_owner = Long_val(owner);
+  intnat requested_call = Long_val(call);
+  intnat requested_timeout = Long_val(timeout_ms);
+  uint64_t native_owner =
+      requested_owner < 0 ? UINT64_MAX : (uint64_t)requested_owner;
+  uint64_t native_call =
+      requested_call < 0 ? UINT64_MAX : (uint64_t)requested_call;
+  uint32_t native_timeout =
+      requested_timeout < 0 || (uintnat)requested_timeout > UINT32_MAX
+          ? UINT32_MAX
+          : (uint32_t)requested_timeout;
+  ocaml_temporal_core_result native_result = {0};
+
+  response = alloc_response();
+  bridge_enter_blocking_section();
+  (void)ocaml_temporal_core_v4_client_await_call(
+      native_owner, native_call, native_timeout, &native_result);
+  caml_leave_blocking_section();
+  Response_val(response)->result = native_result;
+  CAMLreturn(response);
 }
 
 /* Complete an activity that has already returned WillCompleteAsync. Rust
@@ -612,7 +1146,7 @@ CAMLprim value
 ocaml_temporal_client_complete_async_activity_json(value runtime, value input) {
   return invoke_runtime_json(
       runtime, input,
-      ocaml_temporal_core_v2_client_complete_async_activity_json);
+      ocaml_temporal_core_v4_client_complete_async_activity_json);
 }
 
 /* Record progress for an admitted asynchronous activity through the same
@@ -621,14 +1155,14 @@ CAMLprim value ocaml_temporal_client_record_async_activity_heartbeat_json(
     value runtime, value input) {
   return invoke_runtime_json(
       runtime, input,
-      ocaml_temporal_core_v2_client_record_async_activity_heartbeat_json);
+      ocaml_temporal_core_v4_client_record_async_activity_heartbeat_json);
 }
 
 /* Construct and validate the workflow-only Core worker. Network validation
  * and any failure cleanup happen with the OCaml runtime lock released. */
 CAMLprim value ocaml_temporal_worker_start(value runtime, value input) {
   return invoke_runtime_json(runtime, input,
-                             ocaml_temporal_core_v2_worker_start_json);
+                             ocaml_temporal_core_v4_worker_start_json);
 }
 
 /* Construct the workflow-only replay worker from strict settings. Replay
@@ -636,7 +1170,7 @@ CAMLprim value ocaml_temporal_worker_start(value runtime, value input) {
  * is released; Rust owns the Core graph after this call returns. */
 CAMLprim value ocaml_temporal_replay_worker_start(value runtime, value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_replay_worker_start_json);
+      runtime, input, ocaml_temporal_core_v4_replay_worker_start_json);
 }
 
 /* Feed one replay-history document while Rust drives the bounded feeder on its
@@ -645,26 +1179,26 @@ CAMLprim value ocaml_temporal_replay_worker_feed_history(value runtime,
                                                          value input) {
   return invoke_runtime_json(
       runtime, input,
-      ocaml_temporal_core_v2_replay_worker_feed_history_json);
+      ocaml_temporal_core_v4_replay_worker_feed_history_json);
 }
 
 /* Close replay input; Core will publish terminal shutdown after all admitted
  * histories and their workflow completions have been consumed. */
 CAMLprim value ocaml_temporal_replay_worker_finish_input(value runtime) {
   return invoke_runtime(
-      runtime, ocaml_temporal_core_v2_replay_worker_finish_input);
+      runtime, ocaml_temporal_core_v4_replay_worker_finish_input);
 }
 
 /* Drain one replay activation without waiting on Core. */
 CAMLprim value ocaml_temporal_replay_worker_try_poll_workflow(value runtime) {
   return invoke_runtime(
-      runtime, ocaml_temporal_core_v2_replay_worker_try_poll_workflow);
+      runtime, ocaml_temporal_core_v4_replay_worker_try_poll_workflow);
 }
 
 /* Wait for replay readiness with the OCaml runtime lock released. */
 CAMLprim value ocaml_temporal_replay_worker_wait_workflow(value runtime) {
   return invoke_runtime(
-      runtime, ocaml_temporal_core_v2_replay_worker_wait_workflow);
+      runtime, ocaml_temporal_core_v4_replay_worker_wait_workflow);
 }
 
 /* Submit one replay workflow completion after copying the JSON input. */
@@ -672,7 +1206,7 @@ CAMLprim value ocaml_temporal_replay_worker_complete_workflow(value runtime,
                                                               value input) {
   return invoke_runtime_json(
       runtime, input,
-      ocaml_temporal_core_v2_replay_worker_complete_workflow_json);
+      ocaml_temporal_core_v4_replay_worker_complete_workflow_json);
 }
 
 /* Retire one replay activation after OCaml semantic decode failure. */
@@ -680,17 +1214,17 @@ CAMLprim value ocaml_temporal_replay_worker_reject_workflow(value runtime,
                                                             value input) {
   return invoke_runtime_json(
       runtime, input,
-      ocaml_temporal_core_v2_replay_worker_reject_workflow_json);
+      ocaml_temporal_core_v4_replay_worker_reject_workflow_json);
 }
 
 /* Finalize a naturally drained replay while Rust retains ownership on error. */
 CAMLprim value ocaml_temporal_replay_worker_finalize(value runtime) {
-  return invoke_runtime(runtime, ocaml_temporal_core_v2_replay_worker_finalize);
+  return invoke_runtime(runtime, ocaml_temporal_core_v4_replay_worker_finalize);
 }
 
 /* Explicitly dispose replay and force-complete native debts. */
 CAMLprim value ocaml_temporal_replay_worker_dispose(value runtime) {
-  return invoke_runtime(runtime, ocaml_temporal_core_v2_replay_worker_dispose);
+  return invoke_runtime(runtime, ocaml_temporal_core_v4_replay_worker_dispose);
 }
 
 /* Drain one ready workflow activation without waiting on Core. The Rust
@@ -699,7 +1233,7 @@ CAMLprim value ocaml_temporal_replay_worker_dispose(value runtime) {
  * the OCaml scheduler can decide how to yield or wait for native readiness. */
 CAMLprim value ocaml_temporal_worker_try_poll_workflow(value runtime) {
   return invoke_runtime(runtime,
-                        ocaml_temporal_core_v2_worker_try_poll_workflow);
+                        ocaml_temporal_core_v4_worker_try_poll_workflow);
 }
 
 /* Wait for native workflow readiness with the OCaml runtime lock released. The
@@ -708,7 +1242,7 @@ CAMLprim value ocaml_temporal_worker_try_poll_workflow(value runtime) {
  * signals readiness; the owner must still call the non-blocking drain above. */
 CAMLprim value ocaml_temporal_worker_wait_workflow(value runtime) {
   return invoke_runtime(runtime,
-                        ocaml_temporal_core_v2_worker_wait_workflow);
+                        ocaml_temporal_core_v4_worker_wait_workflow);
 }
 
 /* Copy a semantic workflow completion before releasing the OCaml runtime lock.
@@ -717,7 +1251,7 @@ CAMLprim value ocaml_temporal_worker_wait_workflow(value runtime) {
 CAMLprim value ocaml_temporal_worker_complete_workflow_json(value runtime,
                                                             value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_worker_complete_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_worker_complete_workflow_json);
 }
 
 /* Return the exact Rust-produced activation document when the OCaml decoder
@@ -726,21 +1260,28 @@ CAMLprim value ocaml_temporal_worker_complete_workflow_json(value runtime,
 CAMLprim value ocaml_temporal_worker_reject_workflow_json(value runtime,
                                                           value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_worker_reject_workflow_json);
+      runtime, input, ocaml_temporal_core_v4_worker_reject_workflow_json);
 }
 
 /* Drain one ready remote activity task without waiting. Workflow and activity
  * lanes are independent in Rust, so an empty activity lane does not delay a
  * ready workflow activation. */
 CAMLprim value ocaml_temporal_worker_try_poll_activity(value runtime) {
-  return invoke_runtime(runtime, ocaml_temporal_core_v2_worker_try_poll_activity);
+  return invoke_runtime(runtime, ocaml_temporal_core_v4_worker_try_poll_activity);
 }
 
 /* Wait for native remote-activity readiness under the same released-lock and
  * bounded-time contract as workflow readiness. */
 CAMLprim value ocaml_temporal_worker_wait_activity(value runtime) {
   return invoke_runtime(runtime,
-                        ocaml_temporal_core_v2_worker_wait_activity);
+                        ocaml_temporal_core_v4_worker_wait_activity);
+}
+
+/* Wait for readiness on either worker lane with the OCaml runtime lock
+ * released. The worker loop's single idle native wait uses this so a task on
+ * the lane it did not expect is not delayed by the bounded timeout. */
+CAMLprim value ocaml_temporal_worker_wait_any(value runtime) {
+  return invoke_runtime(runtime, ocaml_temporal_core_v4_worker_wait_any);
 }
 
 /* Apply the fixed activity-completion retry delay on the Rust supervisor
@@ -750,7 +1291,7 @@ CAMLprim value
 ocaml_temporal_worker_wait_activity_completion_retry_backoff(value runtime) {
   return invoke_runtime(
       runtime,
-      ocaml_temporal_core_v2_worker_wait_activity_completion_retry_backoff);
+      ocaml_temporal_core_v4_worker_wait_activity_completion_retry_backoff);
 }
 
 /* Copy a semantic activity completion before entering the blocking section.
@@ -759,7 +1300,7 @@ ocaml_temporal_worker_wait_activity_completion_retry_backoff(value runtime) {
 CAMLprim value ocaml_temporal_worker_complete_activity_json(value runtime,
                                                             value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_worker_complete_activity_json);
+      runtime, input, ocaml_temporal_core_v4_worker_complete_activity_json);
 }
 
 /* Submit one heartbeat without exposing the native task token to OCaml. */
@@ -768,7 +1309,7 @@ ocaml_temporal_worker_record_activity_heartbeat_json(value runtime,
                                                      value input) {
   return invoke_runtime_json(
       runtime, input,
-      ocaml_temporal_core_v2_worker_record_activity_heartbeat_json);
+      ocaml_temporal_core_v4_worker_record_activity_heartbeat_json);
 }
 
 /* Return the original Rust-produced activity document after OCaml decode
@@ -777,17 +1318,24 @@ ocaml_temporal_worker_record_activity_heartbeat_json(value runtime,
 CAMLprim value ocaml_temporal_worker_reject_activity_json(value runtime,
                                                           value input) {
   return invoke_runtime_json(
-      runtime, input, ocaml_temporal_core_v2_worker_reject_activity_json);
+      runtime, input, ocaml_temporal_core_v4_worker_reject_activity_json);
+}
+
+/* Stop the worker taking new tasks without releasing it (#1028); Rust treats
+ * an absent worker as already stopped. */
+CAMLprim value ocaml_temporal_worker_initiate_shutdown(value runtime) {
+  return invoke_runtime(runtime,
+                        ocaml_temporal_core_v4_worker_initiate_shutdown);
 }
 
 /* Gracefully stop the worker; Rust treats an absent worker as already closed. */
 CAMLprim value ocaml_temporal_worker_shutdown(value runtime) {
-  return invoke_runtime(runtime, ocaml_temporal_core_v2_worker_shutdown);
+  return invoke_runtime(runtime, ocaml_temporal_core_v4_worker_shutdown);
 }
 
 /* Drop the client only after the worker child is absent. */
 CAMLprim value ocaml_temporal_client_disconnect(value runtime) {
-  return invoke_runtime(runtime, ocaml_temporal_core_v2_client_disconnect);
+  return invoke_runtime(runtime, ocaml_temporal_core_v4_client_disconnect);
 }
 
 /* Close the owner in three ordered phases: reject new borrows, detach the
@@ -807,9 +1355,9 @@ CAMLprim value ocaml_temporal_runtime_close(value runtime) {
   ocaml_temporal_core_runtime *native_runtime = detach_runtime(owned);
   ocaml_temporal_core_status status;
 
-  caml_enter_blocking_section();
+  bridge_enter_blocking_section();
   wait_for_runtime_calls(owned);
-  status = ocaml_temporal_core_v2_runtime_free(&native_runtime);
+  status = ocaml_temporal_core_v4_runtime_free(&native_runtime);
   caml_leave_blocking_section();
   CAMLreturn(Val_int(status));
 }

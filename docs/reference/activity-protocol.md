@@ -26,9 +26,14 @@ Start context retains whether Core leased a local activity, the scheduling
 workflow identity, activity identity,
 headers, ordered arguments, heartbeat details, timestamps, timeouts, one-based
 attempt supplied by Core, normalized retry policy, task priority, and optional
-standalone activity run ID. Cancellation context retains both Core's primary
+standalone activity run ID. The scheduling workflow identity is still
+required: a standalone activity task, which has no workflow, and a task with
+an empty or NUL-containing header key are not representable. Rust fails such
+a task back to Core with a non-retryable `UnrepresentableActivityTask`
+application failure and the worker keeps polling (issue #801; see
+`docs/reference/core-bridge.md`). Cancellation context retains both Core's primary
 reason and its independent detail flags. The completion result is a closed
-variant: completed with an optional payload, failed, cancelled, or
+variant: completed with a required payload, failed, cancelled, or
 will-complete-asynchronously.
 
 The `will-complete-asynchronously` variant is the remote worker-to-client
@@ -88,8 +93,10 @@ Semantic validation then enforces:
 - the same bounded recursive structured failure and payload semantics used by
   workflow activations and completions.
 
-The OCaml encoders reparse their own output through the corresponding strict
-decoders. The Rust bridge validates completion and heartbeat JSON again at the
+The OCaml encoders apply the corresponding strict decoders' semantic rules to
+the validated JSON tree, and the strict parser's tree and raw-text limits to
+the serialized bytes, without parsing their own output again (#846). The Rust
+bridge validates completion and heartbeat JSON again at the
 worker ABI, so a value accepted by one language still crosses a second
 validation boundary before reaching Core.
 
@@ -126,12 +133,21 @@ delivers those facts asynchronously in a later `ActivityTask::Cancel`; no
 synchronous status is invented at the heartbeat call boundary. The normal
 adapter must later submit a terminal completion, including a `Cancelled`
 result when it receives that cancellation task, and only that terminal path
-removes the worker token from its ledger. An asynchronous heartbeat instead
-uses the namespace-bound client path and is checked by Core's async activity
-handle; its separate async lease remains non-terminal until an async terminal
-operation is accepted or a non-retryable bridge failure closes and removes it.
+removes the worker token from its ledger. Because the server accepts a
+cancelled completion only after a cancellation request, a task whose
+primary reason is a pause or reset is instead completed with a retryable
+`ActivityPause` or `ActivityReset` application failure (#1022; see
+[pause and reset](native-activity-execution.md#pause-and-reset)). An asynchronous heartbeat instead
+uses the namespace-bound client path; its separate async lease remains
+non-terminal until an async terminal operation is accepted or a
+non-retryable bridge failure closes and removes it. Its document adds a
+required, nullable `heartbeat_timeout` duration copied from the start task,
+from which the bridge derives the per-token throttle interval (#1025); the
+plain heartbeat decoder rejects that member, and the async one requires it.
 
-The schema is [`activity-heartbeat.schema.json`](../schemas/bridge/activity-heartbeat.schema.json).
+The schema is [`activity-heartbeat.schema.json`](../schemas/bridge/activity-heartbeat.schema.json),
+and [`activity-async-heartbeat.schema.json`](../schemas/bridge/activity-async-heartbeat.schema.json)
+for the async heartbeat.
 The focused bilateral tests are
 `test/bridge/test_ocaml_activity_protocol.ml` and
 `rust/core-bridge/tests/activity_protocol.rs`. The Rust ownership regression
@@ -154,6 +170,19 @@ leased, then retires the ledger entry only after Core accepts the completion.
 If transport or Core rejects the call, the lease remains outstanding so the
 OCaml adapter can retry the same pending completion; it never reruns the user
 activity merely because submission failed.
+
+A `completed` result must carry a payload; `null` is refused (issue #954).
+Temporal Core's `validate_activity_completion` rejects a successful completion
+whose `result` is absent, so a document the bridge accepted with `null` used to
+fail inside Core with `STATUS_WORKER` while the lease stayed held. Both
+decoders now refuse `null` with a protocol error at `$.result.result`, before
+any Core call, so the lease is untouched: a corrected completion or the reject
+path retires it exactly once. A void activity result is an encoded payload
+whose data may be empty. The OCaml executor already encodes every result, and
+the official SDKs send a `binary/null` payload with empty data for a void
+result. Every completion the decoder
+accepts therefore converts to a Core `Success` with a payload, and the
+optional-payload shape no longer exists in the Rust or OCaml types.
 
 A task with `variant.kind = "cancel"` does not invoke user activity code. The
 adapter maps its stable reason to a `Cancelled` completion with the standard
@@ -201,4 +230,11 @@ Separated OCaml tests in
 `test/bridge/test_ocaml_activity_protocol.ml` cover all task and completion
 variants, binary token preservation, required-nullable members, closed nested
 objects, identifiers, headers, time and duration domains, attempt and retry
-numeric ranges, priority bits, and sender-side duplicate-map rejection.
+numeric ranges, priority bits, sender-side duplicate-map rejection, and the
+required completed payload. In Rust, `rust/core-bridge/tests/activity_protocol.rs`
+checks that a `null` or absent payload is refused and that an empty payload
+reaches Core as a present result, and
+`rust/core-bridge/tests/activity_null_completion.rs` drives the worker ABI
+against a loopback gRPC double: after a refused `null` completion, a corrected
+completion or the reject path retires the lease with exactly one server
+response and shutdown reports no outstanding task.

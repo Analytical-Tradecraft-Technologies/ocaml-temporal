@@ -5,6 +5,11 @@
     generic: it knows how to queue and observe a value owned by a scheduler,
     but it does not know about Temporal commands, Rust handles, or OCaml
     effects. *)
+
+(** A scheduler-owned value that becomes ready at most once. Public
+    documentation renders it through its supported alias.
+
+    @canonical Temporal.Future.t *)
 type ('value, 'error) t
 
 (** Constructs a kernel future from callbacks owned by one scheduler.  The

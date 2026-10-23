@@ -3,8 +3,28 @@
  (libraries temporal-sdk temporal_core_bridge unix))
 
 (test
+ (name test_pacing_sleep)
+ (libraries temporal_core_bridge threads.posix))
+
+(test
+ (name test_runtime_threads)
+ (libraries temporal-sdk temporal_core_bridge))
+
+(test
+ (name test_shared_runtime)
+ (libraries temporal-sdk temporal_core_bridge temporal_sdk_supervisor unix))
+
+(test
  (name test_ocaml_runtime_lifetime)
  (libraries temporal_core_bridge unix))
+
+; Seeded runtime/finalizer/supervisor cycles under GC pressure (#522).
+(test
+ (name test_ocaml_lifecycle_gc_stress)
+ (deps
+  (env_var LIFECYCLE_STRESS_SEED)
+  (env_var LIFECYCLE_STRESS_OCAML_CYCLES))
+ (libraries temporal_core_bridge temporal_sdk_supervisor))
 
 (test
  (name test_ocaml_response_buffers)
@@ -45,9 +65,111 @@
  (libraries temporal-sdk temporal_protocol))
 
 (test
+ (name test_client_capacity_error)
+ (flags (:standard -I lib/public/.temporal.objs/byte))
+ (libraries temporal-sdk temporal_sdk_kernel))
+
+(test
+ (name test_client_rpc_errors)
+ (flags (:standard -I lib/public/.temporal.objs/byte))
+ (libraries temporal-sdk temporal_sdk_kernel))
+
+(test
  (name test_ocaml_client_update_protocol)
  (libraries temporal_protocol))
 
 (test
  (name test_failure_diagnostic)
- (libraries temporal_protocol))
+ (libraries temporal_base temporal_protocol))
+
+(test
+ (name test_client_input_limits)
+ (libraries temporal_core_bridge temporal_protocol))
+
+; Offline replay through the public API only, against the retained live
+; task-failure histories. No Temporal Server or network is required.
+(test
+ (name test_public_replay)
+ (modules test_public_replay)
+ (deps
+  (glob_files ../integration/temporal/task_failure/histories/*.pb))
+ (libraries temporal-sdk))
+
+; Developer-facing nondeterminism diagnostics of the public replay API (#529):
+; the history corpus's negative controls replayed against its frozen
+; incompatible definitions. No Temporal Server or network is required.
+(test
+ (name test_replay_diagnostics)
+ (modules test_replay_diagnostics)
+ (deps
+  (glob_files ../fixtures/history-corpus/histories/*.pb))
+ (libraries temporal-sdk temporal_history_corpus_definitions))
+
+; Worker resource and shutdown option encoding and validation (#498).
+(test
+ (name test_worker_tuning)
+ (libraries temporal_core_bridge))
+
+; Client admission limit encoding and validation (#796).
+(test
+ (name test_client_limits)
+ (libraries temporal-sdk temporal_core_bridge))
+
+; Opt-in Prometheus export on a public Runtime, without a server (#500).
+(test
+ (name test_runtime_metrics)
+ (libraries temporal-sdk unix))
+
+; Seeded mutation fuzzing of every OCaml protocol decoder and multi-Domain
+; close/finalizer/attach races through the C stubs (#506).
+;
+; These two run under their own aliases, not `runtest`: the multi-Domain
+; stress starts several Core runtimes and Tokio pools at once, which starved
+; the timing-bound runtime tests on the small Windows runner when Dune ran
+; them side by side. `make test` and `make native-test` build
+; @test/bridge/bridge-stress only after `dune runtest` has finished; see
+; docs/reference/bridge-decoder-fuzz.md.
+(executable
+ (name test_ocaml_decoder_fuzz)
+ (modules test_ocaml_decoder_fuzz)
+ (libraries temporal_protocol temporal_core_bridge))
+
+(rule
+ (alias decoder-fuzz)
+ (deps
+  (source_tree fixtures)
+  (env_var DECODER_FUZZ_SEED)
+  (env_var DECODER_FUZZ_OCAML_CASES)
+  (env_var DECODER_FUZZ_TARGET))
+ (action
+  (run %{exe:test_ocaml_decoder_fuzz.exe})))
+
+(executable
+ (name test_ocaml_concurrent_lifecycle_stress)
+ (modules test_ocaml_concurrent_lifecycle_stress)
+ (libraries temporal_core_bridge))
+
+(rule
+ (alias concurrent-stress)
+ (deps
+  (env_var LIFECYCLE_STRESS_SEED)
+  (env_var CONCURRENT_STRESS_OCAML_ROUNDS)
+  (env_var CONCURRENT_STRESS_OCAML_DOMAINS))
+ (action
+  (run %{exe:test_ocaml_concurrent_lifecycle_stress.exe})))
+
+; Both bridge stresses, run after `dune runtest` by the Make test targets.
+(alias
+ (name bridge-stress)
+ (deps
+  (alias decoder-fuzz)
+  (alias concurrent-stress)))
+
+; A raising signal handler pending at stub entry must not leak borrows (#1018).
+(test
+ (name test_signal_borrow_release)
+ (libraries temporal_core_bridge)
+ (foreign_stubs
+  (language c)
+  (names signal_test_stubs)
+  (flags :standard -Wall -Wextra -Werror)))

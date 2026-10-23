@@ -1,0 +1,34 @@
+# Official Temporal Python SDK closure for the CI-only interoperability
+# regression (#517), resolved for CPython 3.15 with prebuilt wheels only:
+#   uv pip compile --generate-hashes --python-version 3.15 --only-binary :all:
+# Installed by run-driver.sh with --require-hashes --no-deps inside the pinned
+# python image; never part of the OCaml SDK, its lock, or its artifacts.
+# Every package row is mirrored in docs/dependencies.md and checked by
+# scripts/check-dependency-inventory.sh.
+nexus-rpc==1.4.0 \
+    --hash=sha256:14c953d3519113f8ccec533a9efdb6b10c28afef75d11cdd6d422640c40b3a49 \
+    --hash=sha256:3b8b373d4865671789cc43623e3dc0bcbf192562e40e13727e17f1c149050fba
+protobuf==7.36.2 \
+    --hash=sha256:497d0463ff3316681da6c0b9e8d06cb465d61abce00b613ab42226175644d1bb \
+    --hash=sha256:89f23aa53c24553a2416fd4fd1ec06f74fa42b14b546d8883128813f775bbfd2 \
+    --hash=sha256:912c1221170e16c08d1f086762f563dd61ff83c18b5fa6652952dfaded66f728 \
+    --hash=sha256:a300819d441e078a5608c0d3c709796bb548136058fda017ae51d425b44fd353 \
+    --hash=sha256:bdb3a345d48db958e6ce1f18e508beb0cc981d64f24088427549c866cd039f1e \
+    --hash=sha256:cbc70b17ee27e28894c7fee8bb04be1abead49e936bc70eb60052531eee2079e \
+    --hash=sha256:e11e1f0180583a2af89db6a2ecd9e8dc40aa6d2988ca175bfd0e6d12ea72d74e \
+    --hash=sha256:f4fee11ec330d238b34a05c9b675f693c20415d1c5bd7d5320cc2f8a798eb9cf
+temporalio==1.33.0 \
+    --hash=sha256:152b808c622c83052e17e64e228c1fa0410c515a908ed8981d17cba527183cf9 \
+    --hash=sha256:33b5ff39c6737d21c6f16d3fef0c458d64aa9e78ce187e293bda6998d29ea7b8 \
+    --hash=sha256:79840232ed78943951d5f0069193b997d24e1da85890784a7d4351a48eb1f166 \
+    --hash=sha256:8f52f2f175aed174de21fc5782e5cba1e9e2e37cfd5687d5a8bd084b4deba483 \
+    --hash=sha256:a1e506bcad08c995df7ec083bfd953f3c85bd1e2f6accbbb7562ef39386b3afb \
+    --hash=sha256:a46970c35acf77dfe142ee2aa3504462a3ff7aa12abdada57e7e8e2488930cbc \
+    --hash=sha256:c685f6f4629b72645c0f9a9811cb2275d8a7cd0b2893b3349bd0a53985ff6f46 \
+    --hash=sha256:efba3fec8735c4592c57a1a7aa4c2e4acf5a0765f53bd7366b94540755dbab0f
+types-protobuf==7.35.1.20260906 \
+    --hash=sha256:5155e48569e0dabff303fdf578db96cd31ea9a4a63b18018a4ceac6b0ae17462 \
+    --hash=sha256:efd1a3862d4c967dad5512ef8d56b1530ac84f182c41735b94004756518c4998
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
+    --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5

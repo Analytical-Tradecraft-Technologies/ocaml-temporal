@@ -7,19 +7,70 @@ type start_metadata = {
   execution_expiration_time : Temporal_protocol.Workflow_protocol.timestamp option;
 }
 
+(** Run-stable identity and start policy reported by Core's initialization
+    job; see the interface. *)
+type run_info = {
+  workflow_id : string;
+  run_id : string;
+  workflow_type : string;
+  attempt : int;
+  first_execution_run_id : string;
+  parent : Temporal_protocol.Workflow_protocol.namespaced_workflow_execution option;
+  start_time : Temporal_protocol.Workflow_protocol.timestamp option;
+  execution_timeout : Temporal_protocol.Workflow_protocol.duration option;
+  run_timeout : Temporal_protocol.Workflow_protocol.duration option;
+  task_timeout : Temporal_protocol.Workflow_protocol.duration option;
+  retry_policy : Temporal_protocol.Workflow_protocol.retry_policy option;
+  continued_from :
+    (string * Temporal_protocol.Workflow_protocol.continue_as_new_initiator)
+    option;
+}
+
+(** History facts reported with one activation; see the interface. *)
+type activation_history = {
+  history_length : int;
+  history_size_bytes : int option;
+  continue_as_new_suggested : bool;
+  continue_as_new_reasons :
+    Temporal_protocol.Workflow_protocol.suggest_continue_as_new_reason list;
+}
+
 (** Function saved for each pending activity. It receives the raw payload,
     decodes it to the activity's declared output type, and completes the future
     returned to workflow code. *)
 type activity_resolution =
   (Temporal_base.Codec.payload, Temporal_base.Error.t) result -> unit
 
+(** Language-owned retry phase of one local activity (#809). Core's backoff
+    job and the backoff timer's firing are both applied during the activation
+    job pass, but their commands are emitted by scheduler work queued at that
+    point, exactly where a fiber woken by the same job would run. Commands
+    therefore keep their relative order with commands from fibers woken by
+    earlier jobs whether Core delivers those jobs in one activation or several,
+    which is what makes the live history replayable.
+
+    - [Backoff_idle]: no retry delay is in progress; an attempt is either
+      running in Core or the activity is about to be resolved.
+    - [Backoff_timer_queued]: Core requested a backoff and the work that
+      allocates the timer sequence and emits [Start_timer] is queued.
+    - [Backoff_timer seq]: the retry timer with sequence [seq] is outstanding.
+    - [Backoff_retry_queued]: the timer fired and the work that re-emits
+      [Schedule_local_activity] is queued.
+
+    Every non-idle phase rejects a further Core backoff job for the sequence
+    and lets cancellation settle the operation without involving Core. *)
+type local_activity_backoff =
+  | Backoff_idle
+  | Backoff_timer_queued
+  | Backoff_timer of int64
+  | Backoff_retry_queued
+
 (** Retains the immutable request fields needed to re-emit one local activity
     after Core asks the language layer to back off. The resolver remains in the
     ordinary activity table so terminal completions use the same lifecycle;
-    [backoff_timer_seq] is set while the retry timer is outstanding and makes
-    duplicate Core backoff jobs fail closed. [cancellation_requested] shares
-    the handle's decision so a later backoff job cannot revive a cancelled
-    operation. *)
+    [backoff] tracks the language-owned retry delay and makes duplicate Core
+    backoff jobs fail closed. [cancellation_requested] shares the handle's
+    decision so a later backoff job cannot revive a cancelled operation. *)
 type local_activity_state = {
   activity_id : string;
   activity_type : string;
@@ -34,7 +85,7 @@ type local_activity_state = {
   mutable attempt : int64;
   mutable original_schedule_time :
     Temporal_protocol.Workflow_protocol.timestamp option;
-  mutable backoff_timer_seq : int64 option;
+  mutable backoff : local_activity_backoff;
 }
 
 (** Function saved for each pending child workflow. Child and activity
@@ -46,10 +97,18 @@ type child_workflow_resolution =
 (** A child resolver survives its start acknowledgment. Core first reports the
     assigned run ID, then later reports the terminal payload or failure. Keeping
     both pieces in one table entry prevents a successful start from being
-    mistaken for completion and gives duplicate acknowledgments a typed error. *)
+    mistaken for completion and gives duplicate acknowledgments a typed error.
+    [cancellation_requested] is the same cell the public handle's [cancel]
+    closure sets; sharing it lets the resolver accept Core's cancelled
+    resolution for a child that never reported a start acknowledgment.
+    [resolve_started] settles the handle's start-stage future exactly once:
+    with the run ID on acknowledgment, or with the same error as the result
+    future when the child never starts (#1040). *)
 type child_workflow_state = {
   resolve : child_workflow_resolution;
+  resolve_started : (string, Temporal_base.Error.t) result -> unit;
   mutable start_run_id : string option;
+  cancellation_requested : bool ref;
 }
 
 (** Resolver retained for one external signal or cancellation command. The
@@ -76,11 +135,19 @@ type external_workflow_state = {
 type patch_mode = Active | Deprecated
 
 (** Replay evidence and source-level API mode retained for one durable patch
-    ID. History notification may update [decision] before or after source code
-    selects [mode], while [mode = None] means no local patch call has run yet. *)
+    ID. [mode = None] means no local patch call has run yet; in that state
+    [decision] only records that Core reported the marker and may still be
+    seeded by [notify_has_patch]. Once the first local call selects [mode],
+    [decision] has been returned to (or acted on by) workflow code and is
+    immutable for the rest of this execution. [marker_reported] records
+    separately that Core reported a history marker for the ID, even after the
+    decision was fixed at [false]: Core requires a [SetPatchMarker] command to
+    consume a non-deprecated history marker, so a later call must still emit
+    one without changing the branch already taken. *)
 type patch_state = {
   mutable decision : bool;
   mutable mode : patch_mode option;
+  mutable marker_reported : bool;
 }
 
 (** A typed key for one workflow-local value. The integer is allocated once at
@@ -101,7 +168,13 @@ let next_local_id = Atomic.make 0
 type t = {
   scheduler : Scheduler.t;
   task_queue : string;
+  (* Validated namespace of the worker that owns this execution. Activations
+     do not carry it, so the worker adapter supplies it at construction. *)
+  namespace : string;
   mutable start_metadata : start_metadata option;
+  (* Installed once from the initialization activation; strings are
+     immutable copies owned by the protocol decoder, so they can be shared. *)
+  mutable run_info : run_info option;
   conditions : Condition_store.t;
   mutable activation_timestamp :
     Temporal_protocol.Workflow_protocol.timestamp option;
@@ -109,8 +182,12 @@ type t = {
      one run to different builds, so replace it before every activation. *)
   mutable activation_deployment_version : (string * string) option;
   (* Replaced before every activation. Patch decisions use this flag only when
-     their ID has not already been fixed for this workflow execution. *)
+     their ID has neither been notified nor consulted in this execution. *)
   mutable activation_is_replaying : bool;
+  (* Task-local history facts, replaced before every activation like the
+     replay flag so a later task never observes stale continue-as-new
+     advice. *)
+  mutable activation_history : activation_history;
   (* Patch decisions are execution-local durable-language state. A cached
      [false] is as significant as [true], because replay without a marker must
      continue taking the pre-patch branch for the lifetime of this run. *)
@@ -142,23 +219,33 @@ type t = {
   mutable sealed : bool;
 }
 
-(** Validates the worker queue before it becomes an implicit activity option.
+(** Validates a worker-scoped name (the task queue or namespace) before it is
+    retained by an execution; [field] names the value in the diagnostic.
     Queue names cross the strict JSON boundary even when workflow code omits
     [~task_queue], so rejecting an empty, NUL-containing, oversized, or
     non-UTF-8 default at execution construction keeps configuration failures
     out of the later workflow command path. The result carries the stable
     diagnostic so worker construction can reject the same value without
     catching an exception. *)
-let validate_task_queue task_queue =
-  if String.equal task_queue "" then
-    Error "task_queue must not be empty"
-  else if String.contains task_queue '\000' then
-    Error "task_queue must not contain NUL"
-  else if String.length task_queue > 65_536 then
-    Error "task_queue exceeds 65536 bytes"
-  else if not (Temporal_base.Codec.valid_utf_8 task_queue) then
-    Error "task_queue must be valid UTF-8"
+let validate_worker_name ~field value =
+  if String.equal value "" then
+    Error (field ^ " must not be empty")
+  else if String.contains value '\000' then
+    Error (field ^ " must not contain NUL")
+  else if String.length value > 65_536 then
+    Error (field ^ " exceeds 65536 bytes")
+  else if not (Temporal_base.Codec.valid_utf_8 value) then
+    Error (field ^ " must be valid UTF-8")
   else Ok ()
+
+(** Applies the shared worker-name rules to the implicit activity queue. *)
+let validate_task_queue task_queue =
+  validate_worker_name ~field:"task_queue" task_queue
+
+(** Applies the same rules to the worker namespace before it is exposed
+    through [Temporal.Workflow.Info.namespace]. *)
+let validate_namespace namespace =
+  validate_worker_name ~field:"namespace" namespace
 
 (** Converts canonical uint64 decimal text into the generator's bit pattern.
     Zero retains the existing nonzero fallback required by xorshift. *)
@@ -183,26 +270,40 @@ let seed_of_decimal seed =
   in
   if Int64.equal state 0L then 1L else state
 
+(** History facts used before any activation has been installed, and for
+    synthetic activations that carry no metadata. *)
+let empty_activation_history =
+  { history_length = 0; history_size_bytes = None;
+    continue_as_new_suggested = false; continue_as_new_reasons = [] }
+
 (** Creates empty activity and timer tables. The tables grow normally if a
     workflow has more than the small initial capacity. *)
-let create ?(task_queue = "default") ?(randomness_seed = "0") scheduler =
-  match validate_task_queue task_queue with
+let create ?(task_queue = "default") ?(namespace = "default")
+    ?(randomness_seed = "0") scheduler =
+  match
+    Result.bind (validate_task_queue task_queue) (fun () ->
+        validate_namespace namespace)
+  with
   | Error message ->
       (* Preserve the existing execution-construction contract for callers
          that create a runtime directly: invalid worker configuration is a
          programmer defect at this lower-level API. The worker adapter uses
-         [validate_task_queue] directly and returns a typed configuration
-         error before it publishes any execution state. *)
+         [validate_task_queue] and [validate_namespace] directly and returns
+         a typed configuration error before it publishes any execution
+         state. *)
       invalid_arg message
   | Ok () ->
       {
         scheduler;
         task_queue;
+        namespace;
         start_metadata = None;
+        run_info = None;
         conditions = Condition_store.create scheduler;
         activation_timestamp = None;
         activation_deployment_version = None;
         activation_is_replaying = false;
+        activation_history = empty_activation_history;
         patches = Hashtbl.create 8;
         next_sequence = 0L;
         activities = Hashtbl.create 16;
@@ -233,26 +334,41 @@ let set_start_metadata context value =
     the value observed by another handler or later activation. *)
 let start_metadata context = Option.map copy_start_metadata context.start_metadata
 
-(** Stores the currently running workflow separately on each OCaml Domain, so
-    workflow code running on different Domains cannot see the wrong context. *)
-let current_key = Domain.DLS.new_key (fun () -> None)
-let current () = Domain.DLS.get current_key
+(** Stores the currently running workflow separately for each system thread
+    of each OCaml Domain. Keying by Domain alone is insufficient: workers hosted
+    on sibling threads of one Domain may interleave activations, and a shared
+    slot would let one record commands in the other's execution (#765). *)
+let current_binding = Thread_binding.create ()
+
+(** Reads the calling thread's installed workflow context. *)
+let current () = Thread_binding.get current_binding
 
 (** Marks the synchronous query callback allowed to read immutable observations
     of its own live execution. This is separate from the scheduler owner marker:
     queries must never gain permission to mutate scopes or resume fibers. *)
-let query_read_key = Domain.DLS.new_key (fun () -> None)
+let query_read_binding = Thread_binding.create ()
 
 (** Accepts a scope status read only in the marked query for its owning live
-    execution. Both dynamic bindings are Domain-local, and the sealed check
+    execution. Both dynamic bindings are thread-local, and the sealed check
     rejects a scope retained after terminal workflow completion. *)
 let query_read_owner_matches owner_id =
-  match (Domain.DLS.get query_read_key, current ()) with
+  match (Thread_binding.get query_read_binding, current ()) with
   | Some query_context, Some current_context
     when query_context == current_context
          && not query_context.sealed
          && Scheduler.is_active query_context.scheduler ->
       Scheduler.id query_context.scheduler = owner_id
+  | _ -> false
+
+(** Commands attached to a scope must originate in a scheduler turn, even
+    though a synchronous query may read that scope's status. Reject a nested
+    query marker as well as a paused or sealed scheduler before allocation. *)
+let in_owner_turn context =
+  match (Thread_binding.get query_read_binding, current ()) with
+  | None, Some current_context when current_context == context ->
+      not context.sealed
+      && Scheduler.is_active context.scheduler
+      && Future_store.current_owner_matches (Scheduler.id context.scheduler)
   | _ -> false
 
 (** Creates a key whose value, when set, is retained only in each execution's
@@ -299,6 +415,29 @@ let activation_deployment_version context =
 let set_activation_is_replaying context is_replaying =
   context.activation_is_replaying <- is_replaying
 
+(** Returns Core's replay status for the activation currently running. *)
+let activation_is_replaying context = context.activation_is_replaying
+
+(** Replaces the task-local history facts before an activation is applied. *)
+let set_activation_history context history =
+  context.activation_history <- history
+
+(** Returns the history facts installed for the current activation. *)
+let activation_history context = context.activation_history
+
+(** Installs the run identity once initialization has been translated. *)
+let set_run_info context info = context.run_info <- info
+
+(** Returns the run identity; the record is immutable and safely shared. *)
+let run_info context = context.run_info
+
+(** Returns the worker queue this execution uses as its activity default,
+    which is also the queue that delivered its workflow tasks. *)
+let task_queue context = context.task_queue
+
+(** Returns the worker namespace captured at construction. *)
+let namespace context = context.namespace
+
 (** Copies a protocol identifier before retaining it in execution state or an
     emitted command. Although OCaml strings are normally immutable, callers at
     private/native boundaries can construct aliases with [Bytes.unsafe_to_string].
@@ -306,22 +445,43 @@ let set_activation_is_replaying context is_replaying =
     changing a command after the runtime has accepted it. *)
 let snapshot_identifier value = Bytes.to_string (Bytes.of_string value)
 
-(** Applies passive patch metadata before workflow fibers run. Replacing a
-    prior decision is deliberate: a marker reported by Core is authoritative
-    history evidence and must win over any earlier provisional absence. The ID
-    is copied because this execution retains it beyond the activation adapter. *)
+(** Applies passive patch metadata before workflow fibers run. A notification
+    seeds only an ID that workflow code has not consulted yet. Once a local
+    call has fixed the decision it is never replaced: a later notification can
+    only describe a marker recorded after that point (for example by a later
+    task), and flipping an answer the workflow already branched on would make
+    a subsequent call in the same run diverge from the original execution.
+    This mirrors the memoization in Temporal's official SDKs. The ID is copied
+    because this execution retains it beyond the activation adapter. *)
 let notify_has_patch context ~patch_id =
   let patch_id = snapshot_identifier patch_id in
   match Hashtbl.find_opt context.patches patch_id with
-  | Some state -> state.decision <- true
+  | Some ({ mode = Some _; _ } as state) ->
+      (* The branch is fixed, but the marker must still be consumed. *)
+      state.marker_reported <- true
+  | Some state ->
+      state.decision <- true;
+      state.marker_reported <- true
   | None ->
-      Hashtbl.add context.patches patch_id { decision = true; mode = None }
+      Hashtbl.add context.patches patch_id
+        { decision = true; mode = None; marker_reported = true }
 
-(** Evaluates one patch operation and emits its Core marker command on every
-    call. Repeated same-mode commands are intentional because Core owns normal
-    marker deduplication. A conflicting mode is rejected before emission:
-    Core retains the first command for an ID, so accepting both would silently
-    make durable deprecation depend on call order. *)
+(** Evaluates one patch operation. The first call for an ID fixes its decision:
+    [true] when a Core notification already reported the marker or the current
+    activation is not replaying, otherwise [false]. A marker command is emitted
+    while that decision is [true], or once Core has reported a history marker
+    for the ID after the decision was fixed at [false] (so the marker is
+    consumed while the branch stays fixed). Emitting a marker for a [false]
+    replay decision without such a report would let Core record a marker
+    contradicting the branch actually taken: during replay Core creates a real
+    [RecordMarker] command for every [SetPatchMarker] and keeps it queued
+    unless later history displaces it.
+
+    Repeated calls with a [true] decision emit repeated same-mode commands;
+    Core skips IDs for which it has already created a marker command. A
+    conflicting mode is rejected before emission: Core retains the first
+    command for an ID, so accepting both would silently make durable
+    deprecation depend on call order. *)
 let call_patch_api context ~patch_id ~mode =
   if context.sealed then
     invalid_arg "Temporal workflow patch API used after workflow execution ended";
@@ -334,6 +494,7 @@ let call_patch_api context ~patch_id ~mode =
           {
             decision = not context.activation_is_replaying;
             mode = None;
+            marker_reported = false;
           }
         in
         Hashtbl.add context.patches patch_id state;
@@ -345,10 +506,15 @@ let call_patch_api context ~patch_id ~mode =
         "Temporal workflow patch ID cannot be both active and deprecated in one execution"
   | Some _ -> ()
   | None -> state.mode <- Some mode);
-  context.commands_rev <-
-    Activation.Set_patch_marker
-      { patch_id; deprecated = (mode = Deprecated) }
-    :: context.commands_rev;
+  (* A marker is emitted for a [true] decision, and also when Core reported a
+     history marker after the decision was fixed at [false]; otherwise Core
+     would meet that non-deprecated marker with no matching command and fail
+     the task as nondeterministic. The returned decision never changes. *)
+  if state.decision || state.marker_reported then
+    context.commands_rev <-
+      Activation.Set_patch_marker
+        { patch_id; deprecated = (mode = Deprecated) }
+      :: context.commands_rev;
   state.decision
 
 (** Returns the deterministic branch decision for one active patch ID. *)
@@ -356,8 +522,9 @@ let patched context ~patch_id =
   call_patch_api context ~patch_id ~mode:Active
 
 (** Marks one patch ID as deprecated without exposing a branch decision. The
-    internal decision remains cached so replay state matches [patched], but the
-    public operation exists only to record the marker lifecycle transition. *)
+    internal decision is fixed exactly as for [patched], so replay of a history
+    without the marker emits no deprecated marker, matching Core's "call
+    allowed" outcome and the official SDKs. *)
 let deprecate_patch context ~patch_id =
   ignore (call_patch_api context ~patch_id ~mode:Deprecated)
 
@@ -417,49 +584,60 @@ let with_randomness_disabled context action =
 
 (** Buffers a search-attribute merge without consulting wall-clock or process
     state. The payload list is copied at the public boundary before this
-    command is retained by the execution context. *)
+    command is retained by the execution context.
+
+    An empty list buffers nothing (#1033). Temporal Server rejects an upsert
+    command whose indexed fields are empty with [BAD_SEARCH_ATTRIBUTES], and
+    replay would emit the same command again, so every retry of the workflow
+    task would fail. Skipping it is replay-safe because a rejected command is
+    never recorded in history, and an empty merge has no observable effect.
+    The sealed check still runs first, so use after the execution ended stays
+    a programmer error whether or not the list is empty. *)
 let upsert_search_attributes context search_attributes =
   if context.sealed then
     invalid_arg
       "Temporal workflow search attributes used after workflow execution ended";
-  let copied =
-    List.map
-      (fun (key, { Temporal_base.Payload.metadata; data }) ->
-        (snapshot_identifier key,
-         { Temporal_base.Payload.metadata = List.map Fun.id metadata;
-           data = Bytes.copy data }))
-      search_attributes
-  in
-  context.commands_rev <-
-    Activation.Upsert_search_attributes { search_attributes = copied }
-    :: context.commands_rev
+  match search_attributes with
+  | [] -> ()
+  | _ :: _ ->
+      let copied =
+        List.map
+          (fun (key, { Temporal_base.Payload.metadata; data }) ->
+            (snapshot_identifier key,
+             { Temporal_base.Payload.metadata = List.map Fun.id metadata;
+               data = Bytes.copy data }))
+          search_attributes
+      in
+      context.commands_rev <-
+        Activation.Upsert_search_attributes { search_attributes = copied }
+        :: context.commands_rev
 
-(** Makes [context] current while [action] runs, then restores the previous
-    value even if [action] raises. This prevents later code on the same Domain
-    from mistakenly appearing to run inside a workflow. *)
+(** Makes [context] current on the calling thread while [action] runs, then
+    restores the previous value even if [action] raises. This prevents later
+    code on the same thread from mistakenly appearing to run inside a workflow,
+    and code on any other thread from observing this context at all. *)
 let with_context context action =
-  let previous = current () in
-  Domain.DLS.set current_key (Some context);
-  Fun.protect ~finally:(fun () -> Domain.DLS.set current_key previous) action
+  Thread_binding.with_value current_binding (Some context) action
 
-(** Runs a query with its execution context and a Domain-local status-read
+(** Runs a query with its execution context and a thread-local status-read
     marker. The marker is restored even when the handler raises; unlike a
     scheduler owner turn it grants no cancellation or future permissions. *)
 let with_read_only_query context action =
   with_context context (fun () ->
-      let previous = Domain.DLS.get query_read_key in
-      Domain.DLS.set query_read_key (Some context);
-      Fun.protect
-        ~finally:(fun () -> Domain.DLS.set query_read_key previous)
-        (fun () -> with_randomness_disabled context action))
+      Thread_binding.with_value query_read_binding (Some context) (fun () ->
+          with_randomness_disabled context action))
 
-(** Runs infrastructure code with no workflow installed, then restores the
-    previous context. This prevents re-entrant callbacks such as application
-    log reporters from mutating deterministic workflow state. *)
+(** Runs infrastructure code with no workflow installed on the calling thread,
+    then restores the previous context. This prevents re-entrant callbacks such
+    as application log reporters from mutating deterministic workflow state. *)
 let without_context action =
-  let previous = current () in
-  Domain.DLS.set current_key None;
-  Fun.protect ~finally:(fun () -> Domain.DLS.set current_key previous) action
+  Thread_binding.with_value current_binding None action
+
+(** Counts threads on the calling Domain that hold a context or query-read
+    binding, so tests can prove that every extent removed its entry. *)
+let bound_thread_count () =
+  Thread_binding.bound_count current_binding
+  + Thread_binding.bound_count query_read_binding
 
 (** Builds the error returned when code waits for a workflow future from the
     wrong scheduler or after workflow execution has ended. *)
@@ -557,14 +735,17 @@ let resolve_activity context ~seq result =
     Core has already completed the preceding attempt, so there is no running
     attempt to acknowledge cancellation under any of the cancellation policies.
     Removing the timer callback before resolving also prevents another attempt
-    from being scheduled by a stale timer. *)
+    from being scheduled by a stale timer. Work queued for a
+    [Backoff_timer_queued] or [Backoff_retry_queued] phase finds the activity
+    removed from [local_activities] and becomes a no-op, so neither a timer nor
+    a retry is emitted after cancellation. *)
 let cancel_local_activity_backoff context ~seq state =
-  Option.iter
-    (fun timer_seq ->
+  (match state.backoff with
+  | Backoff_timer timer_seq ->
       Hashtbl.remove context.timers timer_seq;
-      state.backoff_timer_seq <- None;
-      emit context (Activation.Cancel_timer { seq = timer_seq }))
-    state.backoff_timer_seq;
+      emit context (Activation.Cancel_timer { seq = timer_seq })
+  | Backoff_idle | Backoff_timer_queued | Backoff_retry_queued -> ());
+  state.backoff <- Backoff_idle;
   resolve_activity context ~seq
     (Error
        (Temporal_base.Error.make ~category:`Cancelled
@@ -617,12 +798,19 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
     | None, None -> Some 60_000L
     | _, value -> value
   in
+  (* [input] is already the argument list: the public layer sends a
+     [Codec.unit] input as zero arguments so a zero-parameter activity in
+     another SDK is not given a surplus [null], and every other input,
+     including an option's [None], as one payload (#1012). OCaml activity
+     workers decode [[]] back to the canonical unit payload. Core does not
+     compare arguments when replaying ScheduleActivityTask or local-activity
+     markers, so histories recorded under either rule still replay. *)
   if local then begin
     let local_state =
       {
         activity_id;
         activity_type = name;
-        arguments = [ input ];
+        arguments = input;
         schedule_to_close_timeout;
         schedule_to_start_timeout;
         start_to_close_timeout;
@@ -632,7 +820,7 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
         cancellation_requested;
         attempt = 1L;
         original_schedule_time = None;
-        backoff_timer_seq = None;
+        backoff = Backoff_idle;
       }
     in
     Hashtbl.add context.local_activities seq local_state;
@@ -644,7 +832,7 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
            activity_type = name;
            attempt = 1L;
            original_schedule_time = None;
-           arguments = [ input ];
+           arguments = input;
            schedule_to_close_timeout;
            schedule_to_start_timeout;
            start_to_close_timeout;
@@ -661,7 +849,7 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
            activity_id;
            activity_type = name;
            task_queue;
-           arguments = [ input ];
+           arguments = input;
            schedule_to_close_timeout;
            schedule_to_start_timeout;
            start_to_close_timeout;
@@ -691,9 +879,8 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
                else Activation.Request_cancel_activity { seq });
             cancellation_requested := true;
             (match Hashtbl.find_opt context.local_activities seq with
-            | Some ({ backoff_timer_seq = Some _; _ } as state) ->
-                cancel_local_activity_backoff context ~seq state
-            | _ -> Ok ()))
+            | Some { backoff = Backoff_idle; _ } | None -> Ok ()
+            | Some state -> cancel_local_activity_backoff context ~seq state))
     | _ ->
         Error
           (Temporal_base.Error.defect
@@ -718,13 +905,17 @@ let schedule_local_activity context ~name ~input ?activity_id
 (** Saves a child resolver before emitting its command. The explicit [id] is
     application-owned durable identity; an optional retry policy is copied
     into the command for Core's durable retry state machine; the private [seq]
-    only correlates Core completion jobs with this in-memory execution. *)
+    only correlates Core completion jobs with this in-memory execution. Both
+    returned futures are allocated before the command so the start stage and
+    the result share the sequence's lifetime. *)
 let start_child_workflow context ~id ~name ~input
     ?retry_policy ?task_queue ?parent_close_policy ?(cancellation_type = Activation.Child_try_cancel) ~decode () =
   let seq = allocate_sequence context in
-  (* Keep this bit in the handle closure rather than in the pending table so a
-    repeated cancel remains idempotent even after Core has removed the child
-    state while delivering its terminal result. *)
+  (* The handle closure owns this cell so a repeated cancel remains idempotent
+    even after Core has removed the child state while delivering its terminal
+    result. The pending table entry shares the same cell so
+    [resolve_child_workflow] can recognise Core's cancelled-before-started
+    resolution. *)
   let cancellation_requested = ref false in
   (* Core removes the table entry before the resolver runs. Retain this
      terminal marker in the handle closure so a valid cancellation arriving
@@ -733,8 +924,12 @@ let start_child_workflow context ~id ~name ~input
      defect. *)
   let terminal = ref false in
   let future, resolve = Scheduler.promise context.scheduler ~outside_error in
+  let started, resolve_started =
+    Scheduler.promise context.scheduler ~outside_error
+  in
   Hashtbl.add context.child_workflows seq
     {
+      resolve_started;
       resolve =
         (fun result ->
           terminal := true;
@@ -751,6 +946,7 @@ let start_child_workflow context ~id ~name ~input
                             ("child workflow result decoder raised: "
                             ^ Printexc.to_string exn)))));
       start_run_id = None;
+      cancellation_requested;
     };
   emit context
     (Activation.Start_child_workflow
@@ -792,7 +988,7 @@ let start_child_workflow context ~id ~name ~input
           (Temporal_base.Error.defect
              ~message:"child workflow cancellation used outside its workflow")
   in
-  (future, cancel)
+  (future, started, cancel)
 
 (** Starts a timer whose future completes with [()] because a timer firing has
     no result payload. *)
@@ -828,10 +1024,31 @@ let cancel_external_workflow context ~workflow_id ~run_id ~reason () =
        { seq; workflow_id; run_id; reason });
   future
 
-(** Starts the language-owned timer requested by Core for a local retry. The
-    original activity sequence stays pending while the timer uses its own
-    sequence; when it fires, the callback updates the attempt metadata and
-    emits the same local activity command with Core's supplied provenance. *)
+(** Returns the local activity state only while it is still in the expected
+    retry [phase]. Queued backoff work uses this to become a no-op after a
+    cancellation, terminal resolution, or shutdown removed or reset the
+    activity before the work reached the front of the scheduler queue. *)
+let local_activity_in_phase context ~seq phase =
+  match Hashtbl.find_opt context.local_activities seq with
+  | Some state when state.backoff = phase -> Some state
+  | Some _ | None -> None
+
+(** Accepts the retry delay Core requested for a local activity and queues the
+    language-owned timer behind work already runnable in this activation.
+
+    Validation and the phase change happen during the job pass so malformed or
+    duplicate Core jobs fail the activation immediately. The timer sequence is
+    allocated and [Start_timer] emitted only when the queued work runs: emitting
+    it inline would place it before commands from fibers woken by earlier jobs
+    in the same activation, and Core may merge jobs that were delivered in
+    separate activations live into one activation on replay (#809). Queuing at
+    the job's position is also how the TypeScript and Python SDKs behave,
+    where the backoff is handled by the coroutine awaiting the activity.
+
+    When the timer fires, its callback likewise queues the work that updates
+    the attempt metadata and re-emits the same local activity sequence with
+    Core's supplied provenance. The original activity sequence stays pending
+    throughout; only a terminal resolution or cancellation completes it. *)
 let resolve_local_activity_backoff context ~seq ~attempt ~backoff_milliseconds
     ~original_schedule_time =
   match Hashtbl.find_opt context.local_activities seq with
@@ -840,65 +1057,87 @@ let resolve_local_activity_backoff context ~seq ~attempt ~backoff_milliseconds
         (bridge_error
            (Printf.sprintf
               "local activity backoff references unknown sequence %Ld" seq))
-  | Some state -> (
-      match state.backoff_timer_seq with
-      | Some _ ->
-          Error
-            (bridge_error
-               (Printf.sprintf
-                  "duplicate local activity backoff sequence %Ld" seq))
-      | None when attempt <= 0L ->
-          Error
-            (bridge_error
-               (Printf.sprintf
-                  "local activity backoff attempt %Ld must be positive" attempt))
-      | None when backoff_milliseconds < 0L ->
-          Error
-            (bridge_error
-               (Printf.sprintf
-                  "local activity backoff duration %Ld must be non-negative"
-                  backoff_milliseconds))
-      | None when Int64.compare attempt state.attempt <= 0 ->
-          Error
-            (bridge_error
-               (Printf.sprintf
-                  "local activity backoff attempt %Ld does not advance sequence %Ld"
-                  attempt seq))
-      | None when !(state.cancellation_requested) ->
-          cancel_local_activity_backoff context ~seq state
-      | None ->
-          let timer_seq = allocate_sequence context in
-          state.backoff_timer_seq <- Some timer_seq;
-          Hashtbl.add context.timers timer_seq (fun () ->
-              match Hashtbl.find_opt context.local_activities seq with
-              | None -> ()
-              | Some state ->
-                  state.backoff_timer_seq <- None;
-                  state.attempt <- attempt;
-                  state.original_schedule_time <- original_schedule_time;
-                  emit context
-                    (Activation.Schedule_local_activity
-                       {
-                         seq;
-                         activity_id = state.activity_id;
-                         activity_type = state.activity_type;
-                         attempt = state.attempt;
-                         original_schedule_time = state.original_schedule_time;
-                         arguments = state.arguments;
-                         schedule_to_close_timeout = state.schedule_to_close_timeout;
-                         schedule_to_start_timeout = state.schedule_to_start_timeout;
-                         start_to_close_timeout = state.start_to_close_timeout;
-                         retry_policy = state.retry_policy;
-                         local_retry_threshold = state.local_retry_threshold;
-                         cancellation_type = state.cancellation_type;
-                       }));
-          emit context
-            (Activation.Start_timer
-               { seq = timer_seq; milliseconds = backoff_milliseconds });
-          Ok ())
+  | Some
+      { backoff = Backoff_timer_queued | Backoff_timer _ | Backoff_retry_queued;
+        _ } ->
+      Error
+        (bridge_error
+           (Printf.sprintf "duplicate local activity backoff sequence %Ld" seq))
+  | Some _ when attempt <= 0L ->
+      Error
+        (bridge_error
+           (Printf.sprintf
+              "local activity backoff attempt %Ld must be positive" attempt))
+  | Some _ when backoff_milliseconds < 0L ->
+      Error
+        (bridge_error
+           (Printf.sprintf
+              "local activity backoff duration %Ld must be non-negative"
+              backoff_milliseconds))
+  | Some state when Int64.compare attempt state.attempt <= 0 ->
+      Error
+        (bridge_error
+           (Printf.sprintf
+              "local activity backoff attempt %Ld does not advance sequence %Ld"
+              attempt seq))
+  | Some state when !(state.cancellation_requested) ->
+      cancel_local_activity_backoff context ~seq state
+  | Some state ->
+      (* Re-emits the next attempt once the timer has fired and every fiber
+         queued before the firing job has run. *)
+      let retry () =
+        match local_activity_in_phase context ~seq Backoff_retry_queued with
+        | None -> ()
+        | Some state ->
+            state.backoff <- Backoff_idle;
+            state.attempt <- attempt;
+            state.original_schedule_time <- original_schedule_time;
+            emit context
+              (Activation.Schedule_local_activity
+                 {
+                   seq;
+                   activity_id = state.activity_id;
+                   activity_type = state.activity_type;
+                   attempt = state.attempt;
+                   original_schedule_time = state.original_schedule_time;
+                   arguments = state.arguments;
+                   schedule_to_close_timeout = state.schedule_to_close_timeout;
+                   schedule_to_start_timeout = state.schedule_to_start_timeout;
+                   start_to_close_timeout = state.start_to_close_timeout;
+                   retry_policy = state.retry_policy;
+                   local_retry_threshold = state.local_retry_threshold;
+                   cancellation_type = state.cancellation_type;
+                 })
+      in
+      (* Runs from [fire_timer] during the job pass, so it only records the
+         phase and queues [retry]. *)
+      let on_timer_fired () =
+        match Hashtbl.find_opt context.local_activities seq with
+        | Some ({ backoff = Backoff_timer _; _ } as state) ->
+            state.backoff <- Backoff_retry_queued;
+            Scheduler.spawn context.scheduler retry
+        | Some _ | None -> ()
+      in
+      (* Allocates the timer sequence in scheduler order, after fibers woken
+         by earlier jobs of this activation have emitted their commands. *)
+      let start_timer () =
+        match local_activity_in_phase context ~seq Backoff_timer_queued with
+        | None -> ()
+        | Some state ->
+            let timer_seq = allocate_sequence context in
+            state.backoff <- Backoff_timer timer_seq;
+            Hashtbl.add context.timers timer_seq on_timer_fired;
+            emit context
+              (Activation.Start_timer
+                 { seq = timer_seq; milliseconds = backoff_milliseconds })
+      in
+      state.backoff <- Backoff_timer_queued;
+      Scheduler.spawn context.scheduler start_timer;
+      Ok ()
 
-(** Records the start acknowledgment or removes the child resolver on a start
-    failure. Once a run ID is recorded, every later start result is rejected so
+(** Records the start acknowledgment, settling the start-stage future with the
+    run ID, or removes the child resolver on a start failure, settling both
+    futures with the failure. Once a run ID is recorded, every later start result is rejected so
     a conflicting acknowledgment cannot complete or discard the child future. *)
 let resolve_child_workflow_start context ~seq result =
   match Hashtbl.find_opt context.child_workflows seq with
@@ -919,12 +1158,24 @@ let resolve_child_workflow_start context ~seq result =
             Error (bridge_error "child workflow start returned an empty run ID")
           else (
             state.start_run_id <- Some run_id;
+            state.resolve_started (Ok run_id);
             Ok ())
       | _, Error error ->
           Hashtbl.remove context.child_workflows seq;
+          state.resolve_started (Error error);
           state.resolve (Error error);
           Ok ())
 
+(** Completes the child future with Core's terminal result. A child normally
+    needs a recorded start acknowledgment first. The one exception is a
+    cancellation the workflow itself requested: when a [Try_cancel] or
+    [Abandon] child is cancelled after [StartChildWorkflowExecutionInitiated]
+    but before [ChildWorkflowExecutionStarted], pinned Temporal Core resolves
+    it directly as cancelled without ever sending a start resolution. That
+    sequence is accepted only for a [`Cancelled] error after this handle
+    emitted [Cancel_child_workflow]; any other pre-start terminal result is
+    still a bridge defect. The decision depends only on activation contents
+    and earlier workflow commands, so it is identical under replay. *)
 let resolve_child_workflow context ~seq result =
   match Hashtbl.find_opt context.child_workflows seq with
   | None ->
@@ -932,7 +1183,23 @@ let resolve_child_workflow context ~seq result =
         (bridge_error
            (Printf.sprintf "unknown or duplicate child workflow sequence %Ld" seq))
   | Some state -> (
+      let cancelled_before_start =
+        !(state.cancellation_requested)
+        &&
+        match result with
+        | Error error -> (Temporal_base.Error.view error).category = `Cancelled
+        | Ok _ -> false
+      in
       match state.start_run_id with
+      | None when cancelled_before_start ->
+          Hashtbl.remove context.child_workflows seq;
+          (* The child never started, so its start stage settles with the
+             same cancellation error as the result. *)
+          (match result with
+          | Error error -> state.resolve_started (Error error)
+          | Ok _ -> ());
+          state.resolve result;
+          Ok ()
       | None ->
           Error
             (bridge_error

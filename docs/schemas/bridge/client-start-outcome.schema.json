@@ -1,16 +1,20 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-start-outcome.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-start-outcome.schema.json",
   "title": "OCaml Temporal native client asynchronous start outcome",
   "description": "Closed terminal value produced when a private asynchronous start ticket is accepted, deterministically rejected, or cannot be proven because a transport/response failure may have occurred after acceptance.",
   "oneOf": [
     {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "execution"],
+      "required": ["kind", "execution", "started"],
       "properties": {
         "kind": {"const": "accepted"},
-        "execution": {"$ref": "client-execution-ref.schema.json"}
+        "execution": {"$ref": "client-execution-ref.schema.json"},
+        "started": {
+          "type": "boolean",
+          "description": "False only when a use_existing start returned the open run created by another request."
+        }
       }
     },
     {

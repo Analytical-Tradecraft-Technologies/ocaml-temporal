@@ -16,6 +16,38 @@ type execution = { namespace : string; workflow_id : string; run_id : string }
     map is constructed and encoding remains deterministic after sorting. *)
 type metadata_field = { key : string; value : payload }
 
+(** Temporal's open-run conflict policy without its [UNSPECIFIED] value. *)
+type id_conflict_policy = Fail | Use_existing | Terminate_existing
+
+(** Temporal's closed-run reuse policy without [UNSPECIFIED] and without the
+    deprecated [TERMINATE_IF_RUNNING]. *)
+type id_reuse_policy = Allow_duplicate | Allow_duplicate_failed_only | Reject_duplicate
+
+let max_rpc_timeout_ms = 60_000L
+let max_workflow_task_timeout_ms = 120_000L
+
+(** A caller deadline: the absolute monotonic expiry fixed at the public entry
+    point and the budget to send. Only [timeout_ms] is serialized. *)
+type rpc_deadline = { timeout_ms : int64; expires_at_ns : int64 }
+
+let rpc_deadline ~now_ns ~timeout_ms =
+  { timeout_ms; expires_at_ns = Int64.add now_ns (Int64.mul timeout_ms 1_000_000L) }
+
+(** Rounds the remaining nanoseconds up to whole milliseconds so a deadline
+    that has not expired is never sent as zero, and caps the result at the
+    original budget so clock granularity cannot lengthen a call. *)
+let remaining_rpc_deadline ~now_ns deadline =
+  let remaining_ns = Int64.sub deadline.expires_at_ns now_ns in
+  if Int64.compare remaining_ns 0L <= 0 then None
+  else
+    let remaining_ms = Int64.div (Int64.add remaining_ns 999_999L) 1_000_000L in
+    let timeout_ms =
+      if Int64.compare remaining_ms deadline.timeout_ms < 0 then remaining_ms
+      else deadline.timeout_ms
+    in
+    Some { deadline with timeout_ms }
+let max_workflow_timeout_ms = 315_576_000_000_999L
+
 type start_request = {
   request_id : string;
   namespace : string;
@@ -25,9 +57,17 @@ type start_request = {
   input : payload list;
   memo : metadata_field list;
   search_attributes : metadata_field list;
+  id_conflict_policy : id_conflict_policy;
+  id_reuse_policy : id_reuse_policy;
+  execution_timeout_ms : int64 option;
+  run_timeout_ms : int64 option;
+  task_timeout_ms : int64 option;
+  retry_policy : Workflow.retry_policy option;
+  rpc_deadline : rpc_deadline option;
 }
 
-type start_response = { execution : execution }
+(** [started] mirrors Temporal's [StartWorkflowExecutionResponse.started]. *)
+type start_response = { execution : execution; started : bool }
 type start_ticket = { request : start_request; ticket : string }
 type wait_request = execution
 
@@ -35,6 +75,7 @@ type cancel_request = {
   execution : execution;
   request_id : string;
   reason : string;
+  rpc_deadline : rpc_deadline option;
 }
 
 type cancel_response = { acknowledged : bool }
@@ -44,6 +85,7 @@ type reset_request = {
   request_id : string;
   reason : string;
   workflow_task_finish_event_id : int64;
+  rpc_deadline : rpc_deadline option;
 }
 
 type reset_response = { execution : execution }
@@ -51,7 +93,11 @@ type reset_response = { execution : execution }
 (** Exact-run termination request. Temporal termination is an immediate
     control-plane operation and therefore carries operator reason text rather
     than a cancellation request ID. *)
-type terminate_request = { execution : execution; reason : string }
+type terminate_request = {
+  execution : execution;
+  reason : string;
+  rpc_deadline : rpc_deadline option;
+}
 
 type terminate_response = { acknowledged : bool }
 
@@ -60,6 +106,7 @@ type signal_request = {
   signal_name : string;
   request_id : string;
   input : payload list;
+  rpc_deadline : rpc_deadline option;
 }
 
 type signal_response = { acknowledged : bool }
@@ -68,6 +115,7 @@ type query_request = {
   execution : execution;
   query_type : string;
   input : payload list;
+  rpc_deadline : rpc_deadline option;
 }
 
 type query_response = { result : payload list }
@@ -77,14 +125,26 @@ type visibility_request = {
   query : string;
   page_size : int;
   next_page_token : string option;
+  rpc_deadline : rpc_deadline option;
 }
+
+type visibility_status =
+  [ `Running
+  | `Completed
+  | `Failed
+  | `Canceled
+  | `Terminated
+  | `Continued_as_new
+  | `Timed_out
+  | `Paused
+  | `Unknown of int ]
 
 type visibility_execution = {
   workflow_id : string;
   run_id : string;
   workflow_type : string;
   task_queue : string;
-  status : string;
+  status : visibility_status;
 }
 
 type visibility_page = {
@@ -97,6 +157,7 @@ type update_request = {
   update_id : string;
   update_name : string;
   input : payload list;
+  rpc_deadline : rpc_deadline option;
 }
 
 type poll_update_request = { execution : execution; update_id : string }
@@ -125,6 +186,7 @@ type wait_response = { execution : execution; outcome : outcome }
 type client_error =
   | Already_started of { workflow_id : string; existing_run_id : string option }
   | Rpc of { code : string }
+  | Query_failed of { message : string }
   | Protocol of { code : string }
 
 type start_outcome =
@@ -199,6 +261,14 @@ let validate_identifier path value =
     Error (invalid ~path "identifier contains a NUL byte")
   else Ok ()
 
+(** Validates the run selector of a request. An empty string selects the
+    workflow's current run, which Temporal resolves when it handles the RPC
+    (#791); any other value must be a valid identifier naming one exact run.
+    Rust applies the same rule. Responses never use it: a run Temporal reports
+    is always a concrete identifier. *)
+let validate_run_selector path value =
+  if String.equal value "" then Ok () else validate_identifier path value
+
 let nullable _path (decode : Yojson.Safe.t -> ('a, error) result)
     (json : Yojson.Safe.t) : ('a option, error) result =
   match json with
@@ -272,6 +342,84 @@ let decode_object input =
   | Ok value -> Ok value
   | Error error -> Error (of_control_error error)
 
+(** Validates an optional caller RPC deadline and returns the JSON member that
+    carries its budget. An absent deadline omits the member, so Rust keeps the
+    operation's default budget; a present budget must be between 1 ms and
+    {!max_rpc_timeout_ms}, the bound Rust enforces too. The absolute expiry is
+    OCaml-side only and is not serialized. *)
+let rpc_timeout_member = function
+  | None -> Ok []
+  | Some { timeout_ms = milliseconds; _ }
+    when Int64.compare milliseconds 1L < 0
+         || Int64.compare milliseconds max_rpc_timeout_ms > 0 ->
+      Error
+        (invalid ~path:"$.rpc_timeout_ms"
+           "rpc timeout must be between 1 and 60000 milliseconds")
+  | Some { timeout_ms = milliseconds; _ } ->
+      Ok [ ("rpc_timeout_ms", `Intlit (Int64.to_string milliseconds)) ]
+
+(** Validates the workflow execution policies of a start request and returns
+    their JSON members, mirroring Rust's [validate_start_policies]: every
+    timeout is positive and bounded, the run timeout does not exceed the
+    execution timeout, the task timeout does not exceed the run (or
+    execution) timeout, and the retry policy satisfies the command
+    invariants. The reuse policy is always explicit; absent timeouts and
+    retry policy are omitted. *)
+let start_policy_members (value : start_request) =
+  let timeout name maximum = function
+    | None -> Ok []
+    | Some milliseconds when Int64.compare milliseconds 0L <= 0 ->
+        Error (invalid ~path:("$." ^ name) "workflow timeout must be positive")
+    | Some milliseconds when Int64.compare milliseconds maximum > 0 ->
+        Error (invalid ~path:("$." ^ name) "workflow timeout exceeds its maximum")
+    | Some milliseconds -> Ok [ (name, `Intlit (Int64.to_string milliseconds)) ]
+  in
+  let* execution =
+    timeout "execution_timeout_ms" max_workflow_timeout_ms value.execution_timeout_ms
+  in
+  let* run = timeout "run_timeout_ms" max_workflow_timeout_ms value.run_timeout_ms in
+  let* task =
+    timeout "task_timeout_ms" max_workflow_task_timeout_ms value.task_timeout_ms
+  in
+  let* () =
+    match (value.execution_timeout_ms, value.run_timeout_ms) with
+    | Some execution, Some run when Int64.compare run execution > 0 ->
+        Error
+          (invalid ~path:"$.run_timeout_ms"
+             "run timeout exceeds the execution timeout")
+    | _ -> Ok ()
+  in
+  let* () =
+    let run =
+      match value.run_timeout_ms with
+      | Some _ as run -> run
+      | None -> value.execution_timeout_ms
+    in
+    match (value.task_timeout_ms, run) with
+    | Some task, Some run when Int64.compare task run > 0 ->
+        Error
+          (invalid ~path:"$.task_timeout_ms" "task timeout exceeds the run timeout")
+    | _ -> Ok ()
+  in
+  let* retry =
+    match value.retry_policy with
+    | None -> Ok []
+    | Some policy ->
+        Workflow.Internal.retry_policy_json policy
+        |> Result.map (fun json -> [ ("retry_policy", json) ])
+        |> Result.map_error (rebase_workflow_error "$.retry_policy")
+  in
+  let reuse =
+    match value.id_reuse_policy with
+    | Allow_duplicate -> "allow_duplicate"
+    | Allow_duplicate_failed_only -> "allow_duplicate_failed_only"
+    | Reject_duplicate -> "reject_duplicate"
+  in
+  let* rpc = rpc_timeout_member value.rpc_deadline in
+  Ok
+    ((("id_reuse_policy", json_string reuse) :: execution)
+    @ run @ task @ retry @ rpc)
+
 let encode_start_request (value : start_request) =
   let* () = validate_identifier "$.request_id" value.request_id in
   let* () = validate_identifier "$.namespace" value.namespace in
@@ -297,9 +445,17 @@ let encode_start_request (value : start_request) =
   in
   let* memo = encode_metadata "$.memo" value.memo in
   let* search_attributes = encode_metadata "$.search_attributes" value.search_attributes in
+  (* Always explicit so the Rust adapter never falls back to a server default. *)
+  let id_conflict_policy =
+    match value.id_conflict_policy with
+    | Fail -> "fail"
+    | Use_existing -> "use_existing"
+    | Terminate_existing -> "terminate_existing"
+  in
+  let* policies = start_policy_members value in
   encode_object
       (`Assoc
-      [
+      ([
         ("request_id", json_string value.request_id);
         ("namespace", json_string value.namespace);
         ("workflow_id", json_string value.workflow_id);
@@ -308,7 +464,9 @@ let encode_start_request (value : start_request) =
         ("input", input);
         ("memo", memo);
         ("search_attributes", search_attributes);
-      ])
+        ("id_conflict_policy", json_string id_conflict_policy);
+      ]
+      @ policies))
 
 (** Serializes the opaque native capability used by asynchronous start polls.
     The request is retained in the OCaml value but is deliberately omitted
@@ -357,23 +515,38 @@ let validate_execution_matches path ~namespace ~workflow_id ?run_id
              "response run ID does not match the requested execution")
     | Some _ | None -> Ok ()
 
+(** Rejects [started = false] unless the request asked for [Use_existing]:
+    under the other policies a successful start always created its run, so a
+    contradictory response is an adapter defect rather than an existing run
+    the caller never agreed to attach to. *)
+let validate_started (request : start_request) started =
+  match (request.id_conflict_policy, started) with
+  | Use_existing, _ | (Fail | Terminate_existing), true -> Ok ()
+  | (Fail | Terminate_existing), false ->
+      Error
+        (invalid ~path:"$.started"
+           "only a use_existing start may return an existing run")
+
 (** Parses a successful start document and correlates its execution with the
     request that produced it before exposing the server-assigned run. *)
 let decode_start_response ~(request : start_request) input =
   let* json = decode_object input in
-  let* entries = exact_object "$" [ "execution" ] json in
+  let* entries = exact_object "$" [ "execution"; "started" ] json in
   let* execution_json = field "$" "execution" entries in
   let* execution = decode_execution "$.execution" execution_json in
   let* () =
     validate_execution_matches "$.execution" ~namespace:request.namespace
       ~workflow_id:request.workflow_id execution
   in
-  Ok ({ execution } : start_response)
+  let* started_json = field "$" "started" entries in
+  let* started = bool "$.started" started_json in
+  let* () = validate_started request started in
+  Ok ({ execution; started } : start_response)
 
 let encode_wait_request (value : wait_request) =
   let* () = validate_identifier "$.namespace" value.namespace in
   let* () = validate_identifier "$.workflow_id" value.workflow_id in
-  let* () = validate_identifier "$.run_id" value.run_id in
+  let* () = validate_run_selector "$.run_id" value.run_id in
   encode_object
     (`Assoc
       [
@@ -389,22 +562,24 @@ let encode_wait_request (value : wait_request) =
 let encode_cancel_request (value : cancel_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
-  let* () = validate_identifier "$.run_id" value.execution.run_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.request_id" value.request_id in
   if String.length value.reason > 65_536 then
     Error (invalid ~path:"$.reason" "reason exceeds the protocol string safety limit")
   else if String.contains value.reason '\000' then
     Error (invalid ~path:"$.reason" "reason contains a NUL byte")
   else
+    let* rpc = rpc_timeout_member value.rpc_deadline in
     encode_object
       (`Assoc
-        [
+        ([
           ("namespace", json_string value.execution.namespace);
           ("workflow_id", json_string value.execution.workflow_id);
           ("run_id", json_string value.execution.run_id);
           ("request_id", json_string value.request_id);
           ("reason", json_string value.reason);
-        ])
+        ]
+        @ rpc))
 
 (** Decodes the positive acknowledgement returned by Rust after Temporal has
     accepted the cancellation RPC. A false acknowledgement is rejected rather
@@ -424,7 +599,7 @@ let decode_cancel_response input : (cancel_response, error) result =
 let encode_reset_request (value : reset_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
-  let* () = validate_identifier "$.run_id" value.execution.run_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.request_id" value.request_id in
   if value.workflow_task_finish_event_id <= 1L then
     Error
@@ -435,9 +610,10 @@ let encode_reset_request (value : reset_request) =
   else if String.contains value.reason '\000' then
     Error (invalid ~path:"$.reason" "reason contains a NUL byte")
   else
+    let* rpc = rpc_timeout_member value.rpc_deadline in
     encode_object
       (`Assoc
-        [
+        ([
           ("namespace", json_string value.execution.namespace);
           ("workflow_id", json_string value.execution.workflow_id);
           ("run_id", json_string value.execution.run_id);
@@ -445,7 +621,8 @@ let encode_reset_request (value : reset_request) =
           ( "workflow_task_finish_event_id",
             `Intlit (Int64.to_string value.workflow_task_finish_event_id) );
           ("reason", json_string value.reason);
-        ])
+        ]
+        @ rpc))
 
 (** Decodes the new exact execution returned by Temporal after a reset. The
     server may choose a different run ID, so only namespace and workflow ID
@@ -472,18 +649,20 @@ let decode_reset_response ~(request : reset_request) input : (reset_response, er
 let encode_terminate_request (value : terminate_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
-  let* () = validate_identifier "$.run_id" value.execution.run_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   if String.length value.reason > 65_536 then
     Error (invalid ~path:"$.reason" "reason exceeds the protocol string safety limit")
   else if String.contains value.reason '\000' then
     Error (invalid ~path:"$.reason" "reason contains a NUL byte")
   else
+    let* rpc = rpc_timeout_member value.rpc_deadline in
     encode_object
       (`Assoc
-        [ ("namespace", json_string value.execution.namespace);
-          ("workflow_id", json_string value.execution.workflow_id);
-          ("run_id", json_string value.execution.run_id);
-          ("reason", json_string value.reason) ])
+        ([ ("namespace", json_string value.execution.namespace);
+           ("workflow_id", json_string value.execution.workflow_id);
+           ("run_id", json_string value.execution.run_id);
+           ("reason", json_string value.reason) ]
+        @ rpc))
 
 (** Decodes the positive acknowledgement returned after Temporal accepts a
     termination request. *)
@@ -501,20 +680,22 @@ let decode_terminate_response input : (terminate_response, error) result =
 let encode_signal_request (value : signal_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
-  let* () = validate_identifier "$.run_id" value.execution.run_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.signal_name" value.signal_name in
   let* () = validate_identifier "$.request_id" value.request_id in
   let* input = payloads_json value.input in
+  let* rpc = rpc_timeout_member value.rpc_deadline in
   encode_object
     (`Assoc
-      [
+      ([
         ("namespace", json_string value.execution.namespace);
         ("workflow_id", json_string value.execution.workflow_id);
         ("run_id", json_string value.execution.run_id);
         ("signal_name", json_string value.signal_name);
         ("request_id", json_string value.request_id);
         ("input", input);
-      ])
+      ]
+      @ rpc))
 
 (** Decodes the positive acknowledgement returned by Rust after Temporal has
     accepted a signal RPC. A false value is rejected so callers never observe
@@ -534,18 +715,20 @@ let decode_signal_response input : (signal_response, error) result =
 let encode_query_request (value : query_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
-  let* () = validate_identifier "$.run_id" value.execution.run_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.query_type" value.query_type in
   let* input = payloads_json value.input in
+  let* rpc = rpc_timeout_member value.rpc_deadline in
   encode_object
     (`Assoc
-      [
+      ([
         ("namespace", json_string value.execution.namespace);
         ("workflow_id", json_string value.execution.workflow_id);
         ("run_id", json_string value.execution.run_id);
         ("query_type", json_string value.query_type);
         ("input", input);
-      ])
+      ]
+      @ rpc))
 
 (** Decodes one successful output-only query response. The server may return
     zero payloads for a unit-like query; the public codec layer decides whether
@@ -565,14 +748,63 @@ let encode_visibility_request (value : visibility_request) =
     Error (invalid ~path:"$.page_size" "page_size must be between 1 and 1000")
   else
     let token = match value.next_page_token with None -> `Null | Some v -> `String v in
+    let* rpc = rpc_timeout_member value.rpc_deadline in
     encode_object
       (`Assoc
-        [
+        ([
           ("namespace", json_string value.namespace);
           ("query", json_string value.query);
           ("page_size", `Int value.page_size);
           ("next_page_token", token);
-        ])
+        ]
+        @ rpc))
+
+(** Prefix Rust uses for a Temporal [WorkflowExecutionStatus] it does not
+    name, followed by the canonical decimal wire value (for example
+    [unknown_9]). *)
+let unknown_visibility_status_prefix = "unknown_"
+
+(** Highest [WorkflowExecutionStatus] wire value with a fixed name. *)
+let max_known_visibility_status = 8
+
+(** Decodes a visibility status name the Rust bridge can emit, mirroring
+    [is_visibility_status_name] in [rust/core-bridge/src/client_protocol.rs],
+    or returns [None] for any other spelling. Besides the fixed names (and the
+    legacy [unspecified], wire value [0]), a value a newer server added is
+    accepted as [unknown_<n>] (#1078), where [n] is the canonical decimal
+    spelling of a 32-bit value outside the named range, so each wire value has
+    exactly one accepted spelling. *)
+let visibility_status_of_name status : visibility_status option =
+  match status with
+  | "running" -> Some `Running
+  | "completed" -> Some `Completed
+  | "failed" -> Some `Failed
+  | "canceled" -> Some `Canceled
+  | "terminated" -> Some `Terminated
+  | "continued_as_new" -> Some `Continued_as_new
+  | "timed_out" -> Some `Timed_out
+  | "paused" -> Some `Paused
+  | "unspecified" -> Some (`Unknown 0)
+  | _ -> (
+      let prefix_length = String.length unknown_visibility_status_prefix in
+      if not (String.starts_with ~prefix:unknown_visibility_status_prefix status)
+      then None
+      else
+        let digits =
+          String.sub status prefix_length (String.length status - prefix_length)
+        in
+        match int_of_string_opt digits with
+        | None -> None
+        | Some value ->
+            (* [int_of_string_opt] also accepts [+], [_], and radix prefixes;
+               comparing against the canonical rendering rejects them. *)
+            if
+              String.equal (string_of_int value) digits
+              && value >= Int32.to_int Int32.min_int
+              && value <= Int32.to_int Int32.max_int
+              && (value < 0 || value > max_known_visibility_status)
+            then Some (`Unknown value)
+            else None)
 
 let decode_visibility_response input : (visibility_page, error) result =
   let* json = decode_object input in
@@ -598,11 +830,9 @@ let decode_visibility_response input : (visibility_page, error) result =
               let* status_json = field path "status" row in
               let* status = identifier (path ^ ".status") status_json in
               let* status =
-                match status with
-                | "running" | "completed" | "failed" | "canceled"
-                | "terminated" | "continued_as_new" | "timed_out"
-                | "paused" | "unspecified" -> Ok status
-                | _ -> Error (invalid ~path:(path ^ ".status") "unknown visibility status")
+                match visibility_status_of_name status with
+                | Some status -> Ok status
+                | None -> Error (invalid ~path:(path ^ ".status") "unknown visibility status")
               in
               loop (index + 1) ({ workflow_id; run_id; workflow_type; task_queue; status } :: acc) rest
         in
@@ -638,25 +868,29 @@ let decode_update_outcome path json =
   | _ -> Error (invalid ~path:(path ^ ".kind") "unknown workflow update outcome kind")
 
 let encode_update_request (value : update_request) =
-  let* _execution = encode_execution "$.execution" value.execution in
+  let* () = validate_identifier "$.namespace" value.execution.namespace in
+  let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.update_id" value.update_id in
   let* () = validate_identifier "$.update_name" value.update_name in
   let* input = payloads_json value.input in
+  let* rpc = rpc_timeout_member value.rpc_deadline in
   encode_object
     (`Assoc
-      [
+      ([
         ("namespace", json_string value.execution.namespace);
         ("workflow_id", json_string value.execution.workflow_id);
         ("run_id", json_string value.execution.run_id);
         ("update_id", json_string value.update_id);
         ("update_name", json_string value.update_name);
         ("input", input);
-      ])
+      ]
+      @ rpc))
 
 let encode_poll_update_request (value : poll_update_request) =
   let* () = validate_identifier "$.namespace" value.execution.namespace in
   let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
-  let* () = validate_identifier "$.run_id" value.execution.run_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
   let* () = validate_identifier "$.update_id" value.update_id in
   encode_object
     (`Assoc
@@ -681,11 +915,16 @@ let decode_update_response ~(request : update_request) input =
   else
     let* execution_json = field "$" "execution" entries in
     let* execution = decode_execution "$.execution" execution_json in
+    (* A current-run request (empty run ID) adopts the concrete run Temporal
+       resolved; an exact request must be answered for that run. *)
+    let expected_run =
+      if String.equal request.execution.run_id "" then None
+      else Some request.execution.run_id
+    in
     let* () =
       validate_execution_matches "$.execution"
         ~namespace:request.execution.namespace
-        ~workflow_id:request.execution.workflow_id
-        ~run_id:request.execution.run_id execution
+        ~workflow_id:request.execution.workflow_id ?run_id:expected_run execution
     in
     let* outcome = decode_optional_update_outcome "$" entries in
     Ok { update_id; execution; outcome }
@@ -819,6 +1058,23 @@ let client_error_code kind path value =
   if List.mem value allowed then Ok value
   else Error (invalid ~path "unknown client error code")
 
+(** Largest query handler failure message, in bytes, accepted from Rust. It
+    mirrors [MAX_QUERY_FAILURE_MESSAGE_BYTES] in the bridge, which truncates
+    the handler's message to this bound before encoding it. *)
+let max_query_failure_message_bytes = 4_096
+
+(** Validates a query handler failure message: bounded, valid UTF-8, and
+    NUL-free like every other protocol string. The message may be empty
+    because a handler may fail without one. *)
+let query_failure_message path value =
+  if String.length value > max_query_failure_message_bytes then
+    Error (invalid ~path "query failure message exceeds its limit")
+  else if not (String.is_valid_utf_8 value) then
+    Error (invalid ~path "query failure message is not valid UTF-8")
+  else if String.contains value '\000' then
+    Error (invalid ~path "query failure message contains a NUL byte")
+  else Ok value
+
 (** Builds one closed client-error object for tests and for callers that need
     to persist a terminal asynchronous outcome. The native bridge normally
     emits this document, but validating the OCaml encoder too keeps both sides
@@ -844,23 +1100,53 @@ let encode_client_error_json path = function
   | Rpc { code } ->
       let* code = client_error_code "rpc" (path ^ ".code") code in
       Ok (`Assoc [ ("kind", json_string "rpc"); ("code", json_string code) ])
+  | Query_failed { message } ->
+      let* message = query_failure_message (path ^ ".message") message in
+      Ok
+        (`Assoc
+          [ ("kind", json_string "query_failed"); ("message", json_string message) ])
   | Protocol { code } ->
       let* code = client_error_code "protocol" (path ^ ".code") code in
       Ok
         (`Assoc
           [ ("kind", json_string "protocol"); ("code", json_string code) ])
 
-(** Parses one terminal exact-run response and verifies that the response
-    execution is the requested run before validating its outcome chain. *)
+(** Decodes the execution echoed by a wait response. Rust echoes the
+    request unchanged, so the run ID is empty exactly when the request
+    selected the current run: Temporal's history response does not name the
+    run it resolved. The echo must equal the request field for field. *)
+let decode_waited_execution ~(request : wait_request) json =
+  let path = "$.execution" in
+  let* entries = exact_object path [ "namespace"; "workflow_id"; "run_id" ] json in
+  let* namespace_json = field path "namespace" entries in
+  let* namespace = identifier (path ^ ".namespace") namespace_json in
+  let* workflow_id_json = field path "workflow_id" entries in
+  let* workflow_id = identifier (path ^ ".workflow_id") workflow_id_json in
+  let* run_id_json = field path "run_id" entries in
+  let* run_id = string (path ^ ".run_id") run_id_json in
+  let* () = validate_run_selector (path ^ ".run_id") run_id in
+  if not (String.equal namespace request.namespace) then
+    Error
+      (invalid ~path:(path ^ ".namespace")
+         "response namespace does not match the requested execution")
+  else if not (String.equal workflow_id request.workflow_id) then
+    Error
+      (invalid ~path:(path ^ ".workflow_id")
+         "response workflow ID does not match the requested execution")
+  else if not (String.equal run_id request.run_id) then
+    Error
+      (invalid ~path:(path ^ ".run_id")
+         "response run ID does not match the requested execution")
+  else Ok { namespace; workflow_id; run_id }
+
+(** Parses one terminal wait response and verifies that the response
+    execution echoes the requested run selector before validating its outcome
+    chain. *)
 let decode_wait_response ~(request : wait_request) input =
   let* json = decode_object input in
   let* entries = exact_object "$" [ "execution"; "outcome" ] json in
   let* execution_json = field "$" "execution" entries in
-  let* execution = decode_execution "$.execution" execution_json in
-  let* () =
-    validate_execution_matches "$.execution" ~namespace:request.namespace
-      ~workflow_id:request.workflow_id ~run_id:request.run_id execution
-  in
+  let* execution = decode_waited_execution ~request execution_json in
   let* outcome_json = field "$" "outcome" entries in
   let* outcome = decode_outcome outcome_json in
   let* () = validate_wait_successor execution outcome in
@@ -897,7 +1183,23 @@ let decode_client_error input =
       let* code = client_error_code kind "$.code" code in
       if String.equal kind "rpc" then Ok (Rpc { code })
       else Ok (Protocol { code })
+  | "query_failed" ->
+      let* entries = exact_object path [ "kind"; "message" ] json in
+      let* message_json = field path "message" entries in
+      let* message = string "$.message" message_json in
+      let* message = query_failure_message "$.message" message in
+      Ok (Query_failed { message })
   | _ -> Error (invalid ~path:"$.kind" "unknown client error kind")
+
+(** Rejects the query-only [Query_failed] kind for an operation named by
+    [operation]. Only a query RPC can report a failed query handler, so the
+    kind on any other operation is a bridge defect, not a server answer. *)
+let reject_query_failed operation = function
+  | Query_failed _ ->
+      Error
+        (invalid ~path:"$.kind"
+           ("query_failed is not a valid " ^ operation ^ " error"))
+  | (Already_started _ | Rpc _ | Protocol _) as error -> Ok error
 
 (** Checks that an error body is valid for a workflow-start operation. The
     [already_started] identity is correlated with the request so a malformed
@@ -910,18 +1212,24 @@ let validate_start_error (request : start_request) = function
         Error
           (invalid ~path:"$.workflow_id"
              "already-started error names a different workflow ID")
+  | Query_failed _ as error -> reject_query_failed "start" error
   | (Rpc _ | Protocol _) as error -> Ok error
 
 (** Serializes one terminal asynchronous-start outcome. [Unknown] is kept as a
     first-class value instead of being encoded as a transport error, because a
     transport failure can occur after Temporal accepted the request. *)
 let encode_start_outcome = function
-  | Accepted { execution } ->
+  | Accepted { execution; started } ->
       let* execution = encode_execution "$.execution" execution in
       encode_object
         (`Assoc
-          [ ("kind", json_string "accepted"); ("execution", execution) ])
+          [
+            ("kind", json_string "accepted");
+            ("execution", execution);
+            ("started", `Bool started);
+          ])
   | Rejected error ->
+      let* error = reject_query_failed "start" error in
       let* error = encode_client_error_json "$.error" error in
       encode_object
         (`Assoc [ ("kind", json_string "rejected"); ("error", error) ])
@@ -951,14 +1259,17 @@ let decode_start_outcome ~(request : start_request) input =
   let* kind = string "$.kind" kind_json in
   match kind with
   | "accepted" ->
-      let* entries = exact_object path [ "kind"; "execution" ] json in
+      let* entries = exact_object path [ "kind"; "execution"; "started" ] json in
       let* execution_json = field path "execution" entries in
       let* execution = decode_execution "$.execution" execution_json in
       let* () =
         validate_execution_matches "$.execution" ~namespace:request.namespace
           ~workflow_id:request.workflow_id execution
       in
-      Ok (Accepted { execution })
+      let* started_json = field path "started" entries in
+      let* started = bool "$.started" started_json in
+      let* () = validate_started request started in
+      Ok (Accepted { execution; started })
   | "rejected" ->
       let* entries = exact_object path [ "kind"; "error" ] json in
       let* error_json = field path "error" entries in
@@ -996,6 +1307,7 @@ let validate_wait_error (_request : wait_request) = function
       Error
         (invalid ~path:"$.kind"
            "already_started is not a valid exact-run wait error")
+  | Query_failed _ as error -> reject_query_failed "exact-run wait" error
   | (Rpc _ | Protocol _) as error -> Ok error
 
 (** Decodes a start failure and correlates any existing-run identity with the
@@ -1019,6 +1331,7 @@ let decode_cancel_error input =
       Error
         (invalid ~path:"$.kind"
            "already_started is not a valid cancellation error")
+  | Query_failed _ -> reject_query_failed "cancellation" error
   | (Rpc _ | Protocol _) -> Ok error
 
 (** Reset shares the cancellation RPC error vocabulary but has its own public
@@ -1034,11 +1347,13 @@ let decode_signal_error input =
       Error
         (invalid ~path:"$.kind"
            "already_started is not a valid signal error")
+  | Query_failed _ -> reject_query_failed "signal" error
   | (Rpc _ | Protocol _) -> Ok error
 
 (** Decodes a query failure while rejecting the start-only conflict category.
     Query rejection is reported as a stable RPC/protocol error; it cannot
-    carry an [Already_started] workflow identity. *)
+    carry an [Already_started] workflow identity. A failed query handler is
+    the query-only [Query_failed] kind. *)
 let decode_query_error input =
   let* error = decode_client_error input in
   match error with
@@ -1046,4 +1361,17 @@ let decode_query_error input =
       Error
         (invalid ~path:"$.kind"
            "already_started is not a valid query error")
+  | (Rpc _ | Query_failed _ | Protocol _) -> Ok error
+
+(** Decodes an update admission or poll failure. Update RPCs share the query
+    error vocabulary except for [Query_failed]: an update validator rejection
+    is a completed outcome, never a query handler failure. *)
+let decode_update_error input =
+  let* error = decode_client_error input in
+  match error with
+  | Already_started _ ->
+      Error
+        (invalid ~path:"$.kind"
+           "already_started is not a valid update error")
+  | Query_failed _ -> reject_query_failed "update" error
   | (Rpc _ | Protocol _) -> Ok error

@@ -330,6 +330,76 @@ pub fn encode_payload_object(value: &JsonValue) -> Result<String, ProtocolError>
     Ok(output)
 }
 
+/// Deserializes one already-decoded payload object into a typed semantic
+/// document.
+///
+/// Serde's diagnostic is replaced by `invalid` at path `$` so input-controlled
+/// member names are never reflected back across the native boundary. Callers
+/// remain responsible for the document's semantic validation.
+pub(crate) fn semantic_from_value<T: serde::de::DeserializeOwned>(
+    value: JsonValue,
+    invalid: &'static str,
+) -> Result<T, ProtocolError> {
+    serde_json::from_value(to_serde(value)).map_err(|_| ProtocolError::invalid("$", invalid))
+}
+
+/// Serializes one validated semantic document through
+/// [`encode_payload_object`], reporting `unencodable` at path `$` if Serde
+/// cannot represent it.
+pub(crate) fn encode_semantic<T: serde::Serialize>(
+    value: &T,
+    unencodable: &'static str,
+) -> Result<String, ProtocolError> {
+    let json = serde_json::to_value(value).map_err(|_| ProtocolError::invalid("$", unencodable))?;
+    encode_payload_object(&from_serde(json)?)
+}
+
+/// Converts the duplicate-aware protocol tree into Serde's value tree.
+///
+/// Duplicate members were already refused by the strict parser, so collecting
+/// into Serde's map loses no information.
+fn to_serde(value: JsonValue) -> serde_json::Value {
+    match value {
+        JsonValue::Null => serde_json::Value::Null,
+        JsonValue::Bool(value) => serde_json::Value::Bool(value),
+        JsonValue::Signed(value) => value.into(),
+        JsonValue::Unsigned(value) => value.into(),
+        JsonValue::String(value) => value.into(),
+        JsonValue::Array(values) => values.into_iter().map(to_serde).collect(),
+        JsonValue::Object(entries) => entries
+            .into_iter()
+            .map(|(key, value)| (key, to_serde(value)))
+            .collect(),
+    }
+}
+
+/// Converts Serde output back into the restricted integral JSON tree.
+///
+/// Semantic documents carry floating-point values as raw IEEE-754 bits, so a
+/// fractional Serde number indicates a semantic-model defect and is refused.
+fn from_serde(value: serde_json::Value) -> Result<JsonValue, ProtocolError> {
+    match value {
+        serde_json::Value::Null => Ok(JsonValue::Null),
+        serde_json::Value::Bool(value) => Ok(JsonValue::Bool(value)),
+        serde_json::Value::Number(value) => value
+            .as_i64()
+            .map(JsonValue::Signed)
+            .or_else(|| value.as_u64().map(JsonValue::Unsigned))
+            .ok_or_else(|| ProtocolError::invalid("$", "non-integral number in semantic output")),
+        serde_json::Value::String(value) => Ok(JsonValue::String(value)),
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(from_serde)
+            .collect::<Result<Vec<_>, _>>()
+            .map(JsonValue::Array),
+        serde_json::Value::Object(entries) => entries
+            .into_iter()
+            .map(|(key, value)| Ok((key, from_serde(value)?)))
+            .collect::<Result<Vec<_>, _>>()
+            .map(JsonValue::Object),
+    }
+}
+
 /// Decodes one closed canonical-base64 payload wrapper.
 pub fn decode_payload(input: &str) -> Result<Vec<u8>, ProtocolError> {
     let entries = expect_object(

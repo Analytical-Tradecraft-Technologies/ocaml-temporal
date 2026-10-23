@@ -11,11 +11,14 @@ complete the same workflow ID and run ID. Applications must no longer use
 | Workflow body returns `Error.make ~category:Workflow ...` | Terminal workflow failure; preserves `non_retryable` and details |
 | Workflow propagates an expected activity, child, cancellation, or timeout error | Existing terminal failure/cancellation semantics remain |
 | Unexpected body/scheduler/signal exception, or a propagated `Defect`, `Bridge`, or `Codec` error | Failed workflow task, no commands |
+| Signal with no registered handler, an undecodable signal payload, or more than one signal payload | Failed workflow task, no commands; the run waits for a compatible worker, reset, or termination ([fail-closed signal policy](interactive-workflows.md#unknown-and-undecodable-signals)) |
+| Signal handler returns a typed non-task error such as `Workflow` | Terminal workflow failure |
 | Workflow result encoder returns an error or raises | Failed workflow task, regardless of the encoder's error category |
+| `Workflow.continue_as_new` input encoder returns an error | Failed workflow task, no continue-as-new command |
 | Missing workflow registration, malformed activation, invalid resolver state, adapter exception before submission | Failed workflow task, no commands |
 | Query lookup, handler, or codec failure | Failed query answer for the original query ID; does not fail the workflow |
-| Missing update handler, input rejection, validation rejection, or deliberate typed handler failure | Rejected update response; does not fail the workflow |
-| Unexpected update exception/invariant failure, or codec failure after acceptance | Failed workflow task; discard speculative acceptance and commands |
+| Missing update handler, input rejection, any validator error (returned in any category, or raised), or deliberate typed handler failure | Rejected update response; does not fail the workflow |
+| Unexpected update handler exception/invariant failure after acceptance, or codec failure after acceptance | Failed workflow task; discard speculative acceptance and commands |
 | Eviction | Successful empty acknowledgement |
 
 For example, a business rule that should close the execution returns:
@@ -23,8 +26,31 @@ For example, a business rule that should close the execution returns:
 ```ocaml
 Error
   (Temporal.Error.make ~category:`Workflow ~non_retryable:true
-     ~message:"order rejected" ())
+     ~error_type:"OrderRejected" ~message:"order rejected" ())
 ```
+
+The optional `~error_type` becomes the failure's Temporal
+`ApplicationFailureInfo.type`, which parents, clients, the Temporal UI, and
+code written with other Temporal SDKs use to identify a business failure.
+Without it the SDK sends the lowercase category name (`Error.kind`, here
+`"workflow"`), which was the only type available before `~error_type`
+existed. Activity failures follow the same rule, and a retry policy's
+`non_retryable_error_types` is matched against this type (see the [durable
+operation policies](durable-operation-policies.md#retry-policy)). In the other
+direction, an error received from an activity, a child workflow, an update, or
+a client `wait` reports the type of the innermost application failure through
+`Error.error_type`, even when Temporal nests it under an activity or
+child-workflow wrapper; its category still describes the wrapper. Because
+that type was written by another SDK, worker or history, it is not held to
+`Error.make`'s rules: the SDK rewrites it deterministically so that it never
+raises (#1011). Malformed UTF-8 becomes U+FFFD, each ASCII control character
+becomes a visible `\uXXXX` escape (a Python type `"Invalid\tInput"` reads as
+`"Invalid\u0009Input"`), and a type whose encoded length exceeds 65,536
+characters is cut at a character boundary and ends in `...`. Valid types are
+unchanged, and replay always yields the same text. The cause
+chain itself is not yet preserved as structure: inbound causes appear only in
+the error message, and outbound OCaml failures carry no `cause`. Every failure
+the SDK emits uses the source `"ocaml-temporal"`.
 
 `non_retryable=false` permits Temporal's configured workflow retry policy to
 start another run. It does not itself install a retry policy. The current
@@ -51,7 +77,7 @@ failed status at the activation-aware Core boundary.
 
 A failed task shuts down its unsafe OCaml generation immediately: pending
 updates, continuations, local state, and every buffered command are discarded.
-The run-map ownership record and copied completion remain until acknowledgement;
+The run-map ownership record and retained completion bytes remain until acknowledgement;
 Core's subsequent eviction/initialization reconstructs a fresh execution.
 Native conversion/decode rejection already uses Core task failure and keeps its
 existing exact-document lease rules.

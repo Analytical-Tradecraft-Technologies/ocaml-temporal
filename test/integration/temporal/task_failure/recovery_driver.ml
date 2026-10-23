@@ -3,11 +3,11 @@
 
 (** Serializes only controlled fixture names and server-issued identities. *)
 let identity name handle = Printf.sprintf "%s\t%s\t%s\n" name
-    (Temporal.Client.workflow_id handle) (Temporal.Client.run_id handle)
+    (Temporal.Client.workflow_id handle) (Option.get (Temporal.Client.run_id handle))
 
 (** Verifies typed public results, including deliberate application retryability. *)
 let assert_outcome name = function
-  | Temporal.Client.Completed "recovered" when List.mem name [ "body"; "encoder"; "missing" ] -> ()
+  | Temporal.Client.Completed { output = "recovered"; _ } when List.mem name [ "body"; "encoder"; "missing" ] -> ()
   | Temporal.Client.Failed { error; _ }
     when List.mem name [ "business-retryable"; "business-permanent" ] ->
       let view = Temporal.Error.view error in

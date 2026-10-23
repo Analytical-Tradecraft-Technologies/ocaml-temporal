@@ -45,6 +45,10 @@ module Make (Backend : Backend) : sig
         (** The graph has begun or completed shutdown. *)
     | Supervisor_failed of exn
         (** The owner contained an unexpected exception and terminated. *)
+    | Owner_unavailable of exn
+        (** The owner Domain could not be spawned, for example because the
+            runtime's Domain limit is reached. This is an operational failure
+            that may succeed once another instance shuts down. *)
 
   (** An abstract instance containing the mailbox, owner Domain, and cached
       terminal result. It contains no publicly accessible native handle. *)
@@ -53,13 +57,26 @@ module Make (Backend : Backend) : sig
   (** [create ~capacity config] starts the owner Domain and creates the backend
       graph on it. [capacity] is the positive number of admitted operations
       which may wait behind the active operation; invalid capacity is a
-      programmer error reported by [Invalid_argument]. *)
+      programmer error reported by [Invalid_argument]. Failure to spawn the
+      owner Domain, for example because the runtime's Domain limit is reached,
+      returns [Owner_unavailable] with the spawn exception. *)
   val create : capacity:int -> Backend.config -> (t, error) result
 
   (** [perform instance operation] blocks an ordinary producer Domain until
       the owner has executed the typed operation. Calls are serialized in the
       mailbox admission order. *)
   val perform : t -> 'result Backend.operation -> ('result, error) result
+
+  (** [spawn_owner_thread instance body] starts [body] on a new system thread
+      of the owner Domain, after the operations admitted before it (#1042).
+      The outer result reports whether the owner accepted the request; the
+      inner one is the [Thread.create] outcome. [body] never receives backend
+      state and may use the instance only through its ordinary entry points,
+      from its own thread. Because joining the owner Domain waits for every
+      thread on it, [body] must return promptly once shutdown has been
+      admitted, or [shutdown] will not return. *)
+  val spawn_owner_thread :
+    t -> (unit -> unit) -> ((unit, exn) result, error) result
 
   (** [initiate_shutdown instance] atomically admits the one terminal request
       and closes operation admission, but does not wait for earlier backend
@@ -73,6 +90,60 @@ module Make (Backend : Backend) : sig
       this same path on a dedicated system thread; the garbage-collector
       finalizer itself never waits on mailbox locks or native teardown. *)
   val shutdown : t -> (unit, error) result
+
+  (** [delegate_abandoned_cleanup instance] makes the caller solely responsible
+      for shutting [instance] down if it is abandoned: the supervisor's own
+      garbage-collector finalizer becomes a no-op. An owner whose abandoned
+      cleanup must drain its own state before the graph closes uses it,
+      because OCaml runs the finalizers of an owner and its supervisor that
+      become unreachable together in no guaranteed order. *)
+  val delegate_abandoned_cleanup : t -> unit
+end
+
+(** Caller-side completion of submitted client calls (#807).
+
+    A client request is submitted by the owner Domain, which returns at once;
+    the caller then waits for the outcome on its own Domain. The owner never
+    blocks on the network, so a pending wait, query, or update poll cannot
+    delay other requests on the same supervisor. *)
+module Client_call : sig
+  (** A submitted call. [Completed] is an outcome produced without any RPC,
+      such as a deadline that expired before dispatch. [In_flight] is a
+      completion handle plus the pure decoder of its terminal native result;
+      the decoder runs on the awaiting caller's Domain. *)
+  type ('value, 'ticket) t =
+    | Completed of ('value, Temporal_core_bridge.Native_bridge.error) result
+    | In_flight of {
+        ticket : 'ticket;
+        decode :
+          (bytes, Temporal_core_bridge.Native_bridge.error) result ->
+          ('value, Temporal_core_bridge.Native_bridge.error) result;
+      }
+
+  (** [Closed]: the supervisor shut down while the call was in flight, so it
+      will never complete. [Failed]: any other bridge failure. *)
+  type failure = Closed | Failed of Temporal_core_bridge.Native_bridge.error
+
+  (** Default length in milliseconds of one bounded completion wait. *)
+  val default_slice_ms : int
+
+  (** [await ~poll ~release call] blocks the calling thread until [call]
+      completes. [poll ticket ~timeout_ms] performs one bounded wait:
+      [Not_ready] repeats it, [Invalid_state] is {!Closed}, and any other
+      result is decoded; a terminal poll retires the call. If the wait is
+      left by an exception instead (including an asynchronous one),
+      [release ticket] is called once so the abandoned call frees its
+      capacity slot, and the exception propagates. It must not run on a
+      workflow scheduler Domain or on the supervisor owner Domain. *)
+  val await :
+    poll:
+      ('ticket ->
+      timeout_ms:int ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result) ->
+    release:('ticket -> (unit, Temporal_core_bridge.Native_bridge.error) result) ->
+    ?slice_ms:int ->
+    ('value, 'ticket) t ->
+    ('value, failure) result
 end
 
 (** The production supervisor over one native runtime-client-worker graph. *)
@@ -94,13 +165,22 @@ module Native : sig
       ( Temporal_protocol.Workflow_protocol.activation option,
         Temporal_core_bridge.Native_bridge.error )
       result
-    (** Maps native [Not_ready] to [None]. If successful bytes fail semantic
-        validation, [reject] must retire their exact native lease first. *)
+    (** Live-worker workflow poll. Maps native [Not_ready] to [None]. If
+        successful bytes fail semantic validation, [reject] must retire their
+        exact native lease first; a successful rejection is local task progress
+        and also maps to [None], so one undecodable activation cannot end
+        [Worker.run]. A failed rejection keeps the [Protocol] error. *)
 
-    val encode_workflow_completion :
-      Temporal_protocol.Workflow_protocol.completion ->
-      (bytes, Temporal_core_bridge.Native_bridge.error) result
-    (** Canonically serializes and reparses one workflow completion. *)
+    val replay_workflow_poll_result :
+      reject:(bytes -> (unit, Temporal_core_bridge.Native_bridge.error) result) ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result ->
+      ( Temporal_protocol.Workflow_protocol.activation option,
+        Temporal_core_bridge.Native_bridge.error )
+      result
+    (** Replay-worker workflow poll. As {!workflow_poll_result}, except that
+        the original [Protocol] error remains the result after a successful
+        rejection: a replay must fail rather than skip history it could not
+        check. *)
 
     val decode_activity_task :
       bytes ->
@@ -116,17 +196,30 @@ module Native : sig
         Temporal_core_bridge.Native_bridge.error )
       result
     (** Maps native [Not_ready] to [None]. If successful bytes fail semantic
-        validation, [reject] must retire their exact native lease first. *)
+        validation, [reject] must retire their exact native lease first; a
+        successful rejection (Rust fails the task back to Core) also maps to
+        [None], so one undecodable task cannot end [Worker.run]. A failed
+        rejection keeps the [Protocol] error. *)
 
-    val encode_activity_completion :
-      Temporal_protocol.Activity_protocol.completion ->
-      (bytes, Temporal_core_bridge.Native_bridge.error) result
-    (** Canonically serializes and reparses one remote activity completion. *)
+    val expired_rpc_deadline_error : Temporal_core_bridge.Native_bridge.error
+    (** The [Connection] failure with the closed [rpc] [deadline_exceeded]
+        document that Rust returns when an RPC budget expires. The supervisor
+        feeds it to a request's result decoder when the deadline expired
+        before dispatch. *)
 
-    val encode_activity_heartbeat :
-      Temporal_protocol.Activity_protocol.heartbeat ->
-      (bytes, Temporal_core_bridge.Native_bridge.error) result
-    (** Canonically serializes and reparses one activity heartbeat. *)
+    val with_rpc_deadline :
+      now_ns:int64 ->
+      Temporal_protocol.Client_protocol.rpc_deadline option ->
+      expired:(unit -> 'a) ->
+      live:(Temporal_protocol.Client_protocol.rpc_deadline option -> 'a) ->
+      'a
+    (** Resolves a client request's caller deadline (#499) at owner-Domain
+        dispatch time [now_ns] on the monotonic clock. [live] receives
+        [None] when there is no deadline, or the deadline lowered to the
+        budget that remains, which is what the request then sends; time the
+        request spent queued behind earlier calls therefore counts. When the
+        deadline has expired, [expired ()] runs instead and nothing is
+        encoded or sent. *)
 
     val encode_client_start_request :
       Temporal_protocol.Client_protocol.start_request ->
@@ -195,6 +288,16 @@ module Native : sig
     (** Decodes one terminal asynchronous-start outcome. [Not_ready] becomes
         [Ok None] so poll and bounded-wait callers can retry without treating
         an in-flight request as a failure. *)
+
+    val decode_client_submitted_start_outcome :
+      Temporal_protocol.Client_protocol.start_request ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result ->
+      ( Temporal_protocol.Client_protocol.start_outcome,
+        Temporal_core_bridge.Native_bridge.error )
+      result
+    (** Decodes a submitted start's terminal outcome document, correlated
+        with its request (#807). Native failures are preserved; the caller
+        treats them as an uncertain start. *)
 
     val decode_client_wait_result :
       Temporal_protocol.Client_protocol.wait_request ->
@@ -303,6 +406,78 @@ module Native : sig
   (** Validated workflow-only worker settings whose representation is private. *)
   type worker_config
 
+  (** A client request submitted through the owner (#807), indexed by the
+      typed value its caller receives: a start yields its closed
+      accepted/rejected/unknown outcome, and every other request yields the
+      same value as the matching synchronous operation below. *)
+  type _ client_rpc =
+    | Rpc_start :
+        Temporal_protocol.Client_protocol.start_request ->
+        Temporal_protocol.Client_protocol.start_outcome client_rpc
+    | Rpc_wait :
+        Temporal_protocol.Client_protocol.wait_request ->
+        ( Temporal_protocol.Client_protocol.wait_response,
+          Temporal_protocol.Client_protocol.client_error )
+        result
+        client_rpc
+    | Rpc_cancel :
+        Temporal_protocol.Client_protocol.cancel_request ->
+        (unit, Temporal_protocol.Client_protocol.client_error) result client_rpc
+    | Rpc_terminate :
+        Temporal_protocol.Client_protocol.terminate_request ->
+        (unit, Temporal_protocol.Client_protocol.client_error) result client_rpc
+    | Rpc_reset :
+        Temporal_protocol.Client_protocol.reset_request ->
+        ( Temporal_protocol.Client_protocol.reset_response,
+          Temporal_protocol.Client_protocol.client_error )
+        result
+        client_rpc
+    | Rpc_signal :
+        Temporal_protocol.Client_protocol.signal_request ->
+        (unit, Temporal_protocol.Client_protocol.client_error) result client_rpc
+    | Rpc_query :
+        Temporal_protocol.Client_protocol.query_request ->
+        ( Temporal_protocol.Client_protocol.payload list,
+          Temporal_protocol.Client_protocol.client_error )
+        result
+        client_rpc
+    | Rpc_update :
+        Temporal_protocol.Client_protocol.update_request ->
+        ( Temporal_protocol.Client_protocol.update_response,
+          Temporal_protocol.Client_protocol.client_error )
+        result
+        client_rpc
+    | Rpc_poll_update :
+        Temporal_protocol.Client_protocol.poll_update_request ->
+        ( Temporal_protocol.Client_protocol.poll_update_response,
+          Temporal_protocol.Client_protocol.client_error )
+        result
+        client_rpc
+    | Rpc_visibility :
+        Temporal_protocol.Client_protocol.visibility_request ->
+        Temporal_protocol.Client_protocol.visibility_page client_rpc
+    | Rpc_async_activity_completion :
+        Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
+        (** Completes, fails, or cancels an activity handed off with
+            [WillCompleteAsync] through the namespace-bound client (#1025).
+            Same request and result as [Complete_async_activity], but the
+            RPC runs on a Rust task, so the owner Domain does not wait for
+            the server while other worker operations queue behind it. *)
+    | Rpc_async_activity_heartbeat :
+        Temporal_protocol.Encoded_async_activity_heartbeat.t ->
+        Temporal_protocol.Activity_protocol.async_heartbeat_response client_rpc
+        (** Heartbeats an activity handed off with [WillCompleteAsync]. Unlike
+            [Record_async_activity_heartbeat], which sends every heartbeat,
+            the bridge throttles these per task token as Core throttles a
+            running activity's heartbeats, using the heartbeat timeout the
+            document carries: a call within the throttle interval only
+            records its details for a trailing send. The result is the
+            activity state reported by the token's latest send. *)
+
+  (** A submitted native call, awaited with {!await_client_call}. *)
+  type 'value client_call =
+    ('value, Temporal_core_bridge.Native_bridge.client_call) Client_call.t
+
   (** Typed lifecycle operations serialized by the owner Domain. *)
   type _ operation =
     | Check_compatibility : unit operation
@@ -393,8 +568,10 @@ module Native : sig
     | Wait_replay_workflow : unit operation
         (** Waits for replay readiness without consuming an activation. *)
     | Complete_replay_workflow :
-        Temporal_protocol.Workflow_protocol.completion -> unit operation
-        (** Completes one previously leased replay activation. *)
+        Temporal_protocol.Encoded_workflow_completion.t -> unit operation
+        (** Completes one previously leased replay activation with the
+            canonical bytes from the completion's single encoder pass. The
+            supervisor does not encode it again. *)
     | Reject_replay_workflow : bytes -> unit operation
         (** Retires a replay activation rejected by OCaml semantic decoding. *)
     | Finalize_replay : unit operation
@@ -410,8 +587,12 @@ module Native : sig
             bridge releases the OCaml runtime lock while this bounded wait is in
             progress, so it never blocks an OCaml workflow scheduler. *)
     | Complete_workflow :
-        Temporal_protocol.Workflow_protocol.completion -> unit operation
-        (** Validates and submits one typed workflow completion. *)
+        Temporal_protocol.Encoded_workflow_completion.t -> unit operation
+        (** Submits one workflow completion as the canonical bytes from its
+            single encoder pass. The value can only be built by
+            [Encoded_workflow_completion.encode], so it is already validated;
+            the supervisor copies it into the C call without encoding it
+            again (issue #846). *)
     | Try_poll_activity :
         Temporal_protocol.Activity_protocol.task option operation
         (** Takes and validates one already-ready remote activity task. [None]
@@ -419,43 +600,81 @@ module Native : sig
     | Wait_activity : unit operation
         (** Waits for activity readiness with the same runtime-lock-free bridge
             contract as [Wait_workflow]. *)
+    | Wait_any : unit operation
+        (** Waits until either worker lane is ready, under the same bounded
+            runtime-lock-free contract as [Wait_workflow]. The worker loop uses
+            it for its single idle native wait so a task on the lane it did not
+            expect is not delayed by the bounded timeout. *)
     | Wait_activity_completion_retry_backoff : unit operation
         (** Applies the fixed native delay used only after an explicit
             retryable activity-completion transport outcome. The supervisor
             owner Domain performs it while the C stub releases the OCaml
             runtime lock. *)
     | Complete_activity :
-        Temporal_protocol.Activity_protocol.completion -> unit operation
-        (** Validates and submits one typed remote activity completion. *)
+        Temporal_protocol.Encoded_activity_completion.t -> unit operation
+        (** Submits one remote activity completion as the canonical bytes from
+            its single encoder pass. The value can only be built by
+            [Encoded_activity_completion.encode], so it is already validated;
+            the supervisor copies it into the C call without encoding it
+            again (issue #995). *)
     | Complete_async_activity :
-        Temporal_protocol.Activity_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_activity_completion.t -> unit operation
         (** Completes an activity after a [WillCompleteAsync] handoff through
-            the namespace-bound client path. *)
+            the namespace-bound client path, with the same single-encode
+            contract as [Complete_activity]. *)
     | Record_activity_heartbeat :
-        Temporal_protocol.Activity_protocol.heartbeat -> unit operation
+        Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
         (** Records progress for a leased activity without retiring it. The
             operation is acknowledgement-only; cancellation, pause, and reset
-            flags arrive later as an activity Cancel task from Core. *)
+            flags arrive later as an activity Cancel task from Core. The
+            heartbeat arrives as the canonical bytes of its single encoder
+            pass ([Encoded_activity_heartbeat.encode]), so it is already
+            validated; the supervisor copies it into the C call without
+            encoding it again (issue #1001). *)
     | Record_async_activity_heartbeat :
-        Temporal_protocol.Activity_protocol.heartbeat -> unit operation
-        (** Records progress for an admitted asynchronous activity. *)
+        Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
+        (** Records progress for an admitted asynchronous activity, with the
+            same single-encode contract as [Record_activity_heartbeat]. *)
+    | Initiate_worker_shutdown : unit operation
+        (** Stops the worker from taking new tasks while leaving it owned by
+            the graph (#1028): Core stops polling the server and starts its
+            own graceful-shutdown timer, while completions and heartbeats for
+            tasks already handed to OCaml remain valid until
+            [Shutdown_worker]. It never waits for the network. Idempotent;
+            without a worker it succeeds. *)
     | Shutdown_worker : unit operation
     | Disconnect_client : unit operation
+    | Client_submit : 'value client_rpc -> 'value client_call operation
+        (** Submits one client request without waiting for Temporal (#807).
+            The owner resolves the request's RPC deadline, validates and
+            encodes it, and spawns native work; a deadline that expired in
+            the mailbox completes the call at once and sends nothing. The
+            caller then awaits the result with {!await_client_call}. *)
 
   (** Production lifecycle and bridge failures. *)
   type error =
     | Backend of Temporal_core_bridge.Native_bridge.error
     | Closed
     | Supervisor_failed of exn
+    | Owner_unavailable of exn
 
   (** An abstract SDK instance which owns the complete Rust handle graph. *)
   type t
 
-  (** Validates client settings without network access. *)
+  (** Validates client settings without network access. [limits] carries the
+      optional admission limits of #796; see
+      {!Temporal_core_bridge.Native_bridge.type-client_limits}. *)
   val client_config :
-    target_url:string -> identity:string -> (client_config, Temporal_core_bridge.Native_bridge.error) result
+    ?limits:Temporal_core_bridge.Native_bridge.client_limits ->
+    target_url:string ->
+    identity:string ->
+    unit ->
+    (client_config, Temporal_core_bridge.Native_bridge.error) result
 
-  (** Validates explicit worker resource settings without network access. *)
+  (** Validates explicit worker resource settings without network access.
+      [workflow_tasks] and [activity_tasks] select the task kinds Core polls
+      and [tuning] carries the optional Core settings of #498; see
+      {!Temporal_core_bridge.Native_bridge.val-worker_config}. *)
   val worker_config :
     namespace:string ->
     task_queue:string ->
@@ -465,15 +684,51 @@ module Native : sig
     max_outstanding_workflow_tasks:int ->
     max_concurrent_workflow_task_polls:int ->
     graceful_shutdown_timeout_ms:int64 ->
+    ?tuning:Temporal_core_bridge.Native_bridge.worker_tuning ->
+    ?workflow_tasks:bool ->
+    ?activity_tasks:bool ->
     unit ->
     (worker_config, Temporal_core_bridge.Native_bridge.error) result
 
-  (** Starts a dedicated owner Domain and creates the real Rust runtime. *)
-  val create : capacity:int -> unit -> (t, error) result
+  (** Starts a dedicated owner Domain and creates the real Rust runtime.
+      [runtime_threads] bounds that runtime's Tokio worker pool; see
+      {!Temporal_core_bridge.Native_bridge.runtime_create}. An out-of-range
+      count is a [Backend] error with status [Invalid_argument].
+
+      With [runtime], the graph is instead attached to that shared Core
+      runtime (#832) and [runtime_threads] is ignored. The supervisor takes
+      ownership of the lease: it releases it after closing its graph during
+      [shutdown], or before returning if creation fails. *)
+  val create :
+    ?runtime_threads:int ->
+    ?runtime:Sdk_shared_runtime.lease ->
+    capacity:int ->
+    unit ->
+    (t, error) result
 
   (** Runs one typed bridge operation on the sole owner Domain. Network waits
       enter Rust through C stubs which release the OCaml runtime lock. *)
   val perform : t -> 'result operation -> ('result, error) result
+
+  (** Awaits one submitted call on the calling Domain with the OCaml runtime
+      lock released during each bounded wait. A call closed because the
+      supervisor shut down while it was in flight is the typed [Closed]
+      error; any other failure is a [Backend] error. Must not be called on a
+      workflow scheduler Domain. [slice_ms] defaults to
+      {!Client_call.default_slice_ms}. *)
+  val await_client_call :
+    ?slice_ms:int -> 'value client_call -> ('value, error) result
+
+  (** [call supervisor rpc] submits [rpc] with [perform] and then awaits it
+      with {!await_client_call}. Only submission occupies the owner Domain,
+      so concurrent calls from other Domains proceed independently. *)
+  val call : t -> 'value client_rpc -> ('value, error) result
+
+  (** Starts a companion system thread on the owner Domain; see
+      {!Make.spawn_owner_thread}. The native worker hosts its activation
+      watchdog there (#1042). *)
+  val spawn_owner_thread :
+    t -> (unit -> unit) -> ((unit, exn) result, error) result
 
   (** Closes operation admission without waiting for native teardown. This is
       an internal lifecycle seam; application code should call [shutdown]. *)
@@ -481,4 +736,8 @@ module Native : sig
 
   (** Deterministically closes worker, client, runtime, then owner Domain. *)
   val shutdown : t -> (unit, error) result
+
+  (** Makes the caller's own finalizer the only abandoned-instance cleanup
+      path; see {!Make.delegate_abandoned_cleanup}. *)
+  val delegate_abandoned_cleanup : t -> unit
 end

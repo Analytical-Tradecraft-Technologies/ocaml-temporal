@@ -1,0 +1,118 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "1970-01-01T00:00:01Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "initial-signals"
+        },
+        "taskQueue": {
+          "name": "initial-signals"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "YmluYXJ5L251bGw="
+              },
+              "data": ""
+            }
+          ]
+        },
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "run-initial-signals",
+        "firstExecutionRunId": "run-initial-signals",
+        "attempt": 1,
+        "firstWorkflowTaskBackoff": "0s"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "1970-01-01T00:00:02Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED",
+      "workflowExecutionSignaledEventAttributes": {
+        "signalName": "record",
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImZpcnN0Ig=="
+            }
+          ]
+        },
+        "identity": "fixture-client"
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "1970-01-01T00:00:03Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED",
+      "workflowExecutionSignaledEventAttributes": {
+        "signalName": "record",
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "InNlY29uZCI="
+            }
+          ]
+        },
+        "identity": "fixture-client"
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "1970-01-01T00:00:04Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "initial-signals"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "1970-01-01T00:00:05Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "4",
+        "identity": "fixture-worker"
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "1970-01-01T00:00:06Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "4",
+        "startedEventId": "5"
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "1970-01-01T00:00:07Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "workflowExecutionCompletedEventAttributes": {
+        "workflowTaskCompletedEventId": "6",
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImZpcnN0LHNlY29uZCI="
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

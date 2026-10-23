@@ -87,7 +87,7 @@ let clear_markers configuration =
     assertion. Non-success terminal values remain typed errors rather than
     exceptions, and their payload details are not copied into marker files. *)
 let require_expected_completion expected = function
-  | Client.Completed actual when String.equal actual expected -> Ok ()
+  | Client.Completed { output = actual; _ } when String.equal actual expected -> Ok ()
   | Client.Completed _ ->
       Error
         (Error.defect
@@ -147,14 +147,14 @@ let run () =
         Support.publish_marker ~path:configuration.accepted_file
           ~contents:
             (Printf.sprintf "workflow_id=%s\nrun_id=%s\n"
-               (Client.workflow_id handle) (Client.run_id handle))
+               (Client.workflow_id handle) (Option.get (Client.run_id handle)))
       in
       let* outcome = Client.wait handle in
       let* () = require_expected_completion configuration.expected_result outcome in
       Support.publish_marker ~path:configuration.result_file
         ~contents:
           (Printf.sprintf "workflow_id=%s\nrun_id=%s\nresult=%s\n"
-             (Client.workflow_id handle) (Client.run_id handle)
+             (Client.workflow_id handle) (Option.get (Client.run_id handle))
              configuration.expected_result)
     with exception_ ->
       Error

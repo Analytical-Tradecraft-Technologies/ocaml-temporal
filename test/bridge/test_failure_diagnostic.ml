@@ -77,6 +77,29 @@ let test_nested_timeout_is_visible () =
   assert (contains diagnostic "application type=LlmUnavailable non_retryable=false details=1");
   assert (contains diagnostic " | ")
 
+(** Failure kinds outside the application/activity/child family, including a
+    failure with no info at all, still render a typed summary for every layer
+    so a server-generated cause stays diagnosable. *)
+let test_extended_kinds_are_visible () =
+  let absent =
+    layer ~message:"no info" ~source:"" ~info:Protocol.Absent ~cause:None
+  in
+  let handler =
+    layer ~message:"handler failed" ~source:""
+      ~info:(Protocol.Nexus_handler
+               { type_name = "INTERNAL"; retry_behavior = Protocol.Nexus_retry_non_retryable })
+      ~cause:(Some absent)
+  in
+  let server =
+    layer ~message:"result too large" ~source:""
+      ~info:(Protocol.Server { non_retryable = true })
+      ~cause:(Some handler)
+  in
+  let diagnostic = Diagnostic.failure_diagnostic server in
+  assert (contains diagnostic "result too large server non_retryable=true");
+  assert (contains diagnostic "nexus_handler type=INTERNAL retry_behavior=non_retryable");
+  assert (contains diagnostic "no info no_failure_info")
+
 (** A recursively constructed value cannot make diagnostics grow without a
     bound, even though normal JSON decoding already rejects excessive depth. *)
 let test_depth_is_bounded () =
@@ -117,8 +140,165 @@ let test_application_options_survive_cause_diagnostic () =
   assert (contains diagnostic "next_retry_delay=3.000000007s");
   assert (contains diagnostic "activity id=lookup-1")
 
+(** Truncated messages, sources, and stack traces must stay valid UTF-8 (#773).
+    Each field is filled with three-byte characters so that a byte cut
+    at the field limit (2,048, 512, or 1,024 bytes) would split a code point;
+    an invalid result would later be replaced wholesale by a generic workflow
+    failure diagnostic. *)
+let test_truncation_keeps_utf_8 () =
+  let straddling limit =
+    (* No limit is a multiple of three, so each byte cut lands mid-character. *)
+    assert (limit mod 3 <> 0);
+    String.concat "" (List.init ((limit / 3) + 2) (fun _ -> "\xe6\x97\xa5"))
+  in
+  let value =
+    {
+      (layer ~message:(straddling 2048) ~source:(straddling 512)
+         ~info:(Protocol.Terminated { identity = "operator" })
+         ~cause:None)
+      with
+      stack_trace = straddling 1024;
+    }
+  in
+  let diagnostic = Diagnostic.failure_diagnostic value in
+  assert (String.is_valid_utf_8 diagnostic);
+  assert (contains diagnostic "\xe6\x97\xa5...");
+  assert (String.length diagnostic < 2048 + 512 + 1024 + 256)
+
+(** The application type is read through activity, child-workflow, and timeout
+    wrappers; the first application layer wins; an empty type, a chain without
+    an application layer, and a layer beyond the depth bound yield [None]. *)
+let test_application_failure_type () =
+  let application type_name cause =
+    layer ~message:"app" ~source:"worker"
+      ~info:(Protocol.Application
+               { type_name; non_retryable = false; details = [];
+                 category = Protocol.Application_category_unspecified;
+                 next_retry_delay = None })
+      ~cause
+  in
+  let activity cause =
+    layer ~message:"activity" ~source:"core"
+      ~info:(Protocol.Activity
+               { scheduled_event_id = 1L; started_event_id = 2L;
+                 identity = "w"; activity_type = "act"; activity_id = "a";
+                 retry_state = Protocol.Non_retryable_failure })
+      ~cause
+  in
+  let child cause =
+    layer ~message:"child" ~source:"core"
+      ~info:(Protocol.Child_workflow
+               { namespace = "default"; workflow_id = "c"; run_id = "r";
+                 workflow_type = "child"; initiated_event_id = 1L;
+                 started_event_id = 2L;
+                 retry_state = Protocol.Non_retryable_failure })
+      ~cause
+  in
+  let timeout cause =
+    layer ~message:"timeout" ~source:"core"
+      ~info:(Protocol.Timeout_failure
+               { timeout_type = Protocol.Timeout_start_to_close;
+                 last_heartbeat_details = [] })
+      ~cause
+  in
+  let type_of = Diagnostic.application_failure_type in
+  assert (type_of (application "InvalidInput" None) = Some "InvalidInput");
+  assert (
+    type_of (activity (Some (application "InvalidInput" None)))
+    = Some "InvalidInput");
+  assert (
+    type_of (child (Some (activity (Some (application "Deep" None)))))
+    = Some "Deep");
+  assert (
+    type_of (activity (Some (timeout (Some (application "Late" None)))))
+    = Some "Late");
+  assert (
+    type_of (application "Outer" (Some (application "Inner" None)))
+    = Some "Outer");
+  assert (type_of (activity (Some (application "" None))) = None);
+  assert (type_of (activity (Some (timeout None))) = None);
+  let rec wrap depth inner =
+    if depth = 0 then inner else activity (Some (wrap (depth - 1) inner))
+  in
+  assert (type_of (wrap 128 (application "Bounded" None)) = Some "Bounded");
+  assert (type_of (wrap 129 (application "TooDeep" None)) = None)
+
+(** Inbound application failure types written by other SDKs may contain
+    control characters, invalid UTF-8 or more than the outbound limit (#1011).
+    The extracted type must be deterministic, must leave valid text unchanged,
+    and must always be accepted by [Error.make], which raises on the raw
+    values. *)
+let test_inbound_failure_type_is_sanitized () =
+  let application type_name =
+    layer ~message:"app" ~source:"python"
+      ~info:(Protocol.Application
+               { type_name; non_retryable = false; details = [];
+                 category = Protocol.Application_category_unspecified;
+                 next_retry_delay = None })
+      ~cause:None
+  in
+  let activity cause =
+    layer ~message:"activity" ~source:"core"
+      ~info:(Protocol.Activity
+               { scheduled_event_id = 1L; started_event_id = 2L;
+                 identity = "w"; activity_type = "act"; activity_id = "a";
+                 retry_state = Protocol.Non_retryable_failure })
+      ~cause:(Some cause)
+  in
+  let accepted raw =
+    match Diagnostic.application_failure_type (activity (application raw)) with
+    | None -> assert false
+    | Some sanitized ->
+        let error =
+          Temporal_base.Error.make ~error_type:sanitized ~category:`Activity
+            ~message:"inbound" ()
+        in
+        assert (Temporal_base.Error.error_type error = Some sanitized);
+        assert (Diagnostic.sanitize_inbound_error_type raw = sanitized);
+        sanitized
+  in
+  let raises raw =
+    match
+      Temporal_base.Error.make ~error_type:raw ~category:`Activity
+        ~message:"raw" ()
+    with
+    | _ -> false
+    | exception Invalid_argument _ -> true
+  in
+  assert (raises "Invalid\tInput");
+  assert (accepted "Invalid\tInput" = "Invalid\\u0009Input");
+  assert (accepted "a\nb\x7f" = "a\\u000Ab\\u007F");
+  assert (accepted "nul\000x" = "nul\\u0000x");
+  assert (accepted "bad\xffutf8" = "bad\xef\xbf\xbdutf8");
+  assert (accepted "Valid \xe6\x97\xa5 \"quoted\"" = "Valid \xe6\x97\xa5 \"quoted\"");
+  let limit = Diagnostic.max_inbound_error_type_encoded_length in
+  let exact = String.make limit 'x' in
+  assert (accepted exact = exact);
+  (* The Rust bridge truncates an over-long type with a marker that starts
+     with a newline; both the length and the marker must be repaired. *)
+  let over_long = String.make (limit + 10) 'y' ^ "\n...[truncated]" in
+  assert (raises over_long);
+  let sanitized = accepted over_long in
+  assert (String.length sanitized = limit);
+  assert (String.ends_with ~suffix:"..." sanitized);
+  (* A cut never splits a multi-byte character or an escape sequence, and a
+     quote counts two encoded characters. *)
+  let multibyte = String.concat "" (List.init limit (fun _ -> "\xe6\x97\xa5")) in
+  let sanitized = accepted multibyte in
+  assert (String.is_valid_utf_8 sanitized);
+  let quoted = String.make limit '"' in
+  let sanitized = accepted quoted in
+  assert (String.length sanitized = ((limit - 3) / 2) + 3);
+  let controls = String.make limit '\t' in
+  let sanitized = accepted controls in
+  assert (String.length sanitized = ((limit - 3) / 7 * 6) + 3)
+
 (** Runs the pure diagnostic regression cases. *)
 let () =
+  test_inbound_failure_type_is_sanitized ();
+  test_application_failure_type ();
   test_nested_timeout_is_visible ();
   test_depth_is_bounded ();
-  test_application_options_survive_cause_diagnostic ()
+  test_application_options_survive_cause_diagnostic ();
+  test_truncation_keeps_utf_8 ();
+  test_extended_kinds_are_visible ()

@@ -11,9 +11,11 @@ where application code normally uses them.
 | Context | Modules | Use them for |
 | --- | --- | --- |
 | Workflow code | `Temporal.Workflow`, `Temporal.Activity`, `Temporal.Child_workflow`, `Temporal.Future`, `Temporal.Condition`, `Temporal.Scope`, `Temporal.Workflow_context`, `Temporal.Time`, `Temporal.Duration` | Defining deterministic work, making replay-safe time and pseudo-random choices, scheduling Temporal operations, waiting for results, and keeping execution-local state |
-| Application startup and shutdown | `Temporal.Client`, `Temporal.Worker`, `Temporal.Runtime_info` | Connecting to Temporal, registering executable definitions, running the worker, and checking the linked bridge |
+| Application startup and shutdown | `Temporal.Client`, `Temporal.Worker`, `Temporal.Runtime`, `Temporal.Runtime_info` | Connecting to Temporal, registering executable definitions, running the worker, optionally sharing background I/O threads, and checking the linked bridge |
 | Values crossing a Temporal boundary | `Temporal.Codec`, `Temporal.Payload`, `Temporal.Error`, `Temporal.Result_syntax` | Encoding typed values, inspecting opaque payloads, representing expected failures, and composing `result` values |
 | Signals, queries, and updates | `Temporal.Signal`, `Temporal.Query`, `Temporal.Update`, `Temporal.Interaction` | Defining typed interactions, registering handlers, and testing deterministic local dispatch |
+| Application tests | `Temporal.Testing` | Running registered workflows and activities in-process with a time-skipping virtual clock, stubbing activities and child workflows, and driving signals, queries, updates, and cancellation without a Temporal Server |
+| Compatibility checks | `Temporal.Replay` | Replaying recorded workflow histories offline against the application's current workflow definitions before deploying a change |
 
 The same module can be used by a workflow helper and by registration code when
 its contract allows it, but the execution context still matters. In
@@ -34,7 +36,18 @@ for those rules.
   `current_deployment_version ()` reports the deployment and build identity
   selected for the current task, or `None` when no versioned task metadata is
   available; it is diagnostic metadata, not a replacement for replay-safe
-  patching. `upsert_search_attributes` merges encoded values into the
+  patching. `info ()` returns an abstract `Workflow.Info.t` with the run's
+  identity (workflow and run IDs, first run ID, type, namespace, task queue,
+  attempt, parent, start time), the start policy recorded for the run
+  (`execution_timeout`, `run_timeout`, `task_timeout`, and `retry_policy` as
+  a `Retry_policy.t`), its continuation provenance
+  (`continued_from_run_id` and `continuation_initiator`: `` `Continue_as_new ``,
+  `` `Retry ``, or the reserved `` `Cron_schedule ``), and the current
+  activation's replay flag, history length and size, and continue-as-new
+  suggestion and its reasons, all taken from Temporal's activations (#512).
+  `start_metadata ()` returns the start memo, search attributes, and execution
+  expiration. `is_replaying ()` is the shorthand for replay-aware logging.
+  `upsert_search_attributes` merges encoded values into the
   execution's indexed search attributes; the update becomes visible after the
   workflow task is accepted. `continue_as_new` ends the current run and starts
   a successor. `patched ~id`
@@ -57,9 +70,20 @@ for those rules.
   returns `Completed`, `Failed`, or `Will_complete_async`; after the handoff,
   `Async_handle` provides terminal `complete`, `fail`, and `cancel` operations
   plus non-terminal `heartbeat`, while `Async_context` is only used to obtain
-  that retained capability. The attempt-scoped `Context` instead supplies
+  that retained capability and, through `Async_context.info`, the same
+  `Activity.Info.t` that a synchronous callback reads. The attempt-scoped
+  `Context` instead supplies
   copied heartbeat details and timeout metadata for callbacks that complete
-  during dispatch.
+  during dispatch, and `Context.info` returns an abstract `Activity.Info.t`
+  with the namespace, scheduling workflow, activity ID and type, attempt,
+  local-activity flag, Core-reported scheduling timestamps, and effective
+  schedule-to-close, start-to-close, and heartbeat timeouts (rounded up to
+  whole milliseconds). Cancellation is cooperative: `Context.cancellation`
+  returns the `Activity.Cancellation.t` (a typed `reason` such as `Requested`,
+  `Timed_out` or `Not_found`) that the worker delivered at a heartbeat, a
+  heartbeat returns a `` `Cancelled `` error once one has been delivered, and
+  returning that error completes the attempt as cancelled.
+  `Context.is_worker_shutting_down` reports that the worker has begun to stop.
 - `Temporal.Child_workflow` schedules a child workflow and exposes its typed
   future. Use its operation handle when the parent must cancel one exact child;
   child retry and cancellation policies are passed to the durable command; see
@@ -101,16 +125,37 @@ for those rules.
 - `Temporal.Client` starts typed workflow executions, optionally attaching
   validated `memo` and `search_attributes` payloads. A caller-owned
   `request_id` makes an uncertain start safe to retry as the same logical
-  request. The client retains the exact workflow/run identity, rebuilds a
-  typed handle for a `Continued_as_new` successor with `Client.follow`,
-  requests exact-run cancellation, reset, or termination. `Client.reset`
+  request. `?id_conflict_policy` (`` `Fail `` by default, `` `Use_existing ``,
+  or `` `Terminate_existing ``) chooses what happens when the workflow ID
+  already has a running execution: a typed already-started error whose
+  existing run `Client.already_started` returns, a handle for the running
+  execution (`Client.started` is `false`), or termination of that execution
+  and a new run. `?id_reuse_policy` (`` `Allow_duplicate `` by default,
+  `` `Allow_duplicate_failed_only ``, or `` `Reject_duplicate ``) decides
+  whether a closed run's ID may be reused, and `?execution_timeout`,
+  `?run_timeout`, `?task_timeout`, and `?retry_policy` set server-side
+  execution policies (#499). Start and the other bounded operations accept a
+  per-call `?rpc_timeout`; an expired start deadline is recognized by
+  `Client.is_start_outcome_uncertain`. The client retains the exact workflow/run identity, rebuilds a
+  typed handle for a successor (from `Continued_as_new`, or the optional
+  `successor` of `Completed { output; successor }`, `Failed`, or `Timed_out`)
+  with `Client.follow`, and requests cancellation, reset, or termination.
+  `Client.get_handle client ~workflow ~id ()` builds a handle from a workflow
+  ID without contacting Temporal, for a process that did not start the
+  workflow. With `~run_id` it addresses that exact run; without it the handle
+  addresses the workflow's current run: every operation lets Temporal resolve
+  the latest run, so the handle keeps working across continue-as-new,
+  `Client.run_id` returns `None`, and `Client.wait` follows continued-as-new,
+  cron, and retry successors to the last run, like the official SDKs' result
+  methods. `Client.reset`
   stops an exact run at a workflow-task event boundary and returns a new
   execution identity; call `Client.follow` explicitly if you want to await
   that successor. The client also sends typed signals and output-only or
   exactly-one-input queries. `Client.query_with_input` encodes the typed query
   argument before transport; the client lists bounded visibility results and
-  waits for typed terminal outcomes. `Client.start_update` admits one typed
-  workflow update and returns an opaque handle; `Client.wait_update` polls that
+  waits for typed terminal outcomes. `Client.start_update` waits until Temporal
+  accepts one typed workflow update and returns an opaque handle;
+  `Client.wait_update` polls that
   exact update until it has a typed outcome, while `Client.update_id` exposes
   the server-correlated update ID for diagnostics and retry bookkeeping.
   `Client.follow`
@@ -122,18 +167,89 @@ for those rules.
   result or a typed error. Call `Client.shutdown` when the client is no longer
   needed to release
   its native graph; shutdown is idempotent and retains a teardown failure so
-  cleanup problems are not silently discarded.
+  cleanup problems are not silently discarded. Shutdown does not wait for or
+  fail because of a concurrent `Client.start`: an in-flight native start is
+  aborted, and that caller receives a non-retryable `bridge` error saying
+  Temporal did not prove whether the start was accepted, including its
+  workflow and request IDs for reconciliation. One native client keeps at
+  most 64 starts in flight, waits on at most 64 distinct runs, and has at
+  most 4,096 calls in flight at once; `Client.create ?max_pending_starts
+  ?max_pending_waits ?max_in_flight_calls` changes these per client (#796;
+  1..4,096, 1..4,096, and 1..65,536, otherwise a typed defect). A call beyond
+  a bound is rejected before reaching Temporal with a retryable `bridge`
+  error that `Client.is_at_capacity` recognizes, and the client stays
+  usable. A Temporal RPC failure is classified by
+  `Client.rpc_status` (one variant per gRPC status, plus
+  `` `Termination_outcome_uncertain ``); the same error carries a stable
+  PascalCase `Error.error_type` such as `"NotFound"` and is `non_retryable`
+  exactly for permanent conditions (invalid argument, not found, already
+  exists, failed precondition, permission denied, unauthenticated,
+  unimplemented, uncertain termination). A failed workflow query handler is a
+  non-retryable `workflow` error with type `"QueryFailed"` and the handler's
+  bounded message, recognized by `Client.is_query_failed`.
+- `Client.create` and `Worker.create` accept `?io_threads`, an upper bound on
+  the background threads each instance uses for network I/O and server
+  communication; the SDK may use fewer (#832). The default is the host's
+  available parallelism capped at 4; a value outside 1..256 is a typed defect
+  returned before anything is allocated. The bound applies per client and per
+  worker.
+- `Temporal.Runtime` is an explicit, shareable background I/O runtime (#832).
+  `Runtime.create ?io_threads ()` starts it, and passing it as `?runtime` to
+  `Client.create` and `Worker.create` makes those instances share its threads
+  instead of starting their own (`?runtime` together with `?io_threads` is a
+  typed defect). Each attached client or worker stays attached until its own
+  `shutdown` returns; `Runtime.attached` reports the count, and
+  `Runtime.shutdown` returns a typed defect while it is non-zero, so
+  instances must be shut down before their runtime. A shut-down runtime
+  rejects new attachments with a typed defect. Without `?runtime`, behavior
+  is unchanged.
+- `Runtime.create ?metrics` exports Temporal Core's built-in worker and
+  client metrics (#500). `Runtime.Metrics.prometheus ~bind_address ()`
+  validates a Prometheus scrape endpoint (IP socket address, optional
+  bounded global tags, and Core's counter, unit, and duration naming
+  switches); the endpoint is bound before `create` returns, a busy address
+  is a typed `Bridge` error, and `Runtime.metrics_address` reports the bound
+  address. Every client and worker attached to the runtime reports there.
+  Metric names and labels match the official SDKs; see
+  [observability](observability.md#worker-metrics).
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.
+  `Worker.request_shutdown` is the signal-handler-safe way to make `run`
+  return; call `Worker.shutdown` afterwards to release the worker.
+  `Worker.shutdown_with_report` is the same bounded shutdown (#495) returning
+  a `Worker.Shutdown_report.t`: elapsed time, whether both lanes stopped,
+  the abandoned activity callbacks and workflow activations, and whether
+  native teardown completed or was left `` `Detached `` in the background.
   `Temporal.Worker.Options` provides typed, immutable resource and worker
   routing settings, including legacy build-ID and deployment-based versioning;
-  see the [worker versioning reference](worker-versioning.md). A
-  successfully shut-down worker is not reusable: the mock backend reports a
-  typed `bridge` error if `Worker.run` is called again, while the native backend
-  returns without polling because its closed gate is already set. Create a new
-  worker for a new polling lifecycle rather than relying on either backend's
-  post-shutdown behavior. The interaction handler registration modes and their
+  see the [worker versioning reference](worker-versioning.md).
+  `Options.make` also takes the resource and shutdown settings of #498:
+  `?max_concurrent_workflow_tasks`, `?workflow_task_pollers`
+  (`Fixed n` or `Autoscaling { minimum; maximum; initial }`),
+  `?sticky_queue_schedule_to_start_timeout`, `?graceful_shutdown_period`,
+  `?shutdown_teardown_timeout` (#495), `?max_heartbeat_throttle_interval`, `?default_heartbeat_throttle_interval`
+  (each a `Duration.t`), `?max_worker_activities_per_second` and
+  `?max_task_queue_activities_per_second`. Each invalid, overflowing or
+  contradictory value is a typed defect returned before anything is
+  allocated. For example, a caching worker with fewer than two workflow task
+  slots or two fixed pollers is rejected, and so is a per-worker activity
+  rate below one per day. A fixed poller count is a total that Core splits
+  between the sticky and normal queues, while autoscaling bounds apply to
+  each queue. One accessor per setting reports the
+  effective value, defaults included, and `Worker.options` returns the
+  options a worker was created with. Activity slot counts are not options:
+  the serial activity executor fixes them at one (#777).
+  `Options.make ?workflow_activation_deadline` (`` `After `` a positive
+  `Duration.t` up to one hour, default two seconds, or `` `Disabled ``)
+  configures the non-yielding workflow watchdog, and the lock-free
+  `Worker.health` returns `Healthy` or a sticky `Stuck_workflow_activation`
+  report for liveness probes; see the
+  [watchdog reference](native-worker-execution.md#non-yielding-workflow-watchdog). A
+  successfully shut-down worker is not reusable: calling `Worker.run` again
+  returns a typed `bridge` error ("worker is shut down") on both the mock and
+  native backends without polling. Create a new worker for a new polling
+  lifecycle. The interaction handler registration modes and their
   current native limitations are described in the [interactive-workflow reference](interactive-workflows.md).
   The final executable remains an OCaml application; Rust is a private linked
   implementation detail.
@@ -146,6 +262,27 @@ for those rules.
   `Temporal.Interaction` is the deterministic,
   synchronous local dispatcher for tests. Native interaction delivery has a
   narrower experimental boundary; see the [interactive-workflow reference](interactive-workflows.md).
+- `Temporal.Testing` is the in-process workflow test environment. It drives
+  the same private workflow runtime as a native worker against a
+  deterministic server simulator, skipping virtual time whenever every
+  workflow is blocked on a timer or activity retry. `mock_activity` and
+  `mock_workflow` stub definitions by name; `start`, `signal`, `query`,
+  `update`, `cancel`, `skip`, and `result` drive a workflow step by step. It is
+  independent of `Client` and `Worker`, whose `mock://` target remains a
+  plumbing-only backend that never runs workflow code. The simulated
+  semantics and their limits are listed in the module documentation and the
+  [workflow guide](../guides/workflows.md#test-workflows-in-process).
+- `Temporal.Replay` replays one recorded history per call through Temporal
+  Core's replay worker and the same workflow adapter a native worker uses,
+  without a server. `History.of_protobuf` accepts a binary `History` protobuf
+  and its workflow ID; `replay` and `replay_all` return `Ok ()` or a typed
+  `failure` (`Nondeterminism`, `Workflow_task_failed`, `Invalid_history`,
+  `Unsupported_history`, or `Replay_error`). `Nondeterminism` carries a
+  `mismatch` record with the workflow ID and type and, when Core's text
+  states them, the first mismatching recorded event and the command it was
+  matched against. Each call owns and releases its own native graph. See the
+  [workflow guide](../guides/workflows.md#replay-recorded-histories-before-deploying)
+  and the [replay bridge reference](replay-bridge.md).
 
 ## What is not public
 

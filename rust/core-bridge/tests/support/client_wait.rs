@@ -34,6 +34,9 @@ enum Reply {
 #[derive(Default)]
 struct Probe {
     requests: Mutex<Vec<GetWorkflowExecutionHistoryRequest>>,
+    /// `supported-features` header of each history request, in arrival order;
+    /// `None` records a request that omitted the header.
+    features: Mutex<Vec<Option<String>>>,
     cancellations: Mutex<Vec<RequestCancelWorkflowExecutionRequest>>,
     completed: AtomicUsize,
     dropped: AtomicUsize,
@@ -53,7 +56,7 @@ impl Drop for RpcDrop {
 fn connected_runtime(reply: Reply) -> (Runtime, Arc<Probe>) {
     let options = RuntimeOptions::builder().build().expect("runtime options");
     let core = CoreRuntime::new(options, TokioRuntimeBuilder::default()).expect("Core runtime");
-    let mut runtime = Runtime::new(core).expect("runtime cleanup thread");
+    let mut runtime = Runtime::with_owned_core(core).expect("runtime cleanup thread");
     let probe = Arc::new(Probe::default());
     let observed = Arc::clone(&probe);
     let service = CallbackBasedGrpcService {
@@ -76,6 +79,12 @@ fn connected_runtime(reply: Reply) -> (Runtime, Arc<Probe>) {
                     });
                 }
                 assert_eq!(request.rpc, "GetWorkflowExecutionHistory");
+                probe.features.lock().unwrap().push(
+                    request
+                        .headers
+                        .get(crate::client_protocol::SUPPORTED_FEATURES_HEADER)
+                        .map(|value| value.to_str().expect("ASCII header").to_owned()),
+                );
                 let request = GetWorkflowExecutionHistoryRequest::decode(request.proto)
                     .expect("valid history request");
                 probe.requests.lock().unwrap().push(request.clone());
@@ -224,6 +233,35 @@ fn pagination_survives_multiple_owner_windows() {
     assert_eq!(runtime.close(true), STATUS_OK);
 }
 
+/// Every history poll, including follow-up pages and current-run waits,
+/// advertises `follows-next-run-id` so Temporal returns the real close event
+/// instead of rewriting a retried or cron-chained run as continued-as-new
+/// (#971).
+#[test]
+fn history_polls_advertise_follows_next_run_id() {
+    let (mut runtime, probe) = connected_runtime(Reply::Paginated);
+    terminal(&mut runtime, &request("paginated-run")).expect("terminal result");
+    terminal(&mut runtime, &request("")).expect("current-run terminal result");
+    let features = probe.features.lock().unwrap();
+    assert_eq!(features.len(), 4);
+    for feature in features.iter() {
+        assert_eq!(
+            feature.as_deref(),
+            Some(crate::client_protocol::FOLLOWS_NEXT_RUN_ID_FEATURE)
+        );
+    }
+    drop(features);
+    assert_eq!(
+        crate::client_protocol::FOLLOWS_NEXT_RUN_ID_FEATURE,
+        "follows-next-run-id"
+    );
+    assert_eq!(
+        crate::client_protocol::SUPPORTED_FEATURES_HEADER,
+        "supported-features"
+    );
+    assert_eq!(runtime.close(true), STATUS_OK);
+}
+
 /// Interleaved waiters cannot replace each other's execution or request state.
 #[test]
 fn concurrent_exact_runs_make_progress_independently() {
@@ -301,6 +339,9 @@ fn cancellation_and_disconnect_remain_responsive() {
 }
 
 /// Admission is bounded without blocking an already retained wait at capacity.
+/// The excess wait reports the dedicated retryable capacity status rather than
+/// the invalid-state status used for a closed client, and leaves the client
+/// connected so a later wait succeeds once a slot is released.
 #[test]
 fn pending_wait_capacity_rejects_only_new_executions() {
     let (mut runtime, probe) = connected_runtime(Reply::Pending);
@@ -318,8 +359,9 @@ fn pending_wait_capacity_rejects_only_new_executions() {
             .wait_workflow_json(&request("excess"))
             .unwrap_err()
             .status,
-        STATUS_INVALID_STATE
+        STATUS_RESOURCE_EXHAUSTED
     );
+    assert!(runtime.client.is_some());
     assert_eq!(
         runtime
             .wait_workflow_json(&request("run-0"))

@@ -29,6 +29,65 @@ updates:
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
+# One entry per supported OCaml series (#1027). Each docker/ocaml-<series>
+# directory holds a single digest-pinned ocaml/opam FROM line, so each job sees
+# exactly one tag and can refresh its manifest-index digest independently.
+# Dependabot compares a candidate tag such as `debian-12-ocaml-5.3` by its
+# trailing number (5.3) but derives `update-types` ranges from the whole
+# current tag (read as 12.5.2), so `semver-minor` cannot stop a retarget to
+# another series. The `versions` ranges below are expressed in that trailing
+# number and ignore every later series; the current tag stays eligible, so its
+# digest is still refreshed. A range must not cover every version (`>= 0`),
+# which Dependabot treats as ignoring the image altogether. Keep the entries in
+# step with scripts/ci-matrix.py; test_build_tool_dependencies.sh checks them.
+- package-ecosystem: docker
+  directory: /docker/ocaml-5.2
+  schedule:
+    interval: cron
+    cronjob: 0 7 * * *
+    timezone: Australia/Sydney
+  cooldown:
+    default-days: 3
+  ignore:
+  - dependency-name: ocaml/opam
+    versions:
+    - '>= 5.3'
+- package-ecosystem: docker
+  directory: /docker/ocaml-5.3
+  schedule:
+    interval: cron
+    cronjob: 0 7 * * *
+    timezone: Australia/Sydney
+  cooldown:
+    default-days: 3
+  ignore:
+  - dependency-name: ocaml/opam
+    versions:
+    - '>= 5.4'
+- package-ecosystem: docker
+  directory: /docker/ocaml-5.4
+  schedule:
+    interval: cron
+    cronjob: 0 7 * * *
+    timezone: Australia/Sydney
+  cooldown:
+    default-days: 3
+  ignore:
+  - dependency-name: ocaml/opam
+    versions:
+    - '>= 5.5'
+- package-ecosystem: docker
+  directory: /docker/ocaml-5.5
+  schedule:
+    interval: cron
+    cronjob: 0 7 * * *
+    timezone: Australia/Sydney
+  cooldown:
+    default-days: 3
+  ignore:
+  - dependency-name: ocaml/opam
+    versions:
+    - '>= 5.6'
 - package-ecosystem: docker-compose
   directory: /test/integration/temporal
   schedule:

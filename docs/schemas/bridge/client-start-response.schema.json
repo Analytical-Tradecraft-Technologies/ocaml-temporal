@@ -1,11 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-start-response.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-start-response.schema.json",
   "title": "OCaml Temporal native client start response",
   "type": "object",
   "additionalProperties": false,
-  "required": ["execution"],
+  "required": ["execution", "started"],
   "properties": {
-    "execution": {"$ref": "client-execution-ref.schema.json"}
+    "execution": {"$ref": "client-execution-ref.schema.json"},
+    "started": {
+      "type": "boolean",
+      "description": "False only when a use_existing start returned the open run created by another request; execution then names that run."
+    }
   }
 }

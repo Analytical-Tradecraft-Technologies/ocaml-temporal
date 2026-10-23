@@ -4,8 +4,9 @@ The PR/merge-queue and master/nightly Temporal jobs run the same seven existing
 controllers through `make test-temporal-live-ci`. Each controller takes snapshots
 before deleting worker generations, containers or coordination files. The outer
 wrapper retains partial console output and the original exit status. Upload and
-job-summary steps use `always()`, with a 40-minute scenario-step budget inside
-the existing 45-minute job budget to leave time for publication.
+job-summary steps use `always()`. Every step of the job has its own timeout
+(40 minutes for this scenario step) and the 93-minute job timeout is at least
+their sum, so a step that times out still leaves time for publication.
 
 Artifacts are named `live-diagnostics-<Actions run ID>-<attempt>` and retained for
 seven days. The job summary links the immutable downloadable artifact and reports
@@ -17,6 +18,16 @@ the upload step. Hard runner loss, global job timeout, forced process-group
 termination or cancellation can still prevent final collection/upload. A
 snapshot is best-effort evidence, not a guarantee that a lost runner can be
 recovered.
+
+The fixed-bug regression suites that `make test-temporal-live-ci` runs first
+(`make test-temporal-live-regressions`) are not wrapped by these collectors.
+Their controller writes one `<suite>.log` per suite, and the official-SDK
+interoperability evidence under `sdk_interop/`, to `_build/live-regressions/`
+and also prints each log to the job output. A separate `always()` step uploads
+those files as `live-regressions-<Actions run ID>-<attempt>`, retained for
+seven days; the admin-tools CLI binary copied into the same directory is not
+uploaded. Like the bundle upload, a failure of that step is reported on its own
+and does not replace the scenario's result.
 
 ## What the bundle proves
 

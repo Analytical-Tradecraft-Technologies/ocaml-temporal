@@ -96,6 +96,7 @@ let test_valid_activations () =
       "child-cancellation-before-start";
       "patch-activation";
       "reset-activation";
+      "extended-failure-info";
     ]
 
 (** Proves continuation initialization metadata remains typed through the OCaml
@@ -815,10 +816,20 @@ let test_invalid_documents () =
       "activation-child-start-invalid-cause";
       "activation-child-terminal-missing-payload";
       "activation-child-terminal-missing-failure-info";
-      "activation-child-failure-empty-run-id-after-start";
-      "activation-child-failure-empty-workflow-id";
       "activation-child-failure-negative-event-id";
       "activation-child-unknown-terminal-kind";
+    ];
+  (* Child-failure wrapper identifiers are SDK-written copies, so an empty
+     workflow ID or a run ID left empty after the start event is text the
+     protocol carries (#1050). *)
+  List.iter
+    (fun name ->
+      match Protocol.decode_activation (fixture [ "valid"; name ^ ".json" ]) with
+      | Ok _ -> ()
+      | Error _ -> failwith (name ^ " was rejected"))
+    [
+      "activation-child-failure-empty-run-id-after-start";
+      "activation-child-failure-empty-workflow-id";
     ];
   List.iter
     (fun name ->
@@ -830,6 +841,8 @@ let test_invalid_documents () =
       "completion-terminal-not-last";
       "completion-invalid-duration";
       "completion-no-activity-timeout";
+      "completion-zero-activity-timeout";
+      "completion-duration-too-large";
       "completion-unknown-nested";
       "completion-duplicate-field";
     ]
@@ -1312,6 +1325,52 @@ let test_initialize_header_keys () =
   in
   require_error (Protocol.encode_activation { activation with jobs })
 
+(** Replaces the realistic initialization fixture's headers so payload-map
+    tests can exercise remote-controlled map sizes and keys. *)
+let initialize_with_headers headers =
+  let activation =
+    unwrap
+      (Protocol.decode_activation
+         (fixture [ "valid"; "realistic-initialize.input.json" ]))
+  in
+  match activation.jobs with
+  | Protocol.Initialize_workflow value :: rest ->
+      let context = Option.get value.context in
+      {
+        activation with
+        jobs =
+          Protocol.Initialize_workflow
+            { value with context = Some { context with headers } }
+          :: rest;
+      }
+  | _ -> failwith "fixture must start with initialization"
+
+(** Proves payload-map duplicate detection is linear (#803). A remote client
+    controls header counts, and the former quadratic scan took about ten
+    seconds of supervisor-Domain CPU for 80,000 entries. The CPU bound is
+    deliberately generous so that only the quadratic regression, not runner
+    load, can exceed it. Duplicate keys must still be rejected. *)
+let test_large_payload_map () =
+  let payload : Protocol.payload = { metadata = []; data = Bytes.empty } in
+  let count = 80_000 in
+  let headers = List.init count (fun index -> (Printf.sprintf "h%d" index, payload)) in
+  let started = Sys.time () in
+  let encoded =
+    unwrap (Protocol.encode_activation (initialize_with_headers headers))
+  in
+  let decoded = unwrap (Protocol.decode_activation encoded) in
+  let elapsed = Sys.time () -. started in
+  (match decoded.jobs with
+  | Protocol.Initialize_workflow { context = Some context; _ } :: _ ->
+      if List.length context.headers <> count then
+        failwith "large payload map lost entries"
+  | _ -> failwith "large payload map lost initialization");
+  if elapsed > 5.0 then
+    failwith (Printf.sprintf "large payload map took %.2fs of CPU" elapsed);
+  require_error
+    (Protocol.encode_activation
+       (initialize_with_headers [ ("trace", payload); ("other", payload); ("trace", payload) ]))
+
 (** Proves two server-default-sized payload byte fields, and their base64
     expansion, fit in one validated semantic document. *)
 let test_batched_default_temporal_payloads () =
@@ -1506,6 +1565,115 @@ let test_terminated_failure_info () =
       {|{"kind":"terminated","identity":"a","identity":"b"}|};
       Printf.sprintf {|{"kind":"terminated","identity":"%s"}|} (String.make 65_537 'i') ]
 
+(** Proves every failure-info kind the bridge previously rejected (server,
+    reset workflow, Nexus operation, Nexus handler, and an absent info) is a
+    closed, round-tripping variant, that malformed shapes still fail closed,
+    and that retryability is derived from the kind where it carries a
+    decision and from the nested cause otherwise. *)
+let test_extended_failure_info_kinds () =
+  let heartbeat : Protocol.payload =
+    { metadata = [ ("encoding", Bytes.of_string "binary/plain") ]; data = Bytes.of_string "1" }
+  in
+  let kinds : Protocol.failure_info list =
+    [
+      Server { non_retryable = true };
+      Reset_workflow { last_heartbeat_details = [ heartbeat ] };
+      Nexus_operation
+        {
+          scheduled_event_id = 8L;
+          endpoint = "payments";
+          service = "billing";
+          operation = "charge";
+          operation_id = "";
+          operation_token = "token-1";
+        };
+      Nexus_handler { type_name = "INTERNAL"; retry_behavior = Nexus_retry_retryable };
+      Absent;
+    ]
+  in
+  List.iter
+    (fun info ->
+      let completion : Protocol.completion =
+        {
+          run_id = "run-extended";
+          task_failure = None;
+          commands = [ Fail_workflow { failure = failure_with_info info } ];
+        }
+      in
+      let encoded = unwrap (Protocol.encode_completion completion) in
+      if unwrap (Protocol.decode_completion encoded) <> completion then
+        failwith "extended failure info did not round-trip")
+    kinds;
+  let with_info info =
+    {|{"run_id":"run","commands":[{"kind":"fail_workflow","failure":{"message":"m","source":"","stack_trace":"","encoded_attributes":null,"cause":null,"info":|}
+    ^ info ^ {|}}]}|}
+  in
+  List.iter
+    (fun info -> ignore (unwrap (Protocol.decode_completion (with_info info))))
+    [
+      {|{"kind":"server","non_retryable":false}|};
+      {|{"kind":"reset_workflow","last_heartbeat_details":[]}|};
+      {|{"kind":"nexus_operation","scheduled_event_id":1,"endpoint":"e","service":"s","operation":"o","operation_id":"","operation_token":""}|};
+      {|{"kind":"nexus_handler","type":"BAD_REQUEST","retry_behavior":"unspecified"}|};
+      {|{"kind":"absent"}|};
+    ];
+  List.iter
+    (fun info -> require_error (Protocol.decode_completion (with_info info)))
+    [
+      {|{"kind":"server"}|};
+      {|{"kind":"server","non_retryable":false,"extra":1}|};
+      {|{"kind":"absent","message":"m"}|};
+      {|{"kind":"nexus_handler","type":"X","retry_behavior":"sometimes"}|};
+      {|{"kind":"nexus_operation","scheduled_event_id":1,"endpoint":"e","service":"s","operation":"o","operation_token":""}|};
+      {|{"kind":"nexus_operation","scheduled_event_id":-1,"endpoint":"e","service":"s","operation":"o","operation_id":"","operation_token":""}|};
+      {|{"kind":"unknown_future_kind"}|};
+    ];
+  let non_retryable_application =
+    failure_with_info
+      (Application
+         {
+           type_name = "Permanent";
+           non_retryable = true;
+           details = [];
+           category = Application_category_unspecified;
+           next_retry_delay = None;
+         })
+  in
+  let over info cause = { (failure_with_info info) with cause = Some cause } in
+  let check label expected failure =
+    if Protocol.failure_non_retryable failure <> expected then
+      failwith (label ^ " retryability differed")
+  in
+  check "server non-retryable" true (failure_with_info (Server { non_retryable = true }));
+  check "server retryable" false
+    (over (Server { non_retryable = false }) non_retryable_application);
+  check "handler non-retryable" true
+    (failure_with_info
+       (Nexus_handler { type_name = "X"; retry_behavior = Nexus_retry_non_retryable }));
+  check "handler retryable" false
+    (over
+       (Nexus_handler { type_name = "X"; retry_behavior = Nexus_retry_retryable })
+       non_retryable_application);
+  (* An unspecified override follows the Nexus default for the handler type,
+     not the unrelated cause. *)
+  check "handler unspecified bad request" true
+    (failure_with_info
+       (Nexus_handler
+          { type_name = "BAD_REQUEST"; retry_behavior = Nexus_retry_unspecified }));
+  check "handler unspecified internal" false
+    (over
+       (Nexus_handler
+          { type_name = "INTERNAL"; retry_behavior = Nexus_retry_unspecified })
+       non_retryable_application);
+  check "handler unspecified unknown type" false
+    (over
+       (Nexus_handler { type_name = "X"; retry_behavior = Nexus_retry_unspecified })
+       non_retryable_application);
+  check "absent inherits" true (over Absent non_retryable_application);
+  check "absent alone" false (failure_with_info Absent);
+  check "reset inherits" true
+    (over (Reset_workflow { last_heartbeat_details = [] }) non_retryable_application)
+
 (** Runs one test with a stable name suitable for CI logs. *)
 let run name test =
   try
@@ -1538,8 +1706,138 @@ let test_child_routing_options () =
      {|"task_queue":23,|}; {|"parent_close_policy":"unknown",|};
      {|"parent_close_policy":1,|}; {|"task_queue":"a","task_queue":"b",|}]
 
+(** Decodes one activation, re-encodes it, and requires the strict decoder to
+    reproduce the same value, proving the input is representable in both
+    directions of the OCaml side of the bridge. *)
+let round_trip_activation label json =
+  let decoded = unwrap (Protocol.decode_activation json) in
+  let reencoded = unwrap (Protocol.encode_activation decoded) in
+  if unwrap (Protocol.decode_activation reencoded) <> decoded then
+    failwith (label ^ " did not round trip");
+  decoded
+
+(** Wraps activation jobs in a minimal valid activation document. *)
+let activation_with_jobs jobs =
+  Printf.sprintf
+    {|{"run_id":"run-802","timestamp":{"seconds":0,"nanoseconds":0},"is_replaying":false,"history_length":3,"jobs":[%s]}|}
+    jobs
+
+(** Renders one failure layer with an absent info kind. [message] must already
+    be a JSON string literal. *)
+let absent_failure_json ~message ~cause =
+  Printf.sprintf
+    {|{"message":%s,"source":"","stack_trace":"","encoded_attributes":null,"cause":%s,"info":{"kind":"absent"}}|}
+    message cause
+
+(** Wraps a failure JSON object in a failed [resolve_activity] job. *)
+let failed_activity_job failure =
+  Printf.sprintf
+    {|{"kind":"resolve_activity","seq":1,"result":{"kind":"failed","failure":%s}}|}
+    failure
+
+(** Rust degrades server-valid but oversized inbound activations
+    deterministically (#802) instead of rejecting them. The OCaml decoder must
+    accept exactly what Rust emits: text truncated to the shared 65,536-byte
+    limit with its marker, a cause chain capped at 100 layers ending in the
+    synthetic omitted-causes layer at the deepest activation location, and
+    signal and update identities whose NUL bytes became U+FFFD. One byte over
+    the shared limit must still be rejected, keeping both sides' limits
+    identical. *)
+let test_inbound_degraded_activation () =
+  let limit = 65_536 in
+  let marker = "\n[truncated by ocaml-temporal: original length 70000 bytes]" in
+  let truncated = String.make (limit - String.length marker) 'm' ^ marker in
+  if String.length truncated <> limit then failwith "test text has the wrong size";
+  let json_text text =
+    "\"" ^ String.concat "\\n" (String.split_on_char '\n' text) ^ "\""
+  in
+  let truncated_json =
+    activation_with_jobs
+      (failed_activity_job
+         (absent_failure_json ~message:(json_text truncated) ~cause:"null"))
+  in
+  (match (round_trip_activation "truncated text" truncated_json).jobs with
+   | [ Resolve_activity { result = Failed failure; _ } ] ->
+       check_string "truncated message" truncated failure.message
+   | _ -> failwith "truncated failure job changed shape");
+  let over_limit = "x" ^ truncated in
+  require_error
+    (Protocol.decode_activation
+       (activation_with_jobs
+          (failed_activity_job
+             (absent_failure_json ~message:(json_text over_limit) ~cause:"null"))));
+  let max_layers = 100 in
+  let synthetic =
+    absent_failure_json
+      ~message:
+        {|"[truncated by ocaml-temporal: 51 deeper failure causes omitted beyond 100 layers]"|}
+      ~cause:"null"
+  in
+  let rec chain layers inner =
+    if layers = 0 then inner
+    else chain (layers - 1) (absent_failure_json ~message:{|"layer"|} ~cause:inner)
+  in
+  let capped = chain (max_layers - 1) synthetic in
+  let continuation =
+    Printf.sprintf
+      {|{"kind":"initialize_workflow","workflow_id":"w","workflow_type":"t","arguments":[],"randomness_seed":"1","attempt":1,"context":{"headers":{},"memo":null,"search_attributes":null,"workflow_execution_expiration_time":null,"first_workflow_task_backoff":null,"identity":"","parent_workflow":null,"workflow_execution_timeout":null,"workflow_run_timeout":null,"workflow_task_timeout":null,"first_execution_run_id":"first-run","start_time":null,"root_workflow":null,"priority":null,"retry_policy":null,"continuation":{"continued_from_execution_run_id":"previous-run","initiator":"workflow","continued_failure":%s,"last_completion_result":null}}}|}
+      capped
+  in
+  let rec depth (failure : Protocol.failure) =
+    match failure.cause with None -> 1 | Some cause -> 1 + depth cause
+  in
+  (match (round_trip_activation "capped cause chain" (activation_with_jobs continuation)).jobs with
+   | [ Initialize_workflow
+         { context = Some { continuation = Some { continued_failure = Some failure; _ }; _ }; _ } ] ->
+       if depth failure <> max_layers then failwith "capped chain changed depth"
+   | _ -> failwith "capped continuation job changed shape");
+  let replacement = "\xEF\xBF\xBD" in
+  let signal =
+    Printf.sprintf
+      {|{"kind":"signal_workflow","signal_name":"order_updated","input":[],"identity":"client%sone","headers":{}}|}
+      replacement
+  in
+  (match (round_trip_activation "sanitized signal identity" (activation_with_jobs signal)).jobs with
+   | [ Signal_workflow { identity; _ } ] ->
+       check_string "signal identity" ("client" ^ replacement ^ "one") identity
+   | _ -> failwith "signal job changed shape");
+  let update =
+    Printf.sprintf
+      {|{"kind":"do_update","id":"u-1","protocol_instance_id":"p-1","name":"set","input":[],"headers":{},"meta":{"identity":"%s","update_id":"u-1"},"run_validator":true}|}
+      replacement
+  in
+  ignore (round_trip_activation "sanitized update identity" (activation_with_jobs update));
+  (* The raw NUL that Rust replaces is still rejected by the OCaml decoder. *)
+  require_error
+    (Protocol.decode_activation
+       (activation_with_jobs
+          {|{"kind":"signal_workflow","signal_name":"s","input":[],"identity":"a\u0000b","headers":{}}|}))
+
+(** Core's eviction message after a failed activation is a Debug dump of the
+    whole failure and can exceed the string limit (#814). Rust truncates it like
+    other inbound text, so the OCaml decoder must accept an eviction-only
+    activation whose message is exactly the truncated 65,536-byte form, with
+    Core's null eviction timestamp, and still reject one byte more. *)
+let test_inbound_truncated_eviction_message () =
+  let limit = 65_536 in
+  let marker = "\n[truncated by ocaml-temporal: original length 300000 bytes]" in
+  let truncated = String.make (limit - String.length marker) 'f' ^ marker in
+  if String.length truncated <> limit then failwith "test text has the wrong size";
+  let eviction message =
+    Printf.sprintf
+      {|{"run_id":"run-814","timestamp":null,"is_replaying":false,"history_length":0,"jobs":[{"kind":"remove_from_cache","message":"%s","reason":"lang_fail"}]}|}
+      (String.concat "\\n" (String.split_on_char '\n' message))
+  in
+  (match (round_trip_activation "truncated eviction" (eviction truncated)).jobs with
+   | [ Remove_from_cache { message; reason = Lang_fail } ] ->
+       check_string "truncated eviction message" truncated message
+   | _ -> failwith "truncated eviction job changed shape");
+  require_error (Protocol.decode_activation (eviction ("x" ^ truncated)))
+
 let () =
   test_child_routing_options ();
+  run "inbound degraded activation" test_inbound_degraded_activation;
+  run "inbound truncated eviction message" test_inbound_truncated_eviction_message;
   run "terminated failure info" test_terminated_failure_info;
   run "workflow activations" test_valid_activations;
   run "invalid reset seeds" test_invalid_reset_seeds;
@@ -1567,9 +1865,11 @@ let () =
   run "failure field semantics" test_failure_field_semantics;
   run "application failure options" test_application_failure_options;
   run "timeout failure info" test_timeout_failure_info;
+  run "extended failure info kinds" test_extended_failure_info_kinds;
   run "failure retryability inheritance" test_failure_retryability_inheritance;
   run "recursive failure depth" test_recursive_failure_depth;
   run "initialize header keys" test_initialize_header_keys;
+  run "large payload map" test_large_payload_map;
   run "batched default Temporal payloads" test_batched_default_temporal_payloads;
   run "required nullable fields" test_required_nullable_fields;
   run "activity retry policy" test_activity_retry_policy

@@ -30,7 +30,7 @@ let () =
   Domain.join waiter;
   assert (Atomic.get progressed);
   let runtime = unwrap (Bridge.runtime_create ()) in
-  (match Bridge.client_config ~target_url:"not a URL" ~identity:"worker" with
+  (match Bridge.client_config ~target_url:"not a URL" ~identity:"worker" () with
   | Error { status = Configuration; message } ->
       assert (String.length message > 0)
   | _ -> failwith "invalid client configuration was accepted");
@@ -89,10 +89,65 @@ let () =
          ~max_concurrent_workflow_task_polls:1
          ~graceful_shutdown_timeout_ms:1_000L ())
   in
+  (* The sender-side mirror rejects a versioned worker without a default
+     behavior; completions never carry a per-workflow behavior, so Core would
+     otherwise send UNSPECIFIED for every task (issue #817). *)
+  (match
+     Bridge.worker_config ~namespace:"temporal-sdk-test"
+       ~task_queue:"ocaml-temporal-unit" ~build_id:"agents-v3"
+       ~versioning:
+         (Bridge.Deployment_based
+            {
+              deployment_name = "agents";
+              build_id = "agents-v3";
+              use_worker_versioning = true;
+              default_versioning_behavior = None;
+            })
+       ~max_cached_workflows:0 ~max_outstanding_workflow_tasks:100
+       ~max_concurrent_workflow_task_polls:1
+       ~graceful_shutdown_timeout_ms:1_000L ()
+   with
+  | Error { status = Configuration; message } ->
+      assert
+        (String.starts_with
+           ~prefix:
+             "versioning.use_worker_versioning requires \
+              default_versioning_behavior"
+           message)
+  | _ -> failwith "versioned worker without a default behavior was accepted");
   (match Bridge.worker_start runtime deployment_worker_config with
   | Error { status = Invalid_state; message } ->
       assert (String.length message > 0)
   | _ -> failwith "deployment worker construction without a client was accepted");
+  (* A worker must poll only the task kinds it registered (#805). Reaching the
+     missing-client state, rather than a configuration error, proves Rust
+     strictly decoded each serialized task_types document. *)
+  List.iter
+    (fun (workflow_tasks, activity_tasks) ->
+      let config =
+        unwrap
+          (Bridge.worker_config ~namespace:"temporal-sdk-test"
+             ~task_queue:"ocaml-temporal-unit" ~build_id:"unit-build"
+             ~max_cached_workflows:100 ~max_outstanding_workflow_tasks:100
+             ~max_concurrent_workflow_task_polls:2
+             ~graceful_shutdown_timeout_ms:1_000L ~workflow_tasks
+             ~activity_tasks ())
+      in
+      match Bridge.worker_start runtime config with
+      | Error { status = Invalid_state; message } ->
+          assert (String.length message > 0)
+      | _ -> failwith "task-type worker construction without a client was accepted")
+    [ (true, false); (false, true) ];
+  (match
+     Bridge.worker_config ~namespace:"temporal-sdk-test"
+       ~task_queue:"ocaml-temporal-unit" ~build_id:"unit-build"
+       ~max_cached_workflows:100 ~max_outstanding_workflow_tasks:100
+       ~max_concurrent_workflow_task_polls:2 ~graceful_shutdown_timeout_ms:1_000L
+       ~workflow_tasks:false ~activity_tasks:false ()
+   with
+  | Error { status = Configuration; message } ->
+      assert (message = "task_types must enable workflows or activities")
+  | _ -> failwith "worker configuration without task types was accepted");
   (match Bridge.worker_try_poll_workflow runtime with
   | Error { status = Invalid_state; message } ->
       assert (String.length message > 0)
@@ -109,6 +164,59 @@ let () =
   | Error { status = Invalid_state; message } ->
       assert (String.length message > 0)
   | _ -> failwith "activity readiness wait without a worker was accepted");
+  (match Bridge.worker_wait_any runtime with
+  | Error { status = Invalid_state; message } ->
+      assert (String.length message > 0)
+  | _ -> failwith "combined readiness wait without a worker was accepted");
+  (* A submitted client call (#807) validates its document, then needs a
+     connected client; neither failure registers a call. *)
+  (match Bridge.client_submit_json runtime Bridge.Call_wait Bytes.empty with
+  | Error { status = Protocol; message } -> assert (String.length message > 0)
+  | _ -> failwith "malformed submitted wait was accepted");
+  (match
+     Bridge.client_submit_json runtime Bridge.Call_signal
+       (Bytes.of_string
+          {|{"namespace":"default","workflow_id":"w","run_id":"r","signal_name":"s","request_id":"q","input":[]}|})
+   with
+  | Error { status = Invalid_state; message } -> assert (String.length message > 0)
+  | _ -> failwith "submitted signal without a client was accepted");
+  (* Handles are "<owner>.<call>" with both parts positive. Awaiting a
+     well-formed handle Rust never issued, for any owner, reports the closed
+     state at once rather than waiting or exposing another owner's call. *)
+  List.iter
+    (fun text ->
+      if Bridge.parse_client_call text <> None then
+        failwith ("malformed call handle accepted: " ^ text))
+    [
+      "";
+      "7";
+      "0.1";
+      "1.0";
+      "-1.2";
+      "1.2.3";
+      "a.b";
+      (* Non-decimal spellings int_of_string_opt would accept (#506). *)
+      "+1.2";
+      "0x1.2";
+      "1.0b1";
+      "0o7.1";
+      "0u5.1";
+      "1_0.2";
+      "1. 2";
+    ];
+  List.iter
+    (fun text ->
+      match Bridge.parse_client_call text with
+      | None -> failwith ("well-formed call handle rejected: " ^ text)
+      | Some handle -> (
+          match Bridge.client_await_call handle ~timeout_ms:60_000 with
+          | Error { status = Invalid_state; _ } -> (
+              (* Releasing a call that is not registered is a no-op. *)
+              match Bridge.client_release_call handle with
+              | Ok () -> ()
+              | Error _ -> failwith "releasing an unissued call handle failed")
+          | _ -> failwith "an unissued call handle was not reported closed"))
+    [ "1.4611686018427387903"; "4611686018427387903.1" ];
   (match Bridge.worker_complete_workflow_json runtime Bytes.empty with
   | Error { status = Protocol; message } ->
       assert (String.length message > 0)

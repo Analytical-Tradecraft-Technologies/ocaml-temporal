@@ -6,22 +6,41 @@ services:
       context: ../../..
       dockerfile: Dockerfile.dev
       args:
-        OCAML_IMAGE: ${OCAML_IMAGE:-ocaml/opam:debian-12-ocaml-5.2}
+        # The digest-pinned ocaml/opam reference that the Makefile and the
+        # live-test scripts resolve from docker/ocaml-<series>/Dockerfile with
+        # scripts/ocaml-image.sh. It is empty only for commands that never
+        # build (logs, config, down); a build without it fails in
+        # Dockerfile.dev rather than using an unpinned image.
+        OCAML_IMAGE: ${OCAML_IMAGE:-}
     working_dir: /workspace
     environment:
       # All worker/driver services extend dev, including isolated Dune trees.
       TEMPORAL_RUST_BRIDGE_DIR: ${TEMPORAL_RUST_BRIDGE_DIR:-}
       TEMPORAL_RUST_BRIDGE_KEY: ${TEMPORAL_RUST_BRIDGE_KEY:-}
       TEMPORAL_PREBUILT_SMOKE: ${TEMPORAL_PREBUILT_SMOKE:-0}
+      # Dune's job limit (#851), which the Makefile exports only when it is
+      # non-empty. With no value here Compose copies it from the caller's
+      # environment and leaves it unset otherwise, because Dune rejects an
+      # empty DUNE_JOBS.
+      DUNE_JOBS:
     volumes:
       - ../../..:/workspace
     init: true
     networks:
       - temporal-network
 
+  # `make docs` runs here: the development image plus the exact CI-only odoc
+  # closure from scripts/docs-tools.locked. The profile keeps it out of every
+  # stack that does not name it explicitly.
+  docs:
+    extends: dev
+    profiles: [docs]
+    build:
+      target: docs
+
   postgresql:
     profiles: [temporal]
-    image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
+    image: postgres:18.6-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c
     environment:
       POSTGRES_USER: temporal
       POSTGRES_PASSWORD: temporal
@@ -514,6 +533,35 @@ services:
       - /workspace/scripts/run-temporal-executable.sh
       - --build-dir=/workspace/_build/parent-child-restart-driver
       - test/integration/temporal/driver/parent_child_restart_driver.exe
+    init: true
+
+  # Official-SDK side of the sdk_interop live regression (#517). It reuses the
+  # digest-pinned Python image already used by the CI license audit, so the
+  # OCaml development image never gains Python. run-driver.sh installs only
+  # the hash-locked official Temporal Python SDK closure into a throwaway
+  # virtual environment; run-live-regressions.sh starts this one-shot service
+  # while the OCaml regression process hosts the workflow worker.
+  sdk-interop-python:
+    profiles: [temporal]
+    image: python:3.15-slim-bookworm@sha256:122756f3fe72c4f5d3d71897888204ee85774bc79de952555b8a474e1d0a5d53
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      HOME: /tmp
+      TEMPORAL_ADDRESS: temporal:7233
+      SDK_INTEROP_EVIDENCE_DIR: /workspace/_build/live-regressions/sdk_interop
+      OCAML_SDK_VERSION: "${OCAML_SDK_VERSION:-}"
+    volumes:
+      - ../../..:/workspace
+    working_dir: /tmp
+    networks:
+      - temporal-network
+    command:
+      - timeout
+      - --signal=TERM
+      - --kill-after=10s
+      - "${SDK_INTEROP_TIMEOUT_SECONDS:-170}"
+      - sh
+      - /workspace/test/integration/sdk_interop/python/run-driver.sh
     init: true
 
 networks:

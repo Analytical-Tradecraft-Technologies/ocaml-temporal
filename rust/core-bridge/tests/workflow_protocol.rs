@@ -116,6 +116,7 @@ fn accepts_and_normalizes_workflow_activations() {
         "child-cancellation-before-start",
         "patch-activation",
         "reset-activation",
+        "extended-failure-info",
     ] {
         let input = fixture(&["valid", &format!("{name}.input.json")]);
         let expected = fixture(&["valid", &format!("{name}.normalized.json")]);
@@ -418,6 +419,7 @@ fn rejects_invalid_patch_marker_documents() {
                     core_completion::Success {
                         commands: vec![core_commands::WorkflowCommand {
                             user_metadata: None,
+                            event_group_markers: Vec::new(),
                             variant: Some(
                                 core_commands::workflow_command::Variant::SetPatchMarker(
                                     core_commands::SetPatchMarker {
@@ -432,6 +434,8 @@ fn rejects_invalid_patch_marker_documents() {
                     },
                 ),
             ),
+            payload_download_metrics: None,
+            payload_upload_metrics: None,
         };
         assert_eq!(
             workflow_protocol::completion_from_core(&core_completion)
@@ -1043,18 +1047,28 @@ fn rejects_malformed_workflow_documents() {
         "activation-child-start-invalid-cause",
         "activation-child-terminal-missing-payload",
         "activation-child-terminal-missing-failure-info",
-        "activation-child-failure-empty-run-id-after-start",
-        "activation-child-failure-empty-workflow-id",
         "activation-child-failure-negative-event-id",
         "activation-child-unknown-terminal-kind",
     ] {
         require_invalid_activation(name);
+    }
+    // Child-failure wrapper identifiers are SDK-written copies, so an empty
+    // workflow ID or a run ID left empty after the start event is text the
+    // protocol carries, not a malformed document (#1050).
+    for name in [
+        "activation-child-failure-empty-run-id-after-start",
+        "activation-child-failure-empty-workflow-id",
+    ] {
+        workflow_protocol::decode_activation(&fixture(&["valid", &format!("{name}.json")]))
+            .unwrap_or_else(|error| panic!("{name} was rejected: {error:?}"));
     }
     for name in [
         "completion-unknown-command",
         "completion-terminal-not-last",
         "completion-invalid-duration",
         "completion-no-activity-timeout",
+        "completion-zero-activity-timeout",
+        "completion-duration-too-large",
         "completion-unknown-nested",
         "completion-duplicate-field",
     ] {
@@ -1126,13 +1140,51 @@ fn converts_pinned_core_values_losslessly() {
         workflow_protocol::ContinueAsNewInitiator::Workflow
     );
 
+    // A peer codec may write an empty metadata key, and a peer SDK using
+    // external storage fills `external_payloads`. Neither can be named by
+    // OCaml code, so both are dropped while the payload itself is kept
+    // (#1050); an over-long key is still outside the protocol limits.
+    let mut peer_payload_activation = activation.clone();
+    peer_payload_activation.jobs[0].variant = Some(Variant::InitializeWorkflow(
+        core_activation::InitializeWorkflow {
+            workflow_type: "workflow".to_owned(),
+            workflow_id: "workflow-1".to_owned(),
+            arguments: vec![temporalio_protos::temporal::api::common::v1::Payload {
+                metadata: [
+                    (String::new(), b"dropped".to_vec()),
+                    ("encoding".to_owned(), b"binary/plain".to_vec()),
+                ]
+                .into(),
+                data: b"body".to_vec(),
+                external_payloads: vec![Default::default()],
+            }],
+            randomness_seed: 1,
+            first_execution_run_id: "first-run".to_owned(),
+            attempt: 1,
+            ..Default::default()
+        },
+    ));
+    let peer_payload = workflow_protocol::activation_from_core(&peer_payload_activation)
+        .expect("peer-written payload details must not reject the activation");
+    let Some(workflow_protocol::ActivationJob::InitializeWorkflow { arguments, .. }) =
+        peer_payload.jobs.first()
+    else {
+        panic!("initialization job was not retained");
+    };
+    assert_eq!(arguments.len(), 1);
+    assert_eq!(
+        arguments[0].metadata.keys().collect::<Vec<_>>(),
+        vec!["encoding"]
+    );
+    assert_eq!(arguments[0].data, b"body".to_vec());
+
     let mut malformed_payload_activation = activation;
     malformed_payload_activation.jobs[0].variant = Some(Variant::InitializeWorkflow(
         core_activation::InitializeWorkflow {
             workflow_type: "workflow".to_owned(),
             workflow_id: "workflow-1".to_owned(),
             arguments: vec![temporalio_protos::temporal::api::common::v1::Payload {
-                metadata: [(String::new(), Vec::new())].into(),
+                metadata: [("k".repeat(65_537), Vec::new())].into(),
                 ..Default::default()
             }],
             randomness_seed: 1,
@@ -1313,14 +1365,25 @@ fn validates_start_metadata_without_continuation_bypass() {
                 workflow_protocol::CoreConversionErrorCode::Unsupported
             );
         }
-        for field in ["memo", "search_attributes", "expiration"] {
+        // A memo key the protocol cannot carry is client-supplied and
+        // server-valid, so it is dropped rather than rejected (#802); the
+        // entry must not survive, and the memo itself stays present.
+        let mut init = baseline.clone();
+        init.memo = Some(Memo {
+            fields: [(String::new(), Default::default())].into(),
+        });
+        let semantic =
+            workflow_protocol::activation_from_core(&start_metadata_activation(init)).unwrap();
+        assert!(matches!(
+            semantic.jobs.as_slice(),
+            [workflow_protocol::ActivationJob::InitializeWorkflow {
+                context: Some(context),
+                ..
+            }] if context.memo.as_ref().is_some_and(|memo| memo.is_empty())
+        ));
+        for field in ["search_attributes", "expiration"] {
             let mut init = baseline.clone();
             match field {
-                "memo" => {
-                    init.memo = Some(Memo {
-                        fields: [(String::new(), Default::default())].into(),
-                    })
-                }
                 "search_attributes" => {
                     init.search_attributes = Some(SearchAttributes {
                         indexed_fields: [(String::new(), Default::default())].into(),
@@ -1356,7 +1419,9 @@ fn preserves_server_continuation_backoff() {
                 init.continued_initiator = initiator;
             }
             let result = workflow_protocol::activation_from_core(&start_metadata_activation(init));
-            if ((initiator == 0 && nanos == 0) || matches!(initiator, 1 | 2))
+            // An unknown future initiator (99) reads as unspecified (#1017),
+            // so it is admitted exactly like a root start: only without delay.
+            if ((matches!(initiator, 0 | 99) && nanos == 0) || matches!(initiator, 1 | 2))
                 && (0..1_000_000_000).contains(&nanos)
             {
                 let activation = result.unwrap();
@@ -1410,6 +1475,7 @@ fn converts_signal_workflow_activation_losslessly() {
                 input: vec![payload.clone()],
                 identity: "séndér".to_owned(),
                 headers: [("trace".to_owned(), payload)].into(),
+                originating_event_id: 0,
             })),
         }],
         ..Default::default()
@@ -1444,8 +1510,11 @@ fn converts_signal_workflow_activation_losslessly() {
 /// Proves a sender identity cannot smuggle an embedded NUL through the
 /// semantic encoder. Rust strings are UTF-8 by construction, so the bilateral
 /// UTF-8 invariant is represented by accepting a non-ASCII identity in the
-/// normal round-trip above while this test covers the byte-level rejection
-/// that Rust can observe directly.
+/// normal round-trip above while this test covers the byte-level rule that
+/// Rust can observe directly. A server-valid Core identity containing NUL is
+/// not rejected (that would wedge the workflow on every replay); conversion
+/// replaces the NUL with U+FFFD instead, while a semantic document carrying
+/// NUL is still rejected by the strict encoder.
 #[test]
 fn rejects_signal_identity_with_nul() {
     use core_activation::workflow_activation_job::Variant;
@@ -1459,17 +1528,19 @@ fn rejects_signal_identity_with_nul() {
                 input: Vec::new(),
                 identity: "sender\0".to_owned(),
                 headers: Default::default(),
+                originating_event_id: 0,
             })),
         }],
         ..Default::default()
     };
 
-    let error = workflow_protocol::activation_from_core(&activation)
-        .expect_err("NUL-containing signal identity was accepted");
-    assert_eq!(
-        error.code,
-        workflow_protocol::CoreConversionErrorCode::InvalidCore
-    );
+    let converted = workflow_protocol::activation_from_core(&activation)
+        .expect("server-valid NUL identity must not reject the activation");
+    assert!(matches!(
+        converted.jobs.as_slice(),
+        [workflow_protocol::ActivationJob::SignalWorkflow { identity, .. }]
+            if identity == "sender\u{FFFD}"
+    ));
 
     let semantic = workflow_protocol::Activation {
         run_id: "run-signal-invalid".to_owned(),
@@ -2143,13 +2214,28 @@ fn preserves_realistic_first_workflow_activation() {
         workflow_protocol::CoreConversionErrorCode::Unsupported
     );
 
+    // Core copies the raw reason numbers into every later activation, so an
+    // unknown reason (the reserved 4 from older servers, or a future one)
+    // must not reject them; it reads as unspecified and the suggestion
+    // itself survives (#1017).
     let mut unknown_suggestion = core;
-    unknown_suggestion.suggest_continue_as_new_reasons = vec![999];
+    unknown_suggestion.suggest_continue_as_new_reasons = vec![1, 4, 999];
+    let semantic = workflow_protocol::activation_from_core(&unknown_suggestion)
+        .expect("unknown suggestion reasons must not reject the activation");
+    let metadata = semantic.metadata.as_ref().unwrap();
+    assert!(metadata.continue_as_new_suggested);
     assert_eq!(
-        workflow_protocol::activation_from_core(&unknown_suggestion)
-            .unwrap_err()
-            .code,
-        workflow_protocol::CoreConversionErrorCode::InvalidCore
+        metadata.suggest_continue_as_new_reasons,
+        vec![
+            workflow_protocol::SuggestContinueAsNewReason::HistorySizeTooLarge,
+            workflow_protocol::SuggestContinueAsNewReason::Unspecified,
+            workflow_protocol::SuggestContinueAsNewReason::Unspecified,
+        ]
+    );
+    let json = workflow_protocol::encode_activation(&semantic).unwrap();
+    assert_eq!(
+        workflow_protocol::decode_activation(&json).unwrap(),
+        semantic
     );
 
     // Keep the imported pinned enum exercised so an upstream name drift is a
@@ -2470,8 +2556,9 @@ fn converts_child_workflow_resolution_lifecycle() {
 
 /// Core application options must survive the complete failure tree and the
 /// private JSON boundary for both activity and child resolutions. Default
-/// values retain the historical JSON shape; future category numbers fail the
-/// individual activation instead of being silently reclassified.
+/// values retain the historical JSON shape; a future category number reads as
+/// unspecified and a negative retry delay as no override, so neither rejects
+/// an immutable history (#1017, #1049).
 #[test]
 fn converts_application_failure_options_in_activity_and_child_causes() {
     use core_activation::workflow_activation_job::Variant;
@@ -2517,6 +2604,7 @@ fn converts_application_failure_options_in_activity_and_child_causes() {
                         status: Some(activity_result::activity_resolution::Status::Failed(
                             activity_result::Failure {
                                 failure: Some(failure),
+                                cause: 0,
                             },
                         )),
                     }),
@@ -2676,18 +2764,65 @@ fn converts_application_failure_options_in_activity_and_child_causes() {
         outbound
     );
 
-    let unsupported = activity(wrapped_activity(application(99, None)));
-    assert_eq!(
-        workflow_protocol::activation_from_core(&unsupported)
-            .unwrap_err()
-            .code,
-        workflow_protocol::CoreConversionErrorCode::InvalidCore
-    );
+    // Go's category is a plain integer, so another SDK can send a number the
+    // pinned schema lacks; it reads as unspecified instead of rejecting the
+    // activation (#1017).
+    let unknown_category = activity(wrapped_activity(application(99, None)));
+    let semantic = workflow_protocol::activation_from_core(&unknown_category)
+        .expect("an unknown category must not reject the activation");
+    let workflow_protocol::ActivationJob::ResolveActivity {
+        result: workflow_protocol::ActivityResolution::Failed { failure },
+        ..
+    } = &semantic.jobs[0]
+    else {
+        panic!("expected failed activity");
+    };
+    assert!(matches!(
+        &failure.cause.as_ref().unwrap().info,
+        workflow_protocol::FailureInfo::Application {
+            category: workflow_protocol::ApplicationFailureCategory::Unspecified,
+            ..
+        }
+    ));
+
+    // The Go SDK sends a negative delay when `time.Until(retryAt)` has already
+    // passed, and the server records it (#1049). It requests no positive
+    // wait, so it is carried as "no override" for whole and fractional
+    // negative values alike, and the activation is delivered.
+    for (seconds, nanos) in [(-1, 0), (0, -1), (-3, -500_000_000)] {
+        let negative_delay = activity(wrapped_activity(application(
+            api_enums::ApplicationErrorCategory::Benign as i32,
+            Some(prost_wkt_types::Duration { seconds, nanos }),
+        )));
+        let semantic = workflow_protocol::activation_from_core(&negative_delay)
+            .expect("a negative next_retry_delay must not reject the activation");
+        let workflow_protocol::ActivationJob::ResolveActivity {
+            result: workflow_protocol::ActivityResolution::Failed { failure },
+            ..
+        } = &semantic.jobs[0]
+        else {
+            panic!("expected failed activity");
+        };
+        assert!(matches!(
+            &failure.cause.as_ref().unwrap().info,
+            workflow_protocol::FailureInfo::Application {
+                category: workflow_protocol::ApplicationFailureCategory::Benign,
+                next_retry_delay: None,
+                ..
+            }
+        ));
+        let encoded = workflow_protocol::encode_activation(&semantic).unwrap();
+        assert_eq!(
+            workflow_protocol::decode_activation(&encoded).unwrap(),
+            semantic
+        );
+    }
+    // A non-normalized delay is still malformed Core data.
     let invalid_delay = activity(wrapped_activity(application(
         api_enums::ApplicationErrorCategory::Benign as i32,
         Some(prost_wkt_types::Duration {
-            seconds: -1,
-            nanos: 0,
+            seconds: 1,
+            nanos: 1_000_000_000,
         }),
     )));
     assert_eq!(
@@ -2739,6 +2874,7 @@ fn converts_timeout_failure_info_losslessly() {
                         status: Some(activity_result::activity_resolution::Status::Failed(
                             activity_result::Failure {
                                 failure: Some(failure),
+                                cause: 0,
                             },
                         )),
                     }),
@@ -2889,13 +3025,25 @@ fn converts_timeout_failure_info_losslessly() {
         empty_completion
     );
 
+    // A timeout kind from a newer protobuf revision names no known kind; it
+    // is delivered as unspecified rather than rejecting history (#1017).
     let unknown = activation_for(timeout_failure(99, None));
-    assert_eq!(
-        workflow_protocol::activation_from_core(&unknown)
-            .unwrap_err()
-            .code,
-        workflow_protocol::CoreConversionErrorCode::InvalidCore
-    );
+    let semantic = workflow_protocol::activation_from_core(&unknown)
+        .expect("an unknown timeout type must not reject the activation");
+    let workflow_protocol::ActivationJob::ResolveActivity {
+        result: workflow_protocol::ActivityResolution::Failed { failure },
+        ..
+    } = &semantic.jobs[0]
+    else {
+        panic!("expected failed activity");
+    };
+    assert!(matches!(
+        failure.info,
+        workflow_protocol::FailureInfo::Timeout {
+            timeout_type: workflow_protocol::TimeoutType::Unspecified,
+            ..
+        }
+    ));
 }
 
 /// Converts Core's local-activity DoBackoff result and rejects the same result
@@ -3058,11 +3206,15 @@ fn accepts_core_child_cancellation_before_start_without_fabricating_run_id() {
         semantic
     );
 
-    // An empty run ID after the child-start event would be ambiguous and must
-    // remain a protocol error rather than being accepted as another Core
-    // cancellation shape.
-    let mut invalid = activation;
-    let Some(Variant::ResolveChildWorkflowExecutionStart(start)) = invalid.jobs[0].variant.as_mut()
+    // Child-failure wrapper fields are copies written by an SDK, possibly in
+    // another language, not server identifiers (#1050). The Java SDK reports a
+    // child cancelled before its start command with namespace "", and a
+    // wrapper may omit the execution or type entirely, or carry an empty run
+    // ID after a start event. Each is delivered as text instead of wedging
+    // the parent.
+    let mut sdk_written = activation;
+    let Some(Variant::ResolveChildWorkflowExecutionStart(start)) =
+        sdk_written.jobs[0].variant.as_mut()
     else {
         panic!("cancellation activation must contain a start resolution");
     };
@@ -3076,25 +3228,41 @@ fn accepts_core_child_cancellation_before_start_without_fabricating_run_id() {
         .failure_info = Some(
         api_failure::failure::FailureInfo::ChildWorkflowExecutionFailureInfo(
             api_failure::ChildWorkflowExecutionFailureInfo {
-                namespace: "default".to_owned(),
-                workflow_execution: Some(api_common::WorkflowExecution {
-                    workflow_id: "child-id-1".to_owned(),
-                    run_id: String::new(),
-                }),
-                workflow_type: Some(api_common::WorkflowType {
-                    name: "child".to_owned(),
-                }),
+                namespace: String::new(),
+                workflow_execution: None,
+                workflow_type: None,
                 initiated_event_id: 2,
                 started_event_id: 7,
                 retry_state: api_enums::RetryState::NonRetryableFailure as i32,
             },
         ),
     );
+    let semantic = workflow_protocol::activation_from_core(&sdk_written)
+        .expect("SDK-written child wrapper fields must not reject the activation");
+    match &semantic.jobs[0] {
+        workflow_protocol::ActivationJob::ResolveChildWorkflowStart {
+            result: workflow_protocol::ChildWorkflowStartResolution::Cancelled { failure },
+            ..
+        } => assert!(matches!(
+            &failure.info,
+            workflow_protocol::FailureInfo::ChildWorkflow {
+                namespace,
+                workflow_id,
+                run_id,
+                workflow_type,
+                started_event_id: 7,
+                ..
+            } if namespace.is_empty()
+                && workflow_id.is_empty()
+                && run_id.is_empty()
+                && workflow_type.is_empty()
+        )),
+        job => panic!("unexpected child cancellation job: {job:?}"),
+    }
+    let encoded = workflow_protocol::encode_activation(&semantic).unwrap();
     assert_eq!(
-        workflow_protocol::activation_from_core(&invalid)
-            .unwrap_err()
-            .code,
-        workflow_protocol::CoreConversionErrorCode::InvalidCore
+        workflow_protocol::decode_activation(&encoded).unwrap(),
+        semantic
     );
 
     // Core can also report the same pre-start cancellation through the
@@ -3190,6 +3358,7 @@ fn enforces_core_absence_and_eviction_invariants() {
 
     let absent_command = core_commands::WorkflowCommand {
         user_metadata: None,
+        event_group_markers: Vec::new(),
         variant: None,
     };
     let core = core_completion::WorkflowActivationCompletion {
@@ -3203,6 +3372,8 @@ fn enforces_core_absence_and_eviction_invariants() {
                 },
             ),
         ),
+        payload_download_metrics: None,
+        payload_upload_metrics: None,
     };
     assert_eq!(
         workflow_protocol::completion_from_core(&core)
@@ -3640,6 +3811,49 @@ fn rejects_omitted_required_nullable_fields() {
     );
 }
 
+/// External-storage metrics (Core 1.x) belong to the whole completion, so
+/// the strict reverse conversion rejects them on a failed task as well as on
+/// a successful one instead of dropping them on the failure path.
+#[test]
+fn external_storage_metrics_are_rejected_for_both_completion_statuses() {
+    let failed = workflow_protocol::completion_to_core(
+        &workflow_protocol::decode_completion(&fixture(&["valid", "task-failure.input.json"]))
+            .unwrap(),
+    )
+    .unwrap();
+    let successful = core_completion::WorkflowActivationCompletion {
+        run_id: "run-metrics".to_owned(),
+        status: Some(
+            core_completion::workflow_activation_completion::Status::Successful(
+                core_completion::Success::default(),
+            ),
+        ),
+        payload_download_metrics: None,
+        payload_upload_metrics: None,
+    };
+    for base in [failed, successful] {
+        assert!(workflow_protocol::completion_from_core(&base).is_ok());
+        for upload in [false, true] {
+            let mut core = base.clone();
+            let metrics = Some(core_common::ExternalStorageMetrics {
+                payload_count: 1,
+                ..Default::default()
+            });
+            if upload {
+                core.payload_upload_metrics = metrics;
+            } else {
+                core.payload_download_metrics = metrics;
+            }
+            assert_eq!(
+                workflow_protocol::completion_from_core(&core)
+                    .unwrap_err()
+                    .code,
+                workflow_protocol::CoreConversionErrorCode::Unsupported
+            );
+        }
+    }
+}
+
 /// The bilateral fixture represents Core's failed status, never a successful
 /// FailWorkflowExecution command. A poisoned activation cannot leak commands,
 /// and query/eviction leases retain their operation-specific acknowledgements.
@@ -3784,4 +3998,461 @@ fn child_options_are_closed_and_validated() {
             "accepted {field}"
         );
     }
+}
+
+/// Builds one Core activity-failure activation whose cause carries
+/// `cause_info`. Wrapping the kind under test in an activity failure
+/// reproduces the reported scenario (for example, a server-generated failure
+/// for an oversized activity result) where the nested cause, not the outer
+/// wrapper, used to make the entire activation unrepresentable.
+fn activity_failure_activation_with_cause(
+    cause_info: Option<temporalio_protos::temporal::api::failure::v1::failure::FailureInfo>,
+) -> (
+    core_activation::WorkflowActivation,
+    temporalio_protos::temporal::api::failure::v1::Failure,
+) {
+    use core_activation::workflow_activation_job::Variant;
+    use temporalio_protos::coresdk::{activity_result, workflow_activation};
+    use temporalio_protos::temporal::api::{common::v1 as api_common, failure::v1 as api_failure};
+
+    let failure = api_failure::Failure {
+        message: "activity failed".to_owned(),
+        source: String::new(),
+        stack_trace: String::new(),
+        encoded_attributes: None,
+        cause: Some(Box::new(api_failure::Failure {
+            message: "cause under test".to_owned(),
+            source: "server".to_owned(),
+            stack_trace: "frame".to_owned(),
+            encoded_attributes: None,
+            cause: None,
+            failure_info: cause_info,
+        })),
+        failure_info: Some(api_failure::failure::FailureInfo::ActivityFailureInfo(
+            api_failure::ActivityFailureInfo {
+                scheduled_event_id: 5,
+                started_event_id: 6,
+                identity: "worker".to_owned(),
+                activity_type: Some(api_common::ActivityType {
+                    name: "upload".to_owned(),
+                }),
+                activity_id: "1".to_owned(),
+                retry_state: 2,
+            },
+        )),
+    };
+    let activation = core_activation::WorkflowActivation {
+        run_id: "run".to_owned(),
+        timestamp: Some(prost_wkt_types::Timestamp::default()),
+        jobs: vec![core_activation::WorkflowActivationJob {
+            variant: Some(Variant::ResolveActivity(
+                workflow_activation::ResolveActivity {
+                    seq: 1,
+                    result: Some(activity_result::ActivityResolution {
+                        status: Some(activity_result::activity_resolution::Status::Failed(
+                            activity_result::Failure {
+                                failure: Some(failure.clone()),
+                                cause: 0,
+                            },
+                        )),
+                    }),
+                    is_local: false,
+                },
+            )),
+        }],
+        ..Default::default()
+    };
+    (activation, failure)
+}
+
+/// Every `failure_info` arm of the pinned Core schema that the bridge used to
+/// reject, and an absent `failure_info`, must convert into a typed semantic
+/// failure instead of rejecting the activation. Each case also proves the
+/// JSON round trip and that a `FailWorkflow` command carrying the converted
+/// failure reproduces the original Core protobuf exactly.
+#[test]
+fn converts_every_core_failure_info_kind_losslessly() {
+    use temporalio_protos::temporal::api::{
+        common::v1 as api_common, enums::v1 as api_enums, failure::v1 as api_failure,
+    };
+    use workflow_protocol::{FailureInfo, NexusHandlerRetryBehavior, NexusOperationFailure};
+    type Core = api_failure::failure::FailureInfo;
+
+    #[allow(deprecated)]
+    let nexus_operation = api_failure::NexusOperationFailureInfo {
+        scheduled_event_id: 9,
+        endpoint: "endpoint".to_owned(),
+        service: "service".to_owned(),
+        operation: "operation".to_owned(),
+        operation_id: "legacy-id".to_owned(),
+        operation_token: String::new(),
+    };
+    let heartbeat = workflow_protocol::Payload {
+        metadata: [("encoding".to_owned(), b"binary/plain".to_vec())].into(),
+        data: b"progress".to_vec(),
+    };
+    let cases: Vec<(Option<Core>, FailureInfo)> = vec![
+        (
+            Some(Core::ServerFailureInfo(api_failure::ServerFailureInfo {
+                non_retryable: true,
+            })),
+            FailureInfo::Server {
+                non_retryable: true,
+            },
+        ),
+        (
+            Some(Core::ResetWorkflowFailureInfo(
+                api_failure::ResetWorkflowFailureInfo {
+                    last_heartbeat_details: Some(api_common::Payloads {
+                        payloads: vec![api_common::Payload {
+                            metadata: heartbeat.metadata.clone().into_iter().collect(),
+                            data: heartbeat.data.clone(),
+                            external_payloads: Vec::new(),
+                        }],
+                    }),
+                },
+            )),
+            FailureInfo::ResetWorkflow {
+                last_heartbeat_details: vec![heartbeat.clone()],
+            },
+        ),
+        (
+            Some(Core::ResetWorkflowFailureInfo(
+                api_failure::ResetWorkflowFailureInfo {
+                    last_heartbeat_details: None,
+                },
+            )),
+            FailureInfo::ResetWorkflow {
+                last_heartbeat_details: Vec::new(),
+            },
+        ),
+        (
+            Some(Core::NexusOperationExecutionFailureInfo(nexus_operation)),
+            FailureInfo::NexusOperation(Box::new(NexusOperationFailure {
+                scheduled_event_id: 9,
+                endpoint: "endpoint".to_owned(),
+                service: "service".to_owned(),
+                operation: "operation".to_owned(),
+                operation_id: "legacy-id".to_owned(),
+                operation_token: String::new(),
+            })),
+        ),
+        (
+            Some(Core::NexusHandlerFailureInfo(
+                api_failure::NexusHandlerFailureInfo {
+                    r#type: "INTERNAL".to_owned(),
+                    retry_behavior: api_enums::NexusHandlerErrorRetryBehavior::NonRetryable as i32,
+                },
+            )),
+            FailureInfo::NexusHandler {
+                type_name: "INTERNAL".to_owned(),
+                retry_behavior: NexusHandlerRetryBehavior::NonRetryable,
+            },
+        ),
+        (None, FailureInfo::Absent {}),
+    ];
+
+    for (core_info, expected) in cases {
+        let (activation, core_failure) = activity_failure_activation_with_cause(core_info);
+        let semantic = workflow_protocol::activation_from_core(&activation)
+            .unwrap_or_else(|error| panic!("{expected:?} rejected the activation: {error:?}"));
+        let failure = match &semantic.jobs[0] {
+            workflow_protocol::ActivationJob::ResolveActivity {
+                result: workflow_protocol::ActivityResolution::Failed { failure },
+                ..
+            } => failure.clone(),
+            job => panic!("unexpected activity job: {job:?}"),
+        };
+        let cause = failure.cause.as_deref().expect("cause must be preserved");
+        assert_eq!(cause.info, expected);
+        assert_eq!(cause.message, "cause under test");
+        assert_eq!(cause.stack_trace, "frame");
+
+        let encoded = workflow_protocol::encode_activation(&semantic).unwrap();
+        assert_eq!(
+            workflow_protocol::decode_activation(&encoded).unwrap(),
+            semantic
+        );
+
+        let completion = workflow_protocol::Completion {
+            task_failure: None,
+            run_id: "run".to_owned(),
+            commands: vec![workflow_protocol::CompletionCommand::FailWorkflow { failure }],
+        };
+        let core = workflow_protocol::completion_to_core(&completion).unwrap();
+        let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+            core.status.as_ref()
+        else {
+            panic!("fail-workflow completion must be successful");
+        };
+        let Some(core_commands::workflow_command::Variant::FailWorkflowExecution(command)) =
+            success.commands[0].variant.as_ref()
+        else {
+            panic!("completion must map to Core's fail command");
+        };
+        assert_eq!(command.failure.as_ref(), Some(&core_failure));
+    }
+}
+
+/// A future Nexus retry-behavior number reads as unspecified ("no override")
+/// like every other advisory Core enum inside a failure (#1017), and the
+/// semantic validators accept the new closed JSON shapes while rejecting
+/// malformed ones and Nexus values that could not be represented on both
+/// sides of the JSON boundary.
+#[test]
+fn validates_extended_failure_info_kinds() {
+    use temporalio_protos::temporal::api::failure::v1 as api_failure;
+
+    let (unknown, _) = activity_failure_activation_with_cause(Some(
+        api_failure::failure::FailureInfo::NexusHandlerFailureInfo(
+            api_failure::NexusHandlerFailureInfo {
+                r#type: "INTERNAL".to_owned(),
+                retry_behavior: 99,
+            },
+        ),
+    ));
+    let semantic = workflow_protocol::activation_from_core(&unknown)
+        .expect("an unknown Nexus retry behavior must not reject the activation");
+    let workflow_protocol::ActivationJob::ResolveActivity {
+        result: workflow_protocol::ActivityResolution::Failed { failure },
+        ..
+    } = &semantic.jobs[0]
+    else {
+        panic!("expected failed activity");
+    };
+    assert!(matches!(
+        &failure.cause.as_ref().unwrap().info,
+        workflow_protocol::FailureInfo::NexusHandler {
+            retry_behavior: workflow_protocol::NexusHandlerRetryBehavior::Unspecified,
+            ..
+        }
+    ));
+
+    let nexus = |scheduled_event_id: i64, endpoint: &str| workflow_protocol::Completion {
+        task_failure: None,
+        run_id: "run".to_owned(),
+        commands: vec![workflow_protocol::CompletionCommand::FailWorkflow {
+            failure: workflow_protocol::Failure {
+                message: "nexus failed".to_owned(),
+                source: String::new(),
+                stack_trace: String::new(),
+                encoded_attributes: None,
+                cause: None,
+                info: workflow_protocol::FailureInfo::NexusOperation(Box::new(
+                    workflow_protocol::NexusOperationFailure {
+                        scheduled_event_id,
+                        endpoint: endpoint.to_owned(),
+                        service: "service".to_owned(),
+                        operation: "operation".to_owned(),
+                        operation_id: String::new(),
+                        operation_token: "token".to_owned(),
+                    },
+                )),
+            },
+        }],
+    };
+    assert!(workflow_protocol::encode_completion(&nexus(0, "endpoint")).is_ok());
+    assert!(workflow_protocol::encode_completion(&nexus(-1, "endpoint")).is_err());
+    assert!(workflow_protocol::encode_completion(&nexus(0, &"e".repeat(65_537))).is_err());
+
+    let base = r#"{"run_id":"run","commands":[{"kind":"fail_workflow","failure":{"message":"m","source":"","stack_trace":"","encoded_attributes":null,"cause":null,"info":INFO}}]}"#;
+    for info in [
+        r#"{"kind":"server","non_retryable":false}"#,
+        r#"{"kind":"reset_workflow","last_heartbeat_details":[]}"#,
+        r#"{"kind":"nexus_operation","scheduled_event_id":1,"endpoint":"e","service":"s","operation":"o","operation_id":"","operation_token":""}"#,
+        r#"{"kind":"nexus_handler","type":"BAD_REQUEST","retry_behavior":"unspecified"}"#,
+        r#"{"kind":"absent"}"#,
+    ] {
+        workflow_protocol::decode_completion(&base.replace("INFO", info))
+            .unwrap_or_else(|error| panic!("rejected {info}: {error:?}"));
+    }
+    for info in [
+        r#"{"kind":"server"}"#,
+        r#"{"kind":"server","non_retryable":false,"extra":1}"#,
+        r#"{"kind":"absent","message":"m"}"#,
+        r#"{"kind":"nexus_handler","type":"X","retry_behavior":"sometimes"}"#,
+        r#"{"kind":"nexus_operation","scheduled_event_id":1,"endpoint":"e","service":"s","operation":"o","operation_token":""}"#,
+        r#"{"kind":"nexus_operation","scheduled_event_id":-1,"endpoint":"e","service":"s","operation":"o","operation_id":"","operation_token":""}"#,
+        r#"{"kind":"unknown_future_kind"}"#,
+    ] {
+        assert!(
+            workflow_protocol::decode_completion(&base.replace("INFO", info)).is_err(),
+            "accepted {info}"
+        );
+    }
+}
+
+/// Returns the initialization context of a converted first activation.
+fn initialize_context(
+    activation: &workflow_protocol::Activation,
+) -> &workflow_protocol::InitializeContext {
+    match &activation.jobs[0] {
+        workflow_protocol::ActivationJob::InitializeWorkflow {
+            context: Some(context),
+            ..
+        } => context,
+        job => panic!("expected an initialization context, got {job:?}"),
+    }
+}
+
+/// A Temporal Schedule starts every action after the first as a fresh run
+/// (empty previous run ID, unspecified initiator) that carries the previous
+/// action's result or failure (#1015). That shape must be represented, with
+/// the empty run ID meaning "no predecessor run", and survive the semantic
+/// JSON boundary; an over-long run ID is still malformed.
+#[test]
+fn accepts_schedule_started_run_with_previous_result_or_failure() {
+    use temporalio_protos::temporal::api::{common::v1 as api_common, failure::v1 as api_failure};
+
+    let previous_failure = api_failure::Failure {
+        message: "previous action failed".to_owned(),
+        failure_info: Some(api_failure::failure::FailureInfo::ApplicationFailureInfo(
+            api_failure::ApplicationFailureInfo {
+                r#type: "PreviousFailure".to_owned(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    for (result, failure) in [(true, false), (false, true), (true, true)] {
+        let mut init = start_metadata_initializer();
+        if result {
+            init.last_completion_result = Some(api_common::Payloads {
+                payloads: vec![api_common::Payload {
+                    metadata: [("encoding".to_owned(), b"json/plain".to_vec())].into(),
+                    data: b"42".to_vec(),
+                    ..Default::default()
+                }],
+            });
+        }
+        if failure {
+            init.continued_failure = Some(previous_failure.clone());
+        }
+        let semantic = workflow_protocol::activation_from_core(&start_metadata_activation(init))
+            .expect("a schedule-started run must be represented");
+        let continuation = initialize_context(&semantic)
+            .continuation
+            .as_ref()
+            .expect("the previous result or failure must be retained");
+        assert!(continuation.continued_from_execution_run_id.is_empty());
+        assert_eq!(
+            continuation.initiator,
+            workflow_protocol::ContinueAsNewInitiator::Unspecified
+        );
+        assert_eq!(continuation.last_completion_result.is_some(), result);
+        assert_eq!(continuation.continued_failure.is_some(), failure);
+        let json = workflow_protocol::encode_activation(&semantic).unwrap();
+        assert_eq!(
+            workflow_protocol::decode_activation(&json).unwrap(),
+            semantic
+        );
+    }
+
+    let mut oversized = start_metadata_initializer();
+    oversized.continued_from_execution_run_id = "r".repeat(65_537);
+    oversized.continued_initiator = 1;
+    assert_eq!(
+        workflow_protocol::activation_from_core(&start_metadata_activation(oversized))
+            .unwrap_err()
+            .code,
+        workflow_protocol::CoreConversionErrorCode::InvalidCore
+    );
+}
+
+/// Priority and retry-policy values recorded in a started event were accepted
+/// by Temporal, which clamps fairness weights rather than rejecting them and
+/// skips retry-policy checks when `maximum_attempts` is 1 (#1016). They must
+/// reach the workflow with their exact bits instead of wedging every task,
+/// while the same values remain rejected on the outbound command path.
+#[test]
+fn accepts_server_valid_inbound_priority_and_retry_policy() {
+    use temporalio_protos::temporal::api::common::v1 as api_common;
+
+    for (weight, key) in [
+        (5000.0_f32, "tenant"),
+        (0.0005, "tenant"),
+        (f32::NAN, "tenant"),
+        (1.0, "nul\0key"),
+    ] {
+        let mut init = start_metadata_initializer();
+        init.priority = Some(api_common::Priority {
+            priority_key: 1,
+            fairness_key: key.to_owned(),
+            fairness_weight: weight,
+        });
+        let semantic = workflow_protocol::activation_from_core(&start_metadata_activation(init))
+            .unwrap_or_else(|error| panic!("priority {weight} {key:?} was rejected: {error:?}"));
+        let priority = initialize_context(&semantic).priority.clone().unwrap();
+        assert_eq!(priority.fairness_weight_bits, weight.to_bits());
+        assert_eq!(priority.fairness_key, key);
+        let json = workflow_protocol::encode_activation(&semantic).unwrap();
+        assert_eq!(
+            workflow_protocol::decode_activation(&json).unwrap(),
+            semantic
+        );
+
+        // The outbound command rule is unchanged.
+        let completion = workflow_protocol::Completion {
+            run_id: "run-1".to_owned(),
+            task_failure: None,
+            commands: vec![workflow_protocol::CompletionCommand::ScheduleActivity {
+                seq: 1,
+                activity_id: "a".to_owned(),
+                activity_type: "a".to_owned(),
+                task_queue: "q".to_owned(),
+                arguments: Vec::new(),
+                schedule_to_close_timeout: Some(workflow_protocol::Duration {
+                    seconds: 1,
+                    nanoseconds: 0,
+                }),
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+                retry_policy: None,
+                priority: Some(priority),
+                cancellation_type: workflow_protocol::ActivityCancellationType::TryCancel,
+                do_not_eagerly_execute: false,
+            }],
+        };
+        assert!(workflow_protocol::encode_completion(&completion).is_err());
+    }
+    let mut long_key = start_metadata_initializer();
+    long_key.priority = Some(api_common::Priority {
+        priority_key: 1,
+        fairness_key: "k".repeat(65),
+        fairness_weight: 1.0,
+    });
+    assert!(workflow_protocol::activation_from_core(&start_metadata_activation(long_key)).is_err());
+
+    // `maximum_attempts = 1` skips server validation: a coefficient below 1.0,
+    // an empty non-retryable type, and absent or negative intervals are all
+    // recorded. Intervals normalize to zero (Temporal's "unset").
+    let mut init = start_metadata_initializer();
+    init.retry_policy = Some(api_common::RetryPolicy {
+        initial_interval: None,
+        backoff_coefficient: 0.5,
+        maximum_interval: Some(prost_wkt_types::Duration {
+            seconds: -5,
+            nanos: 0,
+        }),
+        maximum_attempts: 1,
+        non_retryable_error_types: vec![String::new(), "Permanent".to_owned()],
+    });
+    let semantic = workflow_protocol::activation_from_core(&start_metadata_activation(init))
+        .expect("a server-recorded retry policy must be represented");
+    let policy = initialize_context(&semantic).retry_policy.clone().unwrap();
+    assert_eq!(
+        policy.backoff_coefficient_bits,
+        0.5f64.to_bits().to_string()
+    );
+    assert_eq!(policy.maximum_attempts, 1);
+    assert_eq!(policy.non_retryable_error_types, ["", "Permanent"]);
+    for interval in [policy.initial_interval, policy.maximum_interval] {
+        assert_eq!((interval.seconds, interval.nanoseconds), (0, 0));
+    }
+    let json = workflow_protocol::encode_activation(&semantic).unwrap();
+    assert_eq!(
+        workflow_protocol::decode_activation(&json).unwrap(),
+        semantic
+    );
 }

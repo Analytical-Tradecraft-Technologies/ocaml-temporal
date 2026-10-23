@@ -56,11 +56,12 @@ let run () =
       let* target_url = required_env "TEMPORAL_ADDRESS" in
       let* namespace = required_env "TEMPORAL_NAMESPACE" in
       let* () = clear_marker ready_file in
+      let* options = Worker.Options.make ~max_cached_workflows:1 () in
       let* worker =
         Acceptance_observer.with_worker (fun () ->
           Worker.create ~target_url ~namespace
             ~identity:"ocaml-temporal-cache-eviction-worker"
-            ~max_cached_workflows:1 ~task_queue:Definitions.task_queue
+            ~options ~task_queue:Definitions.task_queue
             ~workflows:
               [
                 Worker.workflow

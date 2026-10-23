@@ -19,23 +19,37 @@ type operation =
 type submit_result = (unit, Error.t) result
 
 (** Private submission disposition, independent of the public diagnostic's
-    error category. [Not_submitted] proves local validation prevented any
-    native call, permitting a corrected or different operation unless an
-    earlier submission is still unresolved. [Rejected_submission] is a
-    definitive native heartbeat rejection that also permits a corrected
-    request while retaining the live handle and lease. An explicitly retryable
-    submission retains the exact request key; a terminal native rejection or
-    closed capability retires the handle. *)
+    error category. [Not_submitted] proves no request reached the server,
+    either because local validation prevented any native call or because the
+    bridge refused to admit it while its client-call registry was full
+    (#1104, reported with a retryable error). It permits a retry or a
+    corrected or different operation unless an earlier submission is still
+    unresolved. [Rejected_submission] is a
+    definitive native rejection of this exact request (heartbeat or terminal)
+    that releases its key, even after an earlier uncertain attempt, while
+    retaining the live handle and lease. [Retryable_submission] means the
+    native outcome is unknown: a terminal operation retains its exact key for
+    a byte-identical retry, while a heartbeat key is released because a newer
+    heartbeat supersedes it. [Terminal_submission] (lost token or closed
+    capability) retires the handle. [Activity_state] means a heartbeat was
+    applied but the server reported the activity cancelled, paused, or reset
+    (#1025); like [Rejected_submission] it releases the key and keeps the
+    live handle, which must still be finished by a terminal operation. *)
 type submission_error =
   | Not_submitted of Error.t
   | Rejected_submission of Error.t
   | Retryable_submission of Error.t
   | Terminal_submission of Error.t
+  | Activity_state of Error.t
 
-(** An opaque handle paired with the output type of its activity definition. *)
+(** An opaque handle paired with the output type of its activity definition.
+
+    @canonical Temporal.Activity.async_handle *)
 type 'output handle
 
-(** An attempt-scoped context from which the callback can obtain its handle. *)
+(** An attempt-scoped context from which the callback can obtain its handle.
+
+    @canonical Temporal.Activity.async_context *)
 type 'output context
 
 (** The outcome returned by an asynchronous activity implementation.
@@ -56,7 +70,10 @@ type ('input, 'output) implementation =
   'output context -> 'input -> 'output async_result
 
 (** Creates a dormant handle. It cannot submit an operation until [activate]
-    succeeds after the worker accepts [WillCompleteAsync]. [encode_output] is
+    succeeds after the worker accepts [WillCompleteAsync]; until then every
+    operation returns a retryable "not active yet" error without entering
+    [submit], so external code that races the handoff can retry instead of
+    losing its result. [encode_output] is
     retained by the handle so callers can complete it with the activity's
     typed output rather than constructing a wire payload themselves. *)
 val create :
@@ -64,8 +81,14 @@ val create :
   encode_output:('output -> (Payload.t, Error.t) result) ->
   'output handle
 
-(** Builds the callback context associated with a handle. *)
-val context : 'output handle -> 'output context
+(** Builds the callback context associated with a handle. The native adapter
+    passes the start task's [info]; contexts built without it report no task
+    metadata. *)
+val context : ?info:Activity_context.info -> 'output handle -> 'output context
+
+(** Returns the task metadata supplied to {!val-context}, if any. It stays
+    readable after the callback returns, like the synchronous context's. *)
+val info : 'output context -> Activity_context.info option
 
 (** Returns the handle retained by a callback context. *)
 val handle : 'output context -> 'output handle
@@ -81,9 +104,17 @@ val activate : 'output handle -> submit_result
     earlier task token. Only the owning adapter calls this function. *)
 val prepare_handoff : expected:'output handle -> 'output handle -> submit_result
 
+(** Closes the handle if it is still [Dormant], that is, if it was never
+    reserved by [prepare_handoff]. The owning adapter calls this after every
+    callback outcome that does not hand the handle off, so retained copies
+    report a non-retryable closed error instead of retrying forever. Handles in
+    any other state are unchanged. *)
+val close_if_dormant : 'output handle -> unit
+
 (** Encodes and submits one complete operation. The state machine derives a
-    canonical key from the encoded payload; if the transport fails, only the
-    same byte-identical request may retry. *)
+    canonical key from the encoded payload; if the native outcome is
+    uncertain, only the same byte-identical request may retry until it
+    receives a definitive answer. *)
 val complete : 'output handle -> 'output -> submit_result
 
 (** Submits one failed operation attempt. *)
@@ -92,10 +123,21 @@ val fail : 'output handle -> Error.t -> submit_result
 (** Submits one cancellation operation attempt with optional detail payloads. *)
 val cancel : 'output handle -> Payload.t list -> submit_result
 
-(** Sends one heartbeat without changing the terminal lifecycle. *)
+(** Sends one heartbeat without changing the terminal lifecycle. A failed
+    heartbeat is reported and forgotten unless the token is gone; it never
+    blocks a later heartbeat or terminal operation. *)
 val heartbeat : 'output handle -> Payload.t list -> submit_result
 
 (** Closes a handle after the owning SDK has stopped. Closing while an
     operation is in flight returns an outstanding-operation error instead of
     silently invalidating that request. *)
 val close : 'output handle -> submit_result
+
+(** The canonical request identity the handle uses to permit a retry after an
+    uncertain submission: two operations with equal keys produce the same wire
+    request, even when they differ structurally (for example a [Fail] whose
+    explicit [error_type] equals its category's default). The native adapter
+    keys its retained encoded bytes on this value so every retry the handle
+    admits resends exactly those bytes. It is an equality key, not a digest or
+    an authentication mechanism, and contains payload bytes. *)
+val operation_key : operation -> string

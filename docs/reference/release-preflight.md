@@ -4,6 +4,16 @@ The initial prerelease is `v0.1.0-rc.1`. OPAM records it as `0.1.0~rc.1`
 in `.release-version`, `temporal-sdk.opam`, and `temporal-sdk.opam.locked`.
 Those three files must agree with the version tag supplied to the release
 workflow; changing the Run workflow field alone does not change package metadata.
+The Rust bridge reports the SDK to Temporal as `temporal-ocaml` with the same
+version in SemVer spelling (`0.1.0-rc.1`), recorded as `SDK_VERSION` in
+`rust/core-bridge/src/abi.rs`; the preflight gate and a Rust unit test reject a
+mismatch with `.release-version`.
+
+Every repository link, including JSON schema `$id` values, uses the canonical
+`https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal` URL. The
+preflight gate rejects any tracked file that still uses the pre-transfer
+location, because GitHub's transfer redirect is not permanent and published
+schema identifiers cannot change later.
 
 ## Build coverage and artifact reuse
 
@@ -28,7 +38,11 @@ action and the GNU/MinGW toolchain. Each producer runs Rust formatting, Clippy,
 and the locked Rust tests before packaging static/dynamic libraries and native
 link dependencies. An exact cache hit reuses the verified bundle; its key
 includes sources, tests, build machinery, profile, and native environment.
-Release builds use a separate optimized profile for tests and packaging.
+Release builds package Cargo's `[profile.release]` and run their Rust tests
+with the same optimization level and without debug assertions or overflow
+checks. Source and opam installations build the same Cargo release profile,
+because Dune's release profile (selected by `opam install` and `dune build -p`)
+selects it; only Dune's dev profile uses Cargo's unoptimized dev profile.
 
 OCaml jobs download their platform's Rust bundle, validate its identity and
 checksums, and compile the OCaml library and C stubs for the selected compiler.
@@ -67,26 +81,49 @@ git push origin refs/tags/v0.1.0-rc.1
 Open **Actions → Release → Run workflow**, select `master`, and enter the same
 **Version tag**. Dispatch must still resolve to the approved SHA. The workflow:
 
-1. Require master, matching version metadata, a clean source checkout, and a
-   remote tag that peels to the exact dispatch commit. A missing, retargeted,
-   or unreachable tag fails before the release build.
+1. Require master, matching version metadata, the committed release notes
+   `docs/releases/<tag>.md` (checked by `scripts/check-release-notes.sh`), a
+   clean source checkout, and a remote tag that peels to the exact dispatch
+   commit. A missing, retargeted, or unreachable tag, or missing or incomplete
+   notes, fails before the release build.
 2. Build/test all four Rust platforms and all sixteen OCaml combinations, plus
    the single live smoke job, quality/security scans, and dependency audits.
-3. Validate all bridge and OCaml SDK bundles, archive the exact source commit, audit the Cargo
-   SPDX SBOM, and generate the release manifest and asset checksums.
-4. Fetch and verify the remote tag again before creating the draft and before
+3. Generate and audit `THIRD-PARTY-NOTICES.txt` from the locked Cargo graph,
+   validate all bridge and OCaml SDK bundles, add `LICENSE` and the notices to
+   every archive, archive the exact source commit with its vendored Cargo
+   sources and notices, audit the Cargo SPDX SBOM,
+   and generate the release manifest and asset checksums. The
+   `source-archive-check` job builds the source archive inside an opam build
+   sandbox, installs that build into a fresh prefix, and builds and runs the
+   archive's installed-package consumer against it.
+4. Sign SLSA build provenance for every asset with
+   `actions/attest-build-provenance`, before any release exists. Only the
+   publish job holds the `id-token: write` and `attestations: write`
+   permissions this needs.
+5. Fetch and verify the remote tag again before creating the draft and before
    publishing it. The workflow never creates or moves the protected tag.
-5. Upload assets to a draft release and publish it as a prerelease when the tag
-   has a prerelease suffix. No manual asset upload is required.
+6. Upload assets to a draft release and publish it as a prerelease when the tag
+   has a prerelease suffix. The release notes are `docs/releases/<tag>.md`
+   followed by a generated description of the assets. No manual asset upload
+   or notes editing is required.
 
 The release contains four compiler-independent Rust bridge archives, sixteen
-compiled OCaml SDK archives, source, `manifest.json`, the Cargo SBOM, and
-`SHA256SUMS`. Compatible applications link the OCaml SDK, C stubs and Rust bridge
+compiled OCaml SDK archives, an offline-buildable source archive for
+[`opam install`](package-boundary.md#offline-opam-source-builds) (the Release
+workflow's `source-archive-check` job builds that exact file inside an opam
+build sandbox before publication), `manifest.json`, the Cargo SBOM, the
+third-party notices, and `SHA256SUMS`. Each bridge and SDK archive carries
+`LICENSE` and `THIRD-PARTY-NOTICES.txt` at its root, so redistributing any one
+archive keeps the licence texts of the statically linked Rust packages with it
+(see [third-party notices](../dependencies.md#third-party-notices-in-release-archives)).
+Compatible applications link the OCaml SDK, C stubs and Rust bridge
 directly without rebuilding them. Each SDK records its exact compiler and compiled
 dependency identities; incompatible environments must use matching dependencies
 or build from source. Linux assets target Debian 12/glibc, not musl/Alpine.
 
-For the next version, first update the three version files in a PR and obtain
+For the next version, first update the three version files and `SDK_VERSION`,
+and add the version's release notes as `docs/releases/<tag>.md` (see the
+[release checklist](release-checklist.md#1-prepare-the-version)), in a PR and obtain
 maintainer approval of the candidate and its evidence. Create the matching
 protected tag at the approved master commit, then dispatch the workflow. The
 tag must be protected against updates and deletion as well as unauthorized
@@ -97,8 +134,13 @@ inspect it. A rerun may finish if no draft release exists yet; it will not
 silently replace an existing draft or release. If a published release is found
 defective, preserve its tag and assets for audit,
 mark it superseded in its notes, and issue a corrected version under a new tag.
-The source SHA and checksums in the manifest identify what was built, but are
-not a signed provenance attestation.
+The source SHA and checksums in the manifest identify what was built; the
+signed provenance attestations bind each asset's digest to the Release workflow
+run, commit and repository that produced it, and `gh attestation verify`
+checks them (see the
+[release checklist](release-checklist.md#4-verify-the-published-release)). The
+[release checklist](release-checklist.md) collects these steps, the sign-off,
+the open qualification gates, and the remediation procedure in one place.
 
 ## Local gate
 
@@ -109,15 +151,65 @@ or a Rust build. It verifies:
 - the working tree has no staged, unstaged, or untracked files;
 - the opam manifests, Dune project, README, license, and pinned Temporal Core
   revision agree on identity, ownership, licensing, release metadata, and the
-  canonical GitHub repository location; and
-- generated build trees are not tracked and the sorted Git source manifest can
-  be fingerprinted reproducibly.
+  canonical GitHub repository location;
+- the README and package metadata carry the maturity label that matches the
+  version (see below); and
+- generated build trees are not tracked and the Git source manifest can be
+  fingerprinted reproducibly.
 
 The clean-tree requirement is intentional: a preflight result must describe
 the exact inputs that would be archived or built, not a mixture of committed
-files and local output. The target also runs the stale-owner rejection fixture;
-that fixture stays out of the ordinary quality target so contributors can run
-the latter from a dirty worktree.
+files and local output. The target also runs the preflight fixture contract
+(`test/smoke/test_release_preflight_contract.sh`), which covers stale-owner
+rejection, manifest content sensitivity, and both maturity directions; it stays
+out of the ordinary quality target so contributors can run the latter from a
+dirty worktree.
+
+### Maturity label
+
+The maturity expectation is derived from `.release-version`, not hard-wired:
+
+- A **prerelease** (an OPAM `~` suffix such as `0.1.0~rc.1`) or any **`0.x`**
+  version is experimental. `README.md` must say so (it must match
+  `experimental` or `pre-0.1.0`, case-insensitively), and `dune-project`,
+  `temporal-sdk.opam`, and `temporal-sdk.opam.locked` must each contain the
+  word `experimental` (the synopsis, description, and `experimental` tag).
+- A **stable** version (`1.0.0` and later, without `~`) must not be labelled
+  experimental: none of those four files may contain `experimental`, and the
+  README may not describe the package as pre-`0.1.0`. Preparing a stable
+  release therefore includes rewording the README status section and removing
+  the experimental synopsis, description, and tag from the package metadata.
+
+`test/smoke/test_repository.ml` applies the same rule to the exact package
+metadata strings, and the Release workflow titles its notes "Experimental OCaml
+Temporal SDK" only for a prerelease or `v0.x` tag.
+
+### Source manifest
+
+The preflight prints `source manifest sha256:` followed by the SHA-256 of the
+NUL-terminated `git ls-tree -r -z --full-tree HEAD` listing. Each record holds
+one tracked entry's mode, object type, Git object ID, and path, so the digest
+changes whenever any file's contents, executable bit, symlink target, or path
+changes, and it is identical for two checkouts of the same tree. Because the
+clean-tree checks pass first, HEAD's tree is exactly what would be archived.
+Git's canonical tree order and `-z` (which bypasses `core.quotePath` escaping)
+make the digest independent of locale, user Git configuration, mtimes, umask,
+commit metadata, and checkout location. Per-file identity relies on Git's
+object IDs (collision-detecting SHA-1, or SHA-256 in a SHA-256 repository).
+The digest is reproducibility evidence for review, not a signed attestation.
+
+## Toolchain bounds
+
+`temporal-sdk.opam` and `dune-project` bound OCaml to `>= 5.2 & < 5.6`,
+matching the CI-tested 5.2–5.5 series; raise the upper bound only together with
+the CI matrix. The opam `conf-rust-2024` dependency only proves edition 2024
+support (Rust 1.85), while the workspace `rust-version` in `rust/Cargo.toml` is
+newer. `scripts/build-rust-bridge.sh` therefore compares the compiler Cargo
+will use (`$RUSTC`, default `rustc`) against that `rust-version` before
+running Cargo, and fails with the required and found versions instead of a
+dependency-resolution error deep inside Cargo.
+`test/smoke/test_rust_version_gate.sh` exercises this with stand-in compilers.
+The package declares no `available:` platform restriction yet.
 
 ## CI SBOM
 
@@ -127,8 +219,16 @@ with `cargo metadata --locked`, then invokes the project-owned standard-library
 SBOM generator inside the pinned official Python image with network access
 disabled. The generated SPDX 2.3 document is deterministic: package IDs are
 derived from Cargo IDs, package order is stable, and its creation timestamp is
-fixed. A second isolated invocation validates the document before the job
-finishes. The SBOM is a CI artifact/input check and is not committed to the
+fixed. Each package records its Cargo `licenseDeclared` and the
+`licenseConcluded` shared with the Cargo licence scanner, so the pinned Temporal
+Core crates, which declare only a licence file, are concluded `MIT` rather than
+`NOASSERTION`. A second isolated invocation validates the document, including
+that every package has a concluded licence, before the job finishes.
+
+The third-party notices are generated by the Release workflow's source-archive job
+rather than here, because they need the downloaded package sources; the
+generator, its audit, and the archive checks are covered offline by
+`make test-ci-artifacts`. The SBOM is a CI artifact/input check and is not committed to the
 repository. It covers the locked Cargo package graph only; it is not yet the
 complete OCaml package or runtime-container SBOM.
 
@@ -139,10 +239,17 @@ before publishing.
 ## Tag consistency gate
 
 Before creating a release tag, run `make release-tag-check RELEASE_TAG=vX.Y.Z`.
-For a prerelease, use either the familiar `v1.0.0-beta.1` spelling or the
-equivalent OPAM-native `v1.0.0~beta.1` spelling. The checker records the
-package version as `1.0.0~beta.1` in both cases, because OPAM's tilde ordering
-keeps the beta below the eventual `1.0.0` release.
+It also runs `scripts/check-release-notes.sh`, which requires complete
+`docs/releases/vX.Y.Z.md` notes; `test/smoke/test_release_notes_contract.sh`
+covers that check and the Release workflow's use of the notes.
+For a prerelease, the Git tag uses the SemVer hyphen spelling
+`v1.0.0-beta.1`, while `.release-version` and both opam files use the OPAM
+spelling `1.0.0~beta.1`, because OPAM's tilde ordering keeps the beta below
+the eventual `1.0.0` release. The checker converts exactly one character: the
+first hyphen after `vMAJOR.MINOR.PATCH` becomes `~`, and the prerelease suffix
+is otherwise compared unchanged. Git refnames cannot contain `~`, so a tag
+input such as `v1.0.0~beta.1` can never exist; the checker and the release
+asset packager reject it with an error that names the hyphen spelling.
 The check accepts only a three-part numeric tag with an optional prerelease
 suffix and verifies the normalized version against `.release-version`,
 `temporal-sdk.opam`, and `temporal-sdk.opam.locked`. A development checkout

@@ -1,0 +1,179 @@
+# MVP v1 scope for the experimental prerelease
+
+**Decision status:** This is the proposed scope for the MVP v1 milestone. It
+takes effect only after a repository maintainer approves the matrix in a review
+on [PR #557] and that PR merges. [#489] remains open until then. MVP v1 is a
+product milestone, **not** a SemVer `1.0.0` compatibility or production-support
+promise. The first candidate uses Git tag `v0.1.0-rc.1` and OPAM version
+`0.1.0~rc.1`. Approval of this document does not qualify or publish that tag.
+
+The SDK and the candidate remain experimental. [Feature coverage](feature-coverage.md)
+records implemented and focused-tested paths; [live acceptance coverage](live-acceptance-coverage.md)
+records bounded server evidence. The matrix below names the core paths to
+qualify on the exact candidate commit. Public APIs outside that set may still
+be useful for evaluation, but their presence in the installed package is not
+an MVP behavior commitment.
+
+## Environment and evidence boundary
+
+| Area | MVP candidate boundary | Evidence limit |
+| --- | --- | --- |
+| Deployment | Self-hosted Temporal in the repository's [Compose fixture](../../test/integration/temporal/compose.yaml), with PostgreSQL and a configured namespace. The OCaml application owns its worker executable. | This is a controlled evaluation environment. The fixture uses plaintext; no production endpoint or deployment is qualified. |
+| Server and Core | Temporal Server **1.32.0**, PostgreSQL **18.6**, and pinned Temporal Core **`8fe478ee179ed754614d230f39586f3edb57da71`**. The [Compose images](../../test/integration/temporal/compose.yaml) and [Cargo manifest](../../rust/Cargo.toml) identify the exact inputs. | No other Server/Core pair, database version, or topology follows from this evidence. A changed pin requires a fresh live run. |
+| Live execution | Linux amd64, Ubuntu 24.04 CI runner, OCaml **5.5.1**, independent OCaml worker/client processes against that Server/PostgreSQL pair. | The [live job](../../.github/workflows/build-pr.yml) exercises selected scenarios. Its green result does not imply arbitrary workflow histories, sustained load, or production operation. |
+| Build and installed package | The [release matrix](release-preflight.md#build-coverage-and-artifact-reuse) builds OCaml 5.2.1, 5.3.0, 5.4.1, and 5.5.1 on Linux amd64/arm64, macOS ARM64, and Windows x64 GNU/MinGW. The installed-consumer witness and private-module negative checks run with those builds. | These are build, unit, bridge, and package checks. Linux arm64, macOS, and Windows have **no** live-server qualification in this matrix. Published binary compatibility is limited to each asset's recorded compiler, dependency, and platform identity. |
+| Authentication | Plaintext connection to the controlled self-hosted fixture only. | SDK-managed trust configuration, mTLS, Temporal Cloud, API keys, TLS proxy deployments, and authenticated endpoint acceptance are outside this candidate. [#496] tracks secure endpoint work. |
+
+The `ocaml >= 5.2` OPAM constraint is a solver bound, not a claim about every
+future compiler. Record exact toolchain versions, image digests, source commit,
+Core revision, and artifact checksums for each release candidate. A green build
+on one platform never substitutes for the live result on another.
+
+## Feature matrix
+
+**Core candidate** means the MVP release must pass the named behavior on the
+exact candidate, subject to the limits below. **Experimental** means exported
+for evaluation without a release behavior or history guarantee. **Deferred**
+means no MVP capability claim, even if private machinery or partial APIs exist.
+
+| Capability | Decision and application boundary | Evidence or qualification |
+| --- | --- | --- |
+| Workflow authoring | **Core candidate:** typed direct-style workflows, deterministic futures/conditions/time, durable timers, child workflows, and continue-as-new. Workflow code must yield and avoid nondeterministic I/O. | [Runtime tests](../../test/runtime/) and named [live scenarios](live-acceptance-coverage.md). Non-yielding code still blocks the workflow lane: the activation watchdog ([#493]) fails the stuck workflow task after the configurable deadline (default 2 s) and reports `Worker.health` as stuck, but cannot interrupt the code, so a supervisor must restart the process ([watchdog reference](native-worker-execution.md#non-yielding-workflow-watchdog), [watchdog tests](../../test/runtime/test_native_worker_watchdog.ml)). The [non-yielding live regression](../../test/integration/non_yielding_workflow/regression.ml) qualifies the path against Temporal Server: detection within the deadline plus one tick, the failed task and diagnostics without payloads, bounded shutdown reporting the abandoned activation, unaffected workflows, and recovery of the same run on a corrected worker. |
+| Remote activities | **Core candidate for bounded callbacks:** typed remote callbacks, retry/timeout policy, heartbeats, and result/failure handling. Application code must put finite deadlines on callback I/O and return within an application-defined budget. Activity delivery may repeat; callers must make external side effects idempotent. | [Native activity contract](native-activity-execution.md) and [live scenarios](live-acceptance-coverage.md). Activity callbacks run on a dedicated activity Domain, separate from the workflow lane, so a blocked callback no longer stops unrelated workflow progress ([PR #752]; the [worker poll isolation live regression](../../test/integration/worker_poll_isolation/regression.ml) completes an unrelated workflow while a callback is held). That lane has capacity one: a blocked callback still stops every other activity on the worker, and [#492] stays open for the remaining qualification. Temporal activity timeouts do not interrupt the OCaml callback. Cancellation and worker shutdown are cooperative ([#494]): a synchronous context callback observes a server cancellation (with its typed reason) at its heartbeats and can complete as cancelled, and can poll `Context.is_worker_shutting_down`; a callback that never heartbeats or checks never observes either. Worker shutdown abandons such a callback when the grace period ends ([#495]): its attempt is failed retryably for Temporal to run elsewhere, and its late result is discarded. An asynchronous handle observes a cancellation request (a non-retryable `` `Cancelled `` error) or a pause or reset (a retryable one) only as the result of `Async_handle.heartbeat`, and the handle stays live for `cancel` or `fail` ([PR #1103]); the [cooperative cancellation example](../../examples/README.md#cancel-activities-cooperatively) exercises it live ([PR #1117]). Asynchronous handles are **not** notified of worker shutdown: shutdown reports an unfinished handle as lost after the grace period, and Temporal retries the attempt per its timeouts. |
+| Client control | **Core candidate:** start, exact-run wait/follow, typed signals, and exact-run cancellation requests with typed outcomes. A request acknowledgement does not prove handler execution or terminal completion; a transport timeout can leave an outcome uncertain. | [Client interface](../../lib/public/client.mli), [client tests](../../test/unit/test_client_worker.ml), and [live driver](../../test/integration/temporal/driver/smoke_driver.ml). Workflow-level cooperative cancellation and durable cleanup are excluded from this candidate ([#514]): a cancellation request closes the run as cancelled in the activation that delivers it, and workflow code cannot observe the request or schedule and await cleanup first. Workflows that need compensation must not rely on Temporal cancellation for it. |
+| Worker and recovery | **Core candidate for supervised processes:** application-owned worker, same-version restart/replay, and selected crash recovery for the tested workload. Workflow cache, task and poller limits, sticky and shutdown timeouts, heartbeat throttling and activity rate limits are validated `Worker.Options` settings ([#498]). `Worker.shutdown_with_report` returns within the grace period plus the teardown timeout ([#495]) and reports any callback or activation it abandoned; the operator must restart a process whose report shows abandoned work, and a supervisor must still force-terminate a process whose callback blocks the whole runtime. Outstanding work depends on Temporal redelivery. | [Worker interface](../../lib/public/worker.mli) and the [live controller matrix](live-acceptance-coverage.md). The resource-options live regression covers a constrained worker's saturation and recovery. Activity concurrency stays fixed at one. The [bounded-shutdown live regression](../../test/integration/bounded_shutdown/regression.ml) shuts down a worker whose activity never heartbeats and checks the bound, the report, and the retry on a second worker; focused tests cover stuck activations, retained completions, and an unreachable server ([#495]). Abandoned OCaml code is not interrupted, so it keeps its Domain and memory until it returns or the process exits. [#501] closed after [PR #555] fixed a polling-capacity mismatch and repeated live checks passed. The sole cause of the earlier 900-second timeout remains unproven; cache eviction must pass again on the exact candidate. |
+| Payloads and errors | **Core candidate:** built-in typed codecs, typed results/errors, and preservation of supported failure details. Application codecs own their schema and migration policy. | [Codec tests](../../test/unit/test_codec.ml), [error tests](../../test/unit/test_error.ml), installed-consumer tests, and selected live payload paths. The [official-SDK interoperability regression](../../test/integration/sdk_interop/README.md) (#517) checks the default `json/plain` converter in both directions against the official Temporal Python SDK 1.33.0: client start, query, signal, accepted and rejected updates, an official-SDK activity called from OCaml, and application failure types and details crossing both SDKs, with exact run IDs and recorded SDK versions. Other SDKs, custom codecs, child workflows across SDKs and official-SDK workflows calling OCaml activities are not qualified, so cross-SDK codec interoperability is not generally guaranteed. |
+| Queries and updates | **Experimental:** output/typed-input queries and immediate/suspended updates. | Existing [interaction tests](../../test/unit/test_interactions.ml) and named live cases do not prove read-only enforcement, validator safety, replay/eviction recovery, or all deadline cases ([#513], [#505]). |
+| Local and asynchronous activities | **Experimental:** local activity start/execution and retained asynchronous completion with task-token completion/heartbeat for remote activities. Deferred completion is unavailable for local activities: a local callback returning `Will_complete_async` fails that attempt. | Focused and limited live cases exist. [#691] closed after [PR #749] made the unsupported local/deferred combination an ordinary activity failure. [#692] closed after [PR #758]: an uncertain remote heartbeat RPC now retains the live handle and lease for an identical retry, so worker drain reports the outstanding lease. Before that fix, a transient heartbeat error could close the handle while the server activity remained live, and drain could falsely succeed. Live network-fault behavior and other retry/replay combinations remain unqualified. Do not depend on a process-local completion handle surviving replacement. |
+| In-process workflow tests | **Experimental:** `Temporal.Testing` runs registered workflows and activities on the real workflow runtime against a deterministic, time-skipping server simulator, with activity/child stubs and signal, query, update, cancellation and continue-as-new drivers. It is a unit-test tool, not a server: activity timeouts, task retries, child cancellation types, asynchronous activities and visibility are not simulated. `mock://` remains a plumbing-only client/worker backend. | [Testing tests](../../test/unit/test_testing.ml) and the [example workflow test](../../examples/testing/example_workflow_test.ml). Passing in-process tests do not replace live qualification. |
+| Additional exported client operations | **Experimental:** start memo/search attributes, exact-run reset and termination, and bounded visibility listing. | These appear in the [public client interface](../../lib/public/client.mli), but presence does not establish complete end-to-end semantics. Workflow code reads the start memo and search attributes through `Workflow.start_metadata`, qualified by `make test-temporal-start-metadata-live` ([start metadata](workflow-start-metadata.md)); [#512] still tracks the remaining start policies and replay-corpus qualification. |
+| Client execution policies and RPC deadlines | **Core candidate:** `Client.start` accepts `?execution_timeout`, `?run_timeout`, `?task_timeout`, a workflow `?retry_policy`, `?id_reuse_policy` for closed runs, and `?id_conflict_policy` for open runs (#933). Start, signal, query, update admission, cancel, terminate, reset, and visibility accept a per-call `?rpc_timeout` between 1 ms and 60 s; omitted, each keeps its documented default (10 s start and visibility, 3 s control RPCs, 30 s queries and update acceptance). An RPC deadline bounds the call, never the workflow, and its expiry does not prove rejection: a start becomes `Client.is_start_outcome_uncertain` and is reconciled by retrying with the same request ID. Zero timeouts, a task timeout above 120 s or above the run (or execution) timeout, and a run timeout above the execution timeout are typed defects, because Temporal would silently ignore or lower them. | [Client interface](../../lib/public/client.mli), [client protocol](client-protocol.md#rpc-deadlines-499), [client tests](../../test/unit/test_client_worker.ml), and the [policy live regression](../../test/integration/client_policies/README.md) ([#499]). An exact-run wait reports a retried run as `Failed` (or `Timed_out`) with the retry run as its successor, not as `Continued_as_new` (#971). Exact-run waits and update completion waits have no caller deadline. Workflow code reads the recorded timeouts, effective retry policy, attempt, and retry or continue-as-new predecessor through `Workflow.Info`; the [start info live regression](../../test/integration/workflow_start_info/README.md) checks them on a root run, a retry run, and a continue-as-new successor across worker replacement ([#512]). |
+| Concurrent calls on one client | **Core candidate:** one `Client.t` may be shared by any number of threads and Domains, and its calls proceed concurrently (#807): the client's supervisor Domain only submits each RPC, the native transport runs it, and each caller waits for its own result, so a pending `wait`, a slow `query`, or an update completion wait never delays another call on the same client. `shutdown` does not wait for calls in flight; it ends them with the closed-client error (an uncertain-start error for a start that may have been sent). Capacity limits default to 64 distinct waited runs, 64 in-flight start request IDs, and 4,096 calls in total; `Client.create ?max_pending_waits ?max_pending_starts ?max_in_flight_calls` sets them per client within 1..4,096, 1..4,096, and 1..65,536 ([#796]). A call beyond a limit is refused before reaching Temporal and reported by `Client.is_at_capacity`. Client calls block their calling thread and must not be made from workflow code. | [Client interface](../../lib/public/client.mli), [submitted client calls](client-protocol.md#submitted-client-calls-807), [supervisor tests](../../test/sdk_supervisor/test_concurrent_client_calls.ml), Rust tests in [`client_calls.rs`](../../rust/core-bridge/tests/support/client_calls.rs) (default and configured limits), the [client limit bridge test](../../test/bridge/test_client_limits.ml), and the [concurrent client live regression](../../test/integration/concurrent_client/README.md), which also refuses a third wait on a client limited to two ([#807], [#796]). |
+| Unavailable client options | **Deferred:** cron schedules and delayed starts. | Not exposed by `Client.start`; OCaml workers reject cron and nonzero root start delay. Applications must not infer support from server-side metadata or private protocol fields. |
+| Offline history replay | **Experimental:** `Temporal.Replay` replays one binary `History` protobuf per call against registered workflow definitions, offline, with typed `Nondeterminism`, `Workflow_task_failed`, `Invalid_history`, `Unsupported_history`, and `Replay_error` results. It checks the recorded paths and command shapes only, not payload values or unrecorded branches. | [Replay interface](../../lib/public/replay.mli) and [public replay tests](../../test/bridge/test_public_replay.ml) over retained live histories ([#515]). A nondeterminism result names the workflow, the first mismatching recorded event and the command Core matched it against whenever Core's text states them, and leaves them absent otherwise ([#529]). The [replay command example](../../examples/README.md#replay-recorded-histories-before-deploying) is a copyable application-linked CLI with stable exit statuses, tested in [`test/replay_cli`](../../test/replay_cli/test_replay_cli.ml) ([#516]). There is no JSON-history input or persistent corpus yet ([#503]). |
+| Worker upgrades and replay tools | **Deferred:** cross-version workflow-history compatibility, deployment/build-ID routing, and an automated upgrade/rollback path. The application-linked replay command is an experimental example, not a cross-version promise. Patching APIs may be evaluated experimentally. | The [patching reference](workflow-patching.md) and the [replay bridge](replay-bridge.md) do not create a cross-version replay promise ([#497], [#503], [#508]). |
+| Worker metrics and log correlation | **Experimental:** `Runtime.create ?metrics` with `Runtime.Metrics.prometheus` serves Temporal Core's built-in worker and client metrics (official SDK names, bounded labels only) for every client and worker attached to that runtime; the same registry carries SDK-side `temporal_ocaml_` worker series for the activity lane, task admission and refusal, completion retries and shutdown outcomes ([PR #1114]). Workflow lease and lifecycle log records carry workflow ID, run ID and a replay flag, and activity lease records carry workflow, run and activity identity and the attempt ([PR #1051]). Instances without a shared runtime export no metrics. | [Observability reference](observability.md#worker-metrics), [exporter Rust tests](../../rust/core-bridge/tests/metrics_exporter.rs), [public runtime test](../../test/bridge/test_runtime_metrics.ml), and the [worker metrics live regression](../../test/integration/worker_metrics/regression.ml), which also checks the `temporal_ocaml_` series, plus [SDK metric tests](../../test/runtime/test_native_worker_metrics.ml) ([#500]). OTLP export, tracing, and a sample deployment exercising induced poll failure, saturation and shutdown timeout are not yet qualified. The scrape endpoint has no authentication or TLS; it relays at most 8 concurrent connections, answers or closes the excess, and bounds each connection's lifetime ([PR #1096], [connection limits](observability.md#failure-isolation-and-resource-use)). |
+| Wider Temporal surface | **Deferred:** schedules, Nexus, interceptors, broad observability/load commitments, and other upstream SDK parity work. | [Feature coverage](feature-coverage.md) is the inventory; adding support requires a separate decision and qualification. |
+
+Known defects that affect a core row must be fixed and retested before that
+row is claimed on a candidate. A documented limit can narrow the workload;
+it cannot turn a failing core test into a pass. The release notes must name
+all residual limits, especially callbacks with application-owned deadlines,
+external process supervision, non-yielding workflows, shutdown behavior,
+repeat activity delivery, and cancellation semantics. Without bounded callback
+I/O and a supervisor willing to force-terminate a stuck process, the core
+worker liveness and shutdown paths are outside this candidate. Workflow
+progress no longer waits on activity callbacks ([PR #752]), but [#492] must
+be qualified before widening that boundary. Shutdown itself is
+bounded ([#495]), but it abandons rather than stops non-cooperative code.
+Signals admitted before workflow completion need an application-defined drain
+pattern; the SDK does not automatically wait for every handler. See the
+[interaction reference](interactive-workflows.md).
+
+## Prerelease compatibility
+
+`0.1.0-rc.1` does **not** start a stable 1.x source, wire, behavior, platform,
+or history compatibility promise. A later prerelease may change public
+signatures or behavior; explain breaking changes and migration steps in its
+release notes. Never reuse a published tag for changed contents.
+
+The public installation boundary is the wrapped `Temporal` module listed in
+[`lib/public/temporal.ml`](../../lib/public/temporal.ml). The [installed witness](../../test/fixtures/install-consumer/public_api.ml)
+and [positive/negative install checks](../../test/bridge/test_install.sh)
+must match it. Private OCaml modules, JSON protocol records, C symbols, Rust
+types, and Temporal Core are not application APIs.
+
+For this candidate, replay/restart qualification covers the *same* SDK/Core
+version and the named histories only. Application workflow changes, SDK/Core
+upgrades, and rolling mixed-version workers require retained-history replay
+and a separate upgrade rehearsal before use. Built-in payload encodings include
+`json/plain`, `binary/plain`, `binary/null`, and the OCaml-specific
+`binary/x-ocaml-optional` envelope; this list is not a general cross-SDK
+interoperability guarantee. Only the `json/plain` paths named in the
+[official-SDK interoperability regression](../../test/integration/sdk_interop/README.md)
+are exercised against an official SDK (Python, #517). Expected operational failures should remain typed;
+diagnostic message text is not a parsing API. Unsupported or experimental
+options are not guaranteed to be rejected before sending a request.
+
+## Candidate qualification and responsibility
+
+The repository maintainer owns scope approval on [PR #557]. The release owner
+records the exact commit and tag, names the people reviewing API/runtime and
+live evidence, and decides whether the experimental candidate may be
+published. The application operator separately owns any deployment and its
+server, namespace, authentication, backups, and workload limits. Publishing a
+prerelease is not evidence that a deployment is fit for production.
+
+For the **exact candidate commit**, retain:
+
+1. A green configured build, unit/runtime/bridge/installed-consumer matrix,
+   including `make test-api`, private-module negative checks, quality and
+   dependency-license gates. Run `make release-preflight` from a clean tree
+   and `make release-tag-check RELEASE_TAG=v0.1.0-rc.1` against matching OPAM
+   metadata. [Release preflight](release-preflight.md) defines the inputs.
+2. A green Linux amd64/OCaml 5.5.1 [Temporal/PostgreSQL live job](../../.github/workflows/build-pr.yml)
+   against the exact Server/Core pins, including the integration driver,
+   restart, crash recovery, cache eviction, parent/child replay, child failure
+   after replay, and patching controllers. Retain run URL, logs, exact run IDs,
+   histories, and residual limitations. Contract-only tests are not live
+   evidence. The [#501 closeout] records ten fresh-stack local passes and
+   scheduled [October 2] and [October 3] master diagnostics with accepted A/B
+   runs and typed cancellation after [PR #555]. These runs support the
+   polling-capacity explanation but do not prove it was the sole cause of the
+   earlier 900-second timeout. They are prior-revision evidence: the exact
+   candidate must pass its own cache-eviction controller, and any new timeout
+   requires investigation. [#505] tracks broader conformance rather than
+   silently making it a prerequisite for every excluded capability.
+3. An explicit review of unresolved core-path defects and release notes that
+   require bounded callback I/O and an external supervisor with a forced-exit
+   deadline. A process kill is not graceful shutdown; document how Temporal
+   retries outstanding tasks. Release approval cannot rely on a test from an
+   older commit or on the presence of a fixture that did not finish.
+4. A successful publish and retrieval of the immutable tag, source and binary
+   assets, manifest, checksums, and Cargo SBOM for the tested commit. The
+   [release procedure](release-preflight.md#publish-a-prerelease) documents a
+   protected maintainer-created tag path. [#510] remains open until the exact
+   candidate's publication and asset retrieval are rehearsed and evidenced.
+
+The maintainer's policy approval closes [#489] only after this PR merges.
+Release publication, secure endpoints, cross-version replay, and production
+deployment remain separate decisions with their own evidence.
+
+[#489]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/489
+[#492]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/492
+[#493]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/493
+[#494]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/494
+[#495]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/495
+[#496]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/496
+[#497]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/497
+[#498]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/498
+[#499]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/499
+[#500]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/500
+[#501]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/501
+[#503]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/503
+[#505]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/505
+[#508]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/508
+[#510]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/510
+[#512]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/512
+[#513]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/513
+[#514]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/514
+[#515]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/515
+[#516]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/516
+[#529]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/529
+[#691]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/691
+[#692]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/692
+[#796]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/796
+[#807]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/807
+[#501 closeout]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/501#issuecomment-5978294089
+[October 2]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/37073688475
+[October 3]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/37156563875
+[PR #555]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/555
+[PR #752]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/752
+[PR #1051]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/1051
+[PR #1096]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/1096
+[PR #1103]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/1103
+[PR #1114]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/1114
+[PR #1117]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/1117
+[PR #749]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/749
+[PR #758]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/758
+[PR #557]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/557

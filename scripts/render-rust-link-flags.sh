@@ -2,7 +2,11 @@
 set -eu
 
 operating_system=$1
-target_root=$2
+# Either a relocated prebuilt bundle (containing import-libs) or the Cargo
+# output directory of the profile that produced the archive, such as
+# target/debug or target/release. Searching only that profile's build-script
+# metadata keeps a stale build of the other profile from being selected (#779).
+artifact_dir=$2
 output=$3
 native_link_flags=$4
 bundle_imports=${5:-}
@@ -49,15 +53,15 @@ windows_path () {
 # script, but --print=native-static-libs reports only -l names. Preserve the
 # corresponding -L directory for the foreign OCaml linker.
 windows_search_dir () {
-  if [ -d "$target_root/import-libs" ]; then
-    complete_imports "$target_root/import-libs" || {
+  if [ -d "$artifact_dir/import-libs" ]; then
+    complete_imports "$artifact_dir/import-libs" || {
       echo 'incomplete bundled Windows import libraries' >&2; exit 1;
     }
-    windows_path "$target_root/import-libs"
+    windows_path "$artifact_dir/import-libs"
     return
   fi
   selected=
-  for metadata in "$target_root"/debug/build/winapi-x86_64-pc-windows-gnu-*/output; do
+  for metadata in "$artifact_dir"/build/winapi-x86_64-pc-windows-gnu-*/output; do
     [ -f "$metadata" ] || continue
     while IFS= read -r candidate; do
       [ -n "$candidate" ] || continue

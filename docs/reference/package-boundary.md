@@ -90,17 +90,183 @@ without a private CMI. `Duration.t`, `Error.t`, `Codec.t`, `Workflow.t`, and
 adapters use the documented `name`, `input`, `output`, and `implementation`
 accessors; they do not rely on record layout.
 
-`Future.t` is the one deliberate type-identity exception. Its signature keeps
-an internal equality with the generic Dune package-private
-`temporal_future_kernel` so private runtime adapters can pass scheduler-owned
-values through the facade without unsafe casts. The public `Temporal` root does
-not re-export the kernel module, and `Future.mli` exposes no constructor, record
-field, callback, or lifecycle operation. The kernel is unavailable through the
-supported `temporal-sdk` dependency and is not part of the public API. Public
+Six public types deliberately keep a type equality with a package-private
+library so private runtime adapters can pass SDK-owned values through the
+facade without unsafe casts:
+
+- `Future.t` equals `Temporal_sdk_kernel.Future.t`, an alias of the generic
+  `temporal_future_kernel` future;
+- `Runtime.t` equals `Temporal_sdk_kernel.Shared_runtime.t`, the shared
+  Core runtime handle owned by the application: `Runtime.create` makes it,
+  the application releases it with `Runtime.shutdown` after every attached
+  client and worker has shut down, and each attached supervisor holds only
+  a lease on it;
+- `Activity.context` equals `Temporal_base.Activity_context.t`;
+- `Activity.async_handle` and `Activity.async_context` equal
+  `Temporal_base.Async_activity.handle` and `.context`;
+- `Activity.Cancellation.reason` re-exports the variant
+  `Temporal_base.Activity_context.cancel_reason`, constructors included.
+
+The first five target types are abstract in their private interfaces. The
+public `Temporal` root does not re-export those modules, and neither
+`Future.mli`, `Runtime.mli` nor `Activity.mli` exposes a constructor or record
+field for them, so an application cannot build one directly; `Runtime.t`
+values come only from `Runtime.create`. `Activity.Cancellation.reason` is the
+exception: its constructors are public so activity code can match on why it
+was cancelled, and the equality only lets the private activity runtime report
+a reason without a conversion. `Future.mli` also exposes no callback or
+scheduler lifecycle operation. `Activity.mli` deliberately exposes the
+supported activity operations on values the SDK supplies: the context
+operations, `Async_context.handle`, and the `Async_handle` completion,
+failure, cancellation, and heartbeat functions. [#793](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/793)
+tracks auditing these equalities before the v1 freeze. The private libraries
+are unavailable through the supported `temporal-sdk` dependency and are not
+part of the public API. Public
 future values originate from SDK operations such as timers, activities, and
 child workflows, or from public combinators over those values. An application
 cannot fabricate an arbitrary scheduler-owned future or access its callbacks
 or continuations.
+
+## Vendored source builds
+
+An application may build the SDK from source inside its own Dune workspace
+instead of installing it, for example as a Git submodule, in a monorepo, or
+through `opam monorepo`:
+
+```lisp
+; consumer/dune
+(vendored_dirs vendor)
+```
+
+with this repository at `vendor/temporal/` and executables depending on
+`(libraries temporal-sdk)`. In that layout Dune's workspace root is the
+consumer's project, which contains neither the bridge scripts nor the Rust
+workspace. The bridge rule in `lib/core_bridge/dune` therefore resolves every
+path relative to its own directory (`../..` is always the SDK root), and its
+writable Cargo fallback is `../../rust-target`, inside the SDK's own build
+directory rather than the consumer's build root. An explicit `CARGO_TARGET_DIR`
+remains authoritative exactly as in the in-repository build, and
+`TEMPORAL_RUST_BRIDGE_DIR`/`TEMPORAL_RUST_BRIDGE_KEY` still select a verified
+prebuilt bundle. Building from source requires the same Rust toolchain and
+`protoc` as any other source build. The bridge rule forwards Dune's
+`%{profile}`: the release profile builds Cargo's optimized `[profile.release]`
+and every other profile, including the default dev profile, builds Cargo's dev
+profile. Consumers that ship a vendored worker should therefore build it with
+`--profile release` (or `-p`).
+
+A vendored SDK's `dune-workspace` is ignored, so the consumer does not inherit
+its `(disable_dynamically_linked_foreign_archives true)` context setting. On
+Linux and macOS the default is harmless: the bridge rule also produces the
+dynamic archive Dune expects, and every Temporal executable links the bridge
+statically. On Windows, FlexDLL cannot consume Rust's GNU-style native linker
+flags while building that unneeded DLL stub, so Windows consumers must add the
+setting to their own `dune-workspace`:
+
+```lisp
+(lang dune 3.18)
+(context
+ (default
+  (disable_dynamically_linked_foreign_archives true)))
+```
+
+`make test-vendored` (or `make native-test-vendored` on the host) builds and
+runs a scratch consumer that vendors a copy of the current checkout this way,
+calls the linked bridge through `Temporal.Runtime_info`, and checks that the
+fallback Cargo directory did not escape into the consumer's build root. It
+compiles the Rust bridge in a fresh workspace, so it is an opt-in check rather
+than part of `make test` or the per-commit CI matrix.
+
+## Offline opam source builds
+
+opam runs package builds in a sandbox that denies network access, so a source
+build cannot let Cargo download the locked crates or the pinned Temporal Core
+Git revision (#778). Each GitHub release therefore publishes
+`ocaml-temporal-<tag>-source.tar.gz`, produced by
+`scripts/create-source-archive.sh`: the committed tree plus
+
+- `rust/vendor.tar`, the `cargo vendor --locked --versioned-dirs` output for
+  exactly the `rust/Cargo.lock` graph, including Temporal Core;
+- `rust/vendor-config.toml`, the matching Cargo source replacement for
+  crates.io and the Temporal Core Git source, pointing at the relative
+  directory `vendor`; and
+- `THIRD-PARTY-NOTICES.txt`, the audited licence texts of the redistributed
+  Rust packages.
+
+When both `rust/` files are present, `scripts/build-rust-bridge.sh` unpacks
+the archive afresh into `vendored-sources/` below the Cargo target directory,
+copies the replacement to `vendored-sources/.cargo/config.toml`, and runs every
+Cargo command with `--frozen --config <that file>` and
+`CARGO_NET_OFFLINE=true`. Cargo then verifies each crate against its vendored
+checksums and fails instead of contacting the network if anything is missing.
+If only one of the two files is present the archive is incomplete and the build
+fails before Cargo runs. A Git checkout has neither file and keeps the normal
+`--locked` build, which fetches on first use.
+
+The crates stay in an uncompressed tar file rather than an unpacked `vendor/`
+directory because Dune's `source_tree` dependency omits directories whose
+names begin with `.` or `_`. Many crates publish such directories (for example
+`.github`), and Cargo's checksum verification would reject the incomplete
+copy that Dune hands to the bridge rule.
+
+To install a release from source inside the sandbox:
+
+```sh
+curl -LO https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/releases/download/<tag>/ocaml-temporal-<tag>-source.tar.gz
+# check the file against the release's SHA256SUMS, then:
+tar -xzf ocaml-temporal-<tag>-source.tar.gz
+opam install ./ocaml-temporal-<version>
+```
+
+An opam-repository package uses the same archive as its `url` with the
+published SHA-256. The archive needs no Rust download, but the build still
+needs the Rust toolchain and `protoc` that `conf-rust-2024` and `conf-protoc`
+require. Running `opam install .` from a Git checkout still needs network
+access for Cargo, so it works only where the build may reach the network;
+installing a release archive is the supported sandboxed path.
+
+CI proves that path with `scripts/check-opam-source-archive.sh`, which unpacks
+an archive and runs the package's opam build command,
+`dune build -p temporal-sdk -j <jobs>`, inside an opam build sandbox. It uses
+opam's own wrapper, `<opam root>/opam-init/hooks/sandbox.sh build`, when the
+switch has sandboxing enabled, and otherwise the same macOS `sandbox-exec`
+policy: network denied except Unix sockets, and writes denied outside the build
+directory, the temporary directories, and the Dune cache. Before building, the
+script sends a request to crates.io through the same wrapper and fails if it
+succeeds, so a sandbox that does not isolate the network cannot produce a pass.
+Cargo runs with a fresh, empty `CARGO_HOME` inside the build directory, as for
+a user who has never run Cargo, so a home warmed by the `cargo vendor` that
+created the archive cannot hide a source the archive's replacement omits. The
+script also clears `CARGO_TARGET_DIR`, `TEMPORAL_RUST_BRIDGE_DIR`/`KEY`, and
+`CARGO_NET_OFFLINE`, and fails unless the build leaves a
+`temporal-sdk.install` that lists the Rust bridge.
+
+`scripts/check-source-archive-consumer.sh` then takes the downstream view of
+that same build (#510). It runs `dune install -p temporal-sdk` from the
+unpacked archive into a fresh prefix, as `opam install` copies the
+`temporal-sdk.install` files into a switch, and builds the archive's own
+`test/fixtures/install-consumer` in a separate Dune root with only that prefix
+added to `OCAMLPATH`. The consumer runs the public API witness natively and as
+a Dune `(modes byte)` program, the worker-environment probe, and offline replay
+of a frozen history. It refuses a switch that already provides `temporal-sdk`,
+which could otherwise satisfy the consumer instead of the archive.
+
+The Release workflow gates publication on the exact published file: its
+`source-archive` job creates the archive and audited notices once and uploads
+them as the `release-source` artifact with the archive's SHA-256; the
+`source-archive-check` job (macOS ARM64, OCaml 5.5) downloads that artifact,
+confirms the digest, and runs both checks; and `publish`, which needs both,
+confirms the digest again before adding the same file to the release. Master
+builds also run the `opam-source-offline` job in `build-pr.yml`, which checks
+an archive it creates itself, as an early warning; pull requests skip both
+because of the full optimized Rust build. Run the checks locally with
+`opam exec -- sh scripts/check-opam-source-archive.sh <archive> <work-dir>`
+followed by `opam exec -- sh scripts/check-source-archive-consumer.sh
+<work-dir>`; they need the
+locked opam dependencies, Rust and `protoc`, and several gigabytes.
+`test/smoke/test_opam_source_archive_check.sh` and
+`test/smoke/test_source_archive_consumer_check.sh` check the scripts' own
+decisions on every `dune runtest` with stand-ins for opam, its hook, curl, and
+dune.
 
 ## Regression evidence
 

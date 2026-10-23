@@ -33,123 +33,48 @@ let test_activity_completion_policy () =
       ("unknown status", Bridge.Unknown 13);
     ]
 
-(** Async client heartbeats do not consume a completion lease. A connection
-    result is uncertain and retains the handle for an identical retry, while
-    the bridge's NotFound/invalid-state response closes it. This must not
-    weaken the ordinary Core completion policy tested above. *)
-let test_async_heartbeat_policy () =
+(** Async client heartbeats and complete/fail/cancel do not consume a Core
+    completion lease. A connection result is uncertain and retains the live
+    handle (#821), a definitive rejection keeps it live for a different
+    request, a submission the full client-call registry did not admit keeps
+    it live for a retry (#1104), and the bridge's NotFound/invalid-state
+    response closes it. This
+    must not weaken the ordinary Core completion policy tested above, which
+    still fails closed on [Connection]. *)
+let test_async_operation_policy () =
   let expect_disposition label expected actual =
     if actual <> expected then failwith label
   in
-  expect_disposition "uncertain heartbeat connection" Policy.Retry_exact
-    (Policy.async_heartbeat_disposition Bridge.Connection);
+  if Policy.activity_completion_retryable Bridge.Connection then
+    failwith "worker completion policy no longer fails closed";
+  expect_disposition "uncertain async connection" Policy.Retry_exact
+    (Policy.async_operation_disposition Bridge.Connection);
   expect_disposition "explicit retryable heartbeat" Policy.Retry_exact
-    (Policy.async_heartbeat_disposition Bridge.Retryable);
+    (Policy.async_operation_disposition Bridge.Retryable);
   List.iter
     (fun (label, status) ->
       expect_disposition label Policy.Rejected_live
-        (Policy.async_heartbeat_disposition status))
+        (Policy.async_operation_disposition status))
     [
       ("definitive RPC rejection", Bridge.Async_heartbeat_rejected);
       ("local invalid argument", Bridge.Invalid_argument);
       ("local protocol rejection", Bridge.Protocol);
       ("local configuration rejection", Bridge.Configuration);
     ];
+  (* A full client-call registry refuses admission before any RPC exists:
+     transient back-pressure that must keep the handle live (#1104). *)
+  expect_disposition "client-call registry full" Policy.Not_admitted
+    (Policy.async_operation_disposition Bridge.Resource_exhausted);
   List.iter
     (fun (label, status) ->
       expect_disposition label Policy.Retired
-        (Policy.async_heartbeat_disposition status))
+        (Policy.async_operation_disposition status))
     [
       ("not-found heartbeat", Bridge.Invalid_state);
       ("not-ready heartbeat", Bridge.Not_ready);
       ("worker heartbeat", Bridge.Worker);
       ("unknown heartbeat status", Bridge.Unknown 13);
     ]
-
-(** Shutdown can reopen admission only when an activity drain retained a
-    completion after an explicitly transient native failure. Workflow drains
-    and permanent activity failures must remain terminal. *)
-let test_shutdown_policy () =
-  expect_bool "retryable activity drain" true
-    (Policy.shutdown_retryable (Policy.Activity_drain true));
-  expect_bool "permanent activity drain" false
-    (Policy.shutdown_retryable (Policy.Activity_drain false));
-  expect_bool "workflow drain" false
-    (Policy.shutdown_retryable Policy.Workflow_drain);
-  expect_bool "retryable activity native cleanup" false
-    (Policy.needs_native_cleanup (Policy.Activity_drain true));
-  expect_bool "permanent activity native cleanup" true
-    (Policy.needs_native_cleanup (Policy.Activity_drain false));
-  expect_bool "workflow native cleanup" true
-    (Policy.needs_native_cleanup Policy.Workflow_drain)
-
-(** Proves that terminal cleanup is injected and its diagnostic cannot replace
-    the adapter failure which explains why admission became terminal. The same
-    helper also contains the exception guard used for a defensive cleanup
-    callback, so an unexpected callback defect cannot change the public result. *)
-let test_terminal_cleanup_preserves_original_error () =
-  let original = "completion could not be retired" in
-  (* A cleanup callback that returns [Ok] also proves the native runtime was
-     released, exactly like an [Error] result -- both mean adapter state may
-     be discarded. This is the exact decision the native worker's successful
-     shutdown path relies on to know it may call [Workflow.discard] and
-     [Activity.discard] after [Native.shutdown] returns [Ok ()]. *)
-  let ok_cleanup_calls = ref 0 in
-  let ok_cleanup_returned, ok_result =
-    Policy.retain_original_error
-      ~cleanup:(fun () ->
-        incr ok_cleanup_calls;
-        Ok ())
-      ~on_cleanup_error:(fun _ -> failwith "unexpected cleanup error")
-      ~on_cleanup_exception:(fun _ -> failwith "unexpected cleanup exception")
-      original
-  in
-  if not ok_cleanup_returned then
-    failwith "successful native cleanup was not recognized as release-complete";
-  if ok_result <> original then
-    failwith "successful native cleanup replaced the original value";
-  if !ok_cleanup_calls <> 1 then failwith "successful native cleanup was not requested";
-  let cleanup_calls = ref 0 in
-  let reported_error = ref None in
-  let reported_exception = ref false in
-  let cleanup_returned, result =
-    Policy.retain_original_error
-      ~cleanup:(fun () ->
-        incr cleanup_calls;
-        Error "native graph already closed")
-      ~on_cleanup_error:(fun error -> reported_error := Some error)
-      ~on_cleanup_exception:(fun _ -> reported_exception := true)
-      original
-  in
-  if not cleanup_returned then
-    failwith "returned native cleanup was not recognized as release-complete";
-  if result <> original then
-    failwith "native cleanup replaced the original adapter error";
-  if !cleanup_calls <> 1 then failwith "native cleanup was not requested";
-  if !reported_error <> Some "native graph already closed" then
-    failwith "native cleanup diagnostic was not reported";
-  if !reported_exception then
-    failwith "cleanup error was incorrectly reported as an exception";
-  let exception_returned, exception_result =
-    Policy.retain_original_error
-      ~cleanup:(fun () -> raise Exit)
-      ~on_cleanup_error:(fun _ -> failwith "unexpected cleanup error")
-      ~on_cleanup_exception:(fun exception_ ->
-        match exception_ with
-        | Exit -> ()
-        | _ -> failwith "unexpected cleanup exception")
-      original
-  in
-  if exception_returned then
-    failwith "cleanup exception was incorrectly treated as release-complete";
-  (* This mirrors the production gate: adapter discard is reachable only after
-     the cleanup callback returned a result, never from the exception branch. *)
-  let exception_discarded = ref false in
-  if exception_returned then exception_discarded := true;
-  if !exception_discarded then
-    failwith "cleanup exception discarded adapter state";
-  if exception_result <> original then
-    failwith "cleanup exception replaced the original adapter error"
 
 (** Proves a re-entrant same-Domain [shutdown] never clears the shared [closed]
     stop flag, reproducing the documented multi-caller deadlock interleaving:
@@ -183,10 +108,23 @@ let test_reentrant_same_domain_shutdown_preserves_closed () =
        concurrent shutdown; the run loop would never exit and deadlock the \
        waiting caller"
 
+(** Every abandoned-worker finalizer path that cannot create its cleanup
+    thread must close supervisor admission, because the supervisor's own
+    finalizer is delegated to the worker (#1044). A successful spawn must not
+    close admission, and an exception from closing is contained. *)
+let test_spawn_failure_closes_admission () =
+  let closes = ref 0 in
+  let close_admission () = incr closes in
+  Policy.spawn_or_close_admission ~spawn:(fun () -> true) ~close_admission;
+  if !closes <> 0 then failwith "a spawned cleanup thread also closed admission";
+  Policy.spawn_or_close_admission ~spawn:(fun () -> false) ~close_admission;
+  if !closes <> 1 then failwith "a failed spawn did not close admission";
+  Policy.spawn_or_close_admission ~spawn:(fun () -> false)
+    ~close_admission:(fun () -> failwith "close raised")
+
 (** Runs all pure policy regressions. *)
 let () =
   test_activity_completion_policy ();
-  test_async_heartbeat_policy ();
-  test_shutdown_policy ();
-  test_terminal_cleanup_preserves_original_error ();
-  test_reentrant_same_domain_shutdown_preserves_closed ()
+  test_async_operation_policy ();
+  test_reentrant_same_domain_shutdown_preserves_closed ();
+  test_spawn_failure_closes_admission ()

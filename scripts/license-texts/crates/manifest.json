@@ -1,0 +1,294 @@
+{
+  "description": "Reviewed upstream licence and notice texts for locked Cargo packages that publish no licence file. scripts/generate-third-party-notices.py uses an entry only for the exact package versions it lists and only while the package's concluded licence equals `license`; each file must match its sha256 and cite an upstream URL pinned to a commit. See docs/dependencies.md.",
+  "notices": [
+    {
+      "packages": [
+        {
+          "name": "jni",
+          "version": "0.22.4"
+        },
+        {
+          "name": "jni-macros",
+          "version": "0.22.4"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "files": [
+        {
+          "path": "jni-rs/LICENSE-APACHE",
+          "upstream": "https://github.com/jni-rs/jni-rs/blob/5ae9458a4ec44c5318f37ddc7569c1d4ae8a69e7/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "path": "jni-rs/LICENSE-MIT",
+          "upstream": "https://github.com/jni-rs/jni-rs/blob/5ae9458a4ec44c5318f37ddc7569c1d4ae8a69e7/LICENSE-MIT",
+          "sha256": "fea1d5bf3dd71605ce5d7d2ff695c1837e914c77195e523a86b5391716477960"
+        }
+      ],
+      "evidence": "Repository root licence files at the .cargo_vcs_info.json commits: jni 5ae9458a4ec44c5318f37ddc7569c1d4ae8a69e7 (crates/jni) and jni-macros 33045a124105c939d1e2cbdcb5a39e5d868ffa03 (crates/jni-macros); both files are byte-identical at the two commits."
+    },
+    {
+      "packages": [
+        {
+          "name": "jni-sys-macros",
+          "version": "0.4.1"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "files": [
+        {
+          "path": "jni-sys/LICENSE-APACHE",
+          "upstream": "https://github.com/jni-rs/jni-sys/blob/64d77b7a5f119d7b55b4e2c169a4668067ff59e6/LICENSE-APACHE",
+          "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
+        },
+        {
+          "path": "jni-sys/LICENSE-MIT",
+          "upstream": "https://github.com/jni-rs/jni-sys/blob/64d77b7a5f119d7b55b4e2c169a4668067ff59e6/LICENSE-MIT",
+          "sha256": "1d85bd754b04ceec93e98e890edd1fa3c6a22e81bcb32135806beeccefa51cd1"
+        }
+      ],
+      "evidence": "Repository root licence files at the .cargo_vcs_info.json commit (path jni-sys-macros)."
+    },
+    {
+      "packages": [
+        {
+          "name": "objc2-core-foundation",
+          "version": "0.3.2"
+        },
+        {
+          "name": "objc2-io-kit",
+          "version": "0.3.2"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "files": [
+        {
+          "path": "objc2/LICENSE.md",
+          "upstream": "https://github.com/madsmtm/objc2/blob/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54"
+        }
+      ],
+      "standard_texts": [
+        "Apache-2.0"
+      ],
+      "evidence": "LICENSE.md at the .cargo_vcs_info.json commit is the only licence file in the repository tree; it states the licence choice and links to the licence texts but contains no copyright line. The Apache-2.0 option is elected because it requires only the licence text (and a NOTICE file, of which upstream has none) for binary redistribution, so no copyright holder needs to be named or invented."
+    },
+    {
+      "packages": [
+        {
+          "name": "opentelemetry",
+          "version": "0.32.0"
+        },
+        {
+          "name": "opentelemetry-http",
+          "version": "0.32.0"
+        },
+        {
+          "name": "opentelemetry-otlp",
+          "version": "0.32.0"
+        },
+        {
+          "name": "opentelemetry-proto",
+          "version": "0.32.0"
+        },
+        {
+          "name": "opentelemetry_sdk",
+          "version": "0.32.1"
+        }
+      ],
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "opentelemetry-rust/LICENSE",
+          "upstream": "https://github.com/open-telemetry/opentelemetry-rust/blob/ec289cb3c6f8260951699c51df968560943c1451/LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ],
+      "evidence": "Repository root LICENSE at the .cargo_vcs_info.json commits ec289cb3c6f8260951699c51df968560943c1451 (0.32.0 crates) and 284a37d93b3856e1975c2807ba3af1421ebd9b52 (opentelemetry_sdk 0.32.1), byte-identical at both. Neither the root nor the crate directories contain a NOTICE file at those commits."
+    },
+    {
+      "packages": [
+        {
+          "name": "pbjson",
+          "version": "0.9.0"
+        },
+        {
+          "name": "pbjson-build",
+          "version": "0.9.0"
+        }
+      ],
+      "license": "MIT",
+      "files": [
+        {
+          "path": "pbjson/LICENSE",
+          "upstream": "https://github.com/influxdata/pbjson/blob/48ee5989564e0ace82ad71b87736d3d1b2e0e1cd/LICENSE",
+          "sha256": "791a00933f2ea7e512856361e026998362241c3918d7be948c24d29441033b55"
+        }
+      ],
+      "evidence": "Repository root LICENSE at the .cargo_vcs_info.json commit of both crates."
+    },
+    {
+      "packages": [
+        {
+          "name": "prost-wkt",
+          "version": "0.7.2"
+        },
+        {
+          "name": "prost-wkt-build",
+          "version": "0.7.2"
+        }
+      ],
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "prost-wkt/LICENSE",
+          "upstream": "https://github.com/fdeantoni/prost-wkt/blob/2f30fc63e8d2a238ee518344d02ea8e006525fba/LICENSE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        }
+      ],
+      "evidence": "Repository root LICENSE at the .cargo_vcs_info.json commit of both crates; the repository has no NOTICE file."
+    },
+    {
+      "packages": [
+        {
+          "name": "prost-wkt-types",
+          "version": "0.7.2"
+        }
+      ],
+      "license": "Apache-2.0 AND BSD-3-Clause",
+      "files": [
+        {
+          "path": "prost-wkt/LICENSE",
+          "upstream": "https://github.com/fdeantoni/prost-wkt/blob/2f30fc63e8d2a238ee518344d02ea8e006525fba/LICENSE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "path": "protobuf/LICENSE",
+          "upstream": "https://github.com/protocolbuffers/protobuf/blob/35cd01f9fe9afbeea38cc7b979a3b6bfcde82c03/LICENSE",
+          "sha256": "6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d"
+        }
+      ],
+      "evidence": "The Apache-2.0 part is the prost-wkt repository LICENSE at the crate's .cargo_vcs_info.json commit. The BSD-3-Clause part covers the google.protobuf schemas the crate vendors from protocolbuffers/protobuf tag v35.1 (recorded in proto/google/protobuf/VERSION; the tag resolves to 35cd01f9fe9afbeea38cc7b979a3b6bfcde82c03); the protobuf LICENSE carries the same Google copyright notice as those files' headers."
+    },
+    {
+      "packages": [
+        {
+          "name": "r-efi",
+          "version": "5.3.0"
+        }
+      ],
+      "license": "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+      "files": [
+        {
+          "path": "r-efi-5.3.0/AUTHORS",
+          "upstream": "https://github.com/r-efi/r-efi/blob/97b55bed1c2c91dcbf787674849f05337ff80b33/AUTHORS",
+          "sha256": "ff92bed461f50338dd703a9ba9aee496a425957873df1d91192776e4bdf5dda7"
+        }
+      ],
+      "evidence": "r-efi keeps its licence statement, MIT permission notice, and copyright holders in AUTHORS (repository root at the .cargo_vcs_info.json commit, also shipped in the crate); the repository has no LICENSE file. The MIT option is elected."
+    },
+    {
+      "packages": [
+        {
+          "name": "r-efi",
+          "version": "6.0.0"
+        }
+      ],
+      "license": "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+      "files": [
+        {
+          "path": "r-efi-6.0.0/AUTHORS",
+          "upstream": "https://github.com/r-efi/r-efi/blob/7e1b0322d31d625f81a5656096330934f9cd835d/AUTHORS",
+          "sha256": "d027e91dbc9cdbb2f1190068e498bd6b61cff022b6a032b191021ba658d96111"
+        }
+      ],
+      "evidence": "r-efi keeps its licence statement, MIT permission notice, and copyright holders in AUTHORS (repository root at the .cargo_vcs_info.json commit, also shipped in the crate); the repository has no LICENSE file. The MIT option is elected."
+    },
+    {
+      "packages": [
+        {
+          "name": "rustls-platform-verifier-android",
+          "version": "0.2.0"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "files": [
+        {
+          "path": "rustls-platform-verifier/LICENSE-APACHE",
+          "upstream": "https://github.com/rustls/rustls-platform-verifier/blob/252e25161a91af476cbea620e29d277592d27ec7/android-release-support/LICENSE-APACHE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        },
+        {
+          "path": "rustls-platform-verifier/LICENSE-MIT",
+          "upstream": "https://github.com/rustls/rustls-platform-verifier/blob/252e25161a91af476cbea620e29d277592d27ec7/android-release-support/LICENSE-MIT",
+          "sha256": "1c7cf76689c837a68ed8d704994e52a0f2940c087958f860d17f3186afbdcc0c"
+        }
+      ],
+      "evidence": "Licence files in the crate directory (android-release-support) at the .cargo_vcs_info.json commit."
+    },
+    {
+      "packages": [
+        {
+          "name": "tonic-prost",
+          "version": "0.14.6"
+        },
+        {
+          "name": "tonic-prost-build",
+          "version": "0.14.6"
+        }
+      ],
+      "license": "MIT",
+      "files": [
+        {
+          "path": "tonic/LICENSE",
+          "upstream": "https://github.com/hyperium/tonic/blob/6cb6056b5a748bc5a29bd48f4602dbc4e552bb7d/LICENSE",
+          "sha256": "e24a56698aa6feaf3a02272b3624f9dc255d982970c5ed97ac4525a95056a5b3"
+        }
+      ],
+      "evidence": "Repository root LICENSE at the .cargo_vcs_info.json commit of both crates."
+    },
+    {
+      "packages": [
+        {
+          "name": "valuable",
+          "version": "0.1.1"
+        }
+      ],
+      "license": "MIT",
+      "files": [
+        {
+          "path": "valuable/LICENSE",
+          "upstream": "https://github.com/tokio-rs/valuable/blob/9efc29b6e58cef28f6566a47aa7e142a55fead77/LICENSE",
+          "sha256": "ed60d479b8fd1f64e9cbc3de449a16a53ac1b3d1b6aeb9bf9d190a8e93061b44"
+        }
+      ],
+      "evidence": "Repository root LICENSE at the .cargo_vcs_info.json commit."
+    },
+    {
+      "packages": [
+        {
+          "name": "winapi-i686-pc-windows-gnu",
+          "version": "0.4.0"
+        },
+        {
+          "name": "winapi-x86_64-pc-windows-gnu",
+          "version": "0.4.0"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "files": [
+        {
+          "path": "winapi-rs/LICENSE-APACHE",
+          "upstream": "https://github.com/retep998/winapi-rs/blob/9497609ef44cc9bcd16cd2411c0ee6ccaf5483aa/LICENSE-APACHE",
+          "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"
+        },
+        {
+          "path": "winapi-rs/LICENSE-MIT",
+          "upstream": "https://github.com/retep998/winapi-rs/blob/9497609ef44cc9bcd16cd2411c0ee6ccaf5483aa/LICENSE-MIT",
+          "sha256": "5b19674a1db628a475850a131956ed49521b744e3dda8f5a94141f9aba681219"
+        }
+      ],
+      "evidence": "These crates predate .cargo_vcs_info.json. Commit 9497609 (\"Publish 0.3.4\") is the last change to i686/Cargo.toml and x86_64/Cargo.toml before the crates gained their own licence files, and sets both to version 0.4.0; the vendored files are the repository root licences at that commit."
+    }
+  ]
+}

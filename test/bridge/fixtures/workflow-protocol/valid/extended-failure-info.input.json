@@ -1,0 +1,83 @@
+{
+  "run_id": "extended-failure-run",
+  "timestamp": {"seconds": 1720000000, "nanoseconds": 0},
+  "is_replaying": true,
+  "history_length": 11,
+  "jobs": [
+    {
+      "kind": "resolve_activity",
+      "seq": 3,
+      "result": {
+        "kind": "failed",
+        "failure": {
+          "message": "Activity task failed",
+          "source": "",
+          "stack_trace": "",
+          "encoded_attributes": null,
+          "info": {
+            "kind": "activity",
+            "scheduled_event_id": 5,
+            "started_event_id": 6,
+            "identity": "worker",
+            "activity_type": "upload",
+            "activity_id": "3",
+            "retry_state": "non_retryable_failure"
+          },
+          "cause": {
+            "message": "result exceeds the blob size limit",
+            "source": "",
+            "stack_trace": "",
+            "encoded_attributes": null,
+            "info": {"kind": "server", "non_retryable": true},
+            "cause": {
+              "message": "workflow reset",
+              "source": "",
+              "stack_trace": "",
+              "encoded_attributes": null,
+              "info": {
+                "kind": "reset_workflow",
+                "last_heartbeat_details": [
+                  {"metadata": {"encoding": {"encoding": "base64", "data": "YmluYXJ5L3BsYWlu"}}, "data": {"encoding": "base64", "data": "MQ=="}}
+                ]
+              },
+              "cause": {
+                "message": "nexus operation failed",
+                "source": "",
+                "stack_trace": "",
+                "encoded_attributes": null,
+                "info": {
+                  "kind": "nexus_operation",
+                  "scheduled_event_id": 8,
+                  "endpoint": "payments",
+                  "service": "billing",
+                  "operation": "charge",
+                  "operation_id": "",
+                  "operation_token": "token-1"
+                },
+                "cause": {
+                  "message": "handler failed",
+                  "source": "GoSDK",
+                  "stack_trace": "",
+                  "encoded_attributes": null,
+                  "info": {
+                    "kind": "nexus_handler",
+                    "type": "INTERNAL",
+                    "retry_behavior": "non_retryable"
+                  },
+                  "cause": {
+                    "message": "failure without failure_info",
+                    "source": "",
+                    "stack_trace": "",
+                    "encoded_attributes": null,
+                    "info": {"kind": "absent"},
+                    "cause": null
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

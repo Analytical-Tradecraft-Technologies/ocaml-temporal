@@ -16,8 +16,11 @@ type t = {
   mutable state : state;
   (* Hooks are kept by the owning scheduler and invoked in registration order
      when this scope is cancelled.  They are the bridge from cooperative OCaml
-     observation to real Temporal cancellation commands. *)
-  mutable cancel_hooks : (unit -> (unit, Error.t) result) option ref list;
+     observation to real Temporal cancellation commands.  The ordered
+     registry lets a completed operation unlink its hook in O(1), so a wide
+     fan-out of scoped operations does not settle in quadratic time. *)
+  cancel_hooks :
+    (unit -> (unit, Error.t) result) option ref Temporal_base.Ordered_registry.t;
 }
 
 (** Constructs the stable public error returned when a scope has been
@@ -26,7 +29,7 @@ let cancellation_error () =
   Error.make ~category:`Cancelled ~message:"workflow scope cancelled" ()
 
 (** Constructs the defect used when a scope operation is attempted from an
-    unrelated Domain or outside its workflow scheduler. *)
+    unrelated Domain or thread, or outside its workflow scheduler. *)
 let ownership_error operation =
   Error.defect
     ~message:("Temporal.Scope." ^ operation ^ " used outside its owning workflow scheduler")
@@ -59,7 +62,7 @@ let create () =
             (fun () ->
               Temporal_sdk_kernel.Future_store.callbacks_live cancellation_base);
           state = Active;
-          cancel_hooks = [];
+          cancel_hooks = Temporal_base.Ordered_registry.create ();
         }
 
 (** Checks whether the current scheduler is the one that owns [scope] and is
@@ -67,16 +70,16 @@ let create () =
     stale as soon as its scheduler has been shut down, including when teardown
     is requested from inside the scheduler's final drain. The short-circuit
     keeps the liveness callback from reading scheduler state on a foreign
-    Domain. *)
+    Domain or thread. *)
 let owns_scheduler scope =
   Temporal_sdk_kernel.Future_store.current_owner_matches scope.owner_id
   && scope.callbacks_live ()
 
 (** Records cancellation and signals waiters through the owning scheduler.
     An active scope cannot be cancelled between scheduler runs or from another
-    Domain: doing so would mutate state without a queue turn that can resume
-    its waiters. The ownership check happens before reading [state], so even a
-    repeated call cannot race an owner-domain cancellation. *)
+    Domain or thread: doing so would mutate state without a queue turn that
+    can resume its waiters. The ownership check happens before reading
+    [state], so even a repeated call cannot race an owner-thread cancellation. *)
 let cancel scope =
   if not (owns_scheduler scope) then Error (ownership_error "cancel")
   else
@@ -88,8 +91,7 @@ let cancel scope =
         (* Seal the hook list before invoking user-owned closures.  If a hook
            re-enters [cancel], it therefore observes the already-cancelled
            state and cannot run this list twice. *)
-        let hooks = List.rev scope.cancel_hooks in
-        scope.cancel_hooks <- [];
+        let hooks = Temporal_base.Ordered_registry.take_all scope.cancel_hooks in
         let first_error =
           List.fold_left
             (fun first_error hook ->
@@ -145,16 +147,20 @@ let on_cancel ?until scope hook =
     | Active ->
         let token = ref None in
         let subscription = ref None in
+        (* Link the (still empty) token now so [detach] can unlink it in O(1);
+           cancellation cannot run between these lines because both happen in
+           one owner-scheduler turn. *)
+        let registration =
+          Temporal_base.Ordered_registry.add scope.cancel_hooks token
+        in
         (* Either completion or cancellation releases both registration sides. *)
         let detach () =
           token := None;
-          scope.cancel_hooks <-
-            List.filter (fun current -> current != token) scope.cancel_hooks;
+          Temporal_base.Ordered_registry.remove registration;
           Option.iter (fun remove -> remove ()) !subscription;
           subscription := None
         in
         token := Some (fun () -> detach (); invoke ());
-        scope.cancel_hooks <- token :: scope.cancel_hooks;
         Option.iter
           (fun future ->
             let remove = Temporal_sdk_kernel.Future.subscribe future (fun _ -> detach ()) in
@@ -163,24 +169,25 @@ let on_cancel ?until scope hook =
           until;
         Ok ()
 
+(** Pure scope reads may run during an owner scheduler turn or from that
+    execution's synchronous query while its scheduler is paused. The query
+    marker grants no permission to mutate the scope or await its signal. *)
+let may_read_state scope =
+  owns_scheduler scope
+  || Temporal_sdk_kernel.Workflow_context_store.query_read_owner_matches
+       scope.owner_id
+
 (** Reports the scope state without scheduling work or touching the resolver.
-    A synchronous query may read its own live scope while the scheduler is
-    paused; the query marker grants no permission to cancel it. Foreign or
-    stale handles still return a typed defect before reading mutable state. *)
+    Foreign or stale handles return a typed defect before reading state. *)
 let is_cancelled scope =
-  if
-    not
-      (owns_scheduler scope
-      || Temporal_sdk_kernel.Workflow_context_store.query_read_owner_matches
-           scope.owner_id)
-  then Error (ownership_error "is_cancelled")
+  if not (may_read_state scope) then Error (ownership_error "is_cancelled")
   else Ok (match scope.state with Cancelled -> true | Active -> false)
 
 (** Returns the scope's current cancellation result. The owner check is kept
-    here rather than delegated to [is_cancelled] so the operation has one
-    clear typed failure for a foreign or already-shutdown execution. *)
+    here rather than delegated to [is_cancelled] so the operation has its own
+    typed failure for a foreign or already-shutdown execution. *)
 let check scope =
-  if not (owns_scheduler scope) then Error (ownership_error "check")
+  if not (may_read_state scope) then Error (ownership_error "check")
   else
     match scope.state with
     | Cancelled -> Error (cancellation_error ())
@@ -193,10 +200,13 @@ let check scope =
 let ensure_owner scope =
   if owns_scheduler scope then Ok () else Error (ownership_error "await")
 
-(** Waits for either the operation or the scope signal. The operation is
-    registered first, so if both inputs are already ready the deterministic
-    Future race rule gives the operation precedence; a cancellation already
-    recorded in [state] wins before registration. *)
+(** Waits for either the operation or the scope signal. A cancellation
+    already recorded in [state] is returned before the race is registered,
+    even if the operation has completed. Because [cancel] records [state] and
+    resolves the signal in the same step, and nothing yields between [check]
+    and the race, the signal is never ready at registration time; the race
+    therefore only ever decides which input completes first while the fiber
+    is suspended. *)
 let await scope future =
   match ensure_owner scope with
   | Error error -> Error error

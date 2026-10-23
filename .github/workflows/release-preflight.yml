@@ -36,7 +36,7 @@ jobs:
             --volume "$PWD:/workspace:ro" \
             --volume "$RUNNER_TEMP/cargo-metadata.json:/tmp/cargo-metadata.json:ro" \
             --workdir /workspace \
-            python:3.14-slim-bookworm@sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9 \
+            python:3.15-slim-bookworm@sha256:122756f3fe72c4f5d3d71897888204ee85774bc79de952555b8a474e1d0a5d53 \
             python3 scripts/generate-cargo-sbom.py --metadata /tmp/cargo-metadata.json \
             > "$RUNNER_TEMP/ocaml-temporal-cargo.spdx.json"
           test -s "$RUNNER_TEMP/ocaml-temporal-cargo.spdx.json"
@@ -48,11 +48,11 @@ jobs:
             --volume "$PWD:/workspace:ro" \
             --volume "$RUNNER_TEMP/ocaml-temporal-cargo.spdx.json:/tmp/ocaml-temporal-cargo.spdx.json:ro" \
             --workdir /workspace \
-            python:3.14-slim-bookworm@sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9 \
+            python:3.15-slim-bookworm@sha256:122756f3fe72c4f5d3d71897888204ee85774bc79de952555b8a474e1d0a5d53 \
             python3 scripts/generate-cargo-sbom.py --audit /tmp/ocaml-temporal-cargo.spdx.json
 
       - name: Retain the Cargo SBOM for release publication
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-cargo-sbom
           path: ${{ runner.temp }}/ocaml-temporal-cargo.spdx.json

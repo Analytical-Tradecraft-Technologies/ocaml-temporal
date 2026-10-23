@@ -1,0 +1,1 @@
+{"run_id":"r","commands":[{"kind":"schedule_activity","seq":1,"activity_id":"a","activity_type":"t","task_queue":"q","arguments":[],"schedule_to_close_timeout":{"seconds":0,"nanoseconds":0},"schedule_to_start_timeout":null,"start_to_close_timeout":null,"heartbeat_timeout":null,"cancellation_type":"try_cancel","do_not_eagerly_execute":false}]}

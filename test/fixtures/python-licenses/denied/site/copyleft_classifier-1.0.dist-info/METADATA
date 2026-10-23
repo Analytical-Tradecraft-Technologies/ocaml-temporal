@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: copyleft-classifier
+Version: 1.0
+License-Expression: MIT
+Classifier: License :: OSI Approved :: GNU General Public License v3 (GPLv3)

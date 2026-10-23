@@ -61,6 +61,23 @@ if [ -z "$cancellation_start_line" ] || [ -z "$child_start_failure_line" ] \
   exit 1
 fi
 
+# The duplicate child ID is held only while the cancellation run is open, so
+# the driver must observe the parent's terminal start-failure result before it
+# cancels that run. Waiting afterwards reintroduces the race in which the
+# cancellation closes the holder before the parent issues its child command.
+child_start_failure_wait_line=$(grep -n -F \
+  'wait_workflow child_start_failure_handle' "$driver" \
+  | head -n 1 | cut -d: -f1)
+cancellation_cancel_line=$(grep -n -F \
+  'cancel_workflow cancellation_handle' "$driver" \
+  | head -n 1 | cut -d: -f1)
+if [ -z "$child_start_failure_wait_line" ] || [ -z "$cancellation_cancel_line" ] \
+  || [ "$child_start_failure_line" -ge "$child_start_failure_wait_line" ] \
+  || [ "$child_start_failure_wait_line" -ge "$cancellation_cancel_line" ]; then
+  echo "child-start-failure result must be awaited before the conflicting run is cancelled" >&2
+  exit 1
+fi
+
 # Preserve the two-process boundary: only the worker registers definitions,
 # while only the driver starts and waits for the exact run.
 if grep -F 'Worker.create' "$driver" >/dev/null \

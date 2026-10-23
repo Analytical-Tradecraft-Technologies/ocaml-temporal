@@ -32,7 +32,9 @@ val signal : t -> 'input Signal.t -> 'input -> (unit, Error.t) result
 (** Routes a query by name and decodes the handler's encoded result using the
     supplied definition. Query callbacks are expected to be read-only and
     non-suspending; this module does not silently make a blocking callback
-    safe. *)
+    safe. The result is decoded only after the callback has run, so an
+    output-encoding mismatch with the registered handler is reported as an
+    [Error] after the callback executed. *)
 val query : t -> 'output Query.t -> ('output, Error.t) result
 
 (** Routes a one-input typed query locally and decodes its typed result. *)
@@ -41,6 +43,9 @@ val query_with_input :
 
 (** Encodes an update request, runs the registered validator before its
     implementation, and decodes the typed result. A rejected validator never
-    invokes the implementation. *)
+    invokes the implementation. An input-encoding mismatch is rejected before
+    the validator runs, but the output is decoded only after the
+    implementation has returned: an output-encoding mismatch yields an [Error]
+    even though the implementation's state changes have already happened. *)
 val update :
   t -> ('input, 'output) Update.t -> 'input -> ('output, Error.t) result

@@ -126,7 +126,7 @@ let greeting_child =
     and activity retries share Temporal Core's wire representation. *)
 let child_retry_policy =
   match
-    Temporal.Activity.Retry_policy.make
+    Temporal.Retry_policy.make
       ~initial_interval:(Temporal.Duration.of_ms 1_000L)
       ~backoff_coefficient:2.0
       ~maximum_interval:(Temporal.Duration.of_ms 5_000L)
@@ -221,7 +221,7 @@ let test_child_workflow_cancellation () =
           seq = 1L;
           id = "cancel-me";
           name = "greeting_child";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_wait_cancellation_requested;
         };
@@ -313,7 +313,7 @@ let test_default_child_workflow_cancellation_policy () =
           seq = 1L;
           id = "default-cancel-me";
           name = "greeting_child";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
         };
@@ -700,7 +700,7 @@ let test_child_workflow_completion () =
           seq = 1L;
           id = "greeting/Ada";
           name = "greeting_child";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
         };
@@ -727,7 +727,7 @@ let test_child_workflow_retry_policy () =
           seq = 1L;
           id = "retrying-child";
           name = "greeting_child";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy =
             Some
               {
@@ -766,7 +766,7 @@ let test_child_workflow_concurrency_and_decoding () =
           seq = 1L;
           id = "child-1";
           name = "greeting_child";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
         };
@@ -928,7 +928,7 @@ let test_child_workflow_id_boundary () =
           seq = 1L;
           id = "after-invalid";
           name = "greeting_child";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
         };
@@ -1022,15 +1022,71 @@ let test_child_workflow_failures_and_sequence_ownership () =
       expect "duplicate child sequence" "bridge" (public_error_kind error)
   | _ -> failwith "duplicate child resolution was accepted"
 
+(** Regression for #810. Pinned Temporal Core resolves a [Try_cancel] child
+    that the parent cancels after start initiation but before the child-started
+    event directly as cancelled, without any start resolution. That sequence
+    must complete the child future with the typed cancellation error rather
+    than fail the workflow task. A non-cancelled terminal result before start
+    remains a bridge defect even after cancellation was requested, so only
+    Core's documented shape is accepted. *)
+let test_child_cancelled_before_start_acknowledgment () =
+  let start_command =
+    Activation.Start_child_workflow
+      {
+        task_queue = None;
+        parent_close_policy = None;
+        seq = 1L;
+        id = "default-cancel-me";
+        name = "greeting_child";
+        input = [ payload "Ada" ];
+        retry_policy = None;
+        cancellation_type = Activation.Child_try_cancel;
+      }
+  in
+  let cancel_command =
+    Activation.Cancel_child_workflow
+      { seq = 1L; reason = "cancelled by workflow" }
+  in
+  let cancelled = Execution.start default_cancelling_child_parent_workflow () in
+  expect "pre-start cancellation commands" [ start_command; cancel_command ]
+    (Execution.activate cancelled [ Activation.Start_workflow ]);
+  expect "pre-start cancellation resolves parent"
+    [ Activation.Complete_workflow (payload "cancelled") ]
+    (Execution.activate cancelled
+       [
+         Activation.Resolve_child_workflow
+           {
+             seq = 1L;
+             result =
+               Error
+                 (Temporal_base.Error.make ~category:`Cancelled
+                    ~message:"child cancelled before start" ());
+           };
+       ]);
+  let completed = Execution.start default_cancelling_child_parent_workflow () in
+  ignore (Execution.activate completed [ Activation.Start_workflow ]);
+  match
+    Execution.activate completed
+      [
+        Activation.Resolve_child_workflow
+          { seq = 1L; result = Ok (payload "too early") };
+      ]
+  with
+  | [] ->
+      let error = require_task_failure completed [] in
+      expect "cancel-requested child completed before start" "bridge"
+        (public_error_kind error)
+  | _ -> failwith "pre-start child completion was accepted after cancel"
+
 (** Ensures a conflicting second start result cannot consume the child resolver.
     The context must report a bridge error, leave the future pending, and still
     accept the legitimate terminal result that follows. *)
 let test_child_start_conflicting_result_keeps_future_pending () =
   let scheduler = Scheduler.create () in
   let context = Workflow_context_store.create scheduler in
-  let future, _cancel =
+  let future, _started, _cancel =
     Workflow_context_store.start_child_workflow context ~id:"child-id"
-      ~name:"child-workflow" ~input:(payload "Ada")
+      ~name:"child-workflow" ~input:[ payload "Ada" ]
       ~decode:(fun value -> Ok value) ()
   in
   (match
@@ -1077,7 +1133,7 @@ let test_activity_cancel_after_natural_completion_is_noop () =
   let context = Workflow_context_store.create scheduler in
   let future, cancel =
     Workflow_context_store.schedule_activity context ~name:"greeting"
-      ~input:(payload "Ada") ~decode:(fun value -> Ok value) ()
+      ~input:[ payload "Ada" ] ~decode:(fun value -> Ok value) ()
   in
   expect "natural-completion activity schedule command"
     [ Activation.Schedule_activity
@@ -1120,6 +1176,33 @@ let test_activity_cancel_after_natural_completion_is_noop () =
     (Workflow_context_store.take_commands context);
   Workflow_context_store.shutdown context
 
+(** The context store forwards an activity's argument list exactly. The
+    public layer decides it from the input codec: a [Codec.unit] input is zero
+    arguments (#819) and anything else is one payload, so a [binary/null]
+    argument such as an option's [None] must not be collapsed here (#1012).
+    Both remote and local activities follow the same rule;
+    [test_input_arguments] covers the codec decision itself. *)
+let test_activity_arguments_are_forwarded_exactly () =
+  let scheduler = Scheduler.create () in
+  let context = Workflow_context_store.create scheduler in
+  let null_argument = Temporal_base.Payload.unit_null () in
+  let _remote, _cancel =
+    Workflow_context_store.schedule_activity context ~name:"ping" ~input:[]
+      ~decode:(fun value -> Ok value) ()
+  in
+  let _local, _cancel_local =
+    Workflow_context_store.schedule_local_activity context ~name:"local-ping"
+      ~input:[ null_argument ] ~decode:(fun value -> Ok value) ()
+  in
+  (match Workflow_context_store.take_commands context with
+  | [ Activation.Schedule_activity { activity_type = "ping"; arguments = []; _ };
+      Activation.Schedule_local_activity
+        { activity_type = "local-ping"; arguments = [ forwarded ]; _ } ]
+    when forwarded = Temporal_base.Payload.unit_null () ->
+      ()
+  | _ -> failwith "activity arguments were not forwarded exactly");
+  Workflow_context_store.shutdown context
+
 (** A Core backoff keeps the original local-activity future pending, creates a
     separate workflow timer, and re-emits the same activity sequence with the
     supplied retry attempt when that timer fires. *)
@@ -1128,7 +1211,7 @@ let test_local_activity_backoff_reschedules_without_resolving () =
   let context = Workflow_context_store.create scheduler in
   let future, _cancel =
     Workflow_context_store.schedule_local_activity context ~name:"local-greeting"
-      ~input:(payload "Ada") ~decode:(fun value -> Ok value) ()
+      ~input:[ payload "Ada" ] ~decode:(fun value -> Ok value) ()
   in
   expect "initial local activity command"
     [ Activation.Schedule_local_activity
@@ -1156,6 +1239,10 @@ let test_local_activity_backoff_reschedules_without_resolving () =
    with
   | Ok () -> ()
   | Error error -> failwith ("local backoff was rejected: " ^ public_error_message error));
+  (* The timer is queued scheduler work (#809), not a job-pass command. *)
+  expect "local backoff timer emitted during the job pass" []
+    (Workflow_context_store.take_commands context);
+  ignore (Scheduler.run scheduler);
   expect "local backoff starts timer"
     [ Activation.Start_timer { seq = 2L; milliseconds = 2_500L } ]
     (Workflow_context_store.take_commands context);
@@ -1165,6 +1252,9 @@ let test_local_activity_backoff_reschedules_without_resolving () =
   (match Workflow_context_store.fire_timer context ~seq:2L with
   | Ok () -> ()
   | Error error -> failwith ("local backoff timer failed: " ^ public_error_message error));
+  expect "local backoff retry emitted during the job pass" []
+    (Workflow_context_store.take_commands context);
+  ignore (Scheduler.run scheduler);
   expect "local backoff reschedules activity"
     [ Activation.Schedule_local_activity
         {
@@ -1195,7 +1285,7 @@ let test_activity_cancel_after_failure_is_noop () =
   let context = Workflow_context_store.create scheduler in
   let future, cancel =
     Workflow_context_store.schedule_activity context ~name:"greeting"
-      ~input:(payload "Ada") ~decode:(fun value -> Ok value) ()
+      ~input:[ payload "Ada" ] ~decode:(fun value -> Ok value) ()
   in
   ignore (Workflow_context_store.take_commands context);
   let failure =
@@ -1234,7 +1324,7 @@ let test_activity_cancel_owner_check () =
   let context = Workflow_context_store.create scheduler in
   let _future, cancel =
     Workflow_context_store.schedule_activity context ~name:"greeting"
-      ~input:(payload "Ada") ~decode:(fun value -> Ok value) ()
+      ~input:[ payload "Ada" ] ~decode:(fun value -> Ok value) ()
   in
   ignore (Workflow_context_store.take_commands context);
   (match cancel () with
@@ -1259,9 +1349,9 @@ let test_activity_cancel_owner_check () =
 let test_child_cancel_after_natural_completion_is_noop () =
   let scheduler = Scheduler.create () in
   let context = Workflow_context_store.create scheduler in
-  let future, cancel =
+  let future, _started, cancel =
     Workflow_context_store.start_child_workflow context ~id:"late-cancel-child"
-      ~name:"child-workflow" ~input:(payload "Ada")
+      ~name:"child-workflow" ~input:[ payload "Ada" ]
       ~decode:(fun value -> Ok value) ()
   in
   expect "natural-completion start command"
@@ -1271,7 +1361,7 @@ let test_child_cancel_after_natural_completion_is_noop () =
           seq = 1L;
           id = "late-cancel-child";
           name = "child-workflow";
-          input = payload "Ada";
+          input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
         };
@@ -1315,9 +1405,9 @@ let test_child_cancel_after_natural_completion_is_noop () =
 let test_child_cancel_after_start_failure_is_noop () =
   let scheduler = Scheduler.create () in
   let context = Workflow_context_store.create scheduler in
-  let future, cancel =
+  let future, _started, cancel =
     Workflow_context_store.start_child_workflow context ~id:"failed-child"
-      ~name:"child-workflow" ~input:(payload "Ada")
+      ~name:"child-workflow" ~input:[ payload "Ada" ]
       ~decode:(fun value -> Ok value) ()
   in
   ignore (Workflow_context_store.take_commands context);
@@ -1362,9 +1452,9 @@ let test_child_cancel_after_start_failure_is_noop () =
 let test_child_resolution_rejections_preserve_lifecycle_state () =
   let scheduler = Scheduler.create () in
   let context = Workflow_context_store.create scheduler in
-  let future, _cancel =
+  let future, _started, _cancel =
     Workflow_context_store.start_child_workflow context ~id:"ordered-child"
-      ~name:"child-workflow" ~input:(payload "Ada")
+      ~name:"child-workflow" ~input:[ payload "Ada" ]
       ~decode:(fun value -> Ok value) ()
   in
   (match
@@ -1426,6 +1516,91 @@ let test_child_resolution_rejections_preserve_lifecycle_state () =
   | Some (Ok _) -> failwith "duplicate terminal overwrote the result"
   | None -> failwith "duplicate terminal removed the resolved result")
 
+(** A parent that keeps an [Abandon] child running after it closes awaits the
+    start stage, so its completion is emitted only after Core acknowledges the
+    child start (#1040). The run ID is returned through the public future, and
+    the result future stays pending. *)
+let test_child_started_acknowledgment () =
+  let parent =
+    Temporal.Workflow.define ~name:"abandoning_parent"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+        let child =
+          Temporal.Child_workflow.start_handle
+            ~parent_close_policy:Temporal.Child_workflow.Parent_close_policy.Abandon
+            ~id:"bill-1" greeting_child "Ada"
+        in
+        match Temporal.Future.await (Temporal.Child_workflow.started child) with
+        | Error error -> Error error
+        | Ok run_id ->
+            if Temporal.Future.is_ready (Temporal.Child_workflow.future child)
+            then Error (Temporal.Error.defect ~message:"child result settled at start")
+            else Ok run_id)
+  in
+  let execution = Execution.start parent () in
+  (match Execution.activate execution [ Activation.Start_workflow ] with
+  | [ Activation.Start_child_workflow { seq = 1L; _ } ] -> ()
+  | _ -> failwith "parent completed before the child start was acknowledged");
+  expect "parent completes after the start acknowledgment"
+    [ Activation.Complete_workflow (payload "child-run") ]
+    (Execution.activate execution [ child_started 1L ])
+
+(** A child that never starts settles its start stage with the same typed
+    error as its result, whether Core rejects the start or the parent cancels
+    it first, so a parent awaiting [started] is never left blocked. *)
+let test_child_started_failure_paths () =
+  let start_failure =
+    Temporal_base.Error.make ~non_retryable:true ~category:`Child_workflow
+      ~message:"child workflow start failed" ()
+  in
+  let cancelled =
+    Temporal_base.Error.make ~category:`Cancelled ~message:"child cancelled" ()
+  in
+  List.iter
+    (fun (label, cancel_first, job, kind) ->
+      let parent =
+        Temporal.Workflow.define ~name:"started_failure_parent"
+          ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+            let child =
+              Temporal.Child_workflow.start_handle
+                ~cancellation_type:Temporal.Child_workflow.Try_cancel
+                ~id:"never-started" greeting_child "Ada"
+            in
+            let cancelled =
+              if cancel_first then Temporal.Child_workflow.cancel child
+              else Ok ()
+            in
+            match cancelled with
+            | Error error -> Error error
+            | Ok () -> (
+                match
+                  ( Temporal.Future.await (Temporal.Child_workflow.started child),
+                    Temporal.Future.peek (Temporal.Child_workflow.future child) )
+                with
+                | Error started, Some (Error result)
+                  when Temporal.Error.kind started = Temporal.Error.kind result ->
+                    Ok (Temporal.Error.kind started)
+                | Ok _, _ -> Error (Temporal.Error.defect ~message:"child started")
+                | Error _, _ ->
+                    Error
+                      (Temporal.Error.defect
+                         ~message:"start stage and result disagree")))
+      in
+      let execution = Execution.start parent () in
+      ignore (Execution.activate execution [ Activation.Start_workflow ]);
+      expect label [ Activation.Complete_workflow (payload kind) ]
+        (Execution.activate execution [ job ]))
+    [
+      ( "start failure settles the start stage",
+        false,
+        Activation.Resolve_child_workflow_start
+          { seq = 1L; result = Error start_failure },
+        "child_workflow" );
+      ( "pre-start cancellation settles the start stage",
+        true,
+        Activation.Resolve_child_workflow { seq = 1L; result = Error cancelled },
+        "cancelled" );
+    ]
+
 (** Verifies cancellation emits once and cache removal releases blocked state
     without producing a workflow command. *)
 let test_cancel_and_evict () =
@@ -1465,14 +1640,10 @@ let test_continue_as_new_terminal () =
         Temporal.Workflow.sleep (Temporal.Duration.of_ms 1L))
   in
   let execution = Execution.start source () in
-  let expected_input =
-    match Temporal.Codec.encode Temporal.Codec.unit () with
-    | Ok value -> base_payload value
-    | Error error -> failwith (Temporal.Error.message error)
-  in
+  (* A [Codec.unit] successor input is sent as zero arguments (#819). *)
   expect "continue-as-new command"
     [ Activation.Continue_as_new
-        { workflow_type = "continuation_target"; input = expected_input } ]
+        { workflow_type = "continuation_target"; input = [] } ]
     (Execution.activate execution [ Activation.Start_workflow ]);
   expect "continue-as-new activation is terminal" []
     (Execution.activate execution [ Activation.Start_workflow ]);
@@ -1505,14 +1676,8 @@ let test_codec_callback_preserves_terminal_control () =
         Ok ())
   in
   let expected =
-    let successor_input =
-      match Temporal.Codec.encode Temporal.Codec.unit () with
-      | Ok payload -> base_payload payload
-      | Error error -> failwith (Temporal.Error.message error)
-    in
     [ Activation.Continue_as_new
-        { workflow_type = "codec_continuation_target";
-          input = successor_input } ]
+        { workflow_type = "codec_continuation_target"; input = [] } ]
   in
   expect "activity codec callback terminal command" expected
     (Execution.activate (Execution.start source ()) [ Activation.Start_workflow ]);
@@ -1683,9 +1848,10 @@ let test_continue_as_new_finally_cannot_emit_cancel () =
     (Execution.activate execution [ Activation.Start_workflow ])
 
 (** Exercises the complete per-execution patch decision rule. Live code takes
-    the new branch, replay without a marker takes the old branch, and replay
-    with Core's notification takes the new branch. Repeated calls deliberately
-    emit repeated marker commands for Core to deduplicate. *)
+    the new branch, replay without a marker takes the old branch and emits no
+    marker, and replay with Core's notification takes the new branch. Repeated
+    [true] calls deliberately emit repeated marker commands for Core to
+    deduplicate. *)
 let test_workflow_patch_decisions () =
   let run ~name ~is_replaying ~jobs implementation =
     let definition =
@@ -1721,10 +1887,10 @@ let test_workflow_patch_decisions () =
         Ok ())
   in
   expect "replay absent patch decision" (Some false) !absent_decision;
+  (* A [false] replay decision must not emit a marker: Core would otherwise
+     queue a real RecordMarker that contradicts the legacy branch taken. *)
   (match absent_commands with
-  | Activation.Set_patch_marker
-      { patch_id = "orders.v2"; deprecated = false }
-    :: Activation.Complete_workflow _ :: [] -> ()
+  | [ Activation.Complete_workflow _ ] -> ()
   | _ -> failwith "replay without marker emitted unexpected commands");
   let present_decision = ref None in
   let present_commands =
@@ -1762,11 +1928,77 @@ let test_workflow_patch_decisions () =
         Temporal.Workflow.deprecate_patch ~id:"orders.v2";
         Ok ())
   in
-  match replay_deprecated_commands with
+  (match replay_deprecated_commands with
+  | [ Activation.Complete_workflow _ ] -> ()
+  | _ -> failwith "marker-free replay emitted a deprecated marker");
+  let replay_deprecated_present_commands =
+    run ~name:"patch_deprecated_replay_present" ~is_replaying:true
+      ~jobs:
+        [ Activation.Start_workflow;
+          Activation.Notify_has_patch { patch_id = "orders.v2" } ]
+      (fun () ->
+        Temporal.Workflow.deprecate_patch ~id:"orders.v2";
+        Ok ())
+  in
+  match replay_deprecated_present_commands with
   | [ Activation.Set_patch_marker
         { patch_id = "orders.v2"; deprecated = true };
       Activation.Complete_workflow _ ] -> ()
-  | _ -> failwith "marker-free replay rejected patch deprecation"
+  | _ -> failwith "replay with marker did not emit the deprecated marker"
+
+(** A decision already returned to workflow code is fixed for the run. The
+    first activation replays history without the marker, so [patched] returns
+    [false] and emits nothing. A later activation that carries
+    [NotifyHasPatch] for the same ID (for example because a stale marker was
+    recorded by an earlier SDK release) must not flip later answers, otherwise
+    the second call would take a branch the original run never took. *)
+let test_workflow_patch_decision_is_not_flipped_by_late_notification () =
+  let decisions = ref [] in
+  let definition =
+    Temporal.Workflow.define ~name:"patch_late_notification"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        let open Temporal.Result_syntax in
+        decisions := [ Temporal.Workflow.patched ~id:"orders.v2" ];
+        let* () = Temporal.Workflow.sleep (Temporal.Duration.of_ms 10L) in
+        decisions := !decisions @ [ Temporal.Workflow.patched ~id:"orders.v2" ];
+        Ok ())
+  in
+  let execution = Execution.start definition () in
+  Execution.set_activation_is_replaying execution true;
+  expect "replayed legacy branch emits only its timer"
+    [ Activation.Start_timer { seq = 1L; milliseconds = 10L } ]
+    (Execution.activate execution [ Activation.Start_workflow ]);
+  expect "replay decision" [ false ] !decisions;
+  Execution.set_activation_is_replaying execution false;
+  (* The later call keeps the false answer but emits the marker command Core
+     needs to consume the reported history marker. *)
+  (match
+     Execution.activate execution
+       [ Activation.Notify_has_patch { patch_id = "orders.v2" };
+         Activation.Fire_timer { seq = 1L } ]
+   with
+  | [ Activation.Set_patch_marker { patch_id = "orders.v2"; deprecated = false };
+      Activation.Complete_workflow _ ] -> ()
+  | _ -> failwith "late patch notification did not consume the history marker");
+  expect "late notification did not flip decision" [ false; false ] !decisions;
+  (* A notification that precedes the first local call still seeds the
+     decision, so replay of a marker history keeps taking the new branch. *)
+  let context = Workflow_context_store.create (Scheduler.create ()) in
+  Workflow_context_store.set_activation_is_replaying context true;
+  expect "unnotified replay decision" false
+    (Workflow_context_store.patched context ~patch_id:"orders.absent");
+  Workflow_context_store.notify_has_patch context ~patch_id:"orders.absent";
+  Workflow_context_store.notify_has_patch context ~patch_id:"orders.present";
+  expect "late notification keeps false" false
+    (Workflow_context_store.patched context ~patch_id:"orders.absent");
+  expect "early notification seeds true" true
+    (Workflow_context_store.patched context ~patch_id:"orders.present");
+  match Workflow_context_store.take_commands context with
+  | [ Activation.Set_patch_marker
+        { patch_id = "orders.absent"; deprecated = false };
+      Activation.Set_patch_marker
+        { patch_id = "orders.present"; deprecated = false } ] -> ()
+  | _ -> failwith "patch decisions emitted unexpected commands"
 
 (** One execution may repeat one marker mode but must never emit both active
     and deprecated commands for the same ID. Core retains the first command,
@@ -1897,9 +2129,10 @@ let test_workflow_patch_mode_isolation_and_public_deprecation_snapshot () =
   | _ -> failwith "public deprecation ID mutation changed retained command"
 
 (** Patch state belongs to one workflow execution and patch IDs are copied at
-    the public boundary. A notification in run A must not affect run B, and a
-    caller mutating an unsafe string alias after [patched] returns must not
-    change the emitted durable marker. *)
+    the public boundary. A notification in run A must not affect run B, which
+    replays without a marker and therefore emits none. A caller mutating an
+    unsafe string alias after [patched] returns in live run C must not change
+    the emitted durable marker. *)
 let test_workflow_patch_isolation_and_public_id_snapshot () =
   let decision_a = ref None in
   let definition_a =
@@ -1909,19 +2142,28 @@ let test_workflow_patch_isolation_and_public_id_snapshot () =
         Ok ())
   in
   let decision_b = ref None in
-  let mutable_id = Bytes.of_string "shared.patch" in
-  let aliased_id = Bytes.unsafe_to_string mutable_id in
   let definition_b =
     Temporal.Workflow.define ~name:"patch_run_b" ~input:Temporal.Codec.unit
       ~output:Temporal.Codec.unit (fun () ->
-        decision_b := Some (Temporal.Workflow.patched ~id:aliased_id);
+        decision_b := Some (Temporal.Workflow.patched ~id:"shared.patch");
+        Ok ())
+  in
+  let decision_c = ref None in
+  let mutable_id = Bytes.of_string "shared.patch" in
+  let aliased_id = Bytes.unsafe_to_string mutable_id in
+  let definition_c =
+    Temporal.Workflow.define ~name:"patch_run_c" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () ->
+        decision_c := Some (Temporal.Workflow.patched ~id:aliased_id);
         Bytes.set mutable_id 0 'X';
         Ok ())
   in
   let execution_a = Execution.start definition_a () in
   let execution_b = Execution.start definition_b () in
+  let execution_c = Execution.start definition_c () in
   Execution.set_activation_is_replaying execution_a true;
   Execution.set_activation_is_replaying execution_b true;
+  Execution.set_activation_is_replaying execution_c false;
   let commands_a =
     Execution.activate execution_a
       [ Activation.Start_workflow;
@@ -1930,12 +2172,19 @@ let test_workflow_patch_isolation_and_public_id_snapshot () =
   let commands_b =
     Execution.activate execution_b [ Activation.Start_workflow ]
   in
+  let commands_c =
+    Execution.activate execution_c [ Activation.Start_workflow ]
+  in
   expect "patch run A decision" (Some true) !decision_a;
   expect "patch run B decision" (Some false) !decision_b;
+  expect "patch run C decision" (Some true) !decision_c;
   (match commands_a with
   | Activation.Set_patch_marker { patch_id = "shared.patch"; _ } :: _ -> ()
   | _ -> failwith "patch run A did not emit its marker");
-  match commands_b with
+  (match commands_b with
+  | [ Activation.Complete_workflow _ ] -> ()
+  | _ -> failwith "patch run B emitted a marker for a false decision");
+  match commands_c with
   | Activation.Set_patch_marker { patch_id = "shared.patch"; _ } :: _ -> ()
   | _ -> failwith "patch ID mutation changed the emitted marker"
 
@@ -2078,6 +2327,31 @@ let test_workflow_search_attribute_upsert () =
         failwith "search-attribute payload was not retained"
   | _ -> failwith "search-attribute upsert emitted an unexpected command sequence"
 
+(** Verifies an empty search-attribute upsert emits no command (#1033).
+    Temporal Server rejects an upsert with empty indexed fields, and replay
+    would re-emit it on every task retry, so the only safe encoding of an
+    empty merge is no command at all. A non-empty upsert in the same
+    activation must still be emitted exactly once, in order. *)
+let test_workflow_empty_search_attribute_upsert () =
+  let workflow =
+    Temporal.Workflow.define ~name:"empty_search_attribute_upsert"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        Temporal.Workflow.upsert_search_attributes [];
+        let value =
+          match Temporal.Codec.encode Temporal.Codec.string "ready" with
+          | Ok value -> value
+          | Error error -> failwith (Temporal.Error.message error)
+        in
+        Temporal.Workflow.upsert_search_attributes [ ("status", value) ];
+        Temporal.Workflow.upsert_search_attributes [];
+        Ok ())
+  in
+  let execution = Execution.start workflow () in
+  match Execution.activate execution [ Activation.Start_workflow ] with
+  | [ Activation.Upsert_search_attributes { search_attributes = [ ("status", _) ] };
+      Activation.Complete_workflow _ ] -> ()
+  | _ -> failwith "empty search-attribute upsert emitted a command"
+
 (** Verifies public child routing and parent closure remain separate from
     explicit cancellation, and survive the native protocol translation. *)
 let test_child_routing_and_parent_close () =
@@ -2140,14 +2414,18 @@ let () =
   test_child_workflow_validation ();
   test_child_workflow_id_boundary ();
   test_child_workflow_failures_and_sequence_ownership ();
+  test_child_cancelled_before_start_acknowledgment ();
   test_child_start_conflicting_result_keeps_future_pending ();
   test_activity_cancel_after_natural_completion_is_noop ();
+  test_activity_arguments_are_forwarded_exactly ();
   test_local_activity_backoff_reschedules_without_resolving ();
   test_activity_cancel_after_failure_is_noop ();
   test_activity_cancel_owner_check ();
   test_child_cancel_after_natural_completion_is_noop ();
   test_child_cancel_after_start_failure_is_noop ();
   test_child_resolution_rejections_preserve_lifecycle_state ();
+  test_child_started_acknowledgment ();
+  test_child_started_failure_paths ();
   test_cancel_and_evict ();
   test_continue_as_new_terminal ();
   test_codec_callback_preserves_terminal_control ();
@@ -2157,9 +2435,11 @@ let () =
   test_continue_as_new_finally_cannot_emit_cancel ();
   test_workflow_patch_decisions ();
   test_workflow_patch_mode_invariant ();
+  test_workflow_patch_decision_is_not_flipped_by_late_notification ();
   test_workflow_patch_mode_isolation_and_public_deprecation_snapshot ();
   test_workflow_patch_isolation_and_public_id_snapshot ();
   test_incoming_patch_notification_snapshot ();
   test_workflow_random_int_is_replay_stable ();
   test_update_validator_cannot_consume_workflow_randomness ();
-  test_workflow_search_attribute_upsert ()
+  test_workflow_search_attribute_upsert ();
+  test_workflow_empty_search_attribute_upsert ()

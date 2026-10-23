@@ -22,12 +22,57 @@ set_fixture_version 0.1.0
 
 sh "$script" "$fixture" v0.1.0
 
-# Prerelease tags are valid release candidates.  A familiar SemVer hyphen is
+# Prerelease tags are valid release candidates. The Git tag's SemVer hyphen is
 # normalized to OPAM's tilde ordering, so the package beta remains older than
-# the eventual final release. A tag written with OPAM's tilde is accepted too.
+# the eventual final release. Assert the exact normalized version reported.
 set_fixture_version 1.0.0~beta.1
-sh "$script" "$fixture" v1.0.0-beta.1
-sh "$script" "$fixture" v1.0.0~beta.1
+output=$(sh "$script" "$fixture" v1.0.0-beta.1)
+if [ "$output" != 'release tag check: ok (v1.0.0-beta.1 -> temporal-sdk 1.0.0~beta.1)' ]; then
+  echo "release tag contract normalized v1.0.0-beta.1 unexpectedly: $output" >&2
+  exit 1
+fi
+
+# Only the separator after the numeric core is converted; later hyphens are
+# part of the prerelease identifier and must survive unchanged.
+set_fixture_version 1.0.0~rc-2.1
+output=$(sh "$script" "$fixture" v1.0.0-rc-2.1)
+if [ "$output" != 'release tag check: ok (v1.0.0-rc-2.1 -> temporal-sdk 1.0.0~rc-2.1)' ]; then
+  echo "release tag contract normalized v1.0.0-rc-2.1 unexpectedly: $output" >&2
+  exit 1
+fi
+if sh "$script" "$fixture" v1.0.0-rc.2.1 >/dev/null 2>&1; then
+  echo "release tag contract normalized a later hyphen in the prerelease" >&2
+  exit 1
+fi
+
+# Git refnames cannot contain "~", so the OPAM spelling can never be a tag.
+# Reject it explicitly, with guidance, even when the manifests match it.
+set_fixture_version 1.0.0~beta.1
+if git check-ref-format "refs/tags/v1.0.0~beta.1"; then
+  echo "release tag contract assumes Git rejects '~' in tags" >&2
+  exit 1
+fi
+if error=$(sh "$script" "$fixture" 'v1.0.0~beta.1' 2>&1); then
+  echo "release tag contract accepted a '~' tag that Git cannot represent" >&2
+  exit 1
+fi
+case "$error" in
+  *"cannot contain '~'"*v1.0.0-beta.1*) ;;
+  *)
+    echo "release tag contract gave an unclear '~' rejection: $error" >&2
+    exit 1
+    ;;
+esac
+
+# A prerelease tag must not match final manifests, nor a final tag a prerelease.
+if sh "$script" "$fixture" v1.0.0 >/dev/null 2>&1; then
+  echo "release tag contract accepted a final tag for a prerelease manifest" >&2
+  exit 1
+fi
+if sh "$script" "$fixture" v1.0.0-beta.2 >/dev/null 2>&1; then
+  echo "release tag contract accepted a different prerelease suffix" >&2
+  exit 1
+fi
 
 # Git accepts some shell metacharacters in ref names. A release tag must never
 # become shell source when passed through the public Make target.

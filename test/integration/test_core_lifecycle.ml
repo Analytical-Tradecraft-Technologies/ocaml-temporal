@@ -20,6 +20,7 @@ let bridge_status = function
   | Already_started -> "already_started"
   | Retryable -> "retryable"
   | Async_heartbeat_rejected -> "async_heartbeat_rejected"
+  | Resource_exhausted -> "resource_exhausted"
   | Unknown code -> Printf.sprintf "unknown(%d)" code
 
 (** Raises a test failure while preserving structured bridge diagnostics. *)
@@ -33,7 +34,7 @@ let require_supervisor = function
   | Ok value -> value
   | Error (Native.Backend error) -> require (Error error)
   | Error Native.Closed -> failwith "supervisor closed unexpectedly"
-  | Error (Native.Supervisor_failed exn) -> raise exn
+  | Error (Native.Supervisor_failed exn | Native.Owner_unavailable exn) -> raise exn
 
 (** Accepts only the structured lifecycle-state error expected by a negative
     transition assertion and fails with the full unexpected diagnostic. *)
@@ -55,7 +56,7 @@ let () =
   let client =
     require
       (Native.client_config ~target_url:address
-         ~identity:"ocaml-temporal-live-lifecycle")
+         ~identity:"ocaml-temporal-live-lifecycle" ())
   in
   let worker =
     require

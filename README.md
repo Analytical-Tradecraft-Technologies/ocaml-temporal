@@ -55,7 +55,7 @@ platforms does not establish live compatibility there.
 | Area | Current evidence and boundary |
 | --- | --- |
 | Workflow authoring | Typed definitions, codecs, direct-style suspension, futures, conditions, deterministic time/randomness, and cancellation scopes have focused unit/runtime tests. Live fixtures exercise timer/activity/child waits and selected replay paths. |
-| Activities | Remote execution, retries, heartbeat details/timeouts, non-immediate retry, and retained asynchronous completion have live scenarios. `smoke.local_activity` live-verifies local activity success; local retry/backoff and cancellation variants have focused tests, not a complete live conformance suite. |
+| Activities | Remote execution, retries, heartbeat details/timeouts, non-immediate retry, retained asynchronous completion, and cooperative cancellation observed at heartbeats (with a worker-shutdown flag) have live scenarios. `smoke.local_activity` live-verifies local activity success; local retry/backoff and cancellation variants have focused tests, not a complete live conformance suite. |
 | Child workflows | Success, propagated failure, explicit child cancellation, child retry, and duplicate-ID start failure are live-tested. Separate controllers verify exact parent/child replay after worker replacement and a child failing after replay while its parent recovers. |
 | Client and interactions | Exact-run start/wait/cancel/terminate, continue-as-new following, direct and external signals, both query forms, typed update completion, unknown-handler rejection, and external cancellation have live assertions. External signal rejection against a completed target and wrong-run cancellation rejection are also exercised. Reset, visibility, and interaction recovery/deadline coverage remain incomplete. |
 | Recovery and patching | Live controllers exercise graceful replacement, forced crash recovery, sticky-cache eviction, parent/child recovery, and marker-free to active, active to deprecated, and deprecated to removed patch histories. These fixtures do not establish arbitrary-history compatibility. |
@@ -70,12 +70,23 @@ platforms does not establish live compatibility there.
 - HTTP(S) endpoint configuration exists, but public authentication, custom
   trust/mTLS/API-key configuration and secure-endpoint acceptance remain work.
   The live fixture uses a local plaintext Temporal endpoint.
-- Running activity callbacks are serialized. Scope cancellation commands,
-  activity task cancellation, and worker shutdown are separate mechanisms;
-  application-visible cooperative callback cancellation and bounded operational
-  shutdown qualification remain incomplete.
-- A public replay API/history tool, wider history and Server/Core compatibility
-  corpora, local-activity recovery, worker deployment routing acceptance,
+- Running activity callbacks are serialized. A synchronous callback observes
+  cancellation only cooperatively, at its heartbeats, and worker shutdown
+  through `Activity.Context.is_worker_shutting_down`; an asynchronous handle
+  observes cancellation, pause and reset only through the result of
+  `Activity.Async_handle.heartbeat` and is not told about worker shutdown.
+  Bounded operational shutdown qualification remains incomplete.
+- Workflow-level cooperative cancellation and durable cleanup are not
+  supported ([#514](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/514)):
+  `Client.cancel` closes the run as cancelled without letting workflow code
+  run cleanup first, and the proposed
+  [v1 support policy](docs/reference/v1-support-policy.md) excludes it from
+  MVP v1.
+- Offline replay of binary histories is available through
+  [`Temporal.Replay`](docs/guides/workflows.md#replay-recorded-histories-before-deploying)
+  and the copyable [replay command example](examples/README.md#replay-recorded-histories-before-deploying);
+  JSON-history input, wider history and Server/Core compatibility corpora,
+  local-activity recovery, worker deployment routing acceptance,
   suspended-update recovery, and broader failure/load testing remain open.
 - Schedules, Nexus, interceptors, workflow side effects, and other parity work
   remain incomplete. Release preflight and package tests exist; release delivery,
@@ -91,6 +102,9 @@ totals throughout the documentation.
 
 Requirements: Docker with Compose v2 and GNU Make. The normal build and test
 path does not require OCaml, Dune, Rust, or Python installed on the host.
+Give the Docker VM at least 8 GiB of memory and 20 GB or more of free disk: the
+development image is about 4 GB and a full `make verify` grows the bind-mounted
+`_build` to roughly 8-9 GB.
 
 ```sh
 make build                    # build OCaml and the pinned Rust bridge
@@ -105,49 +119,25 @@ make test-temporal-parent-child-restart # bilateral exact-run recovery target
 ```
 
 The default development image uses OCaml 5.2. To try another supported image,
-pass `OCAML_VERSION`, for example `make verify OCAML_VERSION=5.5`. CI has a
-fast representative pull-request gate and an exhaustive compatibility gate. A
-code PR verifies Linux amd64 with OCaml 5.2 and 5.5, Linux arm64 with OCaml
-5.5, macOS ARM64 with OCaml 5.5, the pinned quality and dependency-license
-checks, the OCaml 5.5 Temporal/PostgreSQL smoke, and Windows x64 with OCaml
-5.5. PRs and merge groups use one all-or-nothing code gate: documentation-only
-changes skip all these jobs, while code, tests, build inputs, GitHub workflows,
-and composite actions run them all. JSON protocol schemas under `docs/schemas/`
-are code. Unknown file types also trigger the build. The separate release
-metadata/SBOM check still runs without compiling the SDK.
-
-Scheduled runs retain the exhaustive Linux matrix (OCaml 5.2–5.5 on amd64 and
-arm64) plus both OCaml 5.5 native desktop jobs. Pushes to `master` do not start
-builds. The standalone license audit runs once per code workflow, not per
-matrix cell. These entries describe configured jobs, not evidence that a
-particular Actions run has completed. Superseded runs are cancelled for the
-same PR or merge-group ref; job timeouts start after runner allocation.
-
-CI builds the Rust bridge once per operating system and architecture, sharing
-the Linux libraries across OCaml versions and the live smoke. Exact-input
-caches populated by `master` also serve PR, merge-queue, and scheduled runs.
-The C stubs, OCaml libraries, installed consumers, and their tests still build
-in every compatibility lane. Each lane also publishes a tested
+pass `OCAML_VERSION`, for example `make verify OCAML_VERSION=5.5`. The
+[quality and security gates](docs/reference/quality-gates.md) are the
+authoritative reference for CI triggers, required PR and merge-group checks,
+the `master` matrix, Rust artifact sharing, and local checks while Actions is
+queued. Each compatibility lane publishes a tested
 [compiled OCaml SDK bundle](docs/reference/prebuilt-ocaml.md) for compatible
 downstream applications to link without rebuilding the SDK.
-See [Rust artifact sharing](docs/reference/quality-gates.md#rust-artifact-sharing)
-for the cache boundaries and local producer/consumer commands.
 
-When Actions is queued, use `make check OCAML_VERSION=5.2` as the representative
-Docker-backed local baseline. It combines `make verify` with the package/OCaml
-license audit. Run `make quality` separately when the pinned native
-`cargo-deny`, `cargo-machete`, and `typos` binaries are installed; CI installs
-the checksum-verified versions. On Windows or macOS, `make native-verify`
-exercises the corresponding OCaml 5.5/Rust native compatibility path. The
-locked Cargo license scanner runs once in its isolated CI job and is not
-claimed by `make license-check`; `make test-temporal-integration` is the
-optional, expensive live Temporal Server/PostgreSQL check. Local results are
-interim evidence only and do not turn an unexecuted matrix, platform, or live
-server job green.
-
-On a memory-constrained Docker VM, bound Dune's native build concurrency with
-`make build DUNE_JOBS=1`; leaving `DUNE_JOBS` unset preserves the default
-parallelism used by CI.
+Every Dune build, test, and `dune exec` that the Makefile runs is bounded by
+`DUNE_JOBS`, because each test executable links the large Rust static library
+and parallel links can exhaust a Docker VM's memory. Make also exports the
+limit, and the install, prebuilt-consumer and vendored-build checks and the
+long-lived Compose workers pass it to their own Dune runs as `-j`, so they use
+the same bound on every supported Dune release. Local runs default to
+`DUNE_JOBS=2`, chosen for an 8 GiB VM; CI keeps Dune's automatic job count.
+On a 4-6 GiB VM, use `DUNE_JOBS=1 CARGO_BUILD_JOBS=2`, for example
+`make verify DUNE_JOBS=1 CARGO_BUILD_JOBS=2`; on a large one, `DUNE_JOBS=auto`
+restores Dune's default. An explicit `CARGO_BUILD_JOBS` bounds the Rust bridge
+build, which otherwise uses Cargo's default parallelism.
 
 ### Install from a source checkout
 
@@ -162,13 +152,38 @@ run:
 opam install --with-test .
 ```
 
+Cargo downloads the locked Rust dependencies during that build, so installing
+from a Git checkout needs network access, which opam's default build sandbox
+denies. Each release's `ocaml-temporal-<tag>-source.tar.gz` asset vendors those
+dependencies and builds offline inside the sandbox; see
+[Offline opam source builds](docs/reference/package-boundary.md#offline-opam-source-builds).
+
 The OPAM metadata depends on `conf-rust-2024` and `conf-protoc`, so dependency
 resolution checks that `cargo`, a compiler supporting Rust edition 2024, and
 `protoc` are available before Dune builds the private native bridge. Cargo
 still enforces the package's more specific Rust 1.94 minimum from
-`rust/Cargo.toml`. Applications link only the installed `temporal-sdk` library
+`rust/Cargo.toml`. `opam install` builds with Dune's release profile, which
+compiles the private Rust bridge with Cargo's optimized release profile; a
+plain `dune build` of the checkout uses Cargo's faster-to-build, unoptimized
+dev profile. Applications link only the installed `temporal-sdk` library
 and use the wrapped `Temporal` module; the native build tools are prerequisites,
 not part of the public OCaml API.
+
+Two process constraints apply to applications that link the SDK (see
+[Process and linking constraints](docs/guides/workflows.md#process-and-linking-constraints)):
+
+- On Linux and macOS, fork or daemonise before creating any native `Client` or
+  `Worker`. Each one spawns an OCaml Domain (a running worker that registers
+  activities uses one more; see the Domain budget in `Temporal.Worker`), and
+  OCaml 5 rejects `Unix.fork` for
+  the rest of the process once any Domain has been spawned. Starting
+  subprocesses with `Unix.create_process` or `Unix.open_process*` still works,
+  and is the only option on Windows, where `Unix.fork` is unavailable.
+- Build native executables or bytecode executables. The Rust bridge is
+  installed only as a static archive, so the SDK makes every bytecode link
+  (Dune `(modes byte)`, `ocamlfind ocamlc -linkpkg`) use a custom runtime that
+  embeds it, with or without a project `dune-workspace`. The toplevel
+  (`#require "temporal-sdk"`) and native plugins are not supported.
 
 ### The real Temporal smoke
 
@@ -217,9 +232,9 @@ The Docker-free companion checks the checked-in normalized-history,
 diagnostics, and controller fixtures and their rejection paths. It does not
 build workers, start containers, contact Temporal Server, or establish that a
 replay occurred. The complete [PR #348 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29411260374) is the
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374) is the
 corresponding real-server evidence for the original cases; the complete [PR
-#356 run](https://github.com/mfow/ocaml-temporal/actions/runs/29469232271)
+#356 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29469232271)
 verifies the expanded lifecycle cases. Deployment-based routing, arbitrary
 historical compatibility, and migration tooling remain separate; legacy
 build-ID worker routing is covered by bilateral bridge tests but still needs a
@@ -270,7 +285,11 @@ let compose_message name =
   let open Temporal.Result_syntax in
   let name = String.trim name in
   if String.equal name "" then
-    Error (Temporal.Error.defect ~message:"a name is required")
+    (* A [`Workflow] error fails the workflow; [Error.defect] would instead
+       fail only the workflow task and leave the run retrying. *)
+    Error
+      (Temporal.Error.make ~category:`Workflow ~non_retryable:true
+         ~message:"a name is required" ())
   else
     let greeting =
       Temporal.Activity.start render_message ("greeting:" ^ name)
@@ -313,9 +332,15 @@ The complete, buildable version is split the way a real deployment often is:
 - [Client](examples/client/client.ml) connects, starts one exact workflow run,
   waits for its typed terminal result, prints it, and releases the connection.
 
+A separate, self-checking [cancellation example](examples/README.md#cancel-activities-cooperatively)
+shows synchronous and asynchronous activities that release an external
+reservation idempotently when a workflow cancels them, and a synchronous
+activity doing so when its worker shuts down.
+
 See the [examples guide](examples/README.md) for the startup order, connection
-settings, and commands. CI compiles all three executables on every Docker and
-native build without running them.
+settings, and commands. CI compiles every example executable on every Docker
+and native build, and the Linux live job runs them against Temporal Server with
+`make test-temporal-examples-live`.
 
 See [Writing Workflows in OCaml](docs/guides/workflows.md) for codecs, worker
 registration, client handles, child-workflow boundaries, futures, and
@@ -335,7 +360,8 @@ are excluded from log messages. See the [observability reference](docs/reference
 - [Documentation guide and glossary](docs/README.md)
 - [Supported public API map](docs/reference/public-api-map.md)
 - [Workflow authoring guide](docs/guides/workflows.md)
-- [Architecture specification](docs/superpowers/specs/2026-07-11-ocaml-temporal-sdk-design.md)
+- [Worker sizing guide](docs/guides/worker-sizing.md)
+- [Architecture specification](docs/design/sdk-architecture.md)
 - [Implementation roadmap](docs/implementation-roadmap.md)
 - [Runtime invariants](docs/reference/runtime-invariants.md)
 - [Native Core bridge and ownership](docs/reference/core-bridge.md)
@@ -359,6 +385,7 @@ are excluded from log messages. See the [observability reference](docs/reference
 - [Installed package boundary](docs/reference/package-boundary.md)
 - [Local Temporal and PostgreSQL stack](docs/reference/local-temporal-stack.md)
 - [Quality and security gates](docs/reference/quality-gates.md)
+- [Release checklist and bad-release remediation](docs/reference/release-checklist.md)
 - [Dependency and license inventory](docs/dependencies.md)
 - [Verified progress](docs/progress.md)
 
@@ -393,5 +420,7 @@ AI models used to help build this project:
 
 ### Anthropic
 - Fable 5
+- Fable 5.1
 - Opus 4.8
+- Opus 5.5
 - Sonnet 5

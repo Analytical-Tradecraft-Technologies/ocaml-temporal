@@ -6,8 +6,11 @@
 //! ad-hoc state machines.
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::io::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+use temporalio_common::protos::TaskToken;
 use temporalio_common::protos::coresdk::{
     ActivityHeartbeat, ActivityTaskCompletion,
     activity_result::ActivityExecutionResult,
@@ -16,8 +19,11 @@ use temporalio_common::protos::coresdk::{
     workflow_completion::WorkflowActivationCompletion,
 };
 use temporalio_common::protos::temporal::api::enums::v1::WorkflowTaskFailedCause;
+use temporalio_common::protos::temporal::api::failure::v1::{
+    ApplicationFailureInfo, Failure as TemporalFailure, failure::FailureInfo,
+};
 use temporalio_common::worker::WorkerTaskTypes;
-use temporalio_sdk_core::{PollError, Worker};
+use temporalio_sdk_core::{CompleteWfError, PollError, Worker};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::JoinHandle;
@@ -47,6 +53,46 @@ pub const WORKFLOW_DELIVERY_REJECTION_BACKOFF: Duration = Duration::from_millis(
 /// server-visible diagnostic while still identifying the conversion category.
 pub fn workflow_rejection_message(reason: &'static str) -> String {
     format!("OCaml bridge could not represent the workflow activation: {reason}")
+}
+
+/// Application failure type reported for an activity task the bridge cannot
+/// represent to OCaml (issue #801).
+///
+/// The type lets workflow code and operators distinguish this bridge-level
+/// rejection from a failure raised by an activity implementation.
+pub const UNREPRESENTABLE_ACTIVITY_TASK_FAILURE_TYPE: &str = "UnrepresentableActivityTask";
+
+/// Builds the bounded failure text sent to Core when a leased activity task
+/// cannot cross the private semantic boundary.
+///
+/// As with [`workflow_rejection_message`], only a process-static category is
+/// accepted, so payloads, headers, and identifiers never reach the
+/// server-visible failure.
+pub fn activity_rejection_message(reason: &'static str) -> String {
+    format!("OCaml bridge could not represent the activity task: {reason}")
+}
+
+/// Builds the Temporal failure for an activity task the bridge cannot
+/// represent to OCaml.
+///
+/// The failure is a non-retryable application failure. Representability is a
+/// deterministic property of the task document and this worker build: every
+/// redelivery of the same task to this worker would be rejected again, and a
+/// retryable failure would make the server redeliver it under the activity's
+/// retry policy indefinitely. Failing it once lets the scheduling workflow
+/// observe a typed activity failure instead.
+pub fn unrepresentable_activity_failure(reason: &'static str) -> TemporalFailure {
+    TemporalFailure {
+        message: activity_rejection_message(reason),
+        failure_info: Some(FailureInfo::ApplicationFailureInfo(
+            ApplicationFailureInfo {
+                r#type: UNREPRESENTABLE_ACTIVITY_TASK_FAILURE_TYPE.to_owned(),
+                non_retryable: true,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }
 }
 
 /// Builds the bounded failure text sent to Core when a polled workflow
@@ -79,11 +125,72 @@ async fn force_fail_undeliverable_workflow(worker: &Worker, run_id: &str, reason
     let _ = worker.complete_workflow_activation(completion).await;
 }
 
-/// Fails one Core activity task that the bridge will never hand to OCaml.
+/// Completes one workflow activation that runtime disposal retires on OCaml's
+/// behalf.
+///
+/// A pure cache eviction owns no workflow task, so Core accepts only an empty
+/// acknowledgement for it; failing it would leave the eviction outstanding and
+/// keep the workflow poll from ever reporting `ShutDown` (issue #775). Every
+/// other activation is failed, exactly as an undeliverable admission is. Core
+/// errors are ignored because disposal cannot retry them.
+async fn complete_workflow_for_dispose(
+    worker: &Worker,
+    run_id: &str,
+    eviction_only: bool,
+    reason: &'static str,
+) {
+    if eviction_only {
+        let _ = worker
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(run_id))
+            .await;
+    } else {
+        force_fail_undeliverable_workflow(worker, run_id, reason).await;
+    }
+}
+
+/// Reports whether `task_token` names a local activity, using the same
+/// predicate Core uses to route an activity completion to its in-process
+/// local-activity manager instead of the server.
+///
+/// Core marks every local-activity token with a fixed prefix when it
+/// dispatches the activity, so the token alone is authoritative; no separate
+/// ledger bit can disagree with Core's own routing (#1029).
+pub fn is_local_activity_token(task_token: &[u8]) -> bool {
+    TaskToken::from(task_token.to_vec()).is_local_activity_task()
+}
+
+/// Builds the result the bridge sends when it completes an activity task on
+/// OCaml's behalf, during admission failure, shutdown, or disposal.
+///
+/// A remote activity is failed with a retryable application failure carrying
+/// `message`, so the server can dispatch the next attempt under the
+/// activity's retry policy, possibly to another worker.
+///
+/// A local activity is reported as cancelled instead (#1029). A local
+/// activity has no server-side dispatch: Core's local-activity manager
+/// retries a retryable failure *in-process*, generating a new token after a
+/// backoff of 1 s, 2 s, 4 s and so on until the backoff exceeds the
+/// local-retry threshold (60 s by default). During shutdown every such retry
+/// would be admitted and retired again, holding the supervisor for about a
+/// minute and pushing teardown past its timeout. Core reports a cancelled
+/// local activity to its workflow without retrying it. That resolution is
+/// never applied durably here: the bridge retires it by failing the workflow
+/// task that owns it, so the server re-executes the local activity on the
+/// workflow's next worker, exactly as it would after a failed attempt.
+pub fn bridge_retirement_result(task_token: &[u8], message: String) -> ActivityExecutionResult {
+    if is_local_activity_token(task_token) {
+        ActivityExecutionResult::cancel_from_details(None)
+    } else {
+        ActivityExecutionResult::fail(message.into())
+    }
+}
+
+/// Completes one Core activity task that the bridge will never hand to OCaml.
 ///
 /// Used only for undeliverable *start* (or malformed) tasks that would
 /// otherwise leave a Core completion debt. Pure cancel notifications that do
-/// not create a new ledger obligation are not completed here.
+/// not create a new ledger obligation are not completed here. The outcome
+/// depends on locality; see [`bridge_retirement_result`].
 async fn force_fail_undeliverable_activity(
     worker: &Worker,
     task_token: &[u8],
@@ -91,8 +198,9 @@ async fn force_fail_undeliverable_activity(
 ) {
     let completion = ActivityTaskCompletion {
         task_token: task_token.to_vec(),
-        result: Some(ActivityExecutionResult::fail(
-            activity_admission_rejection_message(reason).into(),
+        result: Some(bridge_retirement_result(
+            task_token,
+            activity_admission_rejection_message(reason),
         )),
     };
     let _ = worker.complete_activity_task(completion).await;
@@ -114,17 +222,274 @@ fn is_stale_activity_cancellation(task: &ActivityTask, error: CompleteError) -> 
     ) && matches!(error, CompleteError::UnknownActivity)
 }
 
-/// Returns the exact Core task surface implemented by the first worker slice.
-pub fn bridge_task_types() -> WorkerTaskTypes {
-    WorkerTaskTypes {
-        enable_workflows: true,
-        // Local activities use the same Core activity-task handoff as remote
-        // activities, but Core marks their task token as local and records the
-        // result in workflow history instead of sending an RPC to the server.
-        enable_local_activities: true,
-        enable_remote_activities: true,
-        enable_nexus: false,
+/// Maps the task kinds an OCaml worker registration can execute onto the
+/// exact Core task surface the bridge enables.
+///
+/// `workflows` and `activities` report whether the OCaml worker registered at
+/// least one workflow or activity implementation. Core polls the server only
+/// for the kinds enabled here, so a worker that cannot execute a task kind
+/// never takes such a task from a shared task queue (#805). Polling a kind
+/// without an implementation would let this worker win tasks that a sibling
+/// worker on the same queue could execute, and then fail them.
+///
+/// Local activities are enabled exactly when workflows are. Local activities
+/// use the same Core activity-task handoff as remote activities, but they are
+/// never polled from the server: Core dispatches them in-process from this
+/// worker's own workflow commands and records the result in workflow history,
+/// so they cannot steal another worker's tasks. Keeping them enabled for a
+/// worker without registered activities makes a local activity scheduled by
+/// one of its workflows fail promptly as an unregistered type instead of
+/// waiting forever on a disabled Core manager. Core itself rejects local
+/// activities without workflows. Nexus is never enabled because the bridge has
+/// no Nexus task handoff.
+///
+/// Returns an error when neither kind is selected: such a worker could never
+/// make progress, and Core would reject it with a less specific diagnostic.
+pub fn bridge_task_types(
+    workflows: bool,
+    activities: bool,
+) -> Result<WorkerTaskTypes, &'static str> {
+    if !workflows && !activities {
+        return Err("task_types must enable workflows or activities");
     }
+    Ok(WorkerTaskTypes {
+        enable_workflows: workflows,
+        enable_local_activities: workflows,
+        enable_remote_activities: activities,
+        enable_nexus: false,
+    })
+}
+
+/// Reports which guarded poll lanes a Core worker with `task_types` needs, as
+/// `(workflow_lane, activity_lane)`.
+///
+/// The workflow lane must not run when workflows are disabled: Core's
+/// `poll_workflow_activation` then returns `ShutDown` immediately *and*
+/// initiates shutdown of the whole worker, which would stop an activity-only
+/// worker before it executes anything. The activity lane is needed whenever
+/// Core can produce either a remote or a local activity task.
+pub fn poll_lanes_for(task_types: &WorkerTaskTypes) -> (bool, bool) {
+    (
+        task_types.enable_workflows,
+        task_types.enable_remote_activities || task_types.enable_local_activities,
+    )
+}
+
+/// Upper bound for each phase of releasing a worker whose validation failed.
+///
+/// A worker that never entered the graph has no OCaml-owned tasks, so both
+/// the poll drain and Core's finalizer normally finish in milliseconds. The
+/// bound exists only so a Core regression returns the typed validation error
+/// to `Worker.create` instead of wedging the supervisor Domain forever.
+pub const UNVALIDATED_WORKER_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Delay before re-polling after Core reports a non-shutdown poll error while
+/// an unvalidated worker drains, preventing a tight error loop.
+const UNVALIDATED_WORKER_POLL_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Releases a Core worker whose namespace validation failed before it was
+/// published into the runtime graph.
+///
+/// The caller transfers sole ownership of the never-published worker; this
+/// function is its only release path. Core's `finalize_shutdown` does not
+/// complete until both `poll_workflow_activation` and `poll_activity_task`
+/// have returned `ShutDown`: the activity manager waits for its poll stream to
+/// observe shutdown, and nobody else will ever poll this worker. Awaiting the
+/// finalizer directly therefore hung `Worker.create` forever (issue #770).
+///
+/// The release runs as one task on the worker's Tokio runtime. That task owns
+/// the worker until `finalize_shutdown` completes: it initiates shutdown,
+/// drives both poll APIs until each reports `ShutDown`, force-fails any task
+/// Core unexpectedly hands out (so no completion debt blocks finalization), and
+/// then finalizes. The worker is never dropped mid-release, because only
+/// `finalize_shutdown` performs Core's `finalize_unregister`; dropping it
+/// instead would leave the worker registrator in the client's registry, which
+/// keeps the client alive through an `Arc` cycle.
+///
+/// The caller waits at most [`UNVALIDATED_WORKER_RELEASE_TIMEOUT`] so it can
+/// still return its typed error if Core's `ShutdownWorker` RPC is slow. After
+/// that bound the task keeps ownership and completes the release in the
+/// background; it ends only when finalization finishes or the runtime itself
+/// is shut down. Must run inside the worker's Tokio runtime.
+pub async fn release_unvalidated_worker(worker: Worker) {
+    let release = tokio::spawn(async move {
+        worker.initiate_shutdown();
+        tokio::join!(
+            drain_unvalidated_workflow_polls(&worker),
+            drain_unvalidated_activity_polls(&worker)
+        );
+        worker.finalize_shutdown().await;
+    });
+    // Elapsing only stops waiting: the spawned task keeps the worker and still
+    // completes `finalize_shutdown`, including Core's unregister step.
+    let _ = tokio::time::timeout(UNVALIDATED_WORKER_RELEASE_TIMEOUT, release).await;
+}
+
+/// Polls workflow activations on a shut-down, unvalidated worker until Core
+/// reports `ShutDown`. Any activation is force-failed because no OCaml owner
+/// exists to complete it.
+async fn drain_unvalidated_workflow_polls(worker: &Worker) {
+    loop {
+        match worker.poll_workflow_activation().await {
+            Err(PollError::ShutDown) => return,
+            Ok(activation) => {
+                force_fail_undeliverable_workflow(
+                    worker,
+                    &activation.run_id,
+                    "worker validation failed before delivery",
+                )
+                .await;
+            }
+            Err(_) => tokio::time::sleep(UNVALIDATED_WORKER_POLL_ERROR_BACKOFF).await,
+        }
+    }
+}
+
+/// Polls activity tasks on a shut-down, unvalidated worker until Core reports
+/// `ShutDown`. Start-shaped tasks are force-failed; cancellation updates carry
+/// no separate completion debt and are dropped.
+async fn drain_unvalidated_activity_polls(worker: &Worker) {
+    loop {
+        match worker.poll_activity_task().await {
+            Err(PollError::ShutDown) => return,
+            Ok(task) => {
+                if !matches!(task.variant, Some(activity_task::Variant::Cancel(_))) {
+                    force_fail_undeliverable_activity(
+                        worker,
+                        &task.task_token,
+                        "worker validation failed before delivery",
+                    )
+                    .await;
+                }
+            }
+            Err(_) => tokio::time::sleep(UNVALIDATED_WORKER_POLL_ERROR_BACKOFF).await,
+        }
+    }
+}
+
+/// Upper bound for the drain-and-join phase of a live worker shutdown.
+///
+/// Core's poll APIs report `ShutDown` only after every task they produced has
+/// been completed and, when the server supports graceful poll shutdown, after
+/// the in-flight long poll returns. Shutdown retires every completion debt
+/// itself (see [`PollLanes::drain_and_join_for_shutdown`]), so the remaining
+/// wait is normally Core's `ShutdownWorker` RPC and at most one server long
+/// poll. The bound exceeds the server's default 60-second long-poll interval
+/// plus Core's client-side margin. It is reached only when Core or the server
+/// misbehaves, and exists so `Worker.shutdown` cannot wedge the supervisor
+/// Domain forever (issue #769).
+pub const WORKER_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Upper bound the supervisor waits for Core's terminal finalizer after both
+/// poll lanes have joined.
+///
+/// With both polls already at `ShutDown`, `finalize_shutdown` only awaits the
+/// `ShutdownWorker` RPC and Core's internal manager teardown. After the bound
+/// the finalizer keeps running in a Tokio task that owns the worker; see
+/// [`PollLanes::finalize_bounded`].
+pub const WORKER_FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Completion debts that worker shutdown had to retire on OCaml's behalf.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShutdownRetirement {
+    /// Tasks leased to OCaml that were never completed. Each was completed by
+    /// the bridge (failed, or acknowledged if it was a pure cache eviction),
+    /// so a non-zero count means language-side work was lost.
+    pub abandoned_leases: usize,
+    /// Tasks Core produced that never crossed into OCaml: queued handoffs and
+    /// results of polls already in flight when shutdown began. OCaml never
+    /// owned them, so retiring them is ordinary shutdown behavior.
+    pub undelivered: usize,
+}
+
+/// Reason [`PollLanes::drain_and_join_for_shutdown`] could not establish that
+/// both poll lanes stopped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShutdownDrainError {
+    /// A poll lane task panicked or was cancelled. Both lanes were still
+    /// joined before this was reported.
+    Lane(PollLaneError),
+    /// Core did not report `ShutDown` on every lane within the bound. The
+    /// unjoined lane handles remain owned by [`PollLanes`].
+    TimedOut,
+}
+
+/// Outcome of [`PollLanes::finalize_bounded`].
+pub enum BoundedFinalize {
+    /// Core's finalizer completed, including its worker unregistration.
+    Finalized,
+    /// The bridge refused to consume the worker; ownership is returned so the
+    /// caller can keep it in the runtime graph for disposal.
+    Refused(Box<PollLanes>, WorkerBridgeError),
+    /// Core's finalizer panicked. The worker was released while unwinding.
+    Panicked,
+    /// The bound elapsed. The finalizer task still owns the worker and
+    /// completes in the background, or is cancelled when the Tokio runtime
+    /// itself shuts down.
+    Detached,
+}
+
+/// Awaits one poll lane handle, or never completes when the lane is absent or
+/// already joined. Used as a `select!` branch so an absent lane cannot win.
+async fn join_lane(lane: &mut Option<JoinHandle<()>>) -> Result<(), tokio::task::JoinError> {
+    match lane {
+        Some(handle) => handle.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Builds the bounded failure text sent to Core when worker shutdown retires a
+/// task that OCaml will never complete. Only process-static reasons are
+/// accepted, for the same reason as [`workflow_rejection_message`].
+fn shutdown_retirement_message(reason: &'static str) -> String {
+    format!("OCaml bridge retired the task during worker shutdown: {reason}")
+}
+
+/// Completes one workflow activation that shutdown retires on OCaml's behalf.
+///
+/// A pure cache eviction owns no workflow task, so the only completion Core
+/// accepts for it is an empty acknowledgement; failing it would leave the
+/// eviction outstanding and keep the workflow poll from reporting `ShutDown`.
+/// Every other activation belongs to a real workflow task and is failed, never
+/// completed empty: an empty completion would record a workflow task that
+/// silently dropped the activation's jobs, which a later replay could not
+/// reproduce. Core errors are ignored because shutdown cannot retry them; the
+/// bounded join reports a completion Core never accepted.
+async fn complete_workflow_for_shutdown(
+    worker: &Worker,
+    run_id: &str,
+    eviction_only: bool,
+    reason: &'static str,
+) {
+    let completion = if eviction_only {
+        WorkflowActivationCompletion::empty(run_id)
+    } else {
+        WorkflowActivationCompletion::fail(
+            run_id,
+            shutdown_retirement_message(reason).into(),
+            Some(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
+        )
+    };
+    let _ = worker.complete_workflow_activation(completion).await;
+}
+
+/// Completes one activity start that shutdown retires on OCaml's behalf.
+///
+/// A remote activity is failed retryably under its retry policy, so the
+/// server can dispatch the attempt to another worker. A local activity has no
+/// server-side dispatch and is reported as cancelled, so Core does not retry
+/// it in-process while the worker drains; the workflow task that owns it is
+/// failed by the same drain, and the server re-executes the local activity
+/// on the workflow's next worker. See [`bridge_retirement_result`] (#1029).
+async fn fail_activity_for_shutdown(worker: &Worker, task_token: &[u8], reason: &'static str) {
+    let completion = ActivityTaskCompletion {
+        task_token: task_token.to_vec(),
+        result: Some(bridge_retirement_result(
+            task_token,
+            shutdown_retirement_message(reason),
+        )),
+    };
+    let _ = worker.complete_activity_task(completion).await;
 }
 
 /// Fatal reason a guarded poll lane stopped before ordinary Core shutdown.
@@ -164,6 +529,14 @@ pub enum WorkerBridgeError {
     LostPollLease,
     /// A poll task still retained the worker after both joins completed.
     WorkerStillShared,
+    /// A non-empty replay completion was still awaiting Core's reply when
+    /// Core's workflow stream terminated, so Core may have discarded it
+    /// unprocessed. See [`complete_workflow_unless_stranded`].
+    CompletionStranded,
+    /// A replay completion or rejection received no Core reply within
+    /// [`REPLAY_CORE_WAIT_TIMEOUT`] while Core's workflow stream was still
+    /// running.
+    CoreWaitTimedOut,
 }
 
 /// Converts one internal worker failure into the bounded diagnostic category
@@ -198,6 +571,10 @@ pub fn public_worker_error_message(error: &WorkerBridgeError) -> &'static str {
         WorkerBridgeError::OutstandingTasks(_) => "Temporal worker has outstanding tasks",
         WorkerBridgeError::LostPollLease => "Temporal worker has an uncompleted poll lease",
         WorkerBridgeError::WorkerStillShared => "Temporal worker remains shared after shutdown",
+        WorkerBridgeError::CompletionStranded => {
+            "Temporal workflow completion was not processed before Core shut down"
+        }
+        WorkerBridgeError::CoreWaitTimedOut => "Temporal Core did not respond within its bound",
     }
 }
 
@@ -235,6 +612,226 @@ pub enum ReadinessWait {
 /// polling spin when Core is quiet.
 pub const READINESS_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Upper bound for one replay workflow completion, rejection, or lane join.
+///
+/// Replay completions are processed by Core's in-process workflow stream and
+/// a mock client, so a healthy completion finishes in milliseconds. The bound
+/// only turns a Core or scheduler defect into a typed error instead of a
+/// supervisor that blocks forever (issue #965).
+pub const REPLAY_CORE_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a replay completion may stay pending after Core's workflow stream
+/// has terminated before it is classified as stranded.
+///
+/// Once the workflow lane has observed `PollError::ShutDown`, Core's workflow
+/// processing thread has dropped its input receiver, so a completion sent
+/// before that point either already has its reply or never will (see
+/// [`complete_workflow_unless_stranded`]). The grace only absorbs the gap
+/// between the receiver drop and this bridge observing the flag.
+pub const REPLAY_STRANDED_COMPLETION_GRACE: Duration = Duration::from_millis(250);
+
+/// Interval at which a pending replay completion rechecks whether Core's
+/// workflow stream has terminated. Short enough that a stranded completion
+/// is released promptly, long enough not to spin a Tokio worker.
+const REPLAY_COMPLETION_CHECK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Outcome of a replay workflow completion bounded by
+/// [`complete_workflow_unless_stranded`].
+#[derive(Debug)]
+enum GuardedCompletion {
+    /// Core returned a result for the completion.
+    Finished(Result<(), CompleteWfError>),
+    /// Core's workflow stream terminated while the completion awaited its
+    /// reply, so no reply can ever arrive. The completion message may have
+    /// been dropped unprocessed.
+    Stranded,
+    /// Neither a reply nor stream termination was observed within
+    /// [`REPLAY_CORE_WAIT_TIMEOUT`].
+    TimedOut,
+}
+
+/// Selects how a workflow completion awaits Core's reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionWait {
+    /// Live workers await Core directly. Their shutdown path is bounded as a
+    /// whole by [`PollLanes::drain_and_join_for_shutdown`].
+    Unbounded,
+    /// Replay workers bound each completion with
+    /// [`complete_workflow_unless_stranded`].
+    ReplayBounded,
+}
+
+/// Sends one workflow completion to a replay worker and waits for Core's
+/// reply, but never forever.
+///
+/// Core's `complete_workflow_activation` sends the completion into the
+/// workflow stream's unbounded Tokio channel together with a oneshot reply
+/// sender, then awaits the reply. When the stream ends, Core relies on the
+/// channel's receiver drop to discard queued messages, which drops the reply
+/// sender and lets the caller observe a closed reply as "ignored". Tokio's
+/// receiver drain, however, cannot see a message whose sender passed the
+/// channel's closed check before the receiver closed but finished pushing the
+/// value after the drain. That message (and its reply sender) then lives
+/// until the channel's last sender is dropped; the sender is owned by Core's
+/// `Workflows`, which the bridge itself keeps alive while it waits. The
+/// completion therefore waits forever. Replay routinely sends its last
+/// eviction acknowledgement while Core's replay stream is finishing its
+/// natural shutdown, so the rare window is reachable on every replay; landing
+/// in it is the intermittent hang in issue #965.
+///
+/// The bridge cannot repair Core's channel, so it bounds the await instead:
+///
+/// * a reply that arrives is returned unchanged;
+/// * once `signal` reports that the workflow lane observed Core's
+///   `ShutDown` (the processing thread has dropped its receiver) and the
+///   reply is still missing after [`REPLAY_STRANDED_COMPLETION_GRACE`], the
+///   completion is reported as [`GuardedCompletion::Stranded`];
+/// * otherwise the wait ends with [`GuardedCompletion::TimedOut`] after
+///   [`REPLAY_CORE_WAIT_TIMEOUT`].
+///
+/// Dropping Core's future after the first poll is safe: the message was sent
+/// synchronously on that poll, and the future then owns only the reply
+/// receiver. Must run inside the worker's Tokio runtime because it uses
+/// Tokio timers.
+async fn complete_workflow_unless_stranded(
+    worker: &Worker,
+    signal: &Readiness,
+    completion: WorkflowActivationCompletion,
+) -> GuardedCompletion {
+    await_reply_unless_stranded(
+        worker.complete_workflow_activation(completion),
+        signal,
+        REPLAY_CORE_WAIT_TIMEOUT,
+    )
+    .await
+}
+
+/// Number of replay Core workers leaked by
+/// [`PollLanes::leak_after_replay_join_timeout`] in this process.
+static REPLAY_WORKERS_LEAKED: AtomicU64 = AtomicU64::new(0);
+
+/// Returns how many replay Core workers this process has deliberately leaked
+/// after a lane join timeout. Exposed for tests and diagnostics.
+pub fn replay_workers_leaked() -> u64 {
+    REPLAY_WORKERS_LEAKED.load(Ordering::Relaxed)
+}
+
+/// Outcome of [`join_replay_lane_within`].
+#[derive(Debug)]
+enum ReplayLaneJoin {
+    /// The lane task finished; carries its join result.
+    Joined(Result<(), PollLaneError>),
+    /// The bound elapsed. The lane was aborted and its handle consumed.
+    TimedOut,
+}
+
+/// Upper bound for awaiting a poll lane after it has been aborted.
+///
+/// Tokio cancels an aborted task at its next suspension point, and the lane
+/// spends its life suspended in Core's poll, so this normally completes at
+/// once. The bound only keeps a misbehaving task from extending a join whose
+/// own bound has already elapsed; past it the handle is dropped, which
+/// detaches nothing that can still run, because the task is already aborted.
+const ABORTED_LANE_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Joins a replay workflow lane while acknowledging every activation it
+/// publishes, all within one `bound`.
+///
+/// `acknowledge` receives the run ID of each queued activation after its
+/// ledger entry is removed. Because the timeout wraps the entire drain, a
+/// slow acknowledgement cannot extend the join past `bound` (an earlier
+/// version checked the deadline only between acknowledgements). On timeout
+/// the in-flight acknowledgement is dropped, the lane is aborted and awaited
+/// for at most [`ABORTED_LANE_JOIN_TIMEOUT`], and
+/// [`ReplayLaneJoin::TimedOut`] is returned. Must run inside a Tokio runtime
+/// with timers enabled.
+async fn join_replay_lane_within<A, Fut>(
+    mut workflow_lane: JoinHandle<()>,
+    bound: Duration,
+    signal: &Readiness,
+    ready: &mut mpsc::UnboundedReceiver<ReadyTask<WorkflowActivation>>,
+    ledger: &Mutex<TaskLedger>,
+    mut acknowledge: A,
+) -> ReplayLaneJoin
+where
+    A: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let drain = async {
+        loop {
+            tokio::select! {
+                result = &mut workflow_lane => {
+                    return result.map_err(|error| {
+                        PollLaneError::Core(format!("workflow poll lane failed: {error}"))
+                    });
+                }
+                message = signal.take_async(ready) => {
+                    let Some(message) = message else {
+                        // The sender is dropped only after the poll lane has
+                        // exited, so the join branch will become ready next.
+                        continue;
+                    };
+                    if let Ok(activation) = message {
+                        let run_id = activation.run_id;
+                        ledger
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .force_remove_workflow(&run_id);
+                        acknowledge(run_id).await;
+                    }
+                }
+            }
+        }
+    };
+    let outcome = tokio::time::timeout(bound, drain).await;
+    match outcome {
+        Ok(result) => ReplayLaneJoin::Joined(result),
+        Err(_elapsed) => {
+            workflow_lane.abort();
+            let _ = tokio::time::timeout(ABORTED_LANE_JOIN_TIMEOUT, &mut workflow_lane).await;
+            ReplayLaneJoin::TimedOut
+        }
+    }
+}
+
+/// Awaits one Core completion reply under the stranded-stream and overall
+/// bounds described in [`complete_workflow_unless_stranded`].
+///
+/// Separated from the Core call so the classification can be tested with a
+/// reply future that never resolves, which is otherwise only reachable
+/// through a rare scheduler interleaving inside Tokio's channel.
+async fn await_reply_unless_stranded<F>(
+    reply: F,
+    signal: &Readiness,
+    bound: Duration,
+) -> GuardedCompletion
+where
+    F: std::future::Future<Output = Result<(), CompleteWfError>>,
+{
+    tokio::pin!(reply);
+    let deadline = Instant::now() + bound;
+    let mut stream_ended_at: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            // Poll Core first so its send happens on the first iteration and a
+            // ready reply always wins over a coincident timer tick.
+            biased;
+            result = &mut reply => return GuardedCompletion::Finished(result),
+            () = tokio::time::sleep(REPLAY_COMPLETION_CHECK_INTERVAL) => {}
+        }
+        let now = Instant::now();
+        if signal.core_stream_ended() {
+            let ended_at = *stream_ended_at.get_or_insert(now);
+            if now.saturating_duration_since(ended_at) >= REPLAY_STRANDED_COMPLETION_GRACE {
+                return GuardedCompletion::Stranded;
+            }
+        }
+        if now >= deadline {
+            return GuardedCompletion::TimedOut;
+        }
+    }
+}
+
 /// Shared wake state for one Rust-owned poll queue.
 ///
 /// The state mutex is held across the unbounded-channel send and pending-count
@@ -244,9 +841,55 @@ pub const READINESS_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 /// decrement a count before the producer increments it. The condition variable
 /// is only a wake mechanism; every waiter rechecks the state predicate while
 /// holding the mutex, so notifications cannot be lost before a wait begins.
+///
+/// Each signal also notifies a worker-wide [`AnyLaneWake`] after every state
+/// change, so one owner-domain wait can observe either lane (#806).
 struct Readiness {
     state: Mutex<ReadinessState>,
     wake: Condvar,
+    any: Arc<AnyLaneWake>,
+}
+
+/// Worker-wide wake shared by the workflow and activity [`Readiness`] signals.
+///
+/// A lane-specific wait leaves the sole supervisor owner blind to the other
+/// lane for up to [`READINESS_WAIT_TIMEOUT`], which made every step of a
+/// sequential activity workflow pay one dead bounded wait (#806).
+/// [`wait_any_lane`] waits on this condition instead and rechecks both lane
+/// predicates.
+///
+/// Lock order is `AnyLaneWake::generation` before a lane's `state`, and the
+/// workflow lane's `state` before the activity lane's when both are held. A
+/// producer therefore releases its lane mutex before calling
+/// [`Self::notify`]. That is still lossless: the waiter holds `generation`
+/// from its predicate check until `wait_timeout` atomically releases it, so a
+/// producer whose lane update the check missed cannot notify until the waiter
+/// is already blocked. The counter only makes each notification a state
+/// change; waiters never trust a wake without rechecking the lane predicates.
+#[derive(Debug, Default)]
+struct AnyLaneWake {
+    generation: Mutex<u64>,
+    wake: Condvar,
+}
+
+impl AnyLaneWake {
+    /// Wakes every combined waiter after a lane's predicate changed. Callers
+    /// must not hold any lane `state` mutex (see the lock order above).
+    fn notify(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *generation = generation.wrapping_add(1);
+        self.wake.notify_all();
+    }
+}
+
+/// Snapshot of one lane's wait predicate taken under its state mutex.
+struct LaneObservation {
+    pending: bool,
+    error: Option<PollLaneError>,
+    closed: bool,
 }
 
 /// Mutable predicate protected by [`Readiness::state`].
@@ -262,14 +905,29 @@ struct ReadinessState {
     /// polls may still enqueue messages while the flag is true; pending work
     /// always takes precedence over this terminal state.
     closed: bool,
+    /// Set only when Core itself reported `PollError::ShutDown` to this
+    /// lane's poll loop, which means Core's workflow stream has terminated.
+    /// Unlike `closed`, a bridge-initiated shutdown never sets it, so replay
+    /// completions use it to detect a reply that can no longer arrive (see
+    /// [`complete_workflow_unless_stranded`]).
+    core_stream_ended: bool,
 }
 
 impl Readiness {
-    /// Creates an open signal with no queued work.
+    /// Creates an open signal with no queued work and a private combined
+    /// wake. Only isolated tests use a signal that no sibling lane shares.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::sharing(&Arc::new(AnyLaneWake::default()))
+    }
+
+    /// Creates an open signal that also notifies `any` on every state change.
+    /// Both lanes of one [`PollLanes`] share the same `any` wake.
+    fn sharing(any: &Arc<AnyLaneWake>) -> Self {
         Self {
             state: Mutex::new(ReadinessState::default()),
             wake: Condvar::new(),
+            any: Arc::clone(any),
         }
     }
 
@@ -288,20 +946,25 @@ impl Readiness {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if sender.send(message).is_err() {
+        let sent = if sender.send(message).is_err() {
             // The owner has gone away. No future caller can drain this lane,
             // but marking it closed also prevents a defensive waiter from
             // sleeping forever if it is still holding the runtime graph.
             state.closed = true;
-            self.wake.notify_all();
-            return false;
-        }
-        // Core's outstanding-task permits keep this count far below `usize::MAX`
-        // in normal operation. Saturation is still safer than panicking in a
-        // background lane if a future producer violates that assumption.
-        state.pending = state.pending.saturating_add(1);
+            false
+        } else {
+            // Core's outstanding-task permits keep this count far below
+            // `usize::MAX` in normal operation. Saturation is still safer than
+            // panicking in a background lane if a future producer violates
+            // that assumption.
+            state.pending = state.pending.saturating_add(1);
+            true
+        };
         self.wake.notify_all();
-        true
+        // Release the lane mutex before the combined wake (lock order).
+        drop(state);
+        self.any.notify();
+        sent
     }
 
     /// Consumes one queue message while atomically retiring its pending count.
@@ -354,11 +1017,14 @@ impl Readiness {
             Err(TryRecvError::Disconnected) => {
                 state.closed = true;
                 self.wake.notify_all();
-                if report_failure {
+                let result = if report_failure {
                     state.error.clone().map(Err)
                 } else {
                     None
-                }
+                };
+                drop(state);
+                self.any.notify();
+                result
             }
         }
     }
@@ -391,16 +1057,41 @@ impl Readiness {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.error = Some(error);
         self.wake.notify_all();
+        drop(state);
+        self.any.notify();
     }
 
     /// Marks the lane as normally closed while retaining queued work for drain.
     fn close(&self) {
+        self.close_inner(false);
+    }
+
+    /// Closes the lane because Core's poll reported `ShutDown`, recording that
+    /// Core's workflow stream has terminated.
+    fn close_after_core_shutdown(&self) {
+        self.close_inner(true);
+    }
+
+    /// Shared body of [`Self::close`] and [`Self::close_after_core_shutdown`].
+    /// The Core flag is sticky: a later bridge-side close never clears it.
+    fn close_inner(&self, core_stream_ended: bool) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.closed = true;
+        state.core_stream_ended |= core_stream_ended;
         self.wake.notify_all();
+        drop(state);
+        self.any.notify();
+    }
+
+    /// Reports whether Core has terminated the stream feeding this lane.
+    fn core_stream_ended(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .core_stream_ended
     }
 
     /// Blocks until work, a fatal error, or terminal closure is observable.
@@ -438,12 +1129,80 @@ impl Readiness {
     }
 }
 
+/// Reads both lane predicates as one snapshot by holding both lane mutexes at
+/// once (workflow first, then activity). Reading them one after another would
+/// let a producer publish to the first lane between the two reads, so a
+/// terminal flag on the second lane could win over work that is already
+/// pending. Producers release their lane mutex before taking the combined
+/// wake mutex, and no producer holds two lane mutexes, so this cannot
+/// deadlock with them.
+fn observe_both(workflow: &Readiness, activity: &Readiness) -> [LaneObservation; 2] {
+    let workflow_state = workflow
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let activity_state = activity
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    [&*workflow_state, &*activity_state].map(|state| LaneObservation {
+        pending: state.pending > 0,
+        error: state.error.clone(),
+        closed: state.closed,
+    })
+}
+
+/// Blocks until either lane has work, a fatal error, or terminal closure, or
+/// until [`READINESS_WAIT_TIMEOUT`] elapses.
+///
+/// Queued work in *either* lane wins over every terminal state, so the owner
+/// drains everything before it reports a failure or shutdown. Without work, a
+/// fatal error in either lane is reported before closure, and closure of
+/// either lane is reported as shutdown, matching what a lane-specific wait on
+/// that lane would return. Both signals must share one [`AnyLaneWake`]. The
+/// wait never consumes a task, so the matching non-blocking drain still owns
+/// delivery.
+fn wait_any_lane(workflow: &Readiness, activity: &Readiness) -> ReadinessWait {
+    debug_assert!(Arc::ptr_eq(&workflow.any, &activity.any));
+    let any = &workflow.any;
+    let mut generation = any
+        .generation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let deadline = Instant::now() + READINESS_WAIT_TIMEOUT;
+    loop {
+        let lanes = observe_both(workflow, activity);
+        if lanes.iter().any(|lane| lane.pending) {
+            return ReadinessWait::Ready;
+        }
+        if let Some(error) = lanes.iter().find_map(|lane| lane.error.clone()) {
+            return ReadinessWait::Error(error);
+        }
+        if lanes.iter().any(|lane| lane.closed) {
+            return ReadinessWait::Shutdown;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return ReadinessWait::TimedOut;
+        }
+        // `wait_timeout` releases `generation` atomically, so a producer that
+        // committed after the observation above cannot notify before this
+        // thread is blocked. Every wake loops back to recheck both lanes.
+        let (next, _timeout) = any
+            .wake
+            .wait_timeout(generation, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generation = next;
+    }
+}
+
 /// Rust-owned pair of guarded Core poll lanes for one worker.
 ///
-/// Exactly one Tokio task invokes each Core poll API. The channels are only
-/// consumed by the owner Domain through non-blocking `try_take_*` calls, so a
-/// long Core poll can never block lifecycle or completion messages in the
-/// OCaml supervisor mailbox.
+/// Exactly one Tokio task invokes each Core poll API that the worker's
+/// configured task types enable. The channels are only consumed by the owner
+/// Domain through non-blocking `try_take_*` calls, so a long Core poll can
+/// never block lifecycle or completion messages in the OCaml supervisor
+/// mailbox.
 pub struct PollLanes {
     worker: Arc<Worker>,
     ledger: Arc<Mutex<TaskLedger>>,
@@ -453,13 +1212,43 @@ pub struct PollLanes {
     activity_signal: Arc<Readiness>,
     workflow_lane: Option<JoinHandle<()>>,
     activity_lane: Option<JoinHandle<()>>,
+    /// Senders retained for lanes that a live worker deliberately did not
+    /// start. Holding them keeps the receivers connected, so a disabled lane
+    /// reports "no work" rather than the disconnect that marks a lane closed.
+    /// They never send and are dropped with the lanes.
+    idle_senders: IdleSenders,
     shutdown_started: bool,
+    /// Bound for [`Self::join_replay_poll_lane`]. Always
+    /// [`REPLAY_CORE_WAIT_TIMEOUT`] in production; tests shorten it to force
+    /// the timeout path quickly.
+    replay_join_bound: Duration,
+    /// Set when a replay lane join hit its bound. Core never confirmed
+    /// shutdown, so the worker must be leaked rather than finalized.
+    replay_join_timed_out: bool,
 }
 
+/// Producer halves kept alive for disabled live-worker lanes; see
+/// [`PollLanes::start`].
+type IdleSenders = (
+    Option<mpsc::UnboundedSender<ReadyTask<WorkflowActivation>>>,
+    Option<mpsc::UnboundedSender<ReadyTask<ActivityTask>>>,
+);
+
 impl PollLanes {
-    /// Starts the sole workflow poll and sole remote-activity poll loops.
+    /// Starts the sole workflow poll and sole activity poll loops that the
+    /// worker's configured Core task types require.
+    ///
+    /// The lane plan is derived from the configuration Core was actually
+    /// given (see [`poll_lanes_for`]), so the bridge can neither poll a task
+    /// kind that Core disabled nor skip one that it enabled. A lane that is
+    /// not started stays *open and idle*: non-blocking takes report no work
+    /// and readiness waits time out exactly as for a quiet lane, until
+    /// [`Self::initiate_shutdown`] closes both lanes. Closing it eagerly would
+    /// make a readiness wait report shutdown while the worker is still
+    /// running, which the OCaml owner treats as a lifecycle error.
     pub fn start(worker: Worker, handle: &tokio::runtime::Handle) -> Self {
-        Self::start_with_activity_lane(worker, handle, true)
+        let (workflow, activity) = poll_lanes_for(&worker.get_config().task_types);
+        Self::start_lanes(worker, handle, workflow, activity, false)
     }
 
     /// Starts only the workflow poll loop for a replay worker.
@@ -471,16 +1260,23 @@ impl PollLanes {
     /// worker failure. The shared ledger and readiness machinery remain the
     /// same as the live-worker path.
     pub fn start_workflow_only(worker: Worker, handle: &tokio::runtime::Handle) -> Self {
-        Self::start_with_activity_lane(worker, handle, false)
+        Self::start_lanes(worker, handle, true, false, true)
     }
 
     /// Builds the guarded lanes shared by live and workflow-only replay
-    /// workers. The boolean is internal to construction so the public methods
-    /// cannot create a partially configured lane graph.
-    fn start_with_activity_lane(
+    /// workers. The booleans are internal to construction so the public
+    /// methods cannot create a partially configured lane graph.
+    ///
+    /// `close_absent` selects how a lane without a producer behaves. Replay
+    /// marks it closed before publication so a defensive wait cannot sleep on
+    /// a condition replay can never satisfy. Live workers keep it open and
+    /// idle by retaining its sender; see [`Self::start`].
+    fn start_lanes(
         worker: Worker,
         handle: &tokio::runtime::Handle,
+        start_workflow_lane: bool,
         start_activity_lane: bool,
+        close_absent: bool,
     ) -> Self {
         let worker = Arc::new(worker);
         let ledger = Arc::new(Mutex::new(TaskLedger::new()));
@@ -490,15 +1286,27 @@ impl PollLanes {
         // joining poll lanes during shutdown.
         let (workflow_sender, workflow_ready) = mpsc::unbounded_channel();
         let (activity_sender, activity_ready) = mpsc::unbounded_channel();
-        let workflow_signal = Arc::new(Readiness::new());
-        let activity_signal = Arc::new(Readiness::new());
+        // One combined wake lets the owner wait on both lanes at once (#806).
+        let any_lane_wake = Arc::new(AnyLaneWake::default());
+        let workflow_signal = Arc::new(Readiness::sharing(&any_lane_wake));
+        let activity_signal = Arc::new(Readiness::sharing(&any_lane_wake));
+        let mut idle_senders: IdleSenders = (None, None);
 
-        let workflow_lane = handle.spawn(run_workflow_lane(
-            Arc::clone(&worker),
-            Arc::clone(&ledger),
-            workflow_sender,
-            Arc::clone(&workflow_signal),
-        ));
+        let workflow_lane = if start_workflow_lane {
+            Some(handle.spawn(run_workflow_lane(
+                Arc::clone(&worker),
+                Arc::clone(&ledger),
+                workflow_sender,
+                Arc::clone(&workflow_signal),
+            )))
+        } else {
+            if close_absent {
+                workflow_signal.close();
+            } else {
+                idle_senders.0 = Some(workflow_sender);
+            }
+            None
+        };
         let activity_lane = if start_activity_lane {
             Some(handle.spawn(run_activity_lane(
                 Arc::clone(&worker),
@@ -507,10 +1315,11 @@ impl PollLanes {
                 Arc::clone(&activity_signal),
             )))
         } else {
-            // No producer exists for this lane in workflow-only mode. Mark it
-            // closed before publication so a defensive wait cannot sleep on a
-            // condition that replay can never satisfy.
-            activity_signal.close();
+            if close_absent {
+                activity_signal.close();
+            } else {
+                idle_senders.1 = Some(activity_sender);
+            }
             None
         };
         Self {
@@ -520,10 +1329,33 @@ impl PollLanes {
             activity_ready,
             workflow_signal,
             activity_signal,
-            workflow_lane: Some(workflow_lane),
+            workflow_lane,
             activity_lane,
+            idle_senders,
             shutdown_started: false,
+            replay_join_bound: REPLAY_CORE_WAIT_TIMEOUT,
+            replay_join_timed_out: false,
         }
+    }
+
+    /// Reports whether a Core workflow poll loop was started for this worker.
+    pub fn polls_workflow_tasks(&self) -> bool {
+        self.workflow_lane.is_some()
+    }
+
+    /// Reports whether a Core activity poll loop was started for this worker.
+    ///
+    /// A worker with workflows but no registered activities still starts this
+    /// lane so Core can dispatch its local activities, but Core never polls
+    /// the server for remote activity tasks on its behalf; see
+    /// [`Self::task_types`].
+    pub fn polls_activity_tasks(&self) -> bool {
+        self.activity_lane.is_some()
+    }
+
+    /// Returns the Core task types this worker was constructed with.
+    pub fn task_types(&self) -> WorkerTaskTypes {
+        self.worker.get_config().task_types
     }
 
     /// Takes one ready activation without waiting for Core or a channel lock.
@@ -546,7 +1378,7 @@ impl PollLanes {
                     .ledger
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .lease_workflow(&activation.run_id);
+                    .lease_workflow_activation(&activation.run_id, activation.is_only_eviction());
                 match lease {
                     Ok(()) => Some(Ok(activation)),
                     Err(error) => {
@@ -699,6 +1531,15 @@ impl PollLanes {
         self.activity_signal.wait()
     }
 
+    /// Waits for the next message on either lane without holding the OCaml
+    /// lock. The live worker loop uses this for its single idle native wait,
+    /// so work arriving on the lane it did not expect wakes the owner at once
+    /// instead of after the bounded timeout (#806). A disabled lane of a live
+    /// worker stays open and idle, so it never satisfies this wait.
+    pub fn wait_any(&self) -> ReadinessWait {
+        wait_any_lane(&self.workflow_signal, &self.activity_signal)
+    }
+
     /// Sleeps for one bounded completion retry interval on the supervisor
     /// owner Domain.
     ///
@@ -765,45 +1606,307 @@ impl PollLanes {
     /// acknowledged. The join loop therefore races the lane handle against
     /// the ready queue and sends only shutdown-safe empty completions. A
     /// replay activation never receives the live-worker failure completion.
+    ///
+    /// The whole join, including every acknowledgement it awaits, runs
+    /// under one [`REPLAY_CORE_WAIT_TIMEOUT`] bound (see
+    /// [`join_replay_lane_within`]). If the lane has not stopped by then it
+    /// is aborted, the worker is marked by [`Self::replay_join_timed_out`],
+    /// and the outcome is reported as a lane error. The caller must then
+    /// release the worker through [`Self::leak_after_replay_join_timeout`]
+    /// rather than Core's unbounded finalizer.
     pub async fn join_replay_poll_lane(&mut self) -> Result<(), PollLaneError> {
         let Some(workflow_lane) = self.workflow_lane.take() else {
             return Ok(());
         };
-        tokio::pin!(workflow_lane);
+        let worker = &self.worker;
+        let signal = &self.workflow_signal;
+        let outcome = join_replay_lane_within(
+            workflow_lane,
+            self.replay_join_bound,
+            signal,
+            &mut self.workflow_ready,
+            &self.ledger,
+            |run_id| async move {
+                // Disposal ignores the outcome: a stranded or timed-out
+                // acknowledgement leaves nothing more to retire, and the
+                // enclosing join bound still caps this wait.
+                let completion = WorkflowActivationCompletion::empty(run_id);
+                let _ = complete_workflow_unless_stranded(worker, signal, completion).await;
+            },
+        )
+        .await;
+        self.ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear_dispose_retired();
+        match outcome {
+            ReplayLaneJoin::Joined(result) => result,
+            ReplayLaneJoin::TimedOut => {
+                // Core never confirmed shutdown, so its terminal finalizer may
+                // block forever joining Core's workflow thread. Every later
+                // finalize or dispose consults this flag instead of trusting
+                // the now-empty lane slot.
+                self.replay_join_timed_out = true;
+                Err(PollLaneError::Core(
+                    "workflow poll lane did not stop within its bound".to_owned(),
+                ))
+            }
+        }
+    }
+
+    /// Reports whether a replay lane join hit its bound. Such a worker must
+    /// never reach Core's unbounded terminal finalizer; see
+    /// [`Self::leak_after_replay_join_timeout`].
+    pub fn replay_join_timed_out(&self) -> bool {
+        self.replay_join_timed_out
+    }
+
+    /// Releases a replay lane graph whose lane join timed out by deliberately
+    /// leaking the Core worker instead of finalizing it.
+    ///
+    /// Core's `finalize_shutdown` joins Core's workflow processing thread
+    /// without a bound, and that thread did not stop when asked. Finalizing
+    /// could block the supervisor, or `drop_runtime_graph`, forever. Detaching
+    /// the finalizer into a Tokio task is not safe either: it waits for Core's
+    /// thread through `spawn_blocking`, and dropping the Tokio runtime waits
+    /// for blocking tasks, so the runtime drop would hang instead.
+    ///
+    /// The trade-off is a bounded, one-time leak: the Core worker allocation,
+    /// its workflow thread if that thread never exits, and the worker's
+    /// registration with the in-process replay client stay alive until the
+    /// process exits. Core's Tokio tasks are still cancelled when the runtime
+    /// is dropped, because a leaked `Arc` keeps memory, not tasks, alive. The
+    /// poll lane has already been aborted and awaited, the ledger and queues
+    /// are dropped here, and no OCaml value refers to the worker, so nothing
+    /// can use the leaked worker again. A process-wide counter and one
+    /// stderr line record each leak.
+    pub fn leak_after_replay_join_timeout(self) {
+        let Self { worker, .. } = self;
+        REPLAY_WORKERS_LEAKED.fetch_add(1, Ordering::Relaxed);
+        // One static line on a rare path. It names no workflow data.
+        let _ = writeln!(
+            std::io::stderr(),
+            "ocaml-temporal: leaked a Temporal Core replay worker whose poll lane \
+             did not stop within its bound (issue #965)"
+        );
+        std::mem::forget(worker);
+    }
+
+    /// Retires every outstanding task and joins both poll lanes, waiting at
+    /// most `bound`.
+    ///
+    /// The caller must already have called [`Self::initiate_shutdown`]. From
+    /// then on nothing but this method can complete a task: the supervisor
+    /// Domain that would deliver OCaml completions is blocked in this call, and
+    /// OCaml stopped its run loop before requesting shutdown. Core, however,
+    /// reports `ShutDown` from a poll API only after every task it produced has
+    /// been completed. Joining without completing them therefore hung forever
+    /// whenever a handoff was queued or a lease was abandoned (issue #769).
+    ///
+    /// The method completes every debt exactly once and keeps doing so while
+    /// the lanes run, because polls already in flight, and Core's own
+    /// follow-up cache evictions, publish new tasks until each lane sees
+    /// `ShutDown`:
+    ///
+    /// * a task leased to OCaml is taken from the ledger and completed (see
+    ///   [`TaskLedger::take_leased_for_shutdown`]) and counted as abandoned;
+    /// * a queued handoff is removed from the ledger, completed from its own
+    ///   queue message, and counted as undelivered;
+    /// * an activity cancellation is dropped: it updates its start's single
+    ///   debt, which one of the two cases above retires;
+    /// * a queued lane diagnostic is dropped; the lane already completed any
+    ///   task it could safely complete before publishing it.
+    ///
+    /// Every identity leaves the ledger before its Core completion is awaited,
+    /// so a same-run eviction published in response is admitted as a new debt
+    /// rather than a duplicate. A pure eviction is acknowledged empty and
+    /// every other task is failed; see [`complete_workflow_for_shutdown`].
+    ///
+    /// On success both lane handles are consumed and the ledger is empty, so
+    /// the caller may finalize. On [`ShutdownDrainError::TimedOut`] the
+    /// unjoined handles stay owned by `self` and the ledger is marked as
+    /// having lost a lease: cancelling the drain may have removed an identity
+    /// whose Core completion never ran, so the counts no longer prove that
+    /// finalization is safe and disposal must use its last-resort path.
+    pub async fn drain_and_join_for_shutdown(
+        &mut self,
+        bound: Duration,
+    ) -> Result<ShutdownRetirement, ShutdownDrainError> {
+        let mut retirement = ShutdownRetirement::default();
+        match tokio::time::timeout(bound, self.drain_and_join(&mut retirement)).await {
+            Ok(Ok(())) => Ok(retirement),
+            Ok(Err(error)) => Err(ShutdownDrainError::Lane(error)),
+            Err(_elapsed) => {
+                self.ledger
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .mark_lost_poll_lease();
+                Err(ShutdownDrainError::TimedOut)
+            }
+        }
+    }
+
+    /// Unbounded body of [`Self::drain_and_join_for_shutdown`]; the caller
+    /// supplies the deadline. Both lanes are always joined, even after the
+    /// first reports a failure, so no producer outlives a successful return.
+    async fn drain_and_join(
+        &mut self,
+        retirement: &mut ShutdownRetirement,
+    ) -> Result<(), PollLaneError> {
         let mut first_error = None;
-        loop {
+        // A started lane drops its sender when it exits; the receiver then
+        // yields `None` forever and must stop being selected. A disabled lane's
+        // sender is retained in `idle_senders`, so its receive simply pends.
+        let mut workflow_queue_open = true;
+        let mut activity_queue_open = true;
+        while self.workflow_lane.is_some() || self.activity_lane.is_some() {
+            self.retire_visible_for_shutdown(retirement).await;
             tokio::select! {
-                result = &mut workflow_lane => {
-                    if let Err(error) = result {
-                        first_error = Some(PollLaneError::Core(format!(
+                joined = join_lane(&mut self.workflow_lane) => {
+                    self.workflow_lane = None;
+                    if let Err(error) = joined {
+                        first_error.get_or_insert(PollLaneError::Core(format!(
                             "workflow poll lane failed: {error}"
                         )));
                     }
-                    break;
                 }
-                ready = self.workflow_signal.take_async(&mut self.workflow_ready) => {
-                    let Some(ready) = ready else {
-                        // The sender is dropped only after the poll lane has
-                        // exited, so the join branch will become ready next.
-                        continue;
-                    };
-                    if let Ok(activation) = ready {
-                        let run_id = activation.run_id.clone();
-                        self.ledger
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .force_remove_workflow(&run_id);
-                        let completion = WorkflowActivationCompletion::empty(run_id);
-                        let _ = self.worker.complete_workflow_activation(completion).await;
+                joined = join_lane(&mut self.activity_lane) => {
+                    self.activity_lane = None;
+                    if let Err(error) = joined {
+                        first_error.get_or_insert(PollLaneError::Core(format!(
+                            "activity poll lane failed: {error}"
+                        )));
+                    }
+                }
+                ready = self.workflow_signal.take_async(&mut self.workflow_ready),
+                    if workflow_queue_open =>
+                {
+                    match ready {
+                        Some(message) => self.retire_queued_workflow(message, retirement).await,
+                        None => workflow_queue_open = false,
+                    }
+                }
+                ready = self.activity_signal.take_async(&mut self.activity_ready),
+                    if activity_queue_open =>
+                {
+                    match ready {
+                        Some(message) => self.retire_queued_activity(message, retirement).await,
+                        None => activity_queue_open = false,
                     }
                 }
             }
         }
+        // No producer remains, so this pass retires the last tasks published
+        // between the final wait and each lane's exit.
+        self.retire_visible_for_shutdown(retirement).await;
         self.ledger
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear_dispose_retired();
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Retires every abandoned lease and every message already queued.
+    async fn retire_visible_for_shutdown(&mut self, retirement: &mut ShutdownRetirement) {
+        let (workflows, activities) = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take_leased_for_shutdown();
+        retirement.abandoned_leases += workflows.len() + activities.len();
+        for (run_id, eviction_only) in workflows {
+            complete_workflow_for_shutdown(
+                self.worker.as_ref(),
+                &run_id,
+                eviction_only,
+                "workflow activation leased to OCaml was never completed",
+            )
+            .await;
+        }
+        for task_token in activities {
+            fail_activity_for_shutdown(
+                self.worker.as_ref(),
+                &task_token,
+                "activity task leased to OCaml was never completed",
+            )
+            .await;
+        }
+        while let Some(message) = self.workflow_signal.take(&mut self.workflow_ready) {
+            self.retire_queued_workflow(message, retirement).await;
+        }
+        while let Some(message) = self.activity_signal.take(&mut self.activity_ready) {
+            self.retire_queued_activity(message, retirement).await;
+        }
+    }
+
+    /// Completes one workflow activation that never reached OCaml.
+    async fn retire_queued_workflow(
+        &self,
+        message: ReadyTask<WorkflowActivation>,
+        retirement: &mut ShutdownRetirement,
+    ) {
+        let Ok(activation) = message else {
+            return;
+        };
+        let eviction_only = activation.is_only_eviction();
+        let run_id = activation.run_id;
+        // Retire before awaiting Core; see `drain_and_join_for_shutdown`.
+        self.ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .force_remove_workflow(&run_id);
+        retirement.undelivered += 1;
+        complete_workflow_for_shutdown(
+            self.worker.as_ref(),
+            &run_id,
+            eviction_only,
+            "workflow activation was not delivered before shutdown",
+        )
+        .await;
+    }
+
+    /// Fails one activity start that never reached OCaml. A cancellation has
+    /// no debt of its own and is dropped.
+    async fn retire_queued_activity(
+        &self,
+        message: ReadyTask<ActivityTask>,
+        retirement: &mut ShutdownRetirement,
+    ) {
+        let Ok(task) = message else {
+            return;
+        };
+        if matches!(task.variant, Some(activity_task::Variant::Cancel(_))) {
+            return;
+        }
+        self.ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .force_remove_activity(&task.task_token);
+        retirement.undelivered += 1;
+        fail_activity_for_shutdown(
+            self.worker.as_ref(),
+            &task.task_token,
+            "activity task was not delivered before shutdown",
+        )
+        .await;
+    }
+
+    /// Runs [`Self::finalize`] in a Tokio task and waits for it at most
+    /// `bound`. Must run inside the worker's Tokio runtime.
+    ///
+    /// The task owns the worker until Core's `finalize_shutdown` returns, so
+    /// the worker is never dropped mid-finalization: only that function
+    /// performs Core's `finalize_unregister`, and skipping it would leave the
+    /// worker registered with the client (see [`release_unvalidated_worker`]).
+    /// Elapsing only stops the caller's wait.
+    pub async fn finalize_bounded(self, bound: Duration) -> BoundedFinalize {
+        let finalize = tokio::spawn(self.finalize());
+        match tokio::time::timeout(bound, finalize).await {
+            Ok(Ok(Ok(()))) => BoundedFinalize::Finalized,
+            Ok(Ok(Err((lanes, error)))) => BoundedFinalize::Refused(Box::new(lanes), error),
+            Ok(Err(_join_error)) => BoundedFinalize::Panicked,
+            Err(_elapsed) => BoundedFinalize::Detached,
+        }
     }
 
     /// Reports whether every task admitted before shutdown has completed.
@@ -832,25 +1935,38 @@ impl PollLanes {
     /// Best-effort Core completion for every task still owned by this worker.
     ///
     /// Used by runtime dispose/free when OCaml cannot finish leased work. The
-    /// method drains ready queues, force-fails each undelivered task, then
-    /// force-fails every remaining ledger entry so [`Self::finalize`] is not
-    /// blocked by outstanding completion debt. Dispose calls it once before
-    /// joining the poll lanes and once after both joins, because a poll already
-    /// in flight can publish a task between those two points. Errors from Core
-    /// are ignored: dispose must still release the process graph.
+    /// method completes every ledger entry and every queued handoff exactly
+    /// once so [`Self::finalize`] is not blocked by outstanding completion
+    /// debt. Dispose calls it once before joining the poll lanes and once
+    /// after both joins, because a poll already in flight can publish a task
+    /// between those two points. Errors from Core are ignored: dispose must
+    /// still release the process graph.
+    ///
+    /// A pure cache eviction is acknowledged with an empty completion and
+    /// every other activation is failed (see
+    /// [`complete_workflow_for_dispose`]). For a ledger entry the eviction
+    /// bit comes from the ledger itself, which records it in the same
+    /// critical section that admits the run (see
+    /// [`TaskLedger::admit_polled_workflow_activation`]). The snapshot is
+    /// therefore correct even for an entry the workflow lane admitted but has
+    /// not yet enqueued, whose message a queue drain could not observe and
+    /// whose later queue entry is skipped as already completed (issue #775).
+    /// A queued activation admitted after the snapshot carries its own bit.
     pub async fn force_complete_outstanding_for_dispose(&mut self) {
         // Complete ledger debt first so Core can finish poll loops that are
         // blocked waiting for outstanding-task permits during shutdown.
-        let (workflow_ids, activity_tokens) = self
+        let (workflows, activity_tokens) = self
             .ledger
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take_all_outstanding();
-        let mut completed_workflow_ids: HashSet<String> = workflow_ids.iter().cloned().collect();
-        for run_id in &workflow_ids {
-            force_fail_undeliverable_workflow(
+        let mut completed_workflow_ids: HashSet<String> =
+            workflows.iter().map(|(run_id, _)| run_id.clone()).collect();
+        for (run_id, eviction_only) in &workflows {
+            complete_workflow_for_dispose(
                 self.worker.as_ref(),
                 run_id,
+                *eviction_only,
                 "runtime dispose retired outstanding workflow lease",
             )
             .await;
@@ -866,25 +1982,33 @@ impl PollLanes {
             .await;
         }
 
+        // Drain the ready queue, including activations a poll lane published
+        // while the ledger debt above was being completed.
+        let mut queued_workflows: Vec<(String, bool)> = Vec::new();
         while let Some(ready) = self.workflow_signal.take(&mut self.workflow_ready) {
             if let Ok(activation) = ready {
-                // Already force-failed above if the run was still in the
-                // ledger; a second completion for the same run_id is unsafe.
-                // Retire before awaiting Core so a same-identity poll that
-                // races this queue drain is rejected rather than admitted as
-                // a new obligation for the post-join pass.
-                if Self::claim_dispose_workflow_identity(
-                    &self.ledger,
-                    &mut completed_workflow_ids,
-                    &activation.run_id,
-                ) {
-                    force_fail_undeliverable_workflow(
-                        self.worker.as_ref(),
-                        &activation.run_id,
-                        "runtime dispose drained undelivered workflow activation",
-                    )
-                    .await;
-                }
+                let eviction_only = activation.is_only_eviction();
+                queued_workflows.push((activation.run_id, eviction_only));
+            }
+        }
+        for (run_id, eviction_only) in queued_workflows {
+            // Already completed above if the run was still in the ledger; a
+            // second completion for the same run_id is unsafe. Retire before
+            // awaiting Core so a same-identity poll that races this queue
+            // drain is rejected rather than admitted as a new obligation for
+            // the post-join pass.
+            if Self::claim_dispose_workflow_identity(
+                &self.ledger,
+                &mut completed_workflow_ids,
+                &run_id,
+            ) {
+                complete_workflow_for_dispose(
+                    self.worker.as_ref(),
+                    &run_id,
+                    eviction_only,
+                    "runtime dispose drained undelivered workflow activation",
+                )
+                .await;
             }
         }
         while let Some(ready) = self.activity_signal.take(&mut self.activity_ready) {
@@ -956,9 +2080,14 @@ impl PollLanes {
             }
         }
 
+        // Each acknowledgement is bounded: disposal may run after Core's
+        // replay stream ended on its own, which is exactly when an empty
+        // completion can be stranded in Core's input channel (issue #965).
         for run_id in workflow_ids {
             let completion = WorkflowActivationCompletion::empty(run_id);
-            let _ = self.worker.complete_workflow_activation(completion).await;
+            let _ =
+                complete_workflow_unless_stranded(&self.worker, &self.workflow_signal, completion)
+                    .await;
         }
     }
 
@@ -1030,12 +2159,49 @@ impl PollLanes {
         &self,
         completion: WorkflowActivationCompletion,
     ) -> Result<(), WorkerBridgeError> {
+        self.complete_workflow_with(completion, CompletionWait::Unbounded)
+            .await
+    }
+
+    /// Replay variant of [`Self::complete_workflow`] whose Core await is
+    /// bounded by [`complete_workflow_unless_stranded`].
+    ///
+    /// The ledger lease is retired before Core is called, exactly as for a
+    /// live worker. A stranded empty completion is reported as success: Core
+    /// itself ignores an empty completion that reaches a terminated workflow
+    /// stream, and the acknowledgement has no other effect. A stranded
+    /// non-empty completion, or a timeout, is a typed error; the lease stays
+    /// retired because Core may already have consumed the completion, so
+    /// restoring it could produce a second Core completion for one task.
+    pub async fn complete_replay_workflow(
+        &self,
+        completion: WorkflowActivationCompletion,
+    ) -> Result<(), WorkerBridgeError> {
+        self.complete_workflow_with(completion, CompletionWait::ReplayBounded)
+            .await
+    }
+
+    /// Shared implementation of [`Self::complete_workflow`] and
+    /// [`Self::complete_replay_workflow`]; `wait` selects how Core's reply
+    /// is awaited.
+    async fn complete_workflow_with(
+        &self,
+        completion: WorkflowActivationCompletion,
+        wait: CompletionWait,
+    ) -> Result<(), WorkerBridgeError> {
         let run_id = completion.run_id.clone();
-        self.ledger
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .complete_workflow(&run_id)
-            .map_err(WorkerBridgeError::Completion)?;
+        let is_empty = completion.is_empty();
+        let was_eviction = {
+            let mut ledger = self
+                .ledger
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let was_eviction = ledger.is_eviction_lease(&run_id);
+            ledger
+                .complete_workflow(&run_id)
+                .map_err(WorkerBridgeError::Completion)?;
+            was_eviction
+        };
         // Record the ledger state at the exact handoff to Core. The
         // retirement above must already have removed this run, so a correct
         // ordering always probes `false`. A regression that retired after
@@ -1046,13 +2212,37 @@ impl PollLanes {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .probe_complete_completion(&run_id);
-        match self.worker.complete_workflow_activation(completion).await {
+        let core_result = match wait {
+            CompletionWait::Unbounded => self.worker.complete_workflow_activation(completion).await,
+            CompletionWait::ReplayBounded => {
+                match complete_workflow_unless_stranded(
+                    &self.worker,
+                    &self.workflow_signal,
+                    completion,
+                )
+                .await
+                {
+                    GuardedCompletion::Finished(result) => result,
+                    GuardedCompletion::Stranded if is_empty => return Ok(()),
+                    GuardedCompletion::Stranded => {
+                        return Err(WorkerBridgeError::CompletionStranded);
+                    }
+                    GuardedCompletion::TimedOut => {
+                        return Err(WorkerBridgeError::CoreWaitTimedOut);
+                    }
+                }
+            }
+        };
+        match core_result {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.ledger
+                let mut ledger = self
+                    .ledger
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .restore_rejected_workflow_completion(&run_id);
+                    .unwrap_or_else(|error| error.into_inner());
+                if ledger.restore_rejected_workflow_completion(&run_id) && was_eviction {
+                    ledger.restore_eviction_lease(&run_id);
+                }
                 Err(WorkerBridgeError::CoreWorkflow(error.to_string()))
             }
         }
@@ -1099,7 +2289,9 @@ impl PollLanes {
         Ok(())
     }
 
-    /// Fails an activation that could not cross the semantic JSON boundary.
+    /// Fails an activation that could not cross the semantic JSON boundary,
+    /// or acknowledges it empty when it is a pure cache eviction (see
+    /// [`Self::reject_workflow_delivery_with_reason`]).
     ///
     /// The activation was leased by [`Self::try_take_workflow`] but was never
     /// exposed to OCaml, so no language-side caller can return its completion.
@@ -1117,10 +2309,44 @@ impl PollLanes {
 
     /// Rejects a leased activation with a privacy-safe static conversion
     /// category and then retires the lease exactly once.
+    ///
+    /// A pure cache eviction owns no workflow task, so it is never failed:
+    /// Core accepts only an empty acknowledgement for it (issue #814), and a
+    /// failure would leave the eviction outstanding in release Core and panic
+    /// debug Core's workflow stream. The eviction is therefore acknowledged
+    /// empty, which is exactly what the language side would have sent had the
+    /// activation crossed the boundary; the static `reason` is not reported
+    /// to Core in that case. Every other activation belongs to a real
+    /// workflow task and is failed with [`workflow_rejection_message`].
     pub async fn reject_workflow_delivery_with_reason(
         &self,
         run_id: &str,
         reason: &'static str,
+    ) -> Result<(), WorkerBridgeError> {
+        self.reject_workflow_delivery_with(run_id, reason, CompletionWait::Unbounded)
+            .await
+    }
+
+    /// Replay variant of [`Self::reject_workflow_delivery_with_reason`] whose
+    /// Core await is bounded like [`Self::complete_replay_workflow`]. The
+    /// lease is retired up front in both variants, so a stranded or timed-out
+    /// rejection never leaves ledger debt behind.
+    pub async fn reject_replay_workflow_delivery(
+        &self,
+        run_id: &str,
+        reason: &'static str,
+    ) -> Result<(), WorkerBridgeError> {
+        self.reject_workflow_delivery_with(run_id, reason, CompletionWait::ReplayBounded)
+            .await
+    }
+
+    /// Shared implementation of the two rejection entry points; `wait`
+    /// selects how Core's reply is awaited.
+    async fn reject_workflow_delivery_with(
+        &self,
+        run_id: &str,
+        reason: &'static str,
+        wait: CompletionWait,
     ) -> Result<(), WorkerBridgeError> {
         // Retire the ledger lease *before* the Core completion await.
         //
@@ -1141,16 +2367,27 @@ impl PollLanes {
         // Core result. This mirrors the retire-before-await ordering already
         // used by the dispose queue drain in
         // `force_complete_outstanding_for_dispose`.
-        self.ledger
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .retire_rejected_workflow(run_id)
-            .map_err(WorkerBridgeError::Completion)?;
-        let completion = WorkflowActivationCompletion::fail(
-            run_id,
-            workflow_rejection_message(reason).into(),
-            Some(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
-        );
+        let eviction_only = {
+            let mut ledger = self
+                .ledger
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // Read the eviction bit first: retirement clears it.
+            let eviction_only = ledger.is_eviction_lease(run_id);
+            ledger
+                .retire_rejected_workflow(run_id)
+                .map_err(WorkerBridgeError::Completion)?;
+            eviction_only
+        };
+        let completion = if eviction_only {
+            WorkflowActivationCompletion::empty(run_id)
+        } else {
+            WorkflowActivationCompletion::fail(
+                run_id,
+                workflow_rejection_message(reason).into(),
+                Some(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
+            )
+        };
         // Record the ledger state at the exact handoff to Core. The retirement
         // above must already have removed this run, so a correct ordering
         // always probes `false`. A regression that retired after this await
@@ -1160,10 +2397,30 @@ impl PollLanes {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .probe_reject_completion(run_id);
-        self.worker
-            .complete_workflow_activation(completion)
-            .await
-            .map_err(|error| WorkerBridgeError::CoreWorkflow(error.to_string()))
+        let core_result = match wait {
+            CompletionWait::Unbounded => self.worker.complete_workflow_activation(completion).await,
+            CompletionWait::ReplayBounded => {
+                match complete_workflow_unless_stranded(
+                    &self.worker,
+                    &self.workflow_signal,
+                    completion,
+                )
+                .await
+                {
+                    GuardedCompletion::Finished(result) => result,
+                    // An eviction acknowledgement is empty; see
+                    // `complete_replay_workflow` for why that is success.
+                    GuardedCompletion::Stranded if eviction_only => return Ok(()),
+                    GuardedCompletion::Stranded => {
+                        return Err(WorkerBridgeError::CompletionStranded);
+                    }
+                    GuardedCompletion::TimedOut => {
+                        return Err(WorkerBridgeError::CoreWaitTimedOut);
+                    }
+                }
+            }
+        };
+        core_result.map_err(|error| WorkerBridgeError::CoreWorkflow(error.to_string()))
     }
 
     /// Test-only view of the reject-completion ordering probes recorded by the
@@ -1196,9 +2453,14 @@ impl PollLanes {
     /// and the inaccessible token is retired on every outcome. Retaining it
     /// after conversion failure would make graceful shutdown impossible
     /// because OCaml never received the token needed to complete it.
+    ///
+    /// The generated failure is [`unrepresentable_activity_failure`] for the
+    /// static `reason`. Core's acceptance of that completion also releases the
+    /// task's activity slot, so the poll lane can take the next task.
     pub async fn reject_activity_delivery(
         &self,
         task_token: &[u8],
+        reason: &'static str,
     ) -> Result<(), WorkerBridgeError> {
         self.ledger
             .lock()
@@ -1208,7 +2470,7 @@ impl PollLanes {
         let completion = ActivityTaskCompletion {
             task_token: task_token.to_vec(),
             result: Some(ActivityExecutionResult::fail(
-                "OCaml bridge could not represent the activity task".into(),
+                unrepresentable_activity_failure(reason),
             )),
         };
         let core_result = self
@@ -1230,6 +2492,10 @@ impl PollLanes {
     /// On failure the original [`PollLanes`] is returned so the caller can still
     /// force-complete outstanding tasks or retry. A failed finalize must not
     /// drop the only handle that can still talk to Core.
+    // The error deliberately returns the lane graph itself so ownership is
+    // never lost on failure; boxing it would only move the same value to the
+    // heap.
+    #[allow(clippy::result_large_err)]
     pub async fn finalize(self) -> Result<(), (Self, WorkerBridgeError)> {
         let (outstanding, lost_poll_lease) = {
             let ledger_state = self
@@ -1253,7 +2519,10 @@ impl PollLanes {
             activity_signal,
             workflow_lane,
             activity_lane,
+            idle_senders,
             shutdown_started,
+            replay_join_bound,
+            replay_join_timed_out,
         } = self;
         match Arc::try_unwrap(worker) {
             Ok(worker) => {
@@ -1270,7 +2539,10 @@ impl PollLanes {
                     activity_signal,
                     workflow_lane,
                     activity_lane,
+                    idle_senders,
                     shutdown_started,
+                    replay_join_bound,
+                    replay_join_timed_out,
                 },
                 WorkerBridgeError::WorkerStillShared,
             )),
@@ -1295,6 +2567,28 @@ impl PollLanes {
     /// replay disposal observes exactly one join failure without depending on
     /// whether Core's real poll had already reached natural shutdown.
     /// Production callers always use the Core shutdown path instead.
+    /// Replaces the workflow poll task with one that never finishes, so a
+    /// replay join can only end through its bound.
+    ///
+    /// The original Core poll handle is aborted and awaited first, so no
+    /// real producer is left behind. The replacement is a pending task, not
+    /// an aborted one: the join must abort it itself on timeout.
+    #[cfg(test)]
+    pub(crate) async fn install_stuck_workflow_lane_for_test(&mut self) {
+        if let Some(workflow_lane) = self.workflow_lane.take() {
+            workflow_lane.abort();
+            let _ = workflow_lane.await;
+        }
+        self.workflow_lane = Some(tokio::spawn(std::future::pending::<()>()));
+    }
+
+    /// Shortens the replay lane join bound so tests reach the timeout path in
+    /// milliseconds instead of [`REPLAY_CORE_WAIT_TIMEOUT`].
+    #[cfg(test)]
+    pub(crate) fn set_replay_join_bound_for_test(&mut self, bound: Duration) {
+        self.replay_join_bound = bound;
+    }
+
     #[cfg(test)]
     pub(crate) async fn abort_workflow_lane_for_test(&mut self) {
         let workflow_lane = self
@@ -1327,7 +2621,7 @@ async fn run_workflow_lane(
         let activation = match worker.poll_workflow_activation().await {
             Ok(activation) => activation,
             Err(PollError::ShutDown) => {
-                signal.close();
+                signal.close_after_core_shutdown();
                 return;
             }
             Err(error) => {
@@ -1340,7 +2634,7 @@ async fn run_workflow_lane(
         let admission = ledger
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .admit_polled_workflow(&activation.run_id);
+            .admit_polled_workflow_activation(&activation.run_id, activation.is_only_eviction());
         match admission {
             Ok(Admission::New) => {
                 let run_id = activation.run_id.clone();
@@ -1376,10 +2670,26 @@ async fn run_workflow_lane(
                     return;
                 }
             }
+            Err(AdmitError::Retired) if activation.is_only_eviction() => {
+                // Disposal already completed this run's previous activation,
+                // and Core answers a failed workflow task with a cache
+                // eviction for the same run. That eviction is a fresh Core
+                // debt, not a duplicate of the retired one: Core keeps at
+                // most one activation outstanding per run, so it cannot
+                // publish it until the disposal completion was accepted.
+                // Dropping it would keep the workflow poll from ever
+                // reporting `ShutDown` and wedge the dispose lane join
+                // (issue #775). Acknowledge it with the only completion Core
+                // accepts for an eviction; it never enters the ledger, so no
+                // later pass can complete it again.
+                let completion = WorkflowActivationCompletion::empty(activation.run_id);
+                let _ = worker.complete_workflow_activation(completion).await;
+            }
             Err(error @ AdmitError::Retired) => {
-                // Disposal already force-failed this identity. A second poll
-                // with the same run ID is therefore diagnostic only: dropping
-                // it is safer than sending a duplicate Core completion.
+                // Disposal already force-failed this identity, and this is not
+                // Core's follow-up eviction. A second poll with the same run
+                // ID is therefore diagnostic only: dropping it is safer than
+                // sending a duplicate Core completion.
                 ledger
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -1411,12 +2721,32 @@ async fn run_workflow_lane(
     }
 }
 
+/// Reports whether an activity admission outcome is a cancellation update the
+/// poll lane drops silently.
+///
+/// Core represents cancellation as an update on the original Start token, not
+/// as a second completion debt. A Cancel whose Start is unknown (it completed
+/// between Core's poll returning and this admission), already retired by
+/// disposal, already cancelled, malformed, or polled while draining has no
+/// Start lease left to update. Completing it would fabricate a second
+/// completion for the token, and publishing a lane error would make one
+/// benign race terminate `Worker.run` for the whole task queue (issue #801).
+/// Only a Cancel that updates a live Start (`ExistingCancellation`) is
+/// delivered.
+#[doc(hidden)]
+pub fn is_ignorable_activity_cancellation(
+    kind: ActivityAdmission,
+    admission: &Result<Admission, AdmitError>,
+) -> bool {
+    kind == ActivityAdmission::Cancel && matches!(admission, Ok(Admission::Duplicate) | Err(_))
+}
+
 /// Polls remote activities serially and associates cancellation with its start.
 ///
 /// Start tasks that cannot be delivered are force-failed to Core so their
-/// completion debt cannot stall shutdown. Duplicate cancel notifications do
-/// not create a second Core obligation and are therefore dropped without a
-/// completion after the diagnostic error is published.
+/// completion debt cannot stall shutdown. Cancel notifications that do not
+/// update a live Start create no Core obligation and are dropped without a
+/// completion or lane error (see [`is_ignorable_activity_cancellation`]).
 async fn run_activity_lane(
     worker: Arc<Worker>,
     ledger: Arc<Mutex<TaskLedger>>,
@@ -1460,6 +2790,13 @@ async fn run_activity_lane(
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .admit_polled_activity(&task.task_token, kind);
+        if is_ignorable_activity_cancellation(kind, &admission) {
+            // See `is_ignorable_activity_cancellation`: an unknown, retired,
+            // or repeated cancellation owns no Core completion debt, so it
+            // is dropped without a completion and without a lane error.
+            drop(task);
+            continue;
+        }
         match admission {
             Ok(Admission::New | Admission::ExistingCancellation) => {
                 let task_token = task.task_token.clone();
@@ -1487,29 +2824,23 @@ async fn run_activity_lane(
                 // duplicate Start would complete the already-outstanding lease
                 // still queued or held by OCaml. Drop the duplicate delivery
                 // and surface a lane error instead, matching the workflow
-                // duplicate path. Persist the fatal drain blocker only for a
-                // duplicate Start: a duplicate Cancel is a repeated update
-                // for the original start and does not represent another Core
-                // completion lease that could be lost.
-                if kind == ActivityAdmission::Start {
-                    ledger
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .mark_lost_poll_lease();
-                }
+                // duplicate path, and persist the fatal drain blocker. A
+                // duplicate Cancel never reaches this arm: it was dropped
+                // above as an ignorable update.
+                ledger
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .mark_lost_poll_lease();
                 drop(task);
                 if !signal.enqueue(&sender, Err(PollLaneError::DuplicateIdentity)) {
                     return;
                 }
             }
             Err(error) => {
-                // Only Start-shaped debts need a Core completion. Unknown or
-                // duplicate cancel notifications do not create a second
-                // obligation; force-failing them can spuriously complete an
-                // unrelated or already-finished activity for the same token.
-                if kind == ActivityAdmission::Start
-                    && matches!(error, AdmitError::InvalidIdentity | AdmitError::Draining)
-                {
+                // Only Start admissions reach this arm; every Cancel admission
+                // error was dropped above. A Start owns a Core completion
+                // debt, so an invalid or draining Start is force-failed.
+                if matches!(error, AdmitError::InvalidIdentity | AdmitError::Draining) {
                     let reason = match error {
                         AdmitError::InvalidIdentity => "invalid activity task token",
                         AdmitError::Draining => "worker is draining and cannot admit new work",
@@ -1517,11 +2848,6 @@ async fn run_activity_lane(
                     };
                     force_fail_undeliverable_activity(worker.as_ref(), &task.task_token, reason)
                         .await;
-                } else if kind == ActivityAdmission::Cancel {
-                    // Cancellation is an update to an existing start, not a
-                    // second completion debt. Unknown, retired, and repeated
-                    // cancellation notifications are diagnostic only.
-                    drop(task);
                 } else {
                     ledger
                         .lock()
@@ -1648,6 +2974,18 @@ pub struct TaskLedger {
     /// tombstones, these are bounded by the identities seen in one disposal
     /// window and are cleared after all producers stop.
     retired_activities: HashSet<Vec<u8>>,
+    /// Outstanding workflow identities whose activation contained only a cache
+    /// eviction, whether still queued or already leased to OCaml. Shutdown
+    /// must acknowledge an abandoned eviction with an empty completion: Core
+    /// has no workflow task to fail for it, and a failure completion would
+    /// leave the eviction outstanding. The bit is written in the same critical
+    /// section that admits the workflow entry (see
+    /// [`Self::admit_polled_workflow_activation`]), so a disposal snapshot
+    /// taken after admission but before the poll lane enqueues the message
+    /// still classifies the entry correctly. Membership is removed whenever
+    /// the workflow entry leaves the ledger, so it never outgrows the
+    /// outstanding workflow map.
+    eviction_activations: HashSet<String>,
     /// Test-only trace of whether each rejected run was still recorded in the
     /// ledger at the instant its rejection failure was handed to Core. The
     /// reject path must retire the lease *before* that completion, because the
@@ -1683,6 +3021,7 @@ impl TaskLedger {
             lost_poll_lease: false,
             retired_workflows: HashSet::new(),
             retired_activities: HashSet::new(),
+            eviction_activations: HashSet::new(),
             #[cfg(test)]
             reject_completion_probes: Vec::new(),
             #[cfg(test)]
@@ -1724,7 +3063,7 @@ impl TaskLedger {
     /// Records one workflow activation before its delivery to OCaml.
     pub fn admit_workflow(&mut self, run_id: &str) -> Result<Admission, AdmitError> {
         self.ensure_open()?;
-        self.record_workflow(run_id)
+        self.record_workflow(run_id, false)
     }
 
     /// Records a task returned by a Core poll already in flight at shutdown.
@@ -1735,11 +3074,37 @@ impl TaskLedger {
     /// be able to harvest that late identity.
     #[doc(hidden)]
     pub fn admit_polled_workflow(&mut self, run_id: &str) -> Result<Admission, AdmitError> {
-        self.record_workflow(run_id)
+        self.record_workflow(run_id, false)
+    }
+
+    /// Records a polled workflow activation together with whether it is a pure
+    /// cache eviction.
+    ///
+    /// This is the workflow poll lane's admission. The eviction bit is stored
+    /// atomically with the new ledger entry, before the lane enqueues the
+    /// activation for OCaml, so [`Self::take_all_outstanding`] reports the
+    /// correct completion shape even for an admission whose message is not
+    /// yet visible in the ready queue. Like [`Self::admit_polled_workflow`],
+    /// it bypasses the open-phase check.
+    #[doc(hidden)]
+    pub fn admit_polled_workflow_activation(
+        &mut self,
+        run_id: &str,
+        eviction_only: bool,
+    ) -> Result<Admission, AdmitError> {
+        self.record_workflow(run_id, eviction_only)
     }
 
     /// Applies workflow identity rules after admission-phase handling.
-    fn record_workflow(&mut self, run_id: &str) -> Result<Admission, AdmitError> {
+    ///
+    /// The eviction bit is recorded only for a new entry; a duplicate must not
+    /// overwrite the classification of the activation that already owns the
+    /// identity.
+    fn record_workflow(
+        &mut self,
+        run_id: &str,
+        eviction_only: bool,
+    ) -> Result<Admission, AdmitError> {
         if run_id.is_empty() || run_id.len() > MAX_RUN_ID_BYTES {
             return Err(AdmitError::InvalidIdentity);
         }
@@ -1749,6 +3114,11 @@ impl TaskLedger {
         match self.workflows.entry(run_id.to_owned()) {
             Entry::Vacant(entry) => {
                 entry.insert(false);
+                if eviction_only {
+                    self.eviction_activations.insert(run_id.to_owned());
+                } else {
+                    self.eviction_activations.remove(run_id);
+                }
                 Ok(Admission::New)
             }
             Entry::Occupied(_) => Ok(Admission::Duplicate),
@@ -1828,6 +3198,36 @@ impl TaskLedger {
         }
     }
 
+    /// Leases a ready workflow activation and records whether it is a pure
+    /// cache eviction.
+    ///
+    /// This is the supervisor handoff used by [`PollLanes::try_take_workflow`].
+    /// The eviction bit lets worker shutdown choose the only completion Core
+    /// accepts for an abandoned lease (see [`Self::take_leased_for_shutdown`]).
+    /// The poll lane already recorded the same bit at admission (see
+    /// [`Self::admit_polled_workflow_activation`]); restating it from the
+    /// dequeued activation keeps the lease authoritative for callers that
+    /// admitted without one.
+    pub fn lease_workflow_activation(
+        &mut self,
+        run_id: &str,
+        eviction_only: bool,
+    ) -> Result<(), CompleteError> {
+        self.lease_workflow(run_id)?;
+        if eviction_only {
+            self.eviction_activations.insert(run_id.to_owned());
+        } else {
+            self.eviction_activations.remove(run_id);
+        }
+        Ok(())
+    }
+
+    /// Reports whether the outstanding workflow `run_id` (queued or leased to
+    /// OCaml) is a pure cache eviction.
+    pub fn is_eviction_lease(&self, run_id: &str) -> bool {
+        self.eviction_activations.contains(run_id)
+    }
+
     /// Removes a workflow admission that will never be leased to OCaml.
     ///
     /// Used after a dequeued activation fails lease handoff and has been
@@ -1837,6 +3237,7 @@ impl TaskLedger {
         // Only unleased admissions may be dropped; a true lease must survive.
         if let Some(false) = self.workflows.get(run_id) {
             self.workflows.remove(run_id);
+            self.eviction_activations.remove(run_id);
         }
     }
 
@@ -1904,6 +3305,7 @@ impl TaskLedger {
         match self.workflows.get(run_id) {
             Some(true) => {
                 self.workflows.remove(run_id);
+                self.eviction_activations.remove(run_id);
                 Ok(())
             }
             Some(false) => Err(CompleteError::NotLeased),
@@ -1929,8 +3331,23 @@ impl TaskLedger {
     /// genuinely rejected completion — the existing entry is left untouched
     /// rather than silently overwritten, since blindly stamping it leased
     /// would corrupt an unrelated obligation.
-    pub fn restore_rejected_workflow_completion(&mut self, run_id: &str) {
-        self.workflows.entry(run_id.to_owned()).or_insert(true);
+    ///
+    /// Returns whether the lease was restored, so the caller can also restore
+    /// its eviction bit with [`Self::restore_eviction_lease`].
+    pub fn restore_rejected_workflow_completion(&mut self, run_id: &str) -> bool {
+        match self.workflows.entry(run_id.to_owned()) {
+            Entry::Vacant(entry) => {
+                entry.insert(true);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
+    /// Restores the eviction bit of a lease that
+    /// [`Self::restore_rejected_workflow_completion`] just restored.
+    pub fn restore_eviction_lease(&mut self, run_id: &str) {
+        self.eviction_activations.insert(run_id.to_owned());
     }
 
     /// Verifies that a workflow completion is authorized without mutating it.
@@ -2017,6 +3434,7 @@ impl TaskLedger {
     /// Unconditionally removes one workflow identity during dispose cleanup.
     pub fn force_remove_workflow(&mut self, run_id: &str) {
         self.workflows.remove(run_id);
+        self.eviction_activations.remove(run_id);
     }
 
     /// Unconditionally removes one activity token during dispose cleanup.
@@ -2030,6 +3448,7 @@ impl TaskLedger {
     /// late-poll admission window without holding a lock across I/O.
     pub fn retire_workflow_for_dispose(&mut self, run_id: &str) {
         self.workflows.remove(run_id);
+        self.eviction_activations.remove(run_id);
         self.retired_workflows.insert(run_id.to_owned());
     }
 
@@ -2050,10 +3469,28 @@ impl TaskLedger {
         self.retired_activities.clear();
     }
 
-    /// Takes every outstanding identity so dispose can force-fail each once.
-    pub fn take_all_outstanding(&mut self) -> (Vec<String>, Vec<Vec<u8>>) {
-        let workflows: Vec<String> = self.workflows.drain().map(|(run_id, _)| run_id).collect();
-        self.retired_workflows.extend(workflows.iter().cloned());
+    /// Takes every outstanding identity so dispose can complete each once.
+    ///
+    /// Each workflow is returned with its eviction bit. The bit is recorded at
+    /// admission (see [`Self::admit_polled_workflow_activation`]), so it is
+    /// correct for leased entries, for queued entries, and for entries the
+    /// poll lane has admitted but not yet enqueued; the caller never has to
+    /// reconcile it against the ready queue. Every returned identity is
+    /// tombstoned so a concurrent poll of the same
+    /// identity cannot be admitted as a second debt while disposal completes
+    /// it.
+    pub fn take_all_outstanding(&mut self) -> (Vec<(String, bool)>, Vec<Vec<u8>>) {
+        let workflows: Vec<(String, bool)> = self
+            .workflows
+            .drain()
+            .map(|(run_id, _)| {
+                let eviction_only = self.eviction_activations.contains(&run_id);
+                (run_id, eviction_only)
+            })
+            .collect();
+        self.eviction_activations.clear();
+        self.retired_workflows
+            .extend(workflows.iter().map(|(run_id, _)| run_id.clone()));
         let activities: Vec<Vec<u8>> = self
             .activities
             .drain()
@@ -2071,11 +3508,50 @@ impl TaskLedger {
     /// any identity published after this snapshot.
     pub fn take_all_outstanding_for_replay(&mut self) -> (Vec<String>, Vec<Vec<u8>>) {
         let workflows = self.workflows.drain().map(|(run_id, _)| run_id).collect();
+        self.eviction_activations.clear();
         let activities = self
             .activities
             .drain()
             .map(|(task_token, _)| task_token)
             .collect();
+        (workflows, activities)
+    }
+
+    /// Removes every task currently leased to OCaml so worker shutdown can
+    /// complete each one exactly once on OCaml's behalf.
+    ///
+    /// Each workflow is returned with its eviction bit (see
+    /// [`Self::lease_workflow_activation`]). Unleased entries stay in place:
+    /// each of them has exactly one ready-queue message (or one about to be
+    /// enqueued by its poll lane), and shutdown retires it from that message so
+    /// one identity can never receive two completions. No tombstone is written,
+    /// unlike [`Self::take_all_outstanding`]: Core legitimately answers a
+    /// failed workflow task with a cache eviction for the same run, which
+    /// shutdown must admit and acknowledge for Core to report `ShutDown`.
+    pub fn take_leased_for_shutdown(&mut self) -> (Vec<(String, bool)>, Vec<Vec<u8>>) {
+        let leased_workflows: Vec<String> = self
+            .workflows
+            .iter()
+            .filter(|(_, leased)| **leased)
+            .map(|(run_id, _)| run_id.clone())
+            .collect();
+        let workflows = leased_workflows
+            .into_iter()
+            .map(|run_id| {
+                self.workflows.remove(&run_id);
+                let eviction_only = self.eviction_activations.remove(&run_id);
+                (run_id, eviction_only)
+            })
+            .collect();
+        let activities: Vec<Vec<u8>> = self
+            .activities
+            .iter()
+            .filter(|(_, state)| state.leased)
+            .map(|(task_token, _)| task_token.clone())
+            .collect();
+        for task_token in &activities {
+            self.activities.remove(task_token);
+        }
         (workflows, activities)
     }
 
@@ -2098,8 +3574,8 @@ impl Default for TaskLedger {
 #[cfg(test)]
 mod readiness_tests {
     use super::{
-        ACTIVITY_COMPLETION_RETRY_BACKOFF, PollLaneError, Readiness, ReadinessWait, ReadyTask,
-        WORKFLOW_DELIVERY_REJECTION_BACKOFF,
+        ACTIVITY_COMPLETION_RETRY_BACKOFF, AnyLaneWake, PollLaneError, Readiness, ReadinessWait,
+        ReadyTask, WORKFLOW_DELIVERY_REJECTION_BACKOFF, wait_any_lane,
     };
     use std::sync::Arc;
     use std::thread;
@@ -2203,5 +3679,235 @@ mod readiness_tests {
         signal.fail(error.clone());
         assert_eq!(signal.take_or_failure(&mut receiver), Some(Ok(7)));
         assert_eq!(signal.take_or_failure(&mut receiver), Some(Err(error)));
+    }
+
+    /// Builds the workflow/activity signal pair exactly as a live worker does.
+    fn lane_pair() -> (Arc<Readiness>, Arc<Readiness>) {
+        let any = Arc::new(AnyLaneWake::default());
+        (
+            Arc::new(Readiness::sharing(&any)),
+            Arc::new(Readiness::sharing(&any)),
+        )
+    }
+
+    /// Regression for #806: work committed on the lane the owner was not
+    /// expecting must end a combined wait. A lane-specific wait on the quiet
+    /// lane would keep timing out however often it was repeated. The test
+    /// asserts the outcome rather than elapsed time, so scheduler delays on a
+    /// loaded runner cannot make it fail: a wait that happens to time out
+    /// before the producer runs is simply repeated, as the worker loop does.
+    #[test]
+    fn combined_wait_wakes_for_either_lane() {
+        for activity_side in [true, false] {
+            let (workflow, activity) = lane_pair();
+            let (sender, mut receiver) = mpsc::unbounded_channel::<ReadyTask<()>>();
+            let producer_signal = Arc::clone(if activity_side { &activity } else { &workflow });
+            let waiter_workflow = Arc::clone(&workflow);
+            let waiter_activity = Arc::clone(&activity);
+            let waiter = thread::spawn(move || {
+                for _ in 0..100 {
+                    match wait_any_lane(&waiter_workflow, &waiter_activity) {
+                        ReadinessWait::TimedOut => continue,
+                        other => return other,
+                    }
+                }
+                ReadinessWait::TimedOut
+            });
+            assert!(producer_signal.enqueue(&sender, Ok(())));
+            let result = waiter.join().expect("waiter must not panic");
+
+            assert_eq!(result, ReadinessWait::Ready);
+            // The wait is only a wake signal; the task is still drainable.
+            assert!(producer_signal.take(&mut receiver).is_some());
+        }
+    }
+
+    /// Queued work on one lane wins over a fatal error or closure on the
+    /// other, and the combined wait never consumes that work.
+    #[test]
+    fn combined_wait_prefers_work_then_error_then_shutdown() {
+        let (workflow, activity) = lane_pair();
+        let (sender, mut receiver) = mpsc::unbounded_channel::<ReadyTask<()>>();
+        let error = PollLaneError::Core("poll failed".to_owned());
+
+        assert!(activity.enqueue(&sender, Ok(())));
+        workflow.fail(error.clone());
+        assert_eq!(wait_any_lane(&workflow, &activity), ReadinessWait::Ready);
+        assert_eq!(wait_any_lane(&workflow, &activity), ReadinessWait::Ready);
+        assert!(activity.take(&mut receiver).is_some());
+        assert_eq!(
+            wait_any_lane(&workflow, &activity),
+            ReadinessWait::Error(error)
+        );
+
+        let (workflow, activity) = lane_pair();
+        activity.close();
+        assert_eq!(wait_any_lane(&workflow, &activity), ReadinessWait::Shutdown);
+    }
+
+    /// Closing either lane wakes a combined waiter instead of leaving it
+    /// blocked until the bounded timeout.
+    #[test]
+    fn combined_wait_wakes_on_shutdown() {
+        let (workflow, activity) = lane_pair();
+        let waiter_workflow = Arc::clone(&workflow);
+        let waiter_activity = Arc::clone(&activity);
+        let waiter = thread::spawn(move || wait_any_lane(&waiter_workflow, &waiter_activity));
+        thread::sleep(Duration::from_millis(10));
+        workflow.close();
+
+        assert_eq!(
+            waiter.join().expect("waiter must not panic"),
+            ReadinessWait::Shutdown
+        );
+    }
+
+    /// Two quiet lanes still return control to the supervisor within the
+    /// documented bound, preserving shutdown responsiveness.
+    #[test]
+    fn quiet_combined_wait_is_bounded() {
+        let (workflow, activity) = lane_pair();
+
+        assert_eq!(wait_any_lane(&workflow, &activity), ReadinessWait::TimedOut);
+    }
+}
+
+/// Tests for the bounded replay completion await (issue #965).
+///
+/// The real stranding needs a rare interleaving inside Tokio's mpsc receiver
+/// drop, so these tests drive [`await_reply_unless_stranded`] with reply
+/// futures that model each Core outcome directly.
+#[cfg(test)]
+mod stranded_completion_tests {
+    use super::{
+        GuardedCompletion, REPLAY_STRANDED_COMPLETION_GRACE, Readiness, ReplayLaneJoin, TaskLedger,
+        await_reply_unless_stranded, join_replay_lane_within,
+    };
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    use temporalio_common::protos::coresdk::workflow_activation::WorkflowActivation;
+    use tokio::sync::mpsc;
+
+    /// Builds the current-thread runtime with timers that the helper needs.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime should start")
+    }
+
+    /// A reply that never arrives after Core's stream ended is classified as
+    /// stranded instead of waiting for the much longer overall bound.
+    #[test]
+    fn pending_reply_after_core_shutdown_is_stranded() {
+        let signal = Readiness::new();
+        signal.close_after_core_shutdown();
+        let outcome = runtime().block_on(await_reply_unless_stranded(
+            std::future::pending(),
+            &signal,
+            Duration::from_secs(60),
+        ));
+        assert!(
+            matches!(outcome, GuardedCompletion::Stranded),
+            "{outcome:?}"
+        );
+    }
+
+    /// A bridge-initiated close does not prove Core's stream has ended, so a
+    /// pending reply is only released by the overall bound.
+    #[test]
+    fn bridge_close_alone_does_not_strand_a_reply() {
+        let signal = Readiness::new();
+        signal.close();
+        let outcome = runtime().block_on(await_reply_unless_stranded(
+            std::future::pending(),
+            &signal,
+            REPLAY_STRANDED_COMPLETION_GRACE * 2,
+        ));
+        assert!(
+            matches!(outcome, GuardedCompletion::TimedOut),
+            "{outcome:?}"
+        );
+    }
+
+    /// A reply that is already available wins even when Core's stream has
+    /// ended, so a processed completion is never misreported as stranded.
+    #[test]
+    fn ready_reply_is_returned_after_core_shutdown() {
+        let signal = Readiness::new();
+        signal.close_after_core_shutdown();
+        let outcome = runtime().block_on(await_reply_unless_stranded(
+            std::future::ready(Ok(())),
+            &signal,
+            Duration::from_secs(60),
+        ));
+        assert!(
+            matches!(outcome, GuardedCompletion::Finished(Ok(()))),
+            "{outcome:?}"
+        );
+    }
+
+    /// A reply that arrives within the grace period after Core's stream ended
+    /// is still returned rather than abandoned.
+    #[test]
+    fn late_reply_within_grace_is_returned() {
+        let signal = Readiness::new();
+        signal.close_after_core_shutdown();
+        let outcome = runtime().block_on(await_reply_unless_stranded(
+            async {
+                tokio::time::sleep(REPLAY_STRANDED_COMPLETION_GRACE / 5).await;
+                Ok(())
+            },
+            &signal,
+            Duration::from_secs(60),
+        ));
+        assert!(
+            matches!(outcome, GuardedCompletion::Finished(Ok(()))),
+            "{outcome:?}"
+        );
+    }
+
+    /// The replay lane join bound covers acknowledgement waits too (PR #966
+    /// review). A lane that never exits publishes one activation whose
+    /// acknowledgement never completes; the join must still return
+    /// `TimedOut` close to its injected 200 ms bound, with the lane aborted.
+    #[test]
+    fn lane_join_bound_includes_a_stuck_acknowledgement() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime should start");
+        runtime.block_on(async {
+            let signal = Readiness::new();
+            let (sender, mut ready) = mpsc::unbounded_channel();
+            let ledger = Mutex::new(TaskLedger::new());
+            let activation = WorkflowActivation {
+                run_id: "run-stuck-ack".to_owned(),
+                ..Default::default()
+            };
+            assert!(signal.enqueue(&sender, Ok(activation)));
+            let lane = tokio::spawn(std::future::pending::<()>());
+            let lane_probe = lane.abort_handle();
+            let started = Instant::now();
+            let outcome = join_replay_lane_within(
+                lane,
+                Duration::from_millis(200),
+                &signal,
+                &mut ready,
+                &ledger,
+                |_run_id| std::future::pending::<()>(),
+            )
+            .await;
+            assert!(matches!(outcome, ReplayLaneJoin::TimedOut), "{outcome:?}");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the join overran its bound: {:?}",
+                started.elapsed()
+            );
+            assert!(
+                lane_probe.is_finished(),
+                "the timed-out lane must be aborted"
+            );
+        });
     }
 }

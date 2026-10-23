@@ -16,7 +16,7 @@ fn runtime() -> Runtime {
         .expect("default Temporal Core runtime options");
     let core = CoreRuntime::new(options, TokioRuntimeBuilder::default())
         .expect("default Temporal Core runtime");
-    Runtime::new(core).expect("runtime cleanup thread starts")
+    Runtime::with_owned_core(core).expect("runtime cleanup thread starts")
 }
 
 /// Adds an in-memory client connection without contacting Temporal Server.
@@ -67,6 +67,13 @@ fn request() -> Arc<client_protocol::StartWorkflowRequest> {
         input: Vec::new(),
         memo: Vec::new(),
         search_attributes: Vec::new(),
+        id_conflict_policy: client_protocol::IdConflictPolicy::Fail,
+        id_reuse_policy: client_protocol::IdReusePolicy::AllowDuplicate,
+        execution_timeout_ms: None,
+        run_timeout_ms: None,
+        task_timeout_ms: None,
+        retry_policy: None,
+        rpc_timeout_ms: None,
     })
 }
 
@@ -78,6 +85,7 @@ fn response() -> client_protocol::StartWorkflowResponse {
             workflow_id: "workflow-1".to_owned(),
             run_id: "run-1".to_owned(),
         },
+        started: true,
     }
 }
 

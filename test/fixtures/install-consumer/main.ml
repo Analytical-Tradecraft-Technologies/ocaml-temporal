@@ -1,5 +1,11 @@
 module T = Temporal
 
+(* Dune compiles and links only the modules reachable from an executable's
+   main module, so an unreferenced [Public_api] would never be type-checked
+   by the installed-consumer build.  This reference keeps the compatibility
+   witness in that build; the witness has no top-level effects. *)
+let (_ : string T.Codec.t) = Public_api._codec_string
+
 (** Converts an expected SDK result into a test value while retaining the
     public error message if the installed package violates its contract. *)
 let expect_ok label = function
@@ -85,12 +91,15 @@ let () =
   in
   let handle =
     expect_ok "client start"
-      (T.Client.start client ~workflow ~task_queue:"queue" ~id:"consumer-id"
-         ~input:"input" ())
+      (T.Client.start client ~id_reuse_policy:`Reject_duplicate
+         ~execution_timeout:(T.Duration.of_ms 60_000L)
+         ~task_timeout:(T.Duration.of_ms 10_000L)
+         ~rpc_timeout:(T.Duration.of_ms 5_000L) ~workflow ~task_queue:"queue"
+         ~id:"consumer-id" ~input:"input" ())
   in
-  ignore (T.Client.workflow_id handle, T.Client.run_id handle);
+  ignore (T.Client.workflow_id handle, Option.get (T.Client.run_id handle));
   (match expect_ok "client wait" (T.Client.wait handle) with
-  | T.Client.Completed value when value = "input" -> ()
+  | T.Client.Completed { output = value; _ } when value = "input" -> ()
   | _ -> failwith "unexpected mock client terminal result");
   ignore (expect_ok "client shutdown" (T.Client.shutdown client));
   let worker =
@@ -108,7 +117,7 @@ let () =
      value);
   if T.Workflow_context.is_active () then failwith "consumer context leaked";
   match T.Runtime_info.native_bridge_abi_version () with
-  | Ok 2l -> ()
+  | Ok 4l -> ()
   | Ok version ->
       failwith (Printf.sprintf "unexpected native ABI version %ld" version)
   | Error error -> failwith (T.Error.message error)

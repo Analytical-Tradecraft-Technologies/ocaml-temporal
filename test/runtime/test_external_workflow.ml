@@ -59,7 +59,7 @@ let test_external_operation_lifecycle () =
   let signal_future =
     Workflow_context_store.with_context context (fun () ->
         Temporal.Workflow.signal_external_workflow
-          ~workflow_id:"target-workflow" ~run_id:"run-42" ~signal ~input:"ready")
+          ~workflow_id:"target-workflow" ~run_id:"run-42" ~signal ~input:"ready" ())
   in
   expect "signal starts pending" None (Temporal.Future.peek signal_future);
   let signal_payload = encoded_signal_payload () in
@@ -97,7 +97,7 @@ let test_external_operation_lifecycle () =
     Workflow_context_store.with_context context (fun () ->
         Temporal.Workflow.cancel_external_workflow
           ~workflow_id:"target-workflow" ~run_id:"run-42"
-          ~reason:"no longer needed")
+          ~reason:"no longer needed" ())
   in
   expect "cancellation starts pending" None (Temporal.Future.peek cancel_future);
   expect "cancellation command"
@@ -126,7 +126,7 @@ let test_external_operation_validation () =
   in
   let detached =
     Temporal.Workflow.signal_external_workflow
-      ~workflow_id:"target-workflow" ~run_id:"run-42" ~signal ~input:"ready"
+      ~workflow_id:"target-workflow" ~run_id:"run-42" ~signal ~input:"ready" ()
   in
   expect_public_error "detached signal" "defect"
     "external workflow signal used outside a workflow execution"
@@ -137,7 +137,7 @@ let test_external_operation_validation () =
   let invalid_signal =
     Workflow_context_store.with_context context (fun () ->
         Temporal.Workflow.signal_external_workflow
-          ~workflow_id:"" ~run_id:"run-42" ~signal ~input:"ready")
+          ~workflow_id:"" ~run_id:"run-42" ~signal ~input:"ready" ())
   in
   expect_public_error "empty external workflow ID" "defect"
     "external workflow id must not be empty"
@@ -145,7 +145,7 @@ let test_external_operation_validation () =
   let invalid_cancellation =
     Workflow_context_store.with_context context (fun () ->
         Temporal.Workflow.cancel_external_workflow
-          ~workflow_id:"target-workflow" ~run_id:"run-42" ~reason:"")
+          ~workflow_id:"target-workflow" ~run_id:"run-42" ~reason:"" ())
   in
   expect_public_error "empty cancellation reason" "defect"
     "external cancellation reason must not be empty"
@@ -169,11 +169,12 @@ let expect_complete scheduler =
 (** Exercises every local validation branch and a structured codec failure. *)
 let failure_cases () =
   let signal = Temporal.Signal.define ~name:"refresh" ~input:Temporal.Codec.unit in
-  let signal_call workflow_id run_id () =
-    Temporal.Workflow.signal_external_workflow ~workflow_id ~run_id ~signal ~input:()
+  let signal_call ?run_id workflow_id () =
+    Temporal.Workflow.signal_external_workflow ~workflow_id ?run_id ~signal
+      ~input:() ()
   in
-  let cancel_call workflow_id run_id reason () =
-    Temporal.Workflow.cancel_external_workflow ~workflow_id ~run_id ~reason
+  let cancel_call ?run_id workflow_id reason () =
+    Temporal.Workflow.cancel_external_workflow ~workflow_id ?run_id ~reason ()
   in
   let invalid_identifiers =
     [ "", " must not be empty";
@@ -186,21 +187,22 @@ let failure_cases () =
       (fun (invalid, suffix) ->
         let expected = Temporal.Error.defect ~message:("external workflow id" ^ suffix) in
         let workflows =
-          [ "signal workflow id" ^ suffix, signal_call invalid "", expected;
-            "cancel workflow id" ^ suffix, cancel_call invalid "" "stop", expected ]
+          [ "signal workflow id" ^ suffix, signal_call invalid, expected;
+            "cancel workflow id" ^ suffix, cancel_call invalid "stop", expected ]
         in
-        if invalid = "" then workflows
-        else
-          let expected = Temporal.Error.defect ~message:("external run id" ^ suffix) in
-          workflows @
-          [ "signal run id" ^ suffix, signal_call "target" invalid, expected;
-            "cancel run id" ^ suffix, cancel_call "target" invalid "stop", expected ])
+        (* An explicit run ID is validated like the workflow ID, including
+           the empty string: only an omitted [run_id] selects the current
+           run. *)
+        let expected = Temporal.Error.defect ~message:("external run id" ^ suffix) in
+        workflows @
+        [ "signal run id" ^ suffix, signal_call ~run_id:invalid "target", expected;
+          "cancel run id" ^ suffix, cancel_call ~run_id:invalid "target" "stop", expected ])
       invalid_identifiers
   in
   let reasons =
     List.map
       (fun (invalid, suffix) ->
-        "cancellation reason" ^ suffix, cancel_call "target" "" invalid,
+        "cancellation reason" ^ suffix, cancel_call "target" invalid,
         Temporal.Error.defect ~message:("external cancellation reason" ^ suffix))
       invalid_identifiers
   in
@@ -218,7 +220,7 @@ let failure_cases () =
   targets @ reasons @
   [ "signal codec error",
     (fun () -> Temporal.Workflow.signal_external_workflow
-        ~workflow_id:"target" ~run_id:"" ~signal:failing_signal ~input:()),
+        ~workflow_id:"target" ~signal:failing_signal ~input:() ()),
     codec_error ]
 
 (** Failed operations retain their scheduler in both input positions. Ready
@@ -269,11 +271,11 @@ let test_failure_composition (label, failed_operation, expected) =
 let test_failure_owner_boundaries () =
   let signal = Temporal.Signal.define ~name:"refresh" ~input:Temporal.Codec.unit in
   let failed_operation () =
-    Temporal.Workflow.signal_external_workflow ~workflow_id:"" ~run_id:"" ~signal ~input:()
+    Temporal.Workflow.signal_external_workflow ~workflow_id:"" ~signal ~input:() ()
   in
   let detached_signal = failed_operation () in
   let detached_cancel =
-    Temporal.Workflow.cancel_external_workflow ~workflow_id:"" ~run_id:"" ~reason:""
+    Temporal.Workflow.cancel_external_workflow ~workflow_id:"" ~reason:"" ()
   in
   let detached_error =
     Temporal.Error.defect ~message:"external workflow signal used outside a workflow execution"
@@ -313,9 +315,28 @@ let test_failure_owner_boundaries () =
   Workflow_context_store.shutdown context;
   Workflow_context_store.shutdown foreign_context
 
+(** A unit external signal is sent with zero payloads (#819), as other SDKs
+    do; the receiving [Signal.Handler.dispatch_payloads] decodes [[]] as unit. *)
+let test_unit_external_signal_has_no_payloads () =
+  let scheduler = Scheduler.create () in
+  let context = Workflow_context_store.create scheduler in
+  let signal = Temporal.Signal.define ~name:"wake" ~input:Temporal.Codec.unit in
+  let _future =
+    Workflow_context_store.with_context context (fun () ->
+        Temporal.Workflow.signal_external_workflow ~workflow_id:"target"
+          ~signal ~input:() ())
+  in
+  (match Workflow_context_store.take_commands context with
+  | [ Activation.Signal_external_workflow
+        { signal_name = "wake"; input = []; _ } ] ->
+      ()
+  | _ -> failwith "unit external signal was not sent with zero payloads");
+  Workflow_context_store.shutdown context
+
 (** Runs the isolated external-operation lifecycle and validation scenarios. *)
 let () =
   test_external_operation_lifecycle ();
   test_external_operation_validation ();
+  test_unit_external_signal_has_no_payloads ();
   List.iter test_failure_composition (failure_cases ());
   test_failure_owner_boundaries ()

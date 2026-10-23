@@ -32,18 +32,18 @@ let unsigned_int64_decimal bits =
     accessors preserve the exact float chosen by the caller; converting its
     bits again therefore produces the same replay-stable representation as
     activity commands without exposing the private record field. *)
-let to_runtime (policy : Activity.Retry_policy.t) =
+let to_runtime (policy : Retry_policy.t) =
   Temporal_sdk_kernel.Activation
   .{
     initial_interval =
-      Duration.to_ms (Activity.Retry_policy.initial_interval policy);
+      Duration.to_ms (Retry_policy.initial_interval policy);
     backoff_coefficient_bits =
       unsigned_int64_decimal
         (Int64.bits_of_float
-           (Activity.Retry_policy.backoff_coefficient policy));
+           (Retry_policy.backoff_coefficient policy));
     maximum_interval =
-      Duration.to_ms (Activity.Retry_policy.maximum_interval policy);
-    maximum_attempts = Activity.Retry_policy.maximum_attempts policy;
+      Duration.to_ms (Retry_policy.maximum_interval policy);
+    maximum_attempts = Retry_policy.maximum_attempts policy;
     non_retryable_error_types =
-      Activity.Retry_policy.non_retryable_error_types policy;
+      Retry_policy.non_retryable_error_types policy;
   }

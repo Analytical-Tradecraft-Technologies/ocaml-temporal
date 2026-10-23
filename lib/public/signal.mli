@@ -6,10 +6,8 @@
     the native activation bridge. This module provides the typed definition
     and deterministic in-memory handler path. Native workflow signal delivery
     is available when the handler is attached with [Temporal.Worker.workflow].
-    Native output-only query delivery and immediate one-input, non-suspending
-    update delivery are provided by their respective modules; typed query
-    inputs, suspended updates, and live query/update acceptance remain future
-    milestones. *)
+    Queries and updates are separate message kinds with their own definitions
+    and handlers in [Temporal.Query] and [Temporal.Update]. *)
 
 (** A validated signal name paired with the type of its input value. *)
 type 'input definition
@@ -53,4 +51,22 @@ module Handler : sig
       the package's deterministic dispatcher; exposing only this typed
       boundary keeps codec and callback ownership inside the handler. *)
   val dispatch : t -> Payload.t -> (unit, Error.t) result
+
+  (** Dispatches Temporal's repeated signal payload list. This is the worker
+      adapter boundary. Zero payloads, which the Temporal CLI, Web UI, and
+      other SDKs send for a no-argument signal, are decoded as the canonical
+      [binary/null] unit payload; one payload is passed to [dispatch]; more
+      than one is a non-retryable [`Codec] error and the callback is not
+      invoked.
+
+      Signal delivery is fail-closed in v1. When a native worker receives a
+      signal it cannot apply (no handler registered under the signal's name,
+      a payload the codec cannot decode, or more than one payload) it fails
+      the current workflow task instead of closing the run. The signal stays
+      in history, so every replay fails the same way; the run stays open and
+      makes no progress until a worker with a matching handler and codec is
+      deployed, or an operator resets or terminates it. A typed error that the
+      callback itself returns keeps its own classification: a [`Workflow]
+      error closes the run as Failed. *)
+  val dispatch_payloads : t -> Payload.t list -> (unit, Error.t) result
 end

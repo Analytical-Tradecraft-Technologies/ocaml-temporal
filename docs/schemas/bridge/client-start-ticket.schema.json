@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/docs/schemas/bridge/client-start-ticket.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-start-ticket.schema.json",
   "title": "OCaml Temporal native client asynchronous start ticket",
   "description": "Opaque ticket returned by the private begin-start operation and supplied unchanged to poll or bounded-wait operations.",
   "type": "object",

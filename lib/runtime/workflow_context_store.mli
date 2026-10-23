@@ -7,6 +7,49 @@ type start_metadata = {
   execution_expiration_time : Temporal_protocol.Workflow_protocol.timestamp option;
 }
 
+(** Run-stable identity and start policy copied from Core's initialization
+    job and the activation that carried it. [first_execution_run_id] is empty
+    when Core omitted the initialization context. [parent] is [None] for a
+    top-level workflow. [start_time] is the server's run start time when
+    reported. The three timeouts and [retry_policy] are the exact values the
+    server recorded on this run's start event ([None] when absent); they are
+    metadata only and the runtime never schedules them. [continued_from]
+    pairs the predecessor run ID with Core's reason for creating this run and
+    is [None] for the first run of a chain, including a Temporal Schedule
+    action whose continuation carries an empty run ID (#1015); a [Some]
+    always names a real predecessor run. All fields are immutable values
+    from history, so live execution and replay observe the same record. *)
+type run_info = {
+  workflow_id : string;
+  run_id : string;
+  workflow_type : string;
+  attempt : int;
+  first_execution_run_id : string;
+  parent : Temporal_protocol.Workflow_protocol.namespaced_workflow_execution option;
+  start_time : Temporal_protocol.Workflow_protocol.timestamp option;
+  execution_timeout : Temporal_protocol.Workflow_protocol.duration option;
+  run_timeout : Temporal_protocol.Workflow_protocol.duration option;
+  task_timeout : Temporal_protocol.Workflow_protocol.duration option;
+  retry_policy : Temporal_protocol.Workflow_protocol.retry_policy option;
+  continued_from :
+    (string * Temporal_protocol.Workflow_protocol.continue_as_new_initiator)
+    option;
+}
+
+(** History facts reported with one activation. [history_size_bytes] is
+    [None] when the activation carried no metadata, and
+    [continue_as_new_suggested] is then [false] and
+    [continue_as_new_reasons] empty. [continue_as_new_reasons] keeps Core's
+    order and omits the protocol's [Suggest_unspecified] placeholder, which
+    names no reason. *)
+type activation_history = {
+  history_length : int;
+  history_size_bytes : int option;
+  continue_as_new_suggested : bool;
+  continue_as_new_reasons :
+    Temporal_protocol.Workflow_protocol.suggest_continue_as_new_reason list;
+}
+
 (** The activities, timers, and commands belonging to one workflow execution.
     The runtime temporarily makes this context current while running that
     workflow's OCaml code. *)
@@ -17,9 +60,13 @@ type 'a local
 
 (** Creates an empty context whose futures use [scheduler]. [task_queue] is the
     deterministic default used by activities that do not override their queue;
-    a worker supplies its own queue when it creates an execution. *)
+    a worker supplies its own queue when it creates an execution. [namespace]
+    is the worker's Temporal namespace, reported by [Temporal.Workflow.info];
+    both default to ["default"] and are checked by {!validate_task_queue} and
+    {!validate_namespace}, raising [Invalid_argument] on a defect. *)
 val create :
   ?task_queue:string ->
+  ?namespace:string ->
   ?randomness_seed:string ->
   Scheduler.t ->
   t
@@ -31,13 +78,22 @@ val create :
     [create] callers still receive [Invalid_argument] for the same defect. *)
 val validate_task_queue : string -> (unit, string) result
 
-(** Returns the context installed on the current OCaml Domain, if any. *)
+(** Checks a worker namespace with the same rules as {!validate_task_queue},
+    so the worker adapter can reject it as typed configuration. *)
+val validate_namespace : string -> (unit, string) result
+
+(** Returns the context installed for the calling system thread, if any.
+    Sibling threads of one Domain never observe each other's context. *)
 val current : unit -> t option
 
-(** True only while a synchronous read-only query on this Domain inspects the
+(** True only while a synchronous read-only query on this thread inspects the
     live execution whose scheduler has [owner_id]. Does not grant scheduler
     ownership or permission to mutate workflow state. *)
 val query_read_owner_matches : int -> bool
+
+(** True only in the current execution's scheduler turn, outside a read-only
+    query. Scoped command starts use this before allocating durable state. *)
+val in_owner_turn : t -> bool
 
 (** Allocates a key for execution-local workflow state. The key itself may be
     retained by a workflow definition and its registered interaction handlers;
@@ -82,21 +138,52 @@ val activation_deployment_version : t -> (string * string) option
     This must be installed before patch notifications and workflow dispatch. *)
 val set_activation_is_replaying : t -> bool -> unit
 
+(** Returns the replay status installed for the current activation; [false]
+    before any activation has been installed. *)
+val activation_is_replaying : t -> bool
+
+(** Replaces the task-local history facts for the activation about to run.
+    The native adapter calls this before dispatching jobs. *)
+val set_activation_history : t -> activation_history -> unit
+
+(** Returns the history facts installed for the current activation. *)
+val activation_history : t -> activation_history
+
+(** Installs the run identity before workflow code runs. Later activations
+    omit initialization and retain the same value. *)
+val set_run_info : t -> run_info option -> unit
+
+(** Returns the run identity, or [None] for a synthetic execution that never
+    received an initialization activation. *)
+val run_info : t -> run_info option
+
+(** Returns the validated worker task queue that owns this execution. *)
+val task_queue : t -> string
+
+(** Returns the validated namespace of the worker that owns this execution.
+    Core activations do not carry the namespace, so it is worker
+    configuration fixed for the execution's lifetime. *)
+val namespace : t -> string
+
 (** Records authoritative history evidence that [patch_id] is present for this
-    execution. The ID has already passed the closed protocol validator and is
-    copied before this execution retains it. *)
+    execution. The evidence seeds only an ID that workflow code has not yet
+    consulted; a decision already returned by [patched] or acted on by
+    [deprecate_patch] is never changed. The ID has already passed the closed
+    protocol validator and is copied before this execution retains it. *)
 val notify_has_patch : t -> patch_id:string -> unit
 
-(** Returns this execution's deterministic decision for [patch_id] and emits a
-    non-deprecated marker command on every call. The first decision is true in
-    live execution and false during replay unless Core previously notified the
-    marker. The ID is copied before retention and emission. Calling this after
-    shutdown raises [Invalid_argument]. *)
+(** Returns this execution's deterministic decision for [patch_id]. The first
+    call fixes the decision for the run: true in live execution and false
+    during replay unless Core previously notified the marker. Every call whose
+    decision is true emits a non-deprecated marker command; a false decision
+    emits nothing. The ID is copied before retention and emission. Calling this
+    after shutdown raises [Invalid_argument]. *)
 val patched : t -> patch_id:string -> bool
 
-(** Emits a deprecated marker command for [patch_id] and retains the same
-    execution-local decision state used by [patched]. Repeated deprecation calls
-    are allowed. Mixing [patched] and [deprecate_patch] for one ID in the same
+(** Emits a deprecated marker command for [patch_id] when its retained
+    decision is true, sharing the execution-local decision state used by
+    [patched]; replay of a marker-free history emits nothing. Repeated
+    deprecation calls are allowed. Mixing [patched] and [deprecate_patch] for one ID in the same
     execution raises [Invalid_argument] before a conflicting command is emitted;
     Core would otherwise keep only the first mode. The ID is copied before
     retention and emission, and calls after shutdown raise [Invalid_argument]. *)
@@ -107,7 +194,7 @@ val deprecate_patch : t -> patch_id:string -> unit
     Raises [Invalid_argument] for malformed seeds or after shutdown. *)
 val update_random_seed : t -> randomness_seed:string -> unit
 
-(** Draws one deterministic integer in [0, bound). The stream is seeded from
+(** Draws one deterministic integer [n] with [0 <= n < bound]. The stream is seeded from
     Temporal's initialization or reset metadata and advances only in this execution's
     owner Domain.  Invalid bounds and lifecycle misuse are typed defects. *)
 val random_int : t -> bound:int -> (int, Temporal_base.Error.t) result
@@ -119,23 +206,32 @@ val with_randomness_disabled : t -> (unit -> 'value) -> 'value
 
 (** Emits one durable command that merges encoded values into the workflow's
     indexed search attributes. Keys and payloads are validated by the strict
-    protocol encoder before Core receives the completion. *)
+    protocol encoder before Core receives the completion. An empty list emits
+    no command, because Temporal Server rejects an empty upsert and replay
+    would repeat the rejection on every task retry. Raises [Invalid_argument]
+    after the execution has ended, even for an empty list. *)
 val upsert_search_attributes :
    t -> (string * Temporal_base.Codec.payload) list -> unit
 
-(** Runs [action] with [t] dynamically installed and restores the previous
+(** Runs [action] with [t] installed for the calling system thread and restores the previous
     context even if [action] raises. Nested calls are supported. *)
 val with_context : t -> (unit -> 'value) -> 'value
 
 (** Installs [t] for one synchronous query callback and permits owner-checked
     scope status reads while disabling deterministic randomness. Restores the
-    previous Domain-local bindings even if the callback raises. *)
+    previous thread-local bindings even if the callback raises. *)
 val with_read_only_query : t -> (unit -> 'value) -> 'value
 
 (** Runs [action] with no workflow context installed and restores the previous
     context afterward. Infrastructure callbacks that must not re-enter
     deterministic workflow state use this boundary. *)
 val without_context : (unit -> 'value) -> 'value
+
+(** Sum of the threads on the calling Domain that hold a current-context
+    binding and those that hold a read-only query marker. It is zero whenever
+    no [with_context], [with_read_only_query], or [without_context] extent is
+    active on the Domain; tests use it to detect leaked bindings. *)
+val bound_thread_count : unit -> int
 
 (** Creates an already-resolved future owned by the context scheduler. *)
 val resolved :
@@ -176,11 +272,13 @@ val detached_error :
     Temporal requires at least one activity timeout. The cancellation operation
     emits at most one activity-cancellation command for its sequence and
     remains a valid no-op after a terminal result or activity-start failure.
-    Calls made without this context current are typed lifecycle defects. *)
+    Calls made without this context current are typed lifecycle defects.
+    [input] is the exact argument list sent to Core; the public layer decides
+    it from the input codec ([Codec_private.encode_arguments]). *)
 val schedule_activity :
   t ->
   name:string ->
-  input:Temporal_base.Codec.payload ->
+  input:Temporal_base.Codec.payload list ->
   ?activity_id:string ->
   ?task_queue:string ->
   ?schedule_to_close_timeout:int64 ->
@@ -208,7 +306,7 @@ val schedule_activity :
 val schedule_local_activity :
   t ->
   name:string ->
-  input:Temporal_base.Codec.payload ->
+  input:Temporal_base.Codec.payload list ->
   ?activity_id:string ->
   ?schedule_to_close_timeout:int64 ->
   ?schedule_to_start_timeout:int64 ->
@@ -222,19 +320,25 @@ val schedule_local_activity :
 
 (** Assigns a private correlation sequence, records how to decode the child
     result, emits a command containing the application-supplied durable [id]
-    and optional Core-owned retry policy, and returns the child result future
-    together with a cancellation operation.
+    and optional Core-owned retry policy, and returns the child result future,
+    the start-stage future, and a cancellation operation. The start-stage
+    future resolves with the child's run ID when Core reports the start
+    acknowledgment, or with the start failure (or pre-start cancellation)
+    that also resolves the result future; it never waits for the child to
+    finish.
     The default policy is [Child_try_cancel], so cancellation requests the
     child unless a caller explicitly chooses [Child_abandon]. The operation is
     valid only while this context is current; it emits at most one cancellation
     command and leaves Core to resolve the future. A repeated valid call is a
     no-op, including after Core has delivered a terminal result or start
-    failure; a call after context shutdown remains a typed lifecycle defect. *)
+    failure; a call after context shutdown remains a typed lifecycle defect.
+    [input] is the exact argument list sent to Core, as for
+    [schedule_activity]. *)
 val start_child_workflow :
   t ->
   id:string ->
   name:string ->
-  input:Temporal_base.Codec.payload ->
+  input:Temporal_base.Codec.payload list ->
   ?retry_policy:Activation.retry_policy ->
   ?task_queue:string ->
   ?parent_close_policy:Activation.child_workflow_parent_close_policy ->
@@ -242,6 +346,7 @@ val start_child_workflow :
   decode:(Temporal_base.Codec.payload -> ('output, Temporal_base.Error.t) result) ->
   unit ->
   ( ('output, Temporal_base.Error.t) Future_store.t
+  * (string, Temporal_base.Error.t) Future_store.t
   * (reason:string -> (unit, Temporal_base.Error.t) result) )
 
 (** Sends a signal to an external workflow and returns a future resolved by
@@ -281,9 +386,14 @@ val resolve_activity :
   (unit, Temporal_base.Error.t) result
 
 (** Retains a pending local activity while scheduling the workflow timer Core
-    requested for a long retry backoff. The next timer activation re-emits the
-    same activity sequence with the supplied attempt and original schedule
-    timestamp; terminal resolution remains responsible for completing the
+    requested for a long retry backoff. The job is validated immediately, but
+    the timer's sequence allocation and [Start_timer] command are queued on the
+    execution scheduler, so they follow commands from fibers woken by earlier
+    jobs of the same activation; this keeps command order identical when Core
+    merges live activations on replay. When the timer fires, queued work
+    likewise re-emits the same activity sequence with the supplied attempt and
+    original schedule timestamp. Callers must run the scheduler to observe
+    either command. Terminal resolution remains responsible for completing the
     activity future. *)
 val resolve_local_activity_backoff :
   t ->
@@ -294,7 +404,11 @@ val resolve_local_activity_backoff :
   (unit, Temporal_base.Error.t) result
 
 (** Completes and removes the pending child workflow with this private
-    correlation sequence. Unknown and repeated numbers are bridge defects. *)
+    correlation sequence. Unknown and repeated numbers are bridge defects, as
+    is a terminal result before the start acknowledgment, except for a
+    [`Cancelled] error after the workflow requested cancellation: Core resolves
+    a [Try_cancel] or [Abandon] child cancelled between start initiation and
+    start acknowledgment that way without a separate start resolution. *)
 val resolve_child_workflow :
   t ->
   seq:int64 ->
@@ -330,9 +444,10 @@ val emit : t -> Activation.command -> unit
 val terminate : t -> Activation.command -> 'value
 
 (** Buffers a continue-as-new command and stops the current workflow fiber.
-    The successor input is encoded before it reaches this private operation. *)
+    The successor input is encoded into its argument list before it reaches
+    this private operation. *)
 val continue_as_new :
-  t -> workflow_type:string -> input:Temporal_base.Codec.payload -> 'value
+  t -> workflow_type:string -> input:Temporal_base.Codec.payload list -> 'value
 
 (** True when the pending command buffer already holds a terminal workflow
     command such as complete, fail, cancel, or continue-as-new. *)

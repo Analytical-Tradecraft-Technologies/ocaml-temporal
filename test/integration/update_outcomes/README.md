@@ -16,3 +16,8 @@ It then deletes **only its own exact workflow execution** using the official
 CLI. Once an uncached update handle proves the server record is unavailable,
 a handle whose admission response already contained the successful outcome
 must still return that result, repeatedly, without another server lookup.
+
+CI runs this suite against the Compose Temporal/PostgreSQL stack through
+`make test-temporal-live-regressions`, which `make test-temporal-live-ci`
+invokes. That target supplies the `default` namespace and the pinned
+admin-tools CLI.

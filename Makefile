@@ -50,23 +50,91 @@ SMOKE_REPLAY_WORKFLOW_ID ?= two-binary-worker-restart-replay
 SERVICE ?= dev
 OCAML_VERSION ?= 5.2
 OCAML_SERIES = $(shell printf '%s' "$(OCAML_VERSION)" | cut -d. -f1,2)
-OCAML_IMAGE ?= ocaml/opam:debian-12-ocaml-$(OCAML_SERIES)
+# Base image selector for this compiler series: `ocaml-<series>` names the
+# digest-pinned ocaml/opam reference in docker/ocaml-<series>/Dockerfile (the
+# only copy of each pin, tracked per series by Dependabot, #1027). An explicit
+# image reference may still be supplied locally. The override below replaces
+# the selector, including one given on the command line, with the resolved
+# immutable reference, so every Compose build argument, recursive Make, and
+# live-test script receives the pinned image rather than a series name.
+OCAML_IMAGE ?= ocaml-$(OCAML_SERIES)
+# An unknown series resolves to empty after the script reports it on stderr.
+# That is not fatal here because native targets never build the image; a
+# Docker target then fails in Dockerfile.dev, which has no default base image.
+override OCAML_IMAGE := $(shell sh scripts/ocaml-image.sh '$(OCAML_IMAGE)')
+# Immutable base image behind OCAML_IMAGE, recorded in benchmark reports.
+OCAML_IMAGE_REFERENCE = $(OCAML_IMAGE)
 HOST_UID ?= $(shell id -u)
 HOST_GID ?= $(shell id -g)
-# Leave Dune's worker count unchanged by default. A constrained Docker VM can
-# set `DUNE_JOBS=1` (or another small value) to avoid concurrent native linkers
-# exhausting its memory without changing the normal CI/default behavior.
-DUNE_JOBS ?=
+# Dune links many test executables concurrently, each against the large Rust
+# static library, and a default Docker Desktop VM (about 8-10 GiB) is OOM-killed
+# at Dune's automatic, per-CPU job count (#851). Local runs therefore default to
+# two Dune jobs; CI (which sets CI=true on its larger runners) keeps Dune's
+# automatic count. Override with `DUNE_JOBS=1` on a tighter VM or
+# `DUNE_JOBS=auto` to restore Dune's default; an explicitly empty value omits
+# `-j`. Every Make-owned `dune build`, `runtest`, and `exec` passes
+# DUNE_BUILD_ARGS (enforced by test/smoke/test_build_jobs_contract.sh).
+DUNE_JOBS ?= $(if $(strip $(CI)),auto,2)
 DUNE_BUILD_ARGS := $(if $(strip $(DUNE_JOBS)),-j $(DUNE_JOBS),)
+# Exporting the resolved limit bounds the Dune processes that Make does not
+# start itself: the nested builds in the install, prebuilt-consumer and
+# vendored-build scripts, and the `dune exec` of long-lived Compose workers.
+# The dev service in the Compose file passes the variable through to every
+# container that extends it. Dune 3.22 and later read DUNE_JOBS directly; for
+# the older supported releases, those scripts also pass it as an explicit `-j`.
+# Dune rejects an empty value, so an explicitly empty DUNE_JOBS is removed from
+# recipe environments instead.
+ifneq ($(strip $(DUNE_JOBS)),)
+export DUNE_JOBS
+else
+unexport DUNE_JOBS
+endif
 # Rust integration tests each link the Temporal Core graph into a separate test
 # executable. Serializing those links and disabling unused incremental state
 # keeps the peak disk/memory footprint bounded on hosted runners without
 # changing the test set or the production build profile.
 CARGO_BUILD_JOBS ?= 1
 CARGO_TEST_ENV := CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS) CARGO_INCREMENTAL=0
+# Cargo's own parallelism is kept for the bridge build (the staticlib has no
+# memory-heavy link step), so the serial test default above is not forwarded.
+# A CARGO_BUILD_JOBS given on the command line or in the environment is passed
+# into every Compose container (`compose run -e`), so it reaches the
+# containerized `cargo build` and every Cargo build that a Dune bridge rule
+# starts, including direct COMPOSE_RUN paths such as executable batches and
+# benchmarks, for VMs where even Rust compilation needs bounding.
+CARGO_BUILD_JOBS_RUN_FLAG := $(if $(filter environment command,$(firstword $(origin CARGO_BUILD_JOBS))),-e CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS),)
 STRUCTURED_FUZZ_CASES ?= 128
 STRUCTURED_FUZZ_SEED ?= 0x521506a1
 STRUCTURED_FUZZ_TARGET ?= fuzz_
+# Seeded lifecycle operation-sequence stress (#522). The defaults match the
+# ordinary Rust and OCaml test suites; see docs/reference/bridge-lifecycle-stress.md.
+LIFECYCLE_STRESS_SEED ?= 0x05222026
+LIFECYCLE_STRESS_CASES ?= 24
+LIFECYCLE_STRESS_STEPS ?= 48
+LIFECYCLE_STRESS_CASE ?=
+LIFECYCLE_STRESS_OCAML_CYCLES ?= 48
+# Concurrent live workers and clients in the same Rust test binary (#506).
+LIFECYCLE_STRESS_LIVE_ROUNDS ?= 3
+LIFECYCLE_STRESS_LIVE_THREADS ?= 4
+LIFECYCLE_STRESS_LIVE_STEPS ?= 48
+LIFECYCLE_STRESS_LIVE_ROUND ?=
+LIFECYCLE_STRESS_ENV = LIFECYCLE_STRESS_SEED="$(LIFECYCLE_STRESS_SEED)" LIFECYCLE_STRESS_CASES="$(LIFECYCLE_STRESS_CASES)" LIFECYCLE_STRESS_STEPS="$(LIFECYCLE_STRESS_STEPS)" LIFECYCLE_STRESS_CASE="$(LIFECYCLE_STRESS_CASE)" LIFECYCLE_STRESS_OCAML_CYCLES="$(LIFECYCLE_STRESS_OCAML_CYCLES)" LIFECYCLE_STRESS_LIVE_ROUNDS="$(LIFECYCLE_STRESS_LIVE_ROUNDS)" LIFECYCLE_STRESS_LIVE_THREADS="$(LIFECYCLE_STRESS_LIVE_THREADS)" LIFECYCLE_STRESS_LIVE_STEPS="$(LIFECYCLE_STRESS_LIVE_STEPS)" LIFECYCLE_STRESS_LIVE_ROUND="$(LIFECYCLE_STRESS_LIVE_ROUND)"
+# Decoder fuzzing for every Rust and OCaml JSON decoder (#506). The defaults
+# match the ordinary test suites; see docs/reference/bridge-decoder-fuzz.md.
+DECODER_FUZZ_SEED ?= 0x0506d3c0
+DECODER_FUZZ_CASES ?= 96
+DECODER_FUZZ_OCAML_CASES ?= 96
+DECODER_FUZZ_TARGET ?=
+DECODER_FUZZ_ENV = DECODER_FUZZ_SEED="$(DECODER_FUZZ_SEED)" DECODER_FUZZ_CASES="$(DECODER_FUZZ_CASES)" DECODER_FUZZ_OCAML_CASES="$(DECODER_FUZZ_OCAML_CASES)" DECODER_FUZZ_TARGET="$(DECODER_FUZZ_TARGET)" DECODER_FUZZ_REPLAY="$(DECODER_FUZZ_REPLAY)"
+# Concurrent multi-thread (Rust) and multi-Domain (OCaml) lifecycle stress
+# (#506); see docs/reference/bridge-lifecycle-stress.md.
+CONCURRENT_STRESS_SEED ?= 0x0506c0c0
+CONCURRENT_STRESS_ROUNDS ?= 3
+CONCURRENT_STRESS_THREADS ?= 4
+CONCURRENT_STRESS_GRAPHS ?= 3
+CONCURRENT_STRESS_OCAML_ROUNDS ?= 6
+CONCURRENT_STRESS_OCAML_DOMAINS ?= 4
+CONCURRENT_STRESS_ENV = CONCURRENT_STRESS_SEED="$(CONCURRENT_STRESS_SEED)" CONCURRENT_STRESS_ROUNDS="$(CONCURRENT_STRESS_ROUNDS)" CONCURRENT_STRESS_THREADS="$(CONCURRENT_STRESS_THREADS)" CONCURRENT_STRESS_GRAPHS="$(CONCURRENT_STRESS_GRAPHS)" CONCURRENT_STRESS_OCAML_ROUNDS="$(CONCURRENT_STRESS_OCAML_ROUNDS)" CONCURRENT_STRESS_OCAML_DOMAINS="$(CONCURRENT_STRESS_OCAML_DOMAINS)" LIFECYCLE_STRESS_SEED="$(LIFECYCLE_STRESS_SEED)"
 # CI supplies a verified, immutable bridge bundle. Each OCaml consumer still
 # builds its C stubs and runs its own tests; Rust-only checks belong to the
 # producer. Explicit test-rust/lint-rust targets always remain available.
@@ -77,13 +145,18 @@ NATIVE_RUST_LINT_TARGET := $(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,native-lin
 RUST_BRIDGE_DIR ?= $(CURDIR)/_build/rust-bridge
 RUST_BRIDGE_KEY ?=
 RUST_BRIDGE_PROFILE ?= ci
-# Apply the release configuration to toolchain checks, lint, tests and packaging
-# alike, so the tested library is the one that is subsequently published.
-RUST_PROFILE_ENV = $(if $(filter release,$(RUST_BRIDGE_PROFILE)),CARGO_PROFILE_DEV_OPT_LEVEL=3 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false CARGO_PROFILE_DEV_INCREMENTAL=false CARGO_PROFILE_TEST_OPT_LEVEL=3 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=false)
+# A release bundle packages Cargo's [profile.release], the same profile that
+# Dune's release profile (opam install, dune build -p) links (#779); a ci bundle
+# packages Cargo's dev profile. Release toolchain checks, lint and tests run the
+# dev/test profiles with release code generation (optimization, no debug
+# assertions or overflow checks), so the tested semantics match the published
+# library without repeating thin LTO for every Rust integration-test binary.
+RUST_PROFILE_ENV = $(if $(filter release,$(RUST_BRIDGE_PROFILE)),CARGO_PROFILE_DEV_OPT_LEVEL=3 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false CARGO_PROFILE_DEV_INCREMENTAL=false CARGO_PROFILE_TEST_OPT_LEVEL=3 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=false CARGO_PROFILE_TEST_OVERFLOW_CHECKS=false)
+RUST_BRIDGE_BUILD_PROFILE = $(if $(filter release,$(RUST_BRIDGE_PROFILE)),release,dev)
 # Build separately so Compose's build output goes to stderr and failures stop
 # the command. Only container stdout reaches version and Cargo metadata probes.
 COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress plain build $(SERVICE) >&2 && \
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE)
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) $(SERVICE)
 RUN := $(COMPOSE_RUN) opam exec --
 CARGO := $(COMPOSE_RUN) cargo
 CARGO_MANIFEST := rust/Cargo.toml
@@ -93,7 +166,7 @@ ifeq ($(strip $(NATIVE_CARGO_TARGET_DIR)),)
 NATIVE_CARGO_TARGET_DIR := $(CURDIR)/_build/rust
 endif
 NATIVE_OCAML_VERSION ?= 5.5
-NATIVE_RUST_VERSION ?= 1.98.1
+NATIVE_RUST_VERSION ?= 1.99.1
 NATIVE_ARCH ?=
 NATIVE_RUST_HOST ?=
 NATIVE_ENV := CARGO_TARGET_DIR="$(NATIVE_CARGO_TARGET_DIR)"
@@ -115,11 +188,47 @@ BENCH_COLD_REPORT ?= _build/benchmarks/core-cold-replay.json
 BENCH_COLD_WARMUP ?= 1
 BENCH_COLD_SAMPLES ?= 10
 BENCH_COLD_REPETITIONS ?= 3
+BENCH_PAYLOAD_REPORT ?= _build/benchmarks/payload-codec.json
+BENCH_PAYLOAD_WARMUP ?= 5
+BENCH_PAYLOAD_SAMPLES ?= 50
+# Memory and allocation suites for #527 and fan-out for #528. Each listed size
+# or concurrency level writes its own report under BENCH_REPORT_DIR.
+BENCH_REPORT_DIR ?= _build/benchmarks
+BENCH_HISTORY_SIZES ?= 1000 10000 50000
+BENCH_HISTORY_EVENTS ?= 10000
+BENCH_HISTORY_PAYLOAD_BYTES ?= 128
+BENCH_HISTORY_WARMUP ?= 2
+BENCH_HISTORY_SAMPLES ?= 10
+BENCH_CACHE_RUNS ?= 1000
+BENCH_CACHE_CAPACITY ?= $(BENCH_CACHE_RUNS)
+BENCH_CACHE_CHURN_CAPACITY ?= 250
+BENCH_CACHE_DEPTH ?= 8
+BENCH_CACHE_WARMUP ?= 1000
+BENCH_CACHE_SAMPLES ?= 10000
+BENCH_FANOUT_WIDTH ?= 1000
+BENCH_FANOUT_CONCURRENCY ?= 1
+BENCH_FANOUT_LEVELS ?= 1 8
+BENCH_FANOUT_BATCH ?= 10
+BENCH_FANOUT_PAYLOAD_BYTES ?= 256
+BENCH_FANOUT_WARMUP ?= 2
+BENCH_FANOUT_SAMPLES ?= 20
+# #528 live fan-out against the Compose Temporal stack. The benchmark runs in
+# the development container on the stack's network; TEMPORAL_COMPOSE_PROJECT
+# selects the stack, which this target starts but leaves running for reruns
+# (stop it with `make temporal-clean`).
+BENCH_LIVE_FANOUT_LEVELS ?= 1 8
+BENCH_LIVE_FANOUT_WARMUP ?= 1
+BENCH_LIVE_FANOUT_SAMPLES ?= 5
+BENCH_LIVE_FANOUT_REPETITIONS ?= 1
+BENCH_LIVE_TARGET_URL ?= http://temporal:7233
+BENCH_LIVE_NAMESPACE ?= temporal-sdk-test
+BENCH_LIVE_ATTRIBUTION_SAMPLES ?= 1
+BENCH_SERVER_VERSION ?= none
 
 .PHONY: test-temporal-live-ci test-temporal-diagnostics-contract
-.PHONY: bench bench-activation bench-activation-warm bench-activation-cold
-.NOTPARALLEL: bench-activation
-.PHONY: version-check build build-examples cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
+.PHONY: bench bench-activation bench-activation-warm bench-activation-cold bench-payload-codec bench-memory bench-history bench-cache bench-cache-steady bench-cache-churn bench-fanout bench-fanout-live bench-json-bridge-rust
+.NOTPARALLEL: bench-activation bench-memory bench-cache
+.PHONY: version-check build build-examples docs cargo-metadata test test-unit test-runtime test-rust test-bridge test-install test-api release-preflight release-tag-check test-quality-contract test-temporal-config test-temporal-worker-readiness-contract test-temporal-worker-stop-contract test-temporal-worker-crash-recovery-contract test-temporal-worker-cache-eviction-contract test-core-lifecycle-integration temporal-start temporal-start-worker temporal-run-driver temporal-inspect-smoke temporal-stop-worker test-temporal-two-binary test-temporal-integration test-temporal-worker-restart test-temporal-worker-restart-contract test-temporal-worker-restart-live test-temporal-worker-crash-recovery test-temporal-worker-cache-eviction test-temporal-worker-cache-eviction-live test-temporal-workflow-patching test-temporal-workflow-patching-contract test-temporal-workflow-patching-live test-temporal-parent-child-restart test-temporal-parent-child-restart-contract test-temporal-parent-child-restart-live test-temporal-parent-child-failure-replay test-temporal-parent-child-failure-replay-contract test-temporal-parent-child-failure-replay-live temporal-health temporal-status temporal-logs temporal-stop temporal-clean lint lint-rust fmt quality quality-tool-version-check quality-rust quality-spelling license-check audit clean verify check native-version-check native-build native-test native-test-rust native-test-install native-lint native-lint-rust native-verify
 version-check:
 	@output="$$( $(RUN) ocamlc -version )" || exit $$?; \
 	actual="$$(printf '%s\n' "$$output" | tail -n 1)"; \
@@ -134,10 +243,14 @@ build:
 	$(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,$(CARGO) build --manifest-path $(CARGO_MANIFEST) --locked)
 
 # Keep the examples as explicit compile targets rather than relying on Dune's
-# default alias. Every Docker and native build therefore proves that all three
-# executable applications compile against the public installed-library name.
+# default alias. Every Docker and native build therefore proves that every
+# example executable compiles against the public installed-library name.
+# test-temporal-examples-live runs the same list against the Compose stack, and
+# test/smoke/test_examples_live_contract.sh fails when an example directory is
+# missing from it.
+EXAMPLE_EXECUTABLES := examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe examples/cancellation/cancellation.exe
 build-examples:
-	$(RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
+	$(RUN) dune build $(DUNE_BUILD_ARGS) $(EXAMPLE_EXECUTABLES)
 
 # Emits only the locked Cargo metadata document on stdout, allowing CI to pipe
 # it into the isolated license scanner without knowing the Compose fixture path.
@@ -160,17 +273,30 @@ bench:
 	image_id=$$(docker image inspect --format '{{.Id}}' "$(TEMPORAL_COMPOSE_PROJECT)-$(SERVICE)" 2>/dev/null || true); \
 	if test -z "$$image_id"; then image_id=unavailable; fi; \
 	status=0; \
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) $(SERVICE) env \
 		BENCH_SOURCE_COMMIT="$$source_commit" \
 		BENCH_SOURCE_DIRTY="$$source_dirty" \
 		BENCH_SDK_VERSION="$$(cat .release-version)" \
 		BENCH_CORE_REVISION="$$core_revision" \
 		BENCH_DUNE_PROFILE=release \
-		BENCH_BASE_IMAGE_REFERENCE="$(OCAML_IMAGE)" \
+		BENCH_BASE_IMAGE_REFERENCE="$(OCAML_IMAGE_REFERENCE)" \
 		BENCH_DEVELOPMENT_IMAGE_ID="$$image_id" \
 		BENCH_HOST_LABEL="$(BENCH_HOST_LABEL)" \
 		BENCH_REPLAY_HISTORY="$(BENCH_REPLAY_HISTORY)" \
-		opam exec -- dune exec --profile release test/benchmark/$(BENCH_EXECUTABLE).exe -- \
+		BENCH_HISTORY_EVENTS="$(BENCH_HISTORY_EVENTS)" \
+		BENCH_HISTORY_PAYLOAD_BYTES="$(BENCH_HISTORY_PAYLOAD_BYTES)" \
+		BENCH_CACHE_RUNS="$(BENCH_CACHE_RUNS)" \
+		BENCH_CACHE_CAPACITY="$(BENCH_CACHE_CAPACITY)" \
+		BENCH_CACHE_DEPTH="$(BENCH_CACHE_DEPTH)" \
+		BENCH_FANOUT_WIDTH="$(BENCH_FANOUT_WIDTH)" \
+		BENCH_FANOUT_CONCURRENCY="$(BENCH_FANOUT_CONCURRENCY)" \
+		BENCH_FANOUT_BATCH="$(BENCH_FANOUT_BATCH)" \
+		BENCH_FANOUT_PAYLOAD_BYTES="$(BENCH_FANOUT_PAYLOAD_BYTES)" \
+		BENCH_LIVE_TARGET_URL="$(BENCH_LIVE_TARGET_URL)" \
+		BENCH_LIVE_NAMESPACE="$(BENCH_LIVE_NAMESPACE)" \
+		BENCH_LIVE_ATTRIBUTION_SAMPLES="$(BENCH_LIVE_ATTRIBUTION_SAMPLES)" \
+		BENCH_SERVER_VERSION="$(BENCH_SERVER_VERSION)" \
+		opam exec -- dune exec $(DUNE_BUILD_ARGS) --profile release test/benchmark/$(BENCH_EXECUTABLE).exe -- \
 		--warmup "$(BENCH_WARMUP)" --samples "$(BENCH_SAMPLES)" \
 		--repetitions "$(BENCH_REPETITIONS)" --seed "$(BENCH_SEED)" \
 		>"$$tmp" || status=$$?; \
@@ -194,11 +320,80 @@ bench-activation-cold:
 		BENCH_WARMUP="$(BENCH_COLD_WARMUP)" BENCH_SAMPLES="$(BENCH_COLD_SAMPLES)" \
 		BENCH_REPETITIONS="$(BENCH_COLD_REPETITIONS)"
 
+# Payload-heavy codec throughput for #846: one sample is one 2 MiB activation
+# decode plus validation re-encode and one 2 MiB completion encode/decode.
+bench-payload-codec:
+	$(MAKE) bench BENCH_EXECUTABLE=bench_payload_codec BENCH_REPORT="$(BENCH_PAYLOAD_REPORT)" \
+		BENCH_WARMUP="$(BENCH_PAYLOAD_WARMUP)" BENCH_SAMPLES="$(BENCH_PAYLOAD_SAMPLES)"
+
+# #527 allocation and memory: replay at each history length, then the workflow
+# cache with every run resident (steady) and with eviction churn.
+bench-memory: bench-history bench-cache
+
+bench-history:
+	@set -eu; for events in $(BENCH_HISTORY_SIZES); do \
+		$(MAKE) bench BENCH_EXECUTABLE=bench_history_replay \
+			BENCH_REPORT="$(BENCH_REPORT_DIR)/history-replay-$$events.json" \
+			BENCH_HISTORY_EVENTS="$$events" \
+			BENCH_WARMUP="$(BENCH_HISTORY_WARMUP)" BENCH_SAMPLES="$(BENCH_HISTORY_SAMPLES)"; \
+	done
+
+bench-cache: bench-cache-steady bench-cache-churn
+
+bench-cache-steady:
+	$(MAKE) bench BENCH_EXECUTABLE=bench_workflow_cache \
+		BENCH_REPORT="$(BENCH_REPORT_DIR)/workflow-cache-steady.json" \
+		BENCH_CACHE_CAPACITY="$(BENCH_CACHE_RUNS)" \
+		BENCH_WARMUP="$(BENCH_CACHE_WARMUP)" BENCH_SAMPLES="$(BENCH_CACHE_SAMPLES)"
+
+bench-cache-churn:
+	$(MAKE) bench BENCH_EXECUTABLE=bench_workflow_cache \
+		BENCH_REPORT="$(BENCH_REPORT_DIR)/workflow-cache-churn.json" \
+		BENCH_CACHE_CAPACITY="$(BENCH_CACHE_CHURN_CAPACITY)" \
+		BENCH_WARMUP="$(BENCH_CACHE_WARMUP)" BENCH_SAMPLES="$(BENCH_CACHE_SAMPLES)"
+
+# #528 fan-out at each admitted concurrency level (concurrent runs).
+bench-fanout:
+	@set -eu; for level in $(BENCH_FANOUT_LEVELS); do \
+		$(MAKE) bench BENCH_EXECUTABLE=bench_activity_fanout \
+			BENCH_REPORT="$(BENCH_REPORT_DIR)/activity-fanout-c$$level.json" \
+			BENCH_FANOUT_CONCURRENCY="$$level" \
+			BENCH_WARMUP="$(BENCH_FANOUT_WARMUP)" BENCH_SAMPLES="$(BENCH_FANOUT_SAMPLES)"; \
+	done
+
+# #528 live fan-out: starts the Compose stack, then runs one report per
+# concurrency level against it. The server image is read from the Compose file
+# so the report names the exact server the run used.
+bench-fanout-live:
+	$(MAKE) temporal-start
+	@set -eu; \
+	server=$$(awk '$$1 == "image:" && index($$2, "temporalio/server:") == 1 { print $$2; exit }' "$(TEMPORAL_COMPOSE_FILE)"); \
+	test -n "$$server"; \
+	for level in $(BENCH_LIVE_FANOUT_LEVELS); do \
+		$(MAKE) bench BENCH_EXECUTABLE=bench_live_fanout \
+			BENCH_REPORT="$(BENCH_REPORT_DIR)/live-activity-fanout-c$$level.json" \
+			BENCH_FANOUT_CONCURRENCY="$$level" \
+			BENCH_SERVER_VERSION="$$server" \
+			BENCH_WARMUP="$(BENCH_LIVE_FANOUT_WARMUP)" \
+			BENCH_SAMPLES="$(BENCH_LIVE_FANOUT_SAMPLES)" \
+			BENCH_REPETITIONS="$(BENCH_LIVE_FANOUT_REPETITIONS)"; \
+	done
+
+# #528 Rust half of the JSON bridge: serde encode/decode and Core conversion
+# of fan-out-shaped documents, in Cargo's optimized bench profile. Prints one
+# JSON report; it needs no server.
+bench-json-bridge-rust:
+	$(COMPOSE_RUN) env BENCH_FANOUT_WIDTH="$(BENCH_FANOUT_WIDTH)" \
+		BENCH_FANOUT_BATCH="$(BENCH_FANOUT_BATCH)" \
+		BENCH_FANOUT_PAYLOAD_BYTES="$(BENCH_FANOUT_PAYLOAD_BYTES)" \
+		cargo bench --manifest-path $(CARGO_MANIFEST) --locked --bench json_bridge
+
 test:
 	$(MAKE) test-temporal-config
 	$(MAKE) test-temporal-worker-readiness-contract
 	$(MAKE) test-temporal-worker-stop-contract
-	$(RUN) dune runtest
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS)
+	$(MAKE) test-bridge-stress
 	$(if $(RUST_TEST_TARGET),$(MAKE) $(RUST_TEST_TARGET))
 	$(MAKE) test-bridge
 	$(MAKE) test-install
@@ -219,22 +414,85 @@ test-parser-fuzz:
 native-test-parser-fuzz:
 	$(NATIVE_ENV) $(CARGO_TEST_ENV) STRUCTURED_FUZZ_CASES="$(STRUCTURED_FUZZ_CASES)" STRUCTURED_FUZZ_SEED="$(STRUCTURED_FUZZ_SEED)" STRUCTURED_FUZZ_REPLAY="$(STRUCTURED_FUZZ_REPLAY)" cargo test --manifest-path $(CARGO_MANIFEST) --locked --test structured_parser_fuzz "$(STRUCTURED_FUZZ_TARGET)" -- --nocapture
 
+# The ordinary Rust and OCaml suites already run both lifecycle stresses with
+# the default budget. These targets raise the budget, change the seed, or
+# regenerate one reported case (LIFECYCLE_STRESS_CASE) without editing code.
+.PHONY: test-lifecycle-stress native-test-lifecycle-stress
+test-lifecycle-stress:
+	$(COMPOSE_RUN) env $(CARGO_TEST_ENV) $(LIFECYCLE_STRESS_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test lifecycle_stress -- --nocapture
+	$(COMPOSE_RUN) env $(LIFECYCLE_STRESS_ENV) opam exec -- dune build $(DUNE_BUILD_ARGS) @test/bridge/runtest-test_ocaml_lifecycle_gc_stress
+
+native-test-lifecycle-stress:
+	$(NATIVE_ENV) $(CARGO_TEST_ENV) $(LIFECYCLE_STRESS_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test lifecycle_stress -- --nocapture
+	$(NATIVE_ENV) $(LIFECYCLE_STRESS_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) @test/bridge/runtest-test_ocaml_lifecycle_gc_stress
+
+# The ordinary suites run both decoder fuzzers with the default budget. These
+# targets raise it, change the seed, select one target, or replay a retained
+# Rust input (DECODER_FUZZ_REPLAY, relative to the repository root).
+.PHONY: test-decoder-fuzz native-test-decoder-fuzz
+test-decoder-fuzz:
+	$(COMPOSE_RUN) env $(CARGO_TEST_ENV) $(DECODER_FUZZ_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test decoder_fuzz -- --nocapture
+	$(COMPOSE_RUN) env $(DECODER_FUZZ_ENV) opam exec -- dune build $(DUNE_BUILD_ARGS) @test/bridge/decoder-fuzz
+
+native-test-decoder-fuzz:
+	$(NATIVE_ENV) $(CARGO_TEST_ENV) $(DECODER_FUZZ_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test decoder_fuzz -- --nocapture
+	$(NATIVE_ENV) $(DECODER_FUZZ_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) @test/bridge/decoder-fuzz
+
+# Concurrent lifecycle stress across threads, Domains, and shared runtimes.
+.PHONY: test-concurrent-stress native-test-concurrent-stress test-bridge-stress
+
+# The OCaml decoder fuzz and multi-Domain stress are not in `dune runtest`:
+# the stress starts several Core runtimes at once and starved timing-bound
+# runtime tests when Dune ran them side by side. `make test` and
+# `make native-test` run them with their default budgets here, after
+# `dune runtest` has finished.
+test-bridge-stress:
+	$(RUN) dune build $(DUNE_BUILD_ARGS) @test/bridge/bridge-stress
+
+test-concurrent-stress:
+	$(COMPOSE_RUN) env $(CARGO_TEST_ENV) $(CONCURRENT_STRESS_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test concurrent_lifecycle_stress -- --nocapture
+	$(COMPOSE_RUN) env $(CONCURRENT_STRESS_ENV) opam exec -- dune build $(DUNE_BUILD_ARGS) @test/bridge/concurrent-stress
+
+native-test-concurrent-stress:
+	$(NATIVE_ENV) $(CARGO_TEST_ENV) $(CONCURRENT_STRESS_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked --test concurrent_lifecycle_stress -- --nocapture
+	$(NATIVE_ENV) $(CONCURRENT_STRESS_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) @test/bridge/concurrent-stress
+
+# Scheduled long-run qualification (#506): every fuzzer and stress with a
+# budget sized for the weekly workflow, using the same targets contributors
+# run. Override any budget variable on the command line.
+.PHONY: stress-qualification
+stress-qualification:
+	$(MAKE) test-parser-fuzz STRUCTURED_FUZZ_CASES=20000
+	$(MAKE) test-decoder-fuzz DECODER_FUZZ_CASES=20000 DECODER_FUZZ_OCAML_CASES=20000
+	$(MAKE) test-lifecycle-stress LIFECYCLE_STRESS_CASES=1000 LIFECYCLE_STRESS_OCAML_CYCLES=2000 LIFECYCLE_STRESS_LIVE_ROUNDS=200 LIFECYCLE_STRESS_LIVE_THREADS=12 LIFECYCLE_STRESS_LIVE_STEPS=96
+	$(MAKE) test-concurrent-stress CONCURRENT_STRESS_ROUNDS=300 CONCURRENT_STRESS_THREADS=16 CONCURRENT_STRESS_GRAPHS=4 CONCURRENT_STRESS_OCAML_ROUNDS=300 CONCURRENT_STRESS_OCAML_DOMAINS=8
+
 test-bridge:
 	$(COMPOSE_RUN) sh test/bridge/test_abi.sh
 
 # Requires a disposable Temporal server; the driver owns its worker processes.
 .PHONY: test-completed-queries-live
 test-completed-queries-live:
-	$(RUN) dune exec test/integration/completed_queries/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/completed_queries/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 # Requires a disposable server and an explicit official Temporal CLI path.
 .PHONY: test-local-activity-cancellation-live
 test-local-activity-cancellation-live:
-	$(RUN) dune exec test/integration/local_activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/local_activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
 test-install:
 	$(RUN) sh test/bridge/test_relocatable_link_flags.sh .
 	$(COMPOSE_RUN) sh test/bridge/test_install.sh
+
+# Builds a scratch Dune workspace that vendors this checkout under
+# vendor/temporal (#829). It compiles the Rust bridge from source in a fresh
+# workspace, so it is opt-in rather than part of `test` or the CI matrix.
+.PHONY: test-vendored native-test-vendored
+test-vendored:
+	$(COMPOSE_RUN) sh test/smoke/test_vendored_build.sh .
+
+native-test-vendored:
+	sh test/smoke/test_vendored_build.sh .
 
 # The API witness is part of the installed-consumer regression. Keep a named
 # target so release preparation and downstream CI can request the public
@@ -252,8 +510,11 @@ release-preflight:
 # Validates a concrete vMAJOR.MINOR.PATCH tag against the package manifests.
 # This is deliberately host-only so a release cannot spend time building an
 # artifact whose version metadata is inconsistent.
+# It also requires the reviewed release notes, docs/releases/<tag>.md, that
+# the Release workflow publishes.
 release-tag-check:
 	@sh scripts/check-release-tag.sh .
+	@sh scripts/check-release-notes.sh .
 
 # Source-only documentation inventory, shared by the Linux/native test gates.
 .PHONY: check-live-acceptance-inventory update-live-acceptance-inventory test-live-acceptance-inventory-contract
@@ -266,12 +527,17 @@ update-live-acceptance-inventory:
 test-live-acceptance-inventory-contract:
 	sh test/smoke/test_live_acceptance_inventory_contract.sh .
 
-test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness
+test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness test-temporal-live-regressions-contract
 	sh test/smoke/test_quality_contract.sh .
+	sh test/smoke/test_build_jobs_contract.sh .
+	sh test/smoke/test_opam_locked_deps.sh .
 	sh test/smoke/test_release_tag_contract.sh .
+	sh test/smoke/test_release_notes_contract.sh .
 	sh test/smoke/test_release_tag_commit_contract.sh .
+	sh test/smoke/test_prebuilt_install_tag_contract.sh .
 	sh test/smoke/test_make_docker_commands.sh .
 	sh test/smoke/test_rust_bridge_artifact.sh .
+	sh test/smoke/test_examples_live_contract.sh .
 
 test-temporal-config:
 	sh test/smoke/test_temporal_compose_config.sh
@@ -421,8 +687,10 @@ temporal-clean:
 # CI uses the same controllers as local acceptance, each with a bounded log
 # wrapper. A failed scenario stops the suite; workflow finalizers upload all
 # snapshots already captured, including the deliberate collector regressions.
+# The fixed-bug regression suites run first and print their own logs instead.
 test-temporal-live-ci:
 	$(MAKE) test-temporal-diagnostics-contract
+	$(MAKE) test-temporal-live-regressions
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh integration $(MAKE) test-temporal-integration
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh restart $(MAKE) test-temporal-worker-restart
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh crash $(MAKE) test-temporal-worker-crash-recovery
@@ -430,9 +698,51 @@ test-temporal-live-ci:
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh patching $(MAKE) test-temporal-workflow-patching
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh parent-child-restart $(MAKE) test-temporal-parent-child-restart
 	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh child-failure-replay $(MAKE) test-temporal-parent-child-failure-replay
+	$(MAKE) test-temporal-examples-live
 
 test-temporal-diagnostics-contract:
 	bash test/integration/temporal/scripts/test-live-diagnostics-contract.sh
+
+# Live regressions for fixed bugs, features and recovery paths that each own
+# their workers and a unique task queue. Most have a per-suite test-*-live
+# target that runs one suite against any disposable server; this list is what
+# CI executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
+# and test/smoke/test_live_regressions_contract.sh fails when a regression
+# executable under test/integration is neither here nor otherwise run by CI.
+LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/activity_worker_crash/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/concurrent_client/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/non_yielding_workflow/regression.exe test/integration/sdk_interop/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/update_run_close/regression.exe test/integration/worker_metrics/regression.exe test/integration/worker_resource_options/regression.exe test/integration/workflow_start_info/regression.exe
+# Seconds for each regression process; the suites normally finish in seconds.
+LIVE_REGRESSION_TIMEOUT_SECONDS ?= 180
+
+# Runs LIVE_REGRESSION_EXECUTABLES against a fresh Compose stack. The
+# controller registers the fixtures' `default` namespace, supplies the pinned
+# admin-tools CLI, bounds every process, and runs all suites before failing.
+# In CI the executables come from the verified smoke artifact
+# (TEMPORAL_PREBUILT_SMOKE=1); locally they are compiled first.
+.PHONY: test-temporal-live-regressions test-temporal-live-regressions-contract
+test-temporal-live-regressions: test-temporal-live-regressions-contract test-temporal-config
+	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(LIVE_REGRESSION_EXECUTABLES)
+	@set -eu; \
+	cleanup() { \
+		status=$$?; \
+		trap - EXIT HUP INT TERM; \
+		if [ "$$status" -ne 0 ]; then $(MAKE) temporal-logs || true; fi; \
+		$(MAKE) temporal-clean || true; \
+		exit "$$status"; \
+	}; \
+	$(MAKE) temporal-clean; \
+	trap cleanup EXIT; \
+	trap 'exit 129' HUP; \
+	trap 'exit 130' INT; \
+	trap 'exit 143' TERM; \
+	$(MAKE) temporal-start; \
+	TEMPORAL_COMPOSE_PROJECT="$(TEMPORAL_COMPOSE_PROJECT)" OCAML_IMAGE="$(OCAML_IMAGE)" HOST_UID="$(HOST_UID)" HOST_GID="$(HOST_GID)" \
+		LIVE_REGRESSION_TIMEOUT_SECONDS="$(LIVE_REGRESSION_TIMEOUT_SECONDS)" \
+		sh test/integration/temporal/scripts/run-live-regressions.sh $(LIVE_REGRESSION_EXECUTABLES)
+
+# Docker-free check that every live regression executable is compiled into the
+# CI smoke artifact and executed by a recipe reachable from test-temporal-live-ci.
+test-temporal-live-regressions-contract:
+	sh test/smoke/test_live_regressions_contract.sh .
 
 test-temporal-integration: test-temporal-config
 	@set -eu; \
@@ -843,21 +1153,98 @@ test-temporal-worker-restart-live: test-temporal-config
 	$(MAKE) temporal-clean
 
 test-unit:
-	$(RUN) dune runtest test/unit test/smoke
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/unit test/smoke
+
+# Requires a disposable server with the `temporal-sdk-test` namespace, or the
+# namespace named by TEMPORAL_NAMESPACE (#494).
+.PHONY: test-activity-cancellation-live
+test-activity-cancellation-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+
+# Requires a disposable server with a `default` namespace and an explicit
+# official Temporal CLI path (#519). Optional ACTIVITY_WORKER_CRASH_EVIDENCE
+# names the directory for the describe snapshots, history and worker logs;
+# without it the suite uses a fresh temporary directory and prints its path.
+.PHONY: test-activity-worker-crash-live
+test-activity-worker-crash-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/activity_worker_crash/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI) $(ACTIVITY_WORKER_CRASH_EVIDENCE)
+
+# Requires a disposable server with the `temporal-sdk-test` namespace, or the
+# namespace named by TEMPORAL_NAMESPACE (#495).
+.PHONY: test-bounded-shutdown-live
+test-bounded-shutdown-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/bounded_shutdown/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+
+# Requires a disposable server with a `default` namespace (#807).
+.PHONY: test-concurrent-client-live
+test-concurrent-client-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/concurrent_client/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 # Requires a disposable server and an explicit official Temporal CLI path.
 .PHONY: test-update-outcomes-live
 test-update-outcomes-live:
-	$(RUN) dune exec test/integration/update_outcomes/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/update_outcomes/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
+# Requires a disposable server with a `default` namespace and an explicit
+# official Temporal CLI path (#530).
+.PHONY: test-interaction-recovery-live
+test-interaction-recovery-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/interaction_recovery/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
+# (header)
 
 test-runtime:
-	$(RUN) dune runtest test/runtime test/integration/temporal/observer
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/runtime test/integration/temporal/observer
+
+# Replay history corpus (docs/reference/history-corpus.md). The Docker-free
+# gate also runs in every `dune runtest`, so `make test` and the native jobs
+# already enforce it; this target is the focused command for corpus changes.
+.PHONY: test-history-corpus test-history-corpus-upgrade history-corpus-capture
+test-history-corpus:
+	$(RUN) dune runtest $(DUNE_BUILD_ARGS) test/history_corpus
+
+# SDK/Core upgrade gate (issue #524): replays every corpus entry through the
+# public Temporal.Replay API and writes a JSON report naming the candidate SDK
+# commit and the Core pin from rust/Cargo.lock. Required evidence for a Core
+# pin bump or a Dependabot Cargo PR. The commit is read on the host because
+# the runner may execute in a container without Git metadata.
+HISTORY_CORPUS_REPORT ?= _build/history-corpus/report.json
+HISTORY_CORPUS_SDK_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null)
+test-history-corpus-upgrade:
+	$(RUN) dune build $(DUNE_BUILD_ARGS) test/history_corpus/history_corpus_runner.exe
+	$(RUN) ./_build/default/test/history_corpus/history_corpus_runner.exe \
+		test/fixtures/history-corpus/manifest.json \
+		--report "$(HISTORY_CORPUS_REPORT)" --cargo-lock rust/Cargo.lock \
+		--sdk-commit "$(HISTORY_CORPUS_SDK_COMMIT)"
+
+# Captures fresh histories from a running disposable Compose stack and stages
+# them under .history-corpus-capture/ for review. Set HISTORY_CORPUS_INSTALL to
+# the corpus directory to append them; installation never replaces an entry.
+# The export step needs host python3 with the protobuf package, protoc, and
+# cargo (or HISTORY_CORPUS_CORE_PROTOS naming the pinned Core protos).
+# HISTORY_CORPUS_GENERATIONS optionally limits the capture to the named worker
+# generations (space-separated, in order); empty runs every generation.
+HISTORY_CORPUS_CAPTURE_ID ?=
+HISTORY_CORPUS_INSTALL ?=
+HISTORY_CORPUS_GENERATIONS ?=
+history-corpus-capture: test-temporal-config
+	@test -n "$(HISTORY_CORPUS_CAPTURE_ID)" || { echo "set HISTORY_CORPUS_CAPTURE_ID, e.g. live-YYYY-MM-DD" >&2; exit 2; }
+	$(MAKE) temporal-start
+	$(RUN) dune build $(DUNE_BUILD_ARGS) test/history_corpus/capture/history_corpus_capture.exe
+	HISTORY_CORPUS_CAPTURE_ID="$(HISTORY_CORPUS_CAPTURE_ID)" \
+	HISTORY_CORPUS_INSTALL="$(HISTORY_CORPUS_INSTALL)" \
+	HISTORY_CORPUS_GENERATIONS="$(HISTORY_CORPUS_GENERATIONS)" \
+	HISTORY_CORPUS_RUN='OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env TEMPORAL_ADDRESS=http://temporal:7233 TEMPORAL_NAMESPACE=temporal-sdk-test _build/default/test/history_corpus/capture/history_corpus_capture.exe' \
+	HISTORY_CORPUS_TEMPORAL_CLI='$(TEMPORAL_COMPOSE) run --rm --no-deps -T temporal-admin-tools temporal' \
+	sh test/history_corpus/scripts/capture-history-corpus.sh
+
+# Live regressions for fixed bugs, features and recovery paths
 
 # Requires a disposable running Temporal server. The regression owns its worker,
 # uses a unique task queue, and terminates its workflow executions on exit.
 .PHONY: test-client-request-ids-live
 test-client-request-ids-live:
-	$(RUN) dune exec test/integration/client_request_ids/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/client_request_ids/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 # Requires a disposable running Temporal server. One worker runs both lanes;
 # a fresh client reads the exact timer-workflow result while its activity gate
@@ -886,7 +1273,7 @@ test-worker-poll-isolation-live-build:
 
 .PHONY: test-worker-poll-isolation-live-run
 test-worker-poll-isolation-live-run:
-	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(SERVICE) env TEMPORAL_NAMESPACE=temporal-sdk-test TEMPORAL_POLL_ISOLATION_LOG_FILE=/workspace/test/integration/temporal/.smoke-poll-isolation.log sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) $(SERVICE) env TEMPORAL_NAMESPACE=temporal-sdk-test TEMPORAL_POLL_ISOLATION_LOG_FILE=/workspace/test/integration/temporal/.smoke-poll-isolation.log sh scripts/run-temporal-executable.sh --build-dir=/workspace/_build/worker-poll-isolation test/integration/worker_poll_isolation/regression.exe check $(TEMPORAL_CLIENT_TEST_URL)
 
 lint:
 	$(RUN) dune build @install $(DUNE_BUILD_ARGS)
@@ -927,8 +1314,41 @@ quality-rust: quality-tool-version-check
 quality-spelling: quality-tool-version-check
 	typos
 
-license-check:
+# Builds the rendered odoc API documentation, including the package landing
+# page, and fails on any odoc warning (the root `dune` file makes them fatal in
+# the dev profile). It runs in the Compose `docs` service, which adds the exact
+# CI-only odoc closure from scripts/docs-tools.locked to the development image;
+# odoc is never an SDK dependency. Output: _build/default/_doc/_html.
+docs:
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --profile docs --progress plain build docs >&2 && \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --profile docs --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) docs \
+		opam exec -- dune build $(DUNE_BUILD_ARGS) @doc
+
+# The OPAM licence audit first confirms that docs/dependencies.md still lists
+# exactly the locked and pinned inputs, so the reviewed inventory cannot drift
+# from what is built (#783). The inventory check is host-only POSIX shell.
+# It then audits the CI-only official Python SDK closure (#517).
+license-check: check-dependency-inventory
 	$(COMPOSE_RUN) sh scripts/check-licenses.sh
+	$(MAKE) python-license-check
+
+# Installs test/integration/sdk_interop/python/requirements.lock with its
+# hashes in the digest-pinned image of the sdk-interop-python Compose service
+# and audits each installed distribution's own license metadata; the policy
+# contract on fake distributions runs first. Python never enters the OCaml
+# development image, and this target starts no Temporal service.
+.PHONY: python-license-check
+python-license-check:
+	$(TEMPORAL_COMPOSE) run --rm --no-deps -T sdk-interop-python \
+		sh /workspace/scripts/check-python-licenses.sh
+
+.PHONY: check-dependency-inventory test-dependency-inventory-contract
+check-dependency-inventory:
+	sh scripts/check-dependency-inventory.sh .
+
+# Proves the inventory check rejects drift in each source it compares.
+test-dependency-inventory-contract:
+	sh test/smoke/test_dependency_inventory_contract.sh .
 
 audit: license-check
 
@@ -970,11 +1390,12 @@ native-version-check:
 
 native-build:
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build @install $(DUNE_BUILD_ARGS)
-	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
+	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) $(EXAMPLE_EXECUTABLES)
 	$(if $(strip $(TEMPORAL_RUST_BRIDGE_DIR)),,$(NATIVE_ENV) cargo build --manifest-path $(CARGO_MANIFEST) --locked)
 
 native-test: $(NATIVE_RUST_TEST_TARGET) native-test-install test-quality-contract
-	$(NATIVE_ENV) $(NATIVE_RUN) dune runtest
+	$(NATIVE_ENV) $(NATIVE_RUN) dune runtest $(DUNE_BUILD_ARGS)
+	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) @test/bridge/bridge-stress
 
 native-test-rust:
 	$(NATIVE_ENV) $(CARGO_TEST_ENV) cargo test --manifest-path $(CARGO_MANIFEST) --locked
@@ -985,7 +1406,7 @@ native-test-install:
 
 native-lint: $(NATIVE_RUST_LINT_TARGET)
 	$(NATIVE_ENV) $(NATIVE_RUN) dune build @install $(DUNE_BUILD_ARGS)
-	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe
+	$(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) $(EXAMPLE_EXECUTABLES)
 	sh scripts/check-format.sh
 
 native-lint-rust:
@@ -993,6 +1414,41 @@ native-lint-rust:
 	$(NATIVE_ENV) cargo clippy --manifest-path $(CARGO_MANIFEST) --locked --all-targets -- -D warnings
 
 native-verify: native-version-check native-build native-lint native-test
+
+# Runs the shipped three-process example application (#798) exactly as the
+# examples guide describes: the activity worker and workflow worker as separate
+# long-lived processes on one task queue, then one-shot client runs. The
+# controller asserts the client's exact success output, its typed failure for
+# invalid input, and that both workers exit cleanly after SIGTERM. It then runs
+# the self-checking cooperative cancellation example (#494) on its own task
+# queue and requires its exact report. Every process
+# is bounded by a timeout, and the stack is always removed afterwards. In CI the
+# executables come from the verified smoke artifact (TEMPORAL_PREBUILT_SMOKE=1);
+# locally they are compiled first so no long-lived `dune exec` lock is held.
+.PHONY: test-temporal-examples-live test-temporal-examples-contract
+test-temporal-examples-live: test-temporal-examples-contract test-temporal-config
+	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(EXAMPLE_EXECUTABLES)
+	@set -eu; \
+	cleanup() { \
+		status=$$?; \
+		trap - EXIT HUP INT TERM; \
+		if [ "$$status" -ne 0 ]; then $(MAKE) temporal-logs || true; fi; \
+		$(MAKE) temporal-clean || true; \
+		exit "$$status"; \
+	}; \
+	$(MAKE) temporal-clean; \
+	trap cleanup EXIT; \
+	trap 'exit 129' HUP; \
+	trap 'exit 130' INT; \
+	trap 'exit 143' TERM; \
+	$(MAKE) temporal-start; \
+	TEMPORAL_COMPOSE_PROJECT="$(TEMPORAL_COMPOSE_PROJECT)" HOST_UID="$(HOST_UID)" HOST_GID="$(HOST_GID)" \
+		sh test/integration/temporal/scripts/run-examples-live.sh
+
+# Docker-free check that every example executable is compiled, shipped in the
+# CI smoke artifact, and started by the live examples controller.
+test-temporal-examples-contract:
+	sh test/smoke/test_examples_live_contract.sh .
 
 # Retains exact metadata histories in _build for the conformance/corpus gates.
 # The caller chooses the Compose project and owns the server lifecycle.
@@ -1027,7 +1483,7 @@ native-rust-bridge:
 	$(RUST_PROFILE_ENV) $(NATIVE_ENV) sh test/smoke/test_rust_toolchain.sh
 	$(RUST_PROFILE_ENV) $(MAKE) native-lint-rust
 	$(RUST_PROFILE_ENV) $(MAKE) native-test-rust
-	$(RUST_PROFILE_ENV) $(NATIVE_ENV) sh scripts/rust-bridge-artifact.sh pack . "$(RUST_BRIDGE_DIR)" "$(RUST_BRIDGE_KEY)"
+	$(RUST_PROFILE_ENV) $(NATIVE_ENV) OCAML_TEMPORAL_BUILD_PROFILE=$(RUST_BRIDGE_BUILD_PROFILE) sh scripts/rust-bridge-artifact.sh pack . "$(RUST_BRIDGE_DIR)" "$(RUST_BRIDGE_KEY)"
 
 rust-bridge:
 	docker build -f Dockerfile.rust-ci -t ocaml-temporal-rust-bridge:local .

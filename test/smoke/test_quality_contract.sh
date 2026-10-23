@@ -226,6 +226,23 @@ grep -Fqx '      tier: master' "$master_workflow"
 grep -Fqx '  push:' "$master_workflow"
 grep -Fqx '  workflow_dispatch:' "$master_workflow"
 grep -Fqx '      tier: release' "$source_root/.github/workflows/release.yml"
+# Release provenance (#510): only the publish job may mint an OIDC token or
+# write attestations, it attests the whole published asset directory, and the
+# attestation precedes the step that creates the draft release. The source
+# archive check also builds the installed-package consumer from the archive.
+release_publish_text=$(tr -d '\015' < "$source_root/.github/workflows/release.yml")
+release_publish_job=$(printf '%s\n' "$release_publish_text" | sed -n '/^  publish:/,$p')
+for permission in 'contents: write' 'id-token: write' 'attestations: write'; do
+  printf '%s\n' "$release_publish_job" | grep -Fqx "      $permission"
+done
+test "$(printf '%s\n' "$release_publish_text" | grep -c 'id-token: write')" -eq 1
+test "$(printf '%s\n' "$release_publish_text" | grep -c 'attestations: write')" -eq 1
+printf '%s\n' "$release_publish_job" | grep -Fqx '          subject-path: _build/release-assets/*'
+printf '%s\n' "$release_publish_job" | grep -Fq 'gh release create "$RELEASE_TAG" _build/release-assets/*'
+attest_line=$(printf '%s\n' "$release_publish_job" | grep -n 'uses: actions/attest-build-provenance@' | cut -d: -f1)
+publish_line=$(printf '%s\n' "$release_publish_job" | grep -n 'gh release create' | cut -d: -f1)
+test -n "$attest_line" && test "$attest_line" -lt "$publish_line"
+printf '%s\n' "$release_publish_text" | grep -Fq 'sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"'
 for workflow in "$source_root"/.github/workflows/*.yml "$source_root"/.github/actions/*/action.yml; do
   assert_third_party_actions_pinned "$workflow" "$(cat "$workflow")"
 done

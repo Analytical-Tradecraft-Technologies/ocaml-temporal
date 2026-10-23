@@ -1,0 +1,7 @@
+; Live #504 regression: an in-process TCP fault proxy sits between the SDK and
+; a disposable Temporal Server. Run through make test-temporal-live-regressions,
+; which also supplies the official Temporal CLI used to read activity history.
+(executable
+ (name regression)
+ (modules fault_proxy regression)
+ (libraries temporal-sdk threads.posix unix yojson))

@@ -3,6 +3,9 @@ module Bridge = Temporal_core_bridge.Native_bridge
 module Client = Temporal_protocol.Client_protocol
 module Workflow = Temporal_protocol.Workflow_protocol
 module Activity = Temporal_protocol.Activity_protocol
+module Encoded_completion = Temporal_protocol.Encoded_workflow_completion
+module Encoded_activity = Temporal_protocol.Encoded_activity_completion
+module Encoded_heartbeat = Temporal_protocol.Encoded_activity_heartbeat
 
 (** Requires two structural values to be equal and identifies the violated
     native-worker contract if they differ. *)
@@ -43,6 +46,7 @@ let require_bridge = function
         | Already_started -> "already_started"
         | Retryable -> "retryable"
         | Async_heartbeat_rejected -> "async_heartbeat_rejected"
+        | Resource_exhausted -> "resource_exhausted"
         | Unknown code -> Printf.sprintf "unknown(%d)" code
       in
       failwith (Printf.sprintf "%s: %s" status message)
@@ -92,9 +96,12 @@ let test_nonblocking_readiness_results () =
   | _ -> failwith "hostile activity worker error changed status")
 
 (** If OCaml rejects bytes that Rust already leased, the adapter returns those
-    exact bytes to the native rejection path before exposing the protocol
-    error. A rejection failure is appended without losing the original
-    [Protocol] classification or copying source JSON into the diagnostic. *)
+    exact bytes to the native rejection path. On a live worker a successful
+    rejection is local task progress and reads as an empty poll, so one
+    undecodable task cannot end [Worker.run] (issue #801). A replay keeps the
+    [Protocol] error instead of silently skipping history. A rejection failure
+    is appended without losing the original [Protocol] classification or
+    copying source JSON into the diagnostic. *)
 let test_decode_failure_retires_native_lease () =
   let malformed = Bytes.of_string {|{"run_id":"private-run"}|} in
   let rejected = ref None in
@@ -102,14 +109,25 @@ let test_decode_failure_retires_native_lease () =
     rejected := Some input;
     Ok ()
   in
+  expect "live workflow rejection keeps polling" (Ok None)
+    (Supervisor.Protocol_adapter.workflow_poll_result ~reject (Ok malformed));
+  expect "workflow rejection input" (Some malformed) !rejected;
+  rejected := None;
   (match
-     Supervisor.Protocol_adapter.workflow_poll_result ~reject (Ok malformed)
+     Supervisor.Protocol_adapter.replay_workflow_poll_result ~reject
+       (Ok malformed)
    with
   | Error { Bridge.status = Protocol; message } ->
       if contains_substring message "private-run"
-      then failwith "workflow rejection error exposed source JSON"
-  | _ -> failwith "workflow decode failure did not remain Protocol");
-  expect "workflow rejection input" (Some malformed) !rejected;
+      then failwith "replay rejection error exposed source JSON"
+  | _ -> failwith "replay decode failure did not remain Protocol");
+  expect "replay rejection input" (Some malformed) !rejected;
+  let malformed_task = Bytes.of_string {|{"task_token":"c2VjcmV0"}|} in
+  rejected := None;
+  expect "live activity rejection keeps polling" (Ok None)
+    (Supervisor.Protocol_adapter.activity_poll_result ~reject
+       (Ok malformed_task));
+  expect "activity rejection input" (Some malformed_task) !rejected;
   let rejection_failure =
     { Bridge.status = Worker; message = "native rejection failed safely" }
   in
@@ -146,20 +164,41 @@ let test_protocol_serialization () =
   let workflow_completion : Workflow.completion =
     { run_id = "run-1"; task_failure = None; commands = [] }
   in
+  (* Workflow completions are encoded once, before they enter the supervisor
+     mailbox; the supervisor copies exactly these bytes into the C call. *)
   expect "workflow completion JSON"
     (Bytes.of_string {|{"commands":[],"run_id":"run-1"}|})
-    (require_bridge
-       (Supervisor.Protocol_adapter.encode_workflow_completion
-          workflow_completion));
+    (match Encoded_completion.encode workflow_completion with
+    | Ok encoded -> Encoded_completion.to_bytes encoded
+    | Error _ -> failwith "valid workflow completion was not encoded");
   let activity_completion : Activity.completion =
     { task_token = Bytes.of_string "\000\001\002"; result = Will_complete_async }
   in
+  (* Activity completions follow the same single-encode contract (issue
+     #995): the adapter's encoder pass yields the exact bytes the supervisor
+     copies into the C call, so the wire document is unchanged. *)
   expect "activity completion JSON"
     (Bytes.of_string
        {|{"result":{"kind":"will_complete_async"},"task_token":"AAEC"}|})
-    (require_bridge
-       (Supervisor.Protocol_adapter.encode_activity_completion
-          activity_completion))
+    (match Encoded_activity.encode activity_completion with
+    | Ok encoded -> Encoded_activity.to_bytes encoded
+    | Error _ -> failwith "valid activity completion was not encoded");
+  let heartbeat : Activity.heartbeat =
+    { task_token = Bytes.of_string "\000\001\002"; details = [] }
+  in
+  (* Heartbeats follow the same single-encode contract (issue #1001): the
+     supervisor copies the adapter's encoder output into the C call, so the
+     wire document is unchanged and each copy is caller-owned. *)
+  match Encoded_heartbeat.encode heartbeat with
+  | Error _ -> failwith "valid activity heartbeat was not encoded"
+  | Ok encoded ->
+      let expected = {|{"details":[],"task_token":"AAEC"}|} in
+      if Encoded_heartbeat.to_string encoded <> expected then
+        failwith "activity heartbeat JSON did not match";
+      let copy = Encoded_heartbeat.to_bytes encoded in
+      Bytes.fill copy 0 (Bytes.length copy) 'x';
+      if Encoded_heartbeat.to_string encoded <> expected then
+        failwith "mutating a native copy changed the encoded heartbeat"
 
 (** Invalid incoming and outgoing semantic documents are converted to the
     stable bridge [Protocol] status without including source payload bytes in
@@ -177,12 +216,13 @@ let test_protocol_failures_are_typed () =
   let invalid_completion : Workflow.completion =
     { run_id = ""; task_failure = None; commands = [] }
   in
-  match
-    Supervisor.Protocol_adapter.encode_workflow_completion invalid_completion
-  with
-  | Error { Bridge.status = Protocol; message } ->
-      if String.length message = 0 then failwith "empty completion protocol error"
-  | _ -> failwith "invalid workflow completion was not a protocol error"
+  (* An invalid outgoing completion is rejected by the single encoder pass, so
+     no value exists that could be handed to [Complete_workflow]. *)
+  match Encoded_completion.encode invalid_completion with
+  | Error error ->
+      if String.length (Workflow.error_view error).message = 0 then
+        failwith "empty completion protocol error"
+  | Ok _ -> failwith "invalid workflow completion was encoded"
 
 (** Exercises the typed client adapter without a Temporal server. The native
     result shapes below model the already-owned bytes returned by the private
@@ -199,6 +239,13 @@ let test_client_protocol_adapter () =
       input = [];
       memo = [];
       search_attributes = [];
+      id_conflict_policy = Client.Fail;
+      id_reuse_policy = Client.Allow_duplicate;
+      execution_timeout_ms = None;
+      run_timeout_ms = None;
+      task_timeout_ms = None;
+      retry_policy = None;
+      rpc_deadline = None;
     }
   in
   let wait_request : Client.wait_request =
@@ -209,6 +256,7 @@ let test_client_protocol_adapter () =
       execution = wait_request;
       request_id = "cancel-request-1";
       reason = "operator requested shutdown";
+      rpc_deadline = None;
     }
   in
   let signal_request : Client.signal_request =
@@ -217,6 +265,7 @@ let test_client_protocol_adapter () =
       signal_name = "add_document";
       request_id = "signal-request-1";
       input = [];
+      rpc_deadline = None;
     }
   in
   let query_request : Client.query_request =
@@ -224,10 +273,11 @@ let test_client_protocol_adapter () =
       execution = wait_request;
       query_type = "current_state";
       input = [];
+      rpc_deadline = None;
     }
   in
   let start_json =
-    {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"}}|}
+    {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"},"started":true}|}
   in
   let wait_json =
     {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"outcome":{"kind":"cancelled","details":[]}}|}
@@ -284,7 +334,7 @@ let test_client_protocol_adapter () =
      Supervisor.Protocol_adapter.decode_client_start_result start_request
        (Ok (Bytes.of_string start_json))
    with
-  | Ok (Ok { Client.execution = { run_id = "run-2"; _ } }) -> ()
+  | Ok (Ok { Client.execution = { run_id = "run-2"; _ }; started = true }) -> ()
   | _ -> failwith "valid start response was not typed");
   let start_ticket =
     match
@@ -303,13 +353,13 @@ let test_client_protocol_adapter () =
   if not (contains_substring (Bytes.to_string ticket_bytes) "ticket-1") then
     failwith "typed start ticket was not encoded";
   let accepted_outcome_json =
-    {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"}}|}
+    {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"},"started":true}|}
   in
   (match
      Supervisor.Protocol_adapter.decode_client_start_outcome start_ticket
        (Ok (Bytes.of_string accepted_outcome_json))
    with
-  | Ok (Some (Client.Accepted { execution = { run_id = "run-2"; _ } })) -> ()
+  | Ok (Some (Client.Accepted { execution = { run_id = "run-2"; _ }; started = true })) -> ()
   | _ -> failwith "valid asynchronous start outcome was not typed");
   (match
      Supervisor.Protocol_adapter.decode_client_start_outcome start_ticket
@@ -355,6 +405,38 @@ let test_client_protocol_adapter () =
    with
   | Ok (Error (Client.Rpc { code = "failed_precondition" })) -> ()
   | _ -> failwith "structured query RPC error was not typed");
+  (* Issue #823: a failed query handler shares the RPC status but keeps its
+     own JSON kind and the handler's message. *)
+  (match
+     Supervisor.Protocol_adapter.decode_client_query_result
+       (Error
+          {
+            Bridge.status = Connection;
+            message = {|{"kind":"query_failed","message":"no such query"}|};
+          })
+   with
+  | Ok (Error (Client.Query_failed { message = "no such query" })) -> ()
+  | _ -> failwith "structured query handler failure was not typed");
+  (match
+     Supervisor.Protocol_adapter.decode_client_query_result
+       (Error
+          {
+            Bridge.status = Protocol;
+            message = {|{"kind":"query_failed","message":"no such query"}|};
+          })
+   with
+  | Error { Bridge.status = Protocol; _ } -> ()
+  | _ -> failwith "query failure with a mismatched status was accepted");
+  (match
+     Supervisor.Protocol_adapter.decode_client_signal_result
+       (Error
+          {
+            Bridge.status = Connection;
+            message = {|{"kind":"query_failed","message":"no such query"}|};
+          })
+   with
+  | Error { Bridge.status = Protocol; _ } -> ()
+  | _ -> failwith "query-only failure was accepted for a signal");
   (match
      Supervisor.Protocol_adapter.decode_client_wait_result wait_request
        rpc_failure
@@ -413,7 +495,7 @@ let test_client_protocol_adapter () =
      Supervisor.Protocol_adapter.decode_client_start_result start_request
        (Ok
           (Bytes.of_string
-             {|{"execution":{"namespace":"other","workflow_id":"workflow-1","run_id":"run-2"}}|}))
+             {|{"execution":{"namespace":"other","workflow_id":"workflow-1","run_id":"run-2"},"started":true}|}))
    with
   | Error { Bridge.status = Protocol; _ } -> ()
   | _ -> failwith "mismatched start response was accepted");
@@ -453,17 +535,25 @@ let test_native_lifecycle_guards () =
   (match Supervisor.perform supervisor Supervisor.Wait_activity with
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
   | _ -> failwith "activity readiness wait without worker was accepted");
+  (match Supervisor.perform supervisor Supervisor.Wait_any with
+  | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
+  | _ -> failwith "combined readiness wait without worker was accepted");
   let invalid_completion : Workflow.completion =
     { run_id = ""; task_failure = None; commands = [] }
   in
-  (match
-     Supervisor.perform supervisor
-       (Supervisor.Complete_workflow invalid_completion)
-   with
-  | Error (Supervisor.Backend { Bridge.status = Protocol; _ }) -> ()
-  | _ -> failwith "invalid completion reached the native worker");
-  let workflow_completion : Workflow.completion =
-    { run_id = "run-1"; task_failure = None; commands = [] }
+  (* The encoder is the only constructor of a submittable completion, so an
+     invalid one cannot reach the native worker at all. *)
+  (match Encoded_completion.encode invalid_completion with
+  | Error _ -> ()
+  | Ok _ -> failwith "invalid completion was encoded for the native worker");
+  let workflow_completion =
+    match
+      Encoded_completion.encode
+        ({ run_id = "run-1"; task_failure = None; commands = [] }
+          : Workflow.completion)
+    with
+    | Ok encoded -> encoded
+    | Error _ -> failwith "valid workflow completion was not encoded"
   in
   (match
      Supervisor.perform supervisor
@@ -474,14 +564,19 @@ let test_native_lifecycle_guards () =
   let invalid_activity_completion : Activity.completion =
     { task_token = Bytes.empty; result = Will_complete_async }
   in
-  (match
-     Supervisor.perform supervisor
-       (Supervisor.Complete_activity invalid_activity_completion)
-   with
-  | Error (Supervisor.Backend { Bridge.status = Protocol; _ }) -> ()
-  | _ -> failwith "invalid activity completion reached the native worker");
-  let activity_completion : Activity.completion =
-    { task_token = Bytes.of_string "token"; result = Will_complete_async }
+  (* As for workflows, the encoder is the only constructor of a submittable
+     activity completion, so an invalid one cannot reach the native worker. *)
+  (match Encoded_activity.encode invalid_activity_completion with
+  | Error _ -> ()
+  | Ok _ -> failwith "invalid activity completion was encoded for the native worker");
+  let activity_completion =
+    match
+      Encoded_activity.encode
+        ({ task_token = Bytes.of_string "token"; result = Will_complete_async }
+          : Activity.completion)
+    with
+    | Ok encoded -> encoded
+    | Error _ -> failwith "valid activity completion was not encoded"
   in
   (match
      Supervisor.perform supervisor
@@ -489,6 +584,29 @@ let test_native_lifecycle_guards () =
    with
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
   | _ -> failwith "activity completion without worker was accepted");
+  (* Likewise for heartbeats (issue #1001): an empty token is rejected by the
+     encoder, so no value exists for either heartbeat operation to send. *)
+  (match
+     Encoded_heartbeat.encode
+       ({ task_token = Bytes.empty; details = [] } : Activity.heartbeat)
+   with
+  | Error _ -> ()
+  | Ok _ -> failwith "invalid activity heartbeat was encoded for the native worker");
+  let heartbeat =
+    match
+      Encoded_heartbeat.encode
+        ({ task_token = Bytes.of_string "token"; details = [] }
+          : Activity.heartbeat)
+    with
+    | Ok encoded -> encoded
+    | Error _ -> failwith "valid activity heartbeat was not encoded"
+  in
+  (match
+     Supervisor.perform supervisor
+       (Supervisor.Record_activity_heartbeat heartbeat)
+   with
+  | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
+  | _ -> failwith "activity heartbeat without worker was accepted");
   expect "native shutdown" (Ok ()) (Supervisor.shutdown supervisor);
   expect "poll after shutdown" (Error Supervisor.Closed)
     (Supervisor.perform supervisor Supervisor.Try_poll_workflow)
@@ -511,6 +629,13 @@ let test_native_client_lifecycle_guards () =
       input = [];
       memo = [];
       search_attributes = [];
+      id_conflict_policy = Client.Fail;
+      id_reuse_policy = Client.Allow_duplicate;
+      execution_timeout_ms = None;
+      run_timeout_ms = None;
+      task_timeout_ms = None;
+      retry_policy = None;
+      rpc_deadline = None;
     }
   in
   let wait_request : Client.wait_request =
@@ -561,6 +686,7 @@ let test_native_client_lifecycle_guards () =
             execution = wait_request;
             request_id = "cancel-before-connect";
             reason = "test";
+            rpc_deadline = None;
           })
    with
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
@@ -573,11 +699,348 @@ let test_native_client_lifecycle_guards () =
             signal_name = "add_document";
             request_id = "signal-before-connect";
             input = [];
+            rpc_deadline = None;
           })
    with
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
   | _ -> failwith "client signal without connection was accepted");
   expect "client lifecycle shutdown" (Ok ()) (Supervisor.shutdown supervisor)
+
+(** A deadline that expired one second ago on the monotonic clock, with a
+    one-millisecond budget, so every dispatch finds it expired. *)
+let expired_deadline () =
+  Some
+    (Client.rpc_deadline
+       ~now_ns:(Int64.sub (Bridge.monotonic_now_ns ()) 1_000_000_000L)
+       ~timeout_ms:1L)
+
+(** A deadline with a full minute remaining. *)
+let live_deadline () =
+  Some
+    (Client.rpc_deadline ~now_ns:(Bridge.monotonic_now_ns ()) ~timeout_ms:60_000L)
+
+(** A caller deadline that has already expired when the owner Domain
+    dispatches a request (#499) fails with the typed [deadline_exceeded] RPC
+    error, and the request never reaches the bridge: on this unconnected
+    supervisor a sent request would fail with [Invalid_state] instead, as the
+    same requests with a live deadline still do. An expired start is a
+    definite rejection, never an uncertain outcome. *)
+let test_expired_rpc_deadline_is_not_sent () =
+  let supervisor = Result.get_ok (Supervisor.create ~capacity:4 ()) in
+  let execution : Client.execution =
+    { namespace = "default"; workflow_id = "workflow-1"; run_id = "run-1" }
+  in
+  let start_request rpc_deadline : Client.start_request =
+    {
+      request_id = "request-1";
+      namespace = "default";
+      workflow_id = "workflow-1";
+      workflow_type = "Smoke";
+      task_queue = "queue";
+      input = [];
+      memo = [];
+      search_attributes = [];
+      id_conflict_policy = Client.Fail;
+      id_reuse_policy = Client.Allow_duplicate;
+      execution_timeout_ms = None;
+      run_timeout_ms = None;
+      task_timeout_ms = None;
+      retry_policy = None;
+      rpc_deadline;
+    }
+  in
+  let deadline_exceeded = Client.Rpc { code = "deadline_exceeded" } in
+  (* Each check returns [`Expired] for the typed deadline error, [`Sent] for
+     the unconnected bridge's [Invalid_state], and fails otherwise. *)
+  let classify label = function
+    | Ok (Error error) when error = deadline_exceeded -> `Expired
+    | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> `Sent
+    | _ -> failwith (label ^ " returned an unexpected result")
+  in
+  let operations =
+    [
+      ( "start",
+        fun rpc_deadline ->
+          classify "start"
+            (Result.map
+               (Result.map ignore)
+               (Supervisor.perform supervisor
+                  (Supervisor.Client_start_workflow (start_request rpc_deadline)))) );
+      ( "begin start",
+        fun rpc_deadline ->
+          classify "begin start"
+            (Result.map
+               (Result.map ignore)
+               (Supervisor.perform supervisor
+                  (Supervisor.Client_begin_start_workflow
+                     (start_request rpc_deadline)))) );
+      ( "cancel",
+        fun rpc_deadline ->
+          classify "cancel"
+            (Supervisor.perform supervisor
+               (Supervisor.Client_cancel_workflow
+                  { execution; request_id = "c"; reason = ""; rpc_deadline })) );
+      ( "terminate",
+        fun rpc_deadline ->
+          classify "terminate"
+            (Supervisor.perform supervisor
+               (Supervisor.Client_terminate_workflow
+                  { execution; reason = ""; rpc_deadline })) );
+      ( "reset",
+        fun rpc_deadline ->
+          classify "reset"
+            (Result.map
+               (Result.map ignore)
+               (Supervisor.perform supervisor
+                  (Supervisor.Client_reset_workflow
+                     {
+                       execution;
+                       request_id = "r";
+                       reason = "";
+                       workflow_task_finish_event_id = 3L;
+                       rpc_deadline;
+                     }))) );
+      ( "signal",
+        fun rpc_deadline ->
+          classify "signal"
+            (Supervisor.perform supervisor
+               (Supervisor.Client_signal_workflow
+                  {
+                    execution;
+                    signal_name = "s";
+                    request_id = "s";
+                    input = [];
+                    rpc_deadline;
+                  })) );
+      ( "query",
+        fun rpc_deadline ->
+          classify "query"
+            (Result.map
+               (Result.map ignore)
+               (Supervisor.perform supervisor
+                  (Supervisor.Client_query_workflow
+                     { execution; query_type = "q"; input = []; rpc_deadline }))) );
+      ( "update",
+        fun rpc_deadline ->
+          classify "update"
+            (Result.map
+               (Result.map ignore)
+               (Supervisor.perform supervisor
+                  (Supervisor.Client_update_workflow
+                     {
+                       execution;
+                       update_id = "u";
+                       update_name = "n";
+                       input = [];
+                       rpc_deadline;
+                     }))) );
+      ( "visibility",
+        fun rpc_deadline ->
+          (* Visibility has no structured error channel, so the expired
+             deadline arrives as the same native failure Rust reports. *)
+          match
+            Supervisor.perform supervisor
+              (Supervisor.Client_list_visibility_workflows
+                 {
+                   namespace = "default";
+                   query = "";
+                   page_size = 10;
+                   next_page_token = None;
+                   rpc_deadline;
+                 })
+          with
+          | Error (Supervisor.Backend error)
+            when error = Supervisor.Protocol_adapter.expired_rpc_deadline_error ->
+              `Expired
+          | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) ->
+              `Sent
+          | _ -> failwith "visibility returned an unexpected result" );
+    ]
+  in
+  List.iter
+    (fun (label, perform) ->
+      if perform (expired_deadline ()) <> `Expired then
+        failwith (label ^ " sent a request whose deadline had expired");
+      if perform (live_deadline ()) <> `Sent then
+        failwith (label ^ " did not send a request with a live deadline");
+      if perform None <> `Sent then
+        failwith (label ^ " did not send a request without a deadline"))
+    operations;
+  expect "expired deadline shutdown" (Ok ()) (Supervisor.shutdown supervisor)
+
+(** Submitted client calls (#807) through the real native supervisor. An
+    expired deadline completes the call on the owner without reaching Rust
+    (an unconnected runtime would otherwise refuse it with [Invalid_state]),
+    and awaiting it yields the typed [deadline_exceeded] result; an expired
+    start is a definite rejection. A live or absent deadline reaches Rust,
+    which refuses the unconnected submission synchronously, and a wait (no
+    deadline) does too. After shutdown, submission reports [Closed]. *)
+let test_submitted_client_calls () =
+  let supervisor = Result.get_ok (Supervisor.create ~capacity:4 ()) in
+  let execution : Client.execution =
+    { namespace = "default"; workflow_id = "workflow-1"; run_id = "run-1" }
+  in
+  let deadline_exceeded = Client.Rpc { code = "deadline_exceeded" } in
+  let signal rpc_deadline =
+    Supervisor.Rpc_signal
+      { execution; signal_name = "s"; request_id = "s"; input = []; rpc_deadline }
+  in
+  (match Supervisor.call supervisor (signal (expired_deadline ())) with
+  | Ok (Error error) when error = deadline_exceeded -> ()
+  | _ -> failwith "an expired submitted signal was not completed with its deadline");
+  (match Supervisor.perform supervisor (Supervisor.Client_submit (signal (expired_deadline ()))) with
+  | Ok (Sdk_supervisor.Client_call.Completed _) -> ()
+  | _ -> failwith "an expired submitted signal reached the bridge");
+  List.iter
+    (fun rpc_deadline ->
+      match Supervisor.call supervisor (signal rpc_deadline) with
+      | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
+      | _ -> failwith "an unconnected submitted signal was accepted")
+    [ live_deadline (); None ];
+  let start rpc_deadline : Client.start_request =
+    {
+      request_id = "request-1";
+      namespace = "default";
+      workflow_id = "workflow-1";
+      workflow_type = "Smoke";
+      task_queue = "queue";
+      input = [];
+      memo = [];
+      search_attributes = [];
+      id_conflict_policy = Client.Fail;
+      id_reuse_policy = Client.Allow_duplicate;
+      execution_timeout_ms = None;
+      run_timeout_ms = None;
+      task_timeout_ms = None;
+      retry_policy = None;
+      rpc_deadline;
+    }
+  in
+  (match Supervisor.call supervisor (Supervisor.Rpc_start (start (expired_deadline ()))) with
+  | Ok (Client.Rejected error) when error = deadline_exceeded -> ()
+  | _ -> failwith "an expired submitted start was not a definite rejection");
+  (match Supervisor.call supervisor (Supervisor.Rpc_start (start None)) with
+  | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
+  | _ -> failwith "an unconnected submitted start was accepted");
+  (match Supervisor.call supervisor (Supervisor.Rpc_wait execution) with
+  | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
+  | _ -> failwith "an unconnected submitted wait was accepted");
+  expect "submitted call shutdown" (Ok ()) (Supervisor.shutdown supervisor);
+  match Supervisor.call supervisor (signal None) with
+  | Error Supervisor.Closed -> ()
+  | _ -> failwith "a submission after shutdown was not closed"
+
+(** A fake supervisor backend whose client signal uses the production
+    deadline resolution, so a test can hold the owner Domain busy with a
+    long operation and observe what a queued request does at dispatch. *)
+module Queued_backend = struct
+  type config = unit
+
+  (** Budgets of the signals this backend sent, most recent first; [None]
+      marks a request sent without a deadline. Module-level so the test can
+      read it after the owner Domain has finished. *)
+  let sent : int64 option list Atomic.t = Atomic.make []
+
+  (** The fake graph has no owner-confined state. *)
+  type state = unit
+
+  type error = Bridge.error
+
+  type _ operation =
+    | Hold : (unit -> unit) -> unit operation
+        (** Occupies the owner Domain until the supplied wait returns. *)
+    | Signal :
+        Client.signal_request
+        -> (unit, Client.client_error) result operation
+        (** Resolves the deadline as the native supervisor does, then
+            records the send instead of performing an RPC. *)
+
+  let create () = Ok ()
+
+  let perform : type value. state -> value operation -> (value, error) result =
+   fun () -> function
+    | Hold wait ->
+        wait ();
+        Ok ()
+    | Signal request ->
+        Supervisor.Protocol_adapter.with_rpc_deadline
+          ~now_ns:(Bridge.monotonic_now_ns ())
+          request.rpc_deadline
+          ~expired:(fun () ->
+            Supervisor.Protocol_adapter.decode_client_signal_result
+              (Error Supervisor.Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun deadline ->
+            let budget =
+              Option.map (fun (value : Client.rpc_deadline) -> value.timeout_ms) deadline
+            in
+            let rec record () =
+              let current = Atomic.get sent in
+              if not (Atomic.compare_and_set sent current (budget :: current))
+              then record ()
+            in
+            record ();
+            Ok (Ok ()))
+
+  let shutdown _ = Ok ()
+end
+
+module Queued = Sdk_supervisor.Make (Queued_backend)
+
+(** The caller's RPC deadline covers the time a request waits in the
+    supervisor mailbox (#499). While the owner Domain is held by a long
+    operation, a signal with a 50 ms deadline is queued behind it for about
+    300 ms: when finally dispatched it fails with the typed
+    [deadline_exceeded] error and is never sent. A signal with a two-second
+    deadline queued the same way is sent with only the budget that remains,
+    never its full original budget. *)
+let test_queued_rpc_deadline_counts_wait () =
+  let queued = Result.get_ok (Queued.create ~capacity:4 ()) in
+  let holding = Atomic.make false and release = Atomic.make false in
+  let hold () =
+    Atomic.set holding true;
+    while not (Atomic.get release) do
+      Thread.delay 0.001
+    done
+  in
+  let signal timeout_ms : Client.signal_request =
+    {
+      execution = { namespace = "default"; workflow_id = "w"; run_id = "r" };
+      signal_name = "s";
+      request_id = "s";
+      input = [];
+      rpc_deadline =
+        Some
+          (Client.rpc_deadline ~now_ns:(Bridge.monotonic_now_ns ())
+             ~timeout_ms);
+    }
+  in
+  let holder = Domain.spawn (fun () -> Queued.perform queued (Queued_backend.Hold hold)) in
+  while not (Atomic.get holding) do
+    Thread.delay 0.001
+  done;
+  (* Both deadlines start now, while the owner is already busy. *)
+  let short = signal 50L and long = signal 2_000L in
+  let short_result =
+    Domain.spawn (fun () -> Queued.perform queued (Queued_backend.Signal short))
+  in
+  let long_result =
+    Domain.spawn (fun () -> Queued.perform queued (Queued_backend.Signal long))
+  in
+  Thread.delay 0.3;
+  Atomic.set release true;
+  expect "held operation" (Ok ()) (Domain.join holder);
+  (match Domain.join short_result with
+  | Ok (Error (Client.Rpc { code = "deadline_exceeded" })) -> ()
+  | _ -> failwith "a queued expired deadline was not reported as deadline_exceeded");
+  (match Domain.join long_result with
+  | Ok (Ok ()) -> ()
+  | _ -> failwith "a queued live deadline was not sent");
+  (* Only the long signal was sent, with the budget left after its wait. *)
+  (match Atomic.get Queued_backend.sent with
+  | [ Some budget ] when budget >= 1L && budget <= 1_750L -> ()
+  | [ Some _ ] -> failwith "a queued request was sent with its full budget"
+  | _ -> failwith "an expired queued request was sent");
+  expect "queued shutdown" (Ok ()) (Queued.shutdown queued)
 
 let () =
   test_nonblocking_readiness_results ();
@@ -586,4 +1049,7 @@ let () =
   test_protocol_failures_are_typed ();
   test_client_protocol_adapter ();
   test_native_lifecycle_guards ();
-  test_native_client_lifecycle_guards ()
+  test_native_client_lifecycle_guards ();
+  test_expired_rpc_deadline_is_not_sent ();
+  test_submitted_client_calls ();
+  test_queued_rpc_deadline_counts_wait ()

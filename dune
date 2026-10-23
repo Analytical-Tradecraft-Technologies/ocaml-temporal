@@ -1,1 +1,10 @@
 (data_only_dirs .github)
+
+;; The development profile treats odoc warnings as errors so `make docs` fails
+;; on unresolved references and malformed doc comments in the rendered API
+;; documentation. Release builds (`dune build -p`, as used by opam) keep odoc's
+;; default non-fatal behavior, so a newer odoc cannot break a consumer's build.
+(env
+ (dev
+  (odoc
+   (warnings fatal))))

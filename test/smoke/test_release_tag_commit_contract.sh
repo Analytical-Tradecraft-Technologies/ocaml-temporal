@@ -12,6 +12,12 @@ fixture=$(mktemp -d './.temporal-release-ref.XXXXXX')
 trap 'rm -rf "$fixture"' EXIT HUP INT TERM
 git init --bare "$fixture/origin.git" >/dev/null
 git init -b master "$fixture/checkout" >/dev/null
+# Neither short-lived repository may start detached maintenance while the
+# fixture's EXIT trap removes its Git directories.
+git --git-dir="$fixture/origin.git" config maintenance.auto false
+git --git-dir="$fixture/origin.git" config gc.auto 0
+git -C "$fixture/checkout" config maintenance.auto false
+git -C "$fixture/checkout" config gc.auto 0
 git -C "$fixture/checkout" config user.name 'Release test'
 git -C "$fixture/checkout" config user.email 'release-test@example.invalid'
 git -C "$fixture/checkout" config commit.gpgsign false
@@ -29,6 +35,20 @@ git -C "$fixture/checkout" tag -a v1.0.0-annotated -m 'Release candidate'
 git -C "$fixture/checkout" push origin refs/tags/v1.0.0-light refs/tags/v1.0.0-annotated >/dev/null
 (cd "$fixture/checkout" && sh "$script" v1.0.0-light "$first")
 (cd "$fixture/checkout" && sh "$script" v1.0.0-annotated "$first")
+
+# The OPAM tilde spelling can never name a Git tag; it fails with guidance
+# before any fetch is attempted.
+if error=$(cd "$fixture/checkout" && sh "$script" 'v1.0.0~beta.1' "$first" 2>&1); then
+  echo "release accepted a '~' tag that Git cannot represent" >&2
+  exit 1
+fi
+case "$error" in
+  *"cannot contain '~'"*) ;;
+  *)
+    echo "release gave an unclear '~' tag rejection: $error" >&2
+    exit 1
+    ;;
+esac
 
 # A missing tag or a tag on another commit must stop publication.
 if (cd "$fixture/checkout" && sh "$script" v1.0.0-missing "$first" >/dev/null 2>&1); then

@@ -1,11 +1,17 @@
-use crate::replay_bridge::{ReplayWorker, ReplayWorkerError};
-use crate::worker_bridge::{
-    PollLaneError, PollLanes, ReadinessWait, WorkerBridgeError, public_poll_lane_error_message,
-    public_worker_error_message,
+use crate::heartbeat_throttle::{
+    self, Admission, HeartbeatFlags, HeartbeatIntervals, HeartbeatThrottle,
 };
-use crate::{activity_protocol, client_protocol, workflow_protocol};
+use crate::replay_bridge::{ReplayWorker, ReplayWorkerError};
+/// SDK-side metrics recorder handle; see [`ocaml_temporal_core_v4_shared_runtime_metric_meter`].
+pub use crate::telemetry::MetricMeter;
+use crate::worker_bridge::{
+    BoundedFinalize, PollLaneError, PollLanes, ReadinessWait, ShutdownDrainError,
+    WORKER_FINALIZE_TIMEOUT, WORKER_SHUTDOWN_DRAIN_TIMEOUT, WorkerBridgeError,
+    public_poll_lane_error_message, public_worker_error_message,
+};
+use crate::{activity_protocol, client_protocol, diagnostics, telemetry, workflow_protocol};
 use serde::Deserialize;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::future::Future;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -18,16 +24,23 @@ use std::sync::mpsc::{
 };
 use std::time::Duration;
 use temporalio_client::{
-    ActivityIdentifier, Client, ClientOptions, Connection, ConnectionOptions,
-    errors::AsyncActivityError,
+    Client, ClientOptions, Connection, ConnectionOptions, NamespacedClient,
+    errors::AsyncActivityError, grpc::WorkflowService, tonic::IntoRequest,
 };
 use temporalio_common::protos::coresdk::{
     ActivityHeartbeat as CoreActivityHeartbeat,
     activity_task::{self, ActivityTask as CoreActivityTask},
 };
-use temporalio_common::protos::{
-    TaskToken,
-    temporal::api::{common::v1 as api_common, enums::v1::VersioningBehavior},
+use temporalio_common::protos::temporal::api::{
+    common::v1 as api_common,
+    workflowservice::v1::{
+        RecordActivityTaskHeartbeatRequest, RespondActivityTaskCanceledRequest,
+        RespondActivityTaskCompletedRequest, RespondActivityTaskFailedRequest,
+    },
+};
+use temporalio_common::telemetry::TelemetryOptions;
+use temporalio_common::worker::{
+    VersioningBehavior, WorkerDeploymentOptions, WorkerDeploymentVersion,
 };
 use temporalio_sdk_core::{
     CoreRuntime, PollerBehavior, RuntimeOptions, TokioRuntimeBuilder, WorkerConfig,
@@ -37,7 +50,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// Version of the native ABI implemented by this crate.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 4;
 
 /// Fixed-width status type shared with the C header.
 pub type Status = i32;
@@ -60,7 +73,9 @@ pub const STATUS_CONFIGURATION: Status = 6;
 pub const STATUS_CONNECTION: Status = 7;
 /// Official Core worker construction or namespace validation failed.
 pub const STATUS_WORKER: Status = 8;
-/// Worker shutdown is draining tasks that still require language completion.
+/// Shutdown found tasks that still required language completion. For a live
+/// worker those tasks were force-completed and the worker was still released;
+/// for replay, recorded input was not fully drained.
 pub const STATUS_OUTSTANDING_TASKS: Status = 9;
 /// A bounded readiness operation has no result ready for handoff yet.
 pub const STATUS_NOT_READY: Status = 10;
@@ -76,9 +91,20 @@ pub const STATUS_ALREADY_STARTED: Status = 12;
 /// suppresses those network outcomes, so the production bridge fails closed
 /// rather than emitting this status speculatively.
 pub const STATUS_RETRYABLE: Status = 13;
-/// A namespace-bound async heartbeat was definitively rejected without
-/// proving that its activity token is gone. The caller may correct the request.
+/// A namespace-bound async activity request (heartbeat, complete, fail, or
+/// cancel) was definitively rejected without proving that its activity token
+/// is gone. The caller may correct the request or submit a different one. The
+/// name predates terminal operations and is kept for ABI stability.
 pub const STATUS_ASYNC_HEARTBEAT_REJECTED: Status = 14;
+/// A bounded bridge-owned registry for client operations is full, so this
+/// request was not admitted and nothing was sent to Temporal.
+///
+/// Unlike `STATUS_INVALID_STATE`, the client remains connected and usable: the
+/// caller may retry once another of its in-flight operations finishes. The
+/// bounds are the connection's [`crate::client_calls::ClientLimits`], which
+/// default to `MAX_PENDING_WAITS`, `MAX_PENDING_STARTS`, and
+/// `MAX_PENDING_CALLS` (#796).
+pub const STATUS_RESOURCE_EXHAUSTED: Status = 15;
 
 /// Maximum accepted lifecycle configuration document size.
 const MAX_LIFECYCLE_CONFIG_BYTES: usize = 64 * 1024;
@@ -90,16 +116,54 @@ const MAX_LIFECYCLE_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_TRANSPORT_STRING_BYTES: usize = 64 * 1024;
 /// Prevents accidental allocation of unreasonable in-process worker state.
 const MAX_WORKER_COUNT: u32 = 1_000_000;
-/// Initial remote-activity concurrency until the private worker config grows a
-/// separately tuned activity field in the end-to-end worker slice.
-const DEFAULT_MAX_OUTSTANDING_ACTIVITIES: usize = 100;
-/// Initial Core server-poll concurrency for remote activity tasks.
-const DEFAULT_MAX_CONCURRENT_ACTIVITY_POLLS: usize = 5;
+/// Largest explicit Tokio worker-thread count one runtime accepts (#832).
+///
+/// The Tokio pool only drives gRPC I/O and Core's state machines for one
+/// serial OCaml executor, so counts beyond this bound cannot help and are far
+/// more likely to be a unit or sign mistake. OCaml validates the same bound
+/// before calling the bridge; this copy is the defense-in-depth check.
+pub const MAX_RUNTIME_WORKER_THREADS: u32 = 256;
+/// Upper bound of the default Tokio worker-thread count (#832).
+///
+/// Tokio's own default is one worker per core, which made each client or
+/// worker cost dozens of idle threads on large hosts. Network progress for one
+/// SDK instance needs far fewer, so the bridge defaults to the smaller of the
+/// host's available parallelism and this cap.
+pub const DEFAULT_RUNTIME_WORKER_THREADS_CAP: u32 = 4;
+/// Remote-activity slots granted to Core, matched to the OCaml executor.
+///
+/// The OCaml worker decodes, invokes, and completes one activity callback
+/// before admitting another. Every slot beyond that lets Core accept a task
+/// from the server, which starts its start-to-close clock, only for the task to
+/// wait in the bridge queue where it can time out and where other workers on
+/// the task queue cannot take it. Keep this equal to the executor's real
+/// concurrency until activity execution becomes concurrent (#492); the public
+/// worker options (#498) therefore expose no activity slot count. An
+/// asynchronously completed activity releases its slot once the callback
+/// returns `WillCompleteAsync`.
+const DEFAULT_MAX_OUTSTANDING_ACTIVITIES: usize = 1;
+/// Local-activity slots granted to Core, for the same reason as remote
+/// activities: local activities share the same serial OCaml executor. Core's
+/// unset default would otherwise be 100.
+///
+/// The two kinds deliberately keep separate pools. Core's local-activity
+/// manager reserves its next permit while idle, before any request arrives,
+/// so one pool shared with remote activities would starve remote polling
+/// entirely. At most one remote and one local activity task can therefore be
+/// outstanding at once: a remote task may wait behind one local callback.
+const DEFAULT_MAX_OUTSTANDING_LOCAL_ACTIVITIES: usize = 1;
+/// Core server-poll concurrency for remote activity tasks. Core reserves a
+/// slot before polling, so pollers beyond the slot count would only wait.
+const DEFAULT_MAX_CONCURRENT_ACTIVITY_POLLS: usize = DEFAULT_MAX_OUTSTANDING_ACTIVITIES;
 /// Temporal Core requires two workflow-task pollers whenever workflow caching
 /// is enabled. This mirrors the OCaml sender-side validation.
 const MIN_CACHED_WORKFLOW_POLLS: u32 = 2;
 /// Prevents an unbounded graceful-shutdown duration from entering Core.
 const MAX_GRACEFUL_SHUTDOWN_MS: u64 = 24 * 60 * 60 * 1_000;
+/// Upper bound for the sticky-queue timeout and heartbeat throttle intervals
+/// (#498). It mirrors the OCaml validators and keeps every value far inside
+/// the protobuf duration that Core converts the sticky timeout into.
+const MAX_WORKER_TUNING_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
 /// Maximum time one exact-run client wait may occupy the supervisor owner.
 ///
 /// The Temporal history request remains a close-event long poll, but the
@@ -109,18 +173,731 @@ const MAX_GRACEFUL_SHUTDOWN_MS: u64 = 24 * 60 * 60 * 1_000;
 const CLIENT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 /// Bounds retained exact-run observations, including their RPC and page state.
 /// Completed or failed waits release their slot; disconnect cancels all waits.
-const MAX_PENDING_WAITS: usize = 64;
+/// Waiting on another distinct run at capacity returns
+/// `STATUS_RESOURCE_EXHAUSTED`; concurrent waits on an already retained run
+/// share its slot. This is the default; a connection may configure another
+/// value through `max_pending_waits` (#796). The public `Client.create`
+/// documentation repeats it.
+pub(crate) const MAX_PENDING_WAITS: usize = 64;
 /// Bounds the number of in-flight client starts retained by one supervisor.
 ///
 /// Each entry owns one Tokio task, a response channel, and the validated
 /// request payload until the RPC completes. A finite ceiling prevents a caller
 /// that forgets tickets from turning the supervisor into an unbounded task
 /// registry; the caller can submit more work after polling or closing
-/// completed tickets.
-const MAX_PENDING_STARTS: usize = 64;
+/// completed tickets. Admission at capacity returns
+/// `STATUS_RESOURCE_EXHAUSTED` before any RPC is issued. This is the default;
+/// a connection may configure another value through `max_pending_starts`
+/// (#796). The public `Client.create` documentation repeats it.
+pub(crate) const MAX_PENDING_STARTS: usize = 64;
 /// Maximum time spent in one wait-ticket ABI call before the owner regains
 /// control of its mailbox and can service lifecycle messages.
 const START_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+/// Hard ceiling on submitted client calls outstanding on one runtime (#807).
+///
+/// A call counts from submission until its completion cell is retired: read
+/// by its caller, released by an interrupted caller, or closed with the
+/// runtime. A finished but unread call still counts, so abandoned outcomes
+/// cannot grow the process-wide registry without bound. Tasks whose cells
+/// were released but which are still running are bounded by the same value
+/// through the task registry. Starts and exact-run waits keep their own
+/// documented limits above. Admission beyond the ceiling returns
+/// `STATUS_RESOURCE_EXHAUSTED` before any RPC. This is the default; a
+/// connection may configure another value through `max_in_flight_calls`
+/// (#796).
+pub(crate) const MAX_PENDING_CALLS: usize = 4_096;
+/// Longest single wait on a submitted call's completion cell. The wait wakes
+/// as soon as the outcome is published or the runtime releases the call; the
+/// bound only lets the calling OCaml thread regain its runtime lock
+/// periodically (for signals and asynchronous exceptions).
+const MAX_CALL_AWAIT_MS: u32 = 60_000;
+
+/// Closed numeric selector of one submitted client operation (#807). The
+/// values are part of ABI version 4 and are mirrored by the C header and the
+/// OCaml bridge; each request document is the one the operation's synchronous
+/// symbol accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientCallKind {
+    Start,
+    Wait,
+    Cancel,
+    Terminate,
+    Reset,
+    Signal,
+    Query,
+    Update,
+    PollUpdate,
+    Visibility,
+    /// Complete, fail, or cancel an activity handed off with
+    /// `WillCompleteAsync` (#1025).
+    AsyncActivityCompletion,
+    /// Heartbeat an activity handed off with `WillCompleteAsync` (#1025),
+    /// throttled per task token like Core's own heartbeats. Unlike every
+    /// other selector, its document is not the one its synchronous symbol
+    /// accepts: it adds the attempt's heartbeat timeout; see
+    /// [`activity_protocol::AsyncActivityHeartbeat`].
+    AsyncActivityHeartbeat,
+}
+
+impl TryFrom<u32> for ClientCallKind {
+    type Error = Failure;
+
+    /// Accepts exactly the selectors documented in the C header.
+    fn try_from(value: u32) -> std::result::Result<Self, Failure> {
+        Ok(match value {
+            1 => Self::Start,
+            2 => Self::Wait,
+            3 => Self::Cancel,
+            4 => Self::Terminate,
+            5 => Self::Reset,
+            6 => Self::Signal,
+            7 => Self::Query,
+            8 => Self::Update,
+            9 => Self::PollUpdate,
+            10 => Self::Visibility,
+            11 => Self::AsyncActivityCompletion,
+            12 => Self::AsyncActivityHeartbeat,
+            _ => {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "unknown Temporal client call kind".to_owned(),
+                });
+            }
+        })
+    }
+}
+
+/// One validated client request, decoded on the owner Domain before any
+/// connection clone or task exists, so malformed input fails synchronously.
+enum ClientRpc {
+    Start(Arc<client_protocol::StartWorkflowRequest>),
+    Wait(client_protocol::WaitWorkflowRequest),
+    Cancel(client_protocol::CancelWorkflowRequest),
+    Terminate(client_protocol::TerminateWorkflowRequest),
+    Reset(client_protocol::ResetWorkflowRequest),
+    Signal(client_protocol::SignalWorkflowRequest),
+    Query(client_protocol::QueryWorkflowRequest),
+    Update(client_protocol::UpdateWorkflowRequest),
+    PollUpdate(client_protocol::PollWorkflowUpdateRequest),
+    Visibility(client_protocol::VisibilityRequest),
+    /// A namespace-bound async activity completion, failure, or
+    /// cancellation (#1025). `binding` is `None` straight after
+    /// [`ClientRpc::decode`], which has no runtime;
+    /// [`ClientRpc::bind_async_activity`] fills it from the worker before
+    /// the future is built.
+    AsyncActivity {
+        request: AsyncActivityRequest,
+        binding: Option<AsyncActivityBinding>,
+    },
+    /// A throttled async activity heartbeat (#1025), bound like
+    /// [`ClientRpc::AsyncActivity`].
+    AsyncHeartbeat {
+        heartbeat: ThrottledHeartbeat,
+        binding: Option<AsyncActivityBinding>,
+    },
+}
+
+/// The worker-scoped state an async activity request needs, captured on the
+/// owner Domain when the request is submitted.
+struct AsyncActivityBinding {
+    /// Namespace of the worker that handed the activity off.
+    namespace: String,
+    /// The runtime's heartbeat throttle; terminal requests evict their token
+    /// from it and heartbeats are admitted through it.
+    throttle: Arc<HeartbeatThrottle>,
+    /// The worker's heartbeat throttle settings.
+    intervals: HeartbeatIntervals,
+    /// Most tokens the throttle tracks: the connection's in-flight call
+    /// limit, since every tracked token has a driver that may hold an RPC.
+    max_throttled_tokens: usize,
+}
+
+/// One validated async heartbeat, converted to protobuf values before any
+/// RPC, with the attempt's heartbeat timeout for the throttle interval.
+struct ThrottledHeartbeat {
+    /// Opaque token of the handed-off activity; the throttle's key.
+    task_token: Vec<u8>,
+    /// Details for the server; `None` when the caller sent none.
+    details: Option<api_common::Payloads>,
+    /// The attempt's heartbeat timeout, `None` when unset.
+    heartbeat_timeout: Option<Duration>,
+}
+
+impl ThrottledHeartbeat {
+    /// Strictly decodes an async-activity heartbeat document.
+    fn decode(text: &str) -> std::result::Result<Self, Failure> {
+        let semantic = activity_protocol::decode_async_heartbeat(text).map_err(protocol_failure)?;
+        let task_token =
+            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
+        let heartbeat_timeout = match semantic.heartbeat_timeout {
+            None => None,
+            Some(timeout) => Some(std_duration(timeout)?),
+        };
+        Ok(Self {
+            task_token,
+            details: async_payloads(&semantic.details)?,
+            heartbeat_timeout,
+        })
+    }
+}
+
+/// Converts a validated nonnegative protobuf duration to a standard one.
+fn std_duration(value: workflow_protocol::Duration) -> std::result::Result<Duration, Failure> {
+    let seconds = u64::try_from(value.seconds).map_err(|_| Failure {
+        status: STATUS_PROTOCOL,
+        message: "duration must not be negative".to_owned(),
+    })?;
+    let nanoseconds = u32::try_from(value.nanoseconds).map_err(|_| Failure {
+        status: STATUS_PROTOCOL,
+        message: "duration nanoseconds are outside protobuf range".to_owned(),
+    })?;
+    Ok(Duration::new(seconds, 0).saturating_add(Duration::from_nanos(u64::from(nanoseconds))))
+}
+
+/// A client RPC future that owns its connection clone and produces exactly
+/// the bytes or failure the operation's synchronous symbol would return.
+type ClientRpcFuture = Pin<Box<dyn Future<Output = Operation> + Send>>;
+
+impl ClientRpc {
+    /// Strictly decodes the request document for `kind`.
+    fn decode(kind: ClientCallKind, text: &str) -> std::result::Result<Self, Failure> {
+        Ok(match kind {
+            ClientCallKind::Start => Self::Start(Arc::new(
+                client_protocol::decode_start_request(text).map_err(protocol_failure)?,
+            )),
+            ClientCallKind::Wait => {
+                Self::Wait(client_protocol::decode_wait_request(text).map_err(protocol_failure)?)
+            }
+            ClientCallKind::Cancel => Self::Cancel(
+                client_protocol::decode_cancel_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::Terminate => Self::Terminate(
+                client_protocol::decode_terminate_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::Reset => {
+                Self::Reset(client_protocol::decode_reset_request(text).map_err(protocol_failure)?)
+            }
+            ClientCallKind::Signal => Self::Signal(
+                client_protocol::decode_signal_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::Query => {
+                Self::Query(client_protocol::decode_query_request(text).map_err(protocol_failure)?)
+            }
+            ClientCallKind::Update => Self::Update(
+                client_protocol::decode_update_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::PollUpdate => Self::PollUpdate(
+                client_protocol::decode_poll_update_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::Visibility => Self::Visibility(
+                client_protocol::decode_visibility_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::AsyncActivityCompletion => Self::AsyncActivity {
+                request: AsyncActivityRequest::decode_completion(text)?,
+                binding: None,
+            },
+            ClientCallKind::AsyncActivityHeartbeat => Self::AsyncHeartbeat {
+                heartbeat: ThrottledHeartbeat::decode(text)?,
+                binding: None,
+            },
+        })
+    }
+
+    /// Supplies the worker state an async activity request needs, built by
+    /// `binding` only for such a request; every other request is returned
+    /// unchanged. A runtime without a worker namespace rejects the request
+    /// synchronously with the same `STATUS_INVALID_STATE` failure as the
+    /// synchronous symbols.
+    fn bind_async_activity(
+        self,
+        binding: impl FnOnce() -> std::result::Result<AsyncActivityBinding, Failure>,
+    ) -> std::result::Result<Self, Failure> {
+        match self {
+            Self::AsyncActivity { request, .. } => Ok(Self::AsyncActivity {
+                request,
+                binding: Some(binding()?),
+            }),
+            Self::AsyncHeartbeat { heartbeat, .. } => Ok(Self::AsyncHeartbeat {
+                heartbeat,
+                binding: Some(binding()?),
+            }),
+            other => Ok(other),
+        }
+    }
+
+    /// Builds the operation's future. The future captures `connection` and
+    /// the validated request; it never touches the runtime or OCaml. Every
+    /// bounded RPC applies its own `rpc_timeout_ms` (or default budget)
+    /// inside `client_protocol`, so the future ends by itself when its
+    /// deadline expires.
+    fn into_future(self, connection: Connection) -> ClientRpcFuture {
+        match self {
+            Self::Start(request) => Box::pin(async move {
+                let result =
+                    client_protocol::start_workflow(connection, request.as_ref().clone()).await;
+                start_outcome_bytes(&request, Some(result))
+            }),
+            Self::Wait(request) => Box::pin(async move {
+                let response = client_protocol::wait_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_wait_response(&response))
+            }),
+            Self::Cancel(request) => Box::pin(async move {
+                let response = client_protocol::cancel_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_cancel_response(&response))
+            }),
+            Self::Terminate(request) => Box::pin(async move {
+                let response = client_protocol::terminate_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_terminate_response(&response))
+            }),
+            Self::Reset(request) => Box::pin(async move {
+                let response = client_protocol::reset_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_reset_response(&response))
+            }),
+            Self::Signal(request) => Box::pin(async move {
+                let response = client_protocol::signal_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_signal_response(&response))
+            }),
+            Self::Query(request) => Box::pin(async move {
+                let response = client_protocol::query_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_query_response(&response))
+            }),
+            Self::Update(request) => Box::pin(async move {
+                let response = client_protocol::update_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_update_response(&response))
+            }),
+            Self::PollUpdate(request) => Box::pin(async move {
+                let response = client_protocol::poll_workflow_update(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_poll_update_response(&response))
+            }),
+            Self::Visibility(request) => Box::pin(async move {
+                let response = client_protocol::list_visibility(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_visibility_response(&response))
+            }),
+            Self::AsyncActivity { request, binding } => Box::pin(async move {
+                let binding = binding.ok_or_else(unbound_async_activity)?;
+                let client = async_activity_client_for(connection, binding.namespace)?;
+                let outcome = request
+                    .send_evicting(client, &binding.throttle)
+                    .await
+                    .map(|()| Vec::new());
+                submitted_async_activity_outcome(outcome)
+            }),
+            Self::AsyncHeartbeat { heartbeat, binding } => Box::pin(async move {
+                let binding = binding.ok_or_else(unbound_async_activity)?;
+                let client = async_activity_client_for(connection, binding.namespace)?;
+                let ThrottledHeartbeat {
+                    task_token,
+                    details,
+                    heartbeat_timeout,
+                } = heartbeat;
+                let admission = binding.throttle.record(
+                    &tokio::runtime::Handle::current(),
+                    client.clone(),
+                    task_token.clone(),
+                    details,
+                    binding.intervals.interval(heartbeat_timeout),
+                    binding.max_throttled_tokens,
+                );
+                let outcome = match admission {
+                    Admission::Sent(outcome) => outcome
+                        .await
+                        .unwrap_or_else(|_| Err(heartbeat_throttle::unknown_outcome())),
+                    Admission::Coalesced(flags) => Ok(flags),
+                    Admission::Unthrottled(details) => {
+                        send_async_heartbeat(client, task_token, details).await
+                    }
+                };
+                submitted_async_activity_outcome(outcome.map(|flags| flags.outcome_body().to_vec()))
+            }),
+        }
+    }
+}
+
+/// The failure of an async activity request whose future was built without
+/// its worker binding. [`ClientRpc::bind_async_activity`] always runs first;
+/// should it ever not, the task must still not fail with
+/// `STATUS_INVALID_STATE`, which an await reserves for a closed call.
+fn unbound_async_activity() -> Failure {
+    Failure {
+        status: STATUS_INTERNAL,
+        message: "asynchronous activity request has no worker binding".to_owned(),
+    }
+}
+
+/// Fixed success body of a submitted async activity call whose task token
+/// the server no longer knows (`NotFound`). A submitted task must never fail
+/// with `STATUS_INVALID_STATE`: an await reports that status as the call
+/// having been closed by its runtime (see `client_calls`). The synchronous
+/// symbols keep returning `STATUS_INVALID_STATE` for the same outcome, and
+/// the OCaml decoder maps this body back to it.
+const ASYNC_ACTIVITY_NOT_FOUND_OUTCOME: &[u8] = b"not_found";
+
+/// Converts the outcome of an async activity RPC for a submitted call:
+/// success is its body (empty for an accepted terminal request; for a
+/// heartbeat, see [`HeartbeatFlags::outcome_body`]), `NotFound` is
+/// [`ASYNC_ACTIVITY_NOT_FOUND_OUTCOME`], and every other failure is returned
+/// unchanged.
+fn submitted_async_activity_outcome(outcome: std::result::Result<Vec<u8>, Failure>) -> Operation {
+    match outcome {
+        Ok(body) => Ok(body),
+        Err(failure) if failure.status == STATUS_INVALID_STATE => {
+            Ok(ASYNC_ACTIVITY_NOT_FOUND_OUTCOME.to_vec())
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
+/// The failure for an async activity request on a runtime that has never
+/// started a worker, and so has no namespace to address.
+fn missing_worker_namespace() -> Failure {
+    Failure {
+        status: STATUS_INVALID_STATE,
+        message: "Temporal worker namespace is not available".to_owned(),
+    }
+}
+
+/// Creates the namespace-bound official client used for activities handed
+/// off with `WillCompleteAsync`; see [`Runtime::async_activity_client`].
+fn async_activity_client_for(
+    connection: Connection,
+    namespace: String,
+) -> std::result::Result<Client, Failure> {
+    Client::new(connection, ClientOptions::new(namespace).build()).map_err(|_| Failure {
+        status: STATUS_CONNECTION,
+        message: "Temporal asynchronous activity client could not be created".to_owned(),
+    })
+}
+
+/// Converts ordered semantic payloads into the optional protobuf collection
+/// accepted by the async activity RPCs; an empty list is no payloads.
+fn async_payloads(
+    values: &[workflow_protocol::Payload],
+) -> std::result::Result<Option<api_common::Payloads>, Failure> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let payloads = values
+        .iter()
+        .map(workflow_protocol::payload_to_core)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(core_conversion_failure)?;
+    Ok(Some(api_common::Payloads { payloads }))
+}
+
+/// One validated namespace-bound request for an activity handed off with
+/// `WillCompleteAsync`, converted to Core protobuf values before any RPC.
+///
+/// Decoding is synchronous so malformed input fails before a task or RPC
+/// exists. [`Self::send`] performs the single RPC and is shared by the
+/// synchronous symbols, which block the owner thread on it, and by submitted
+/// client calls (#1025), which run it on a Tokio task so the worker's owner
+/// Domain never waits for the server. No worker ledger entry is read or
+/// retired: the OCaml async lease owns the capability until the server
+/// accepts a terminal request.
+enum AsyncActivityRequest {
+    /// `RespondActivityTaskCompleted` with an optional result payload.
+    Completed {
+        task_token: Vec<u8>,
+        result: Option<api_common::Payloads>,
+    },
+    /// `RespondActivityTaskFailed` with a converted Temporal failure, boxed
+    /// because it is far larger than every other variant.
+    Failed {
+        task_token: Vec<u8>,
+        failure: Box<temporalio_common::protos::temporal::api::failure::v1::Failure>,
+    },
+    /// `RespondActivityTaskCanceled` with the canceled failure's details.
+    Cancelled {
+        task_token: Vec<u8>,
+        details: Option<api_common::Payloads>,
+    },
+    /// `RecordActivityTaskHeartbeat` with the heartbeat details.
+    Heartbeat {
+        task_token: Vec<u8>,
+        details: Option<api_common::Payloads>,
+    },
+}
+
+impl AsyncActivityRequest {
+    /// Strictly decodes a semantic activity completion for the async client.
+    ///
+    /// The decoder is shared with worker completions, but this path rejects
+    /// `will_complete_async`: that marker is the worker-to-client handoff,
+    /// not a terminal client operation. A cancellation must carry a canceled
+    /// failure, whose details become the RPC details.
+    fn decode_completion(text: &str) -> std::result::Result<Self, Failure> {
+        let semantic = activity_protocol::decode_completion(text).map_err(protocol_failure)?;
+        let task_token =
+            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
+        Ok(match &semantic.result {
+            activity_protocol::ActivityCompletionResult::Completed { result } => Self::Completed {
+                task_token,
+                result: async_payloads(std::slice::from_ref(result))?,
+            },
+            activity_protocol::ActivityCompletionResult::Failed { failure } => Self::Failed {
+                task_token,
+                failure: Box::new(
+                    workflow_protocol::failure_to_core(failure).map_err(core_conversion_failure)?,
+                ),
+            },
+            activity_protocol::ActivityCompletionResult::Cancelled { failure } => {
+                let details = match &failure.info {
+                    workflow_protocol::FailureInfo::Canceled { details, .. } => {
+                        async_payloads(details)?
+                    }
+                    _ => {
+                        return Err(Failure {
+                            status: STATUS_PROTOCOL,
+                            message:
+                                "asynchronous activity cancellation must use a canceled failure"
+                                    .to_owned(),
+                        });
+                    }
+                };
+                Self::Cancelled {
+                    task_token,
+                    details,
+                }
+            }
+            activity_protocol::ActivityCompletionResult::WillCompleteAsync => {
+                return Err(Failure {
+                    status: STATUS_PROTOCOL,
+                    message: "asynchronous activity completion cannot defer again".to_owned(),
+                });
+            }
+        })
+    }
+
+    /// Strictly decodes a semantic activity heartbeat for the async client.
+    fn decode_heartbeat(text: &str) -> std::result::Result<Self, Failure> {
+        let semantic = activity_protocol::decode_heartbeat(text).map_err(protocol_failure)?;
+        let task_token =
+            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
+        Ok(Self::Heartbeat {
+            task_token,
+            details: async_payloads(&semantic.details)?,
+        })
+    }
+
+    /// The task token the request addresses.
+    fn task_token(&self) -> &[u8] {
+        match self {
+            Self::Completed { task_token, .. }
+            | Self::Failed { task_token, .. }
+            | Self::Cancelled { task_token, .. }
+            | Self::Heartbeat { task_token, .. } => task_token,
+        }
+    }
+
+    /// Sends a terminal request after evicting its token from `throttle`,
+    /// as Core evicts a completed activity from its heartbeat manager, so no
+    /// trailing heartbeat follows the completion and the token's state is
+    /// freed at once. Like Core, details recorded for a trailing heartbeat
+    /// are flushed first only before a cancellation, which does not carry
+    /// the last heartbeat's details; the flush's outcome is ignored, as Core
+    /// ignores it. A heartbeat request is sent unchanged.
+    async fn send_evicting(
+        self,
+        client: Client,
+        throttle: &HeartbeatThrottle,
+    ) -> std::result::Result<(), Failure> {
+        if !matches!(self, Self::Heartbeat { .. })
+            && let Some(pending) = throttle.evict(self.task_token())
+            && matches!(self, Self::Cancelled { .. })
+        {
+            let _ = send_async_heartbeat(client.clone(), self.task_token().to_vec(), pending).await;
+        }
+        self.send(client).await
+    }
+
+    /// Sends the request through `client`, which owns its connection clone.
+    /// A server `NotFound` is `STATUS_INVALID_STATE`, a definite rejection is
+    /// `STATUS_ASYNC_HEARTBEAT_REJECTED`, and every other RPC failure is
+    /// `STATUS_CONNECTION`; see [`async_activity_failure`].
+    async fn send(self, mut client: Client) -> std::result::Result<(), Failure> {
+        let namespace = client.namespace();
+        let identity = client.identity();
+        let (operation, result) = match self {
+            Self::Completed { task_token, result } => {
+                let request = RespondActivityTaskCompletedRequest {
+                    task_token,
+                    result,
+                    identity,
+                    namespace,
+                    ..Default::default()
+                };
+                (
+                    AsyncActivityOperation::Completion,
+                    client
+                        .respond_activity_task_completed(request.into_request())
+                        .await
+                        .map(drop),
+                )
+            }
+            Self::Failed {
+                task_token,
+                failure,
+            } => {
+                let request = RespondActivityTaskFailedRequest {
+                    task_token,
+                    failure: Some(*failure),
+                    identity,
+                    namespace,
+                    ..Default::default()
+                };
+                (
+                    AsyncActivityOperation::Completion,
+                    client
+                        .respond_activity_task_failed(request.into_request())
+                        .await
+                        .map(drop),
+                )
+            }
+            Self::Cancelled {
+                task_token,
+                details,
+            } => {
+                let request = RespondActivityTaskCanceledRequest {
+                    task_token,
+                    details,
+                    identity,
+                    namespace,
+                    ..Default::default()
+                };
+                (
+                    AsyncActivityOperation::Completion,
+                    client
+                        .respond_activity_task_canceled(request.into_request())
+                        .await
+                        .map(drop),
+                )
+            }
+            Self::Heartbeat {
+                task_token,
+                details,
+            } => {
+                return send_async_heartbeat(client, task_token, details)
+                    .await
+                    .map(drop);
+            }
+        };
+        result.map_err(|status| async_activity_failure(operation, async_activity_rpc_error(status)))
+    }
+}
+
+/// Sends one `RecordActivityTaskHeartbeat` for an async activity through
+/// `client` and returns the server's activity flags. Failures are classified
+/// as for every async activity request; see [`async_activity_failure`].
+pub(crate) async fn send_async_heartbeat(
+    mut client: Client,
+    task_token: Vec<u8>,
+    details: Option<api_common::Payloads>,
+) -> std::result::Result<HeartbeatFlags, Failure> {
+    let request = RecordActivityTaskHeartbeatRequest {
+        namespace: client.namespace(),
+        identity: client.identity(),
+        task_token,
+        details,
+        ..Default::default()
+    };
+    let response = client
+        .record_activity_task_heartbeat(request.into_request())
+        .await
+        .map_err(|status| {
+            async_activity_failure(
+                AsyncActivityOperation::Heartbeat,
+                async_activity_rpc_error(status),
+            )
+        })?
+        .into_inner();
+    Ok(HeartbeatFlags {
+        cancel_requested: response.cancel_requested,
+        paused: response.activity_paused,
+        reset: response.activity_reset,
+    })
+}
+
+/// Converts a validated response encoding into the ABI byte result.
+fn encode_bytes(encoded: std::result::Result<String, crate::protocol::ProtocolError>) -> Operation {
+    encoded
+        .map(|encoded| encoded.into_bytes())
+        .map_err(protocol_failure)
+}
+
+/// Encodes the closed accepted/rejected/unknown outcome of one start.
+///
+/// `None` means the task ended without a result, so acceptance is unknown.
+/// An outcome that cannot be encoded is reported as `Unknown` built from the
+/// validated request identities, which always encodes: losing an accepted or
+/// rejected start to a protocol error would be worse than an uncertain one.
+fn start_outcome_bytes(
+    request: &client_protocol::StartWorkflowRequest,
+    result: Option<
+        std::result::Result<
+            client_protocol::StartWorkflowResponse,
+            client_protocol::ClientOperationError,
+        >,
+    >,
+) -> Operation {
+    let unknown = || client_protocol::StartWorkflowOutcome::Unknown {
+        request_id: request.request_id.clone(),
+        workflow_id: request.workflow_id.clone(),
+    };
+    let outcome = match result {
+        Some(Ok(response)) => client_protocol::StartWorkflowOutcome::Accepted(response),
+        Some(Err(error)) if error.uncertain_start() => unknown(),
+        Some(Err(error)) => client_protocol::StartWorkflowOutcome::Rejected(error),
+        None => unknown(),
+    };
+    match client_protocol::encode_start_outcome(&outcome) {
+        Ok(encoded) => Ok(encoded.into_bytes()),
+        Err(_) => encode_bytes(client_protocol::encode_start_outcome(&unknown())),
+    }
+}
+
+/// Capacity class of one in-flight submitted call. Starts and waits keep
+/// the limits documented for the public client; the class also carries the
+/// identity those limits deduplicate on.
+enum CallScope {
+    /// A start; calls with the same `request_id` share one start slot.
+    Start(Arc<client_protocol::StartWorkflowRequest>),
+    /// An exact-run or current-run wait; calls on the same run share a slot.
+    Wait(client_protocol::WaitWorkflowRequest),
+    /// Any other RPC, bounded by its own deadline.
+    Bounded,
+    /// A call that left the completion registry (read, or released by an
+    /// interrupted caller) while its task was still running (#1019). Its task
+    /// has been aborted and is kept only so disconnect and close can join it.
+    /// It holds no start, wait, or in-flight slot, but its handle still counts
+    /// toward the bound on retained handles: submission joins released tasks
+    /// once the map reaches the in-flight ceiling.
+    Released,
+}
+
+/// One submitted call's Tokio task, retained by the runtime owner so that
+/// disconnect and close can abort and join it.
+struct PendingCall {
+    scope: CallScope,
+    task: JoinHandle<()>,
+}
 
 /// Identifies which async-client operation failed without inferring its
 /// semantics from a diagnostic string.
@@ -140,10 +917,15 @@ impl AsyncActivityOperation {
     }
 }
 
-/// Recognizes RPC codes that definitively reject one heartbeat request without
-/// proving its task token is gone. Ambiguous and potentially transient codes
-/// remain Connection so the caller retains the exact request for retry.
-fn heartbeat_rpc_rejected(code: temporalio_client::tonic::Code) -> bool {
+/// Recognizes RPC codes that definitively reject one namespace-bound async
+/// activity request without proving its task token is gone.
+///
+/// The server answered these requests without applying them, so the caller
+/// may correct the request or choose a different operation (for example
+/// `fail` after a rejected `cancel` or an oversized `complete`). Ambiguous and
+/// potentially transient codes are deliberately absent: they remain
+/// Connection so a terminal request is retried byte-for-byte.
+fn async_rpc_rejected(code: temporalio_client::tonic::Code) -> bool {
     use temporalio_client::tonic::Code;
     matches!(
         code,
@@ -159,14 +941,22 @@ fn heartbeat_rpc_rejected(code: temporalio_client::tonic::Code) -> bool {
 /// Converts an asynchronous activity client error into the closed status
 /// vocabulary understood by the OCaml lease state machine.
 ///
-/// `NotFound` is a terminal outcome for a retained task token: Temporal has
-/// already completed, cancelled, timed out, or otherwise discarded that
-/// activity, so retrying the same request could never make it valid. A
-/// definitive heartbeat RPC rejection releases only that request: it cannot
-/// consume the nonterminal completion capability. Ambiguous RPC outcomes keep
-/// the generic Connection status for exact-request retry. Terminal completions
-/// retain their conservative policy. Remote diagnostic prose is discarded so
-/// server-controlled text cannot enter the stable ABI.
+/// These are namespace-bound `RespondActivityTask*ByToken` and
+/// `RecordActivityTaskHeartbeat` RPCs, not Core worker completions: Core never
+/// consumes a lease for them, and the server applies at most one terminal
+/// response per activity attempt. The classification is therefore the same
+/// for heartbeats and terminal operations:
+///
+/// - `NotFound` is terminal for the retained task token: Temporal has already
+///   completed, cancelled, timed out, or otherwise discarded that activity, so
+///   no later request can succeed. It maps to `STATUS_INVALID_STATE`.
+/// - A definitive rejection (`async_rpc_rejected`) maps to
+///   `STATUS_ASYNC_HEARTBEAT_REJECTED`; the handle and lease stay live.
+/// - Every other RPC outcome is ambiguous and maps to `STATUS_CONNECTION`;
+///   OCaml keeps the lease so a terminal request can be retried exactly.
+///
+/// Remote diagnostic prose is discarded so server-controlled text cannot enter
+/// the stable ABI.
 fn async_activity_failure(operation: AsyncActivityOperation, error: AsyncActivityError) -> Failure {
     let label = operation.label();
     match error {
@@ -174,15 +964,10 @@ fn async_activity_failure(operation: AsyncActivityOperation, error: AsyncActivit
             status: STATUS_INVALID_STATE,
             message: format!("Temporal asynchronous activity {label} is no longer active"),
         },
-        AsyncActivityError::Rpc(status)
-            if operation == AsyncActivityOperation::Heartbeat
-                && heartbeat_rpc_rejected(status.code()) =>
-        {
-            Failure {
-                status: STATUS_ASYNC_HEARTBEAT_REJECTED,
-                message: "Temporal asynchronous activity heartbeat request was rejected".to_owned(),
-            }
-        }
+        AsyncActivityError::Rpc(status) if async_rpc_rejected(status.code()) => Failure {
+            status: STATUS_ASYNC_HEARTBEAT_REJECTED,
+            message: format!("Temporal asynchronous activity {label} request was rejected"),
+        },
         AsyncActivityError::Rpc(_) => Failure {
             status: STATUS_CONNECTION,
             message: format!("Temporal asynchronous activity {label} failed"),
@@ -194,12 +979,88 @@ fn async_activity_failure(operation: AsyncActivityOperation, error: AsyncActivit
     }
 }
 
+/// Classifies the status of a raw namespace-bound async activity RPC exactly
+/// as Core's `AsyncActivityHandle` did at the previous pin: `NotFound` means
+/// the task token is gone and every other status is an RPC failure for
+/// [`async_activity_failure`] to subdivide.
+///
+/// Core 1.x routes its handle through the client data converter and
+/// interceptors and takes a high-level `ApplicationFailure`. The bridge
+/// already carries exact protobuf payloads and failures decoded from OCaml, so
+/// it sends the four `RespondActivityTask*`/`RecordActivityTaskHeartbeat`
+/// requests itself to keep their bytes unchanged.
+fn async_activity_rpc_error(status: temporalio_client::tonic::Status) -> AsyncActivityError {
+    if status.code() == temporalio_client::tonic::Code::NotFound {
+        AsyncActivityError::NotFound(status)
+    } else {
+        AsyncActivityError::Rpc(status)
+    }
+}
+
 const _: () = assert!(size_of::<Status>() == 4);
 
 /// Monotonic test instrumentation for successfully exposed runtime owners.
 static RUNTIMES_CREATED: AtomicU64 = AtomicU64::new(0);
-/// Monotonic test instrumentation for Core instances whose destructor ran.
+/// Monotonic test instrumentation for instance graphs whose cleanup
+/// completed. For an owned runtime this includes Core's destructor; for a
+/// graph attached to a [`SharedRuntime`] it includes Core's destructor only
+/// when that graph held the last reference.
 static RUNTIMES_CLEANED: AtomicU64 = AtomicU64::new(0);
+/// Monotonic test instrumentation for [`SharedRuntime`] handles exposed.
+static SHARED_RUNTIMES_CREATED: AtomicU64 = AtomicU64::new(0);
+/// Monotonic test instrumentation for Core runtimes whose destructor
+/// returned, counted by [`CoreDropMarker`] after Core and its log writer.
+static CORE_RUNTIMES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Zero-sized marker declared last in [`SharedCore`] so its destructor runs
+/// only after Core and the log writer have been dropped.
+struct CoreDropMarker;
+
+impl Drop for CoreDropMarker {
+    /// Publishes Core destruction for the isolated ownership tests.
+    fn drop(&mut self) {
+        CORE_RUNTIMES_DROPPED.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// One Temporal Core runtime (its Tokio executor, telemetry, and optional
+/// Core log writer), reference-counted between its users (#832).
+///
+/// Every instance graph ([`Runtime`]) holds one `Arc` clone, and a
+/// [`SharedRuntime`] handle holds one more while it is open. Core is
+/// therefore destroyed exactly once, by whichever holder drops the last
+/// reference, and can never be released while a client or worker created on
+/// it still exists. Every holder drops its reference on a plain OS thread
+/// (a cleanup thread or an OCaml thread outside the runtime lock), never on
+/// a Tokio worker, because dropping a Tokio runtime inside its own context
+/// panics.
+///
+/// Field order is load-bearing: Rust drops fields in declaration order, so
+/// the metrics exporter's scrape server is aborted first, then Core is
+/// dropped (its Tokio shutdown closes the scrape socket) before the log
+/// writer (which then flushes Core's shutdown records within
+/// `CORE_LOG_CLOSE_TIMEOUT`), and the drop marker last.
+pub(crate) struct SharedCore {
+    /// Opt-in Prometheus scrape server running on Core's Tokio pool (#500);
+    /// see [`telemetry::MetricsExporter`].
+    metrics: Option<telemetry::MetricsExporter>,
+    core: CoreRuntime,
+    /// Writer thread draining Core's log queue to stderr, absent when Core
+    /// logging is `off`; see [`diagnostics::CoreLogWriter`]. The writer owns
+    /// a non-`Sync` receiver, and the mutex is what lets an `Arc` of this
+    /// struct cross threads; it is locked only by the test log-sink helper.
+    core_log: std::sync::Mutex<Option<diagnostics::CoreLogWriter>>,
+    _dropped: CoreDropMarker,
+}
+
+impl std::ops::Deref for SharedCore {
+    type Target = CoreRuntime;
+
+    /// Lets holders use Core exactly as they used an owned `CoreRuntime`.
+    fn deref(&self) -> &CoreRuntime {
+        &self.core
+    }
+}
 
 /// Borrows one exact-run history future for a bounded owner interval.
 ///
@@ -232,7 +1093,7 @@ where
 /// Byte allocation owned by the Rust bridge.
 ///
 /// Callers must treat this as an opaque field of [`Result`] and release it
-/// only through [`ocaml_temporal_core_v2_result_free`].
+/// only through [`ocaml_temporal_core_v4_result_free`].
 #[repr(C)]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Buffer {
@@ -289,17 +1150,21 @@ const _: () = {
 
 /// Internal structured failure converted into an owned ABI diagnostic.
 #[derive(Debug)]
-struct Failure {
-    status: Status,
-    message: String,
+pub(crate) struct Failure {
+    pub(crate) status: Status,
+    pub(crate) message: String,
 }
 
-/// Owns the Tokio executor and shared Temporal Core runtime for one SDK instance.
+/// Owns the native graph (client, worker, and their bookkeeping) for one SDK
+/// instance, plus one reference to the Temporal Core runtime it runs on.
 ///
-/// The type is opaque to C. Higher-level client and worker handles will retain
-/// the same runtime owner rather than creating independent executors.
+/// The type is opaque to C. The Core reference is either the only one (a
+/// runtime created by [`ocaml_temporal_core_v4_runtime_new_with_worker_threads`])
+/// or a clone shared with a [`SharedRuntime`] and its other attached graphs
+/// (created by [`ocaml_temporal_core_v4_runtime_new_attached`]). Either way
+/// the graph's children are dropped before its Core reference.
 pub struct Runtime {
-    core: Option<CoreRuntime>,
+    core: Option<Arc<SharedCore>>,
     client: Option<Connection>,
     worker: Option<PollLanes>,
     /// Optional workflow-only replay graph. It is mutually exclusive with the
@@ -315,7 +1180,150 @@ pub struct Runtime {
     activity_tasks: HashMap<Vec<u8>, Vec<activity_protocol::ActivityTask>>,
     pending_starts: HashMap<String, PendingStart>,
     pending_waits: HashMap<client_protocol::WaitWorkflowRequest, PendingWait>,
+    /// Identity under which this runtime registers submitted client calls in
+    /// the process-wide completion registry (#807); disconnect and close
+    /// release every call registered under it.
+    call_owner: u64,
+    /// Tasks of submitted client calls that may still be running, keyed by
+    /// call identifier. Finished tasks are pruned on each submission, and a
+    /// call that has left the completion registry is marked
+    /// [`CallScope::Released`] there so it stops counting against the limits.
+    /// Released tasks are joined before admission whenever the map has
+    /// reached the in-flight ceiling, so the map never holds more than
+    /// `client_limits.in_flight_calls` handles after a submission.
+    pending_calls: HashMap<u64, PendingCall>,
+    /// Per-token throttle of async activity heartbeats (#1025). Its drivers
+    /// own connection clones, so disconnect and close abort and join them
+    /// like submitted calls; disconnect replaces it with an empty throttle.
+    heartbeat_throttle: Arc<HeartbeatThrottle>,
+    /// Heartbeat throttle settings of the most recently started worker, the
+    /// same values handed to Core; Core's defaults before any worker.
+    heartbeat_intervals: HeartbeatIntervals,
+    /// Admission limits of the current connection (#796). Set by a successful
+    /// connect and reset to the defaults by disconnect, so a runtime without
+    /// a connection always reports the defaults.
+    client_limits: crate::client_calls::ClientLimits,
     cleanup: std::sync::mpsc::Sender<RuntimeCleanup>,
+}
+
+/// Opaque handle to a Core runtime that several instance graphs share (#832).
+///
+/// The handle owns one reference to its [`SharedCore`]; every graph created
+/// from it by [`ocaml_temporal_core_v4_runtime_new_attached`] owns another.
+/// Releasing the handle therefore never invalidates an attached graph: Core
+/// is destroyed only when the handle and every attached graph have released
+/// their references, in any order. Callers that need Core destroyed when the
+/// handle is released (the OCaml `Runtime.shutdown` contract) must release
+/// every attached graph first; the OCaml layer enforces that ordering with a
+/// typed error before reaching this ABI.
+///
+/// Like [`Runtime`], the handle starts its own cleanup thread before it is
+/// published, so the non-blocking GC fallback can hand a possibly-last
+/// reference to a plain OS thread instead of destroying Tokio inside an
+/// OCaml finalizer.
+pub struct SharedRuntime {
+    core: Option<Arc<SharedCore>>,
+    cleanup: std::sync::mpsc::Sender<SharedRuntimeCleanup>,
+}
+
+/// Reference transfer consumed by a [`SharedRuntime`]'s cleanup thread.
+struct SharedRuntimeCleanup {
+    core: Arc<SharedCore>,
+    /// Present for explicit release, which waits until the reference (and,
+    /// when it was the last one, Core itself) has been dropped.
+    completed: Option<SyncSender<Status>>,
+}
+
+#[cfg(test)]
+impl Runtime {
+    /// Test-only graph that owns `core` alone, with Core logging off. Unit
+    /// tests build Core with custom options, then wrap it exactly as
+    /// [`create_runtime`] would.
+    fn with_owned_core(core: CoreRuntime) -> std::result::Result<Self, Failure> {
+        Self::new(Arc::new(SharedCore {
+            metrics: None,
+            core,
+            core_log: std::sync::Mutex::new(None),
+            _dropped: CoreDropMarker,
+        }))
+    }
+}
+
+impl SharedRuntime {
+    /// Starts the cleanup thread before exposing a handle, mirroring
+    /// [`Runtime::new`]: every published handle has a non-blocking release
+    /// path.
+    fn new(core: SharedCore) -> std::result::Result<Self, Failure> {
+        let (cleanup, receiver) = channel();
+        std::thread::Builder::new()
+            .name("ocaml-temporal-shared-runtime-cleanup".to_owned())
+            .spawn(move || {
+                // Dropping Core here can flush or close its connections.
+                crate::sigpipe::block_current_thread();
+                run_shared_runtime_cleanup(receiver)
+            })
+            .map_err(|error| Failure {
+                status: STATUS_INTERNAL,
+                message: format!("could not start Temporal runtime cleanup thread: {error}"),
+            })?;
+        SHARED_RUNTIMES_CREATED.fetch_add(1, Ordering::Relaxed);
+        Ok(Self {
+            core: Some(Arc::new(core)),
+            cleanup,
+        })
+    }
+
+    /// Creates one instance graph holding a new reference to this Core.
+    fn attach(&self) -> std::result::Result<Runtime, Failure> {
+        let core = self.core.as_ref().ok_or_else(|| Failure {
+            status: STATUS_INVALID_STATE,
+            message: "shared Temporal runtime is already released".to_owned(),
+        })?;
+        Runtime::new(Arc::clone(core))
+    }
+
+    /// Transfers this handle's Core reference to the cleanup thread and
+    /// optionally waits until it has been dropped. A release with attached
+    /// graphs still alive only decrements the count; Core then outlives this
+    /// handle until the last graph is closed.
+    fn release(mut self, wait: bool) -> Status {
+        let Some(core) = self.core.take() else {
+            return STATUS_OK;
+        };
+        let (completed, receiver) = if wait {
+            let (sender, receiver) = sync_channel(1);
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        if let Err(error) = self.cleanup.send(SharedRuntimeCleanup { core, completed }) {
+            // The receiver exits only after a message, so this is a defect in
+            // the cleanup thread. Reclaim here to preserve the no-leak rule;
+            // both callers run outside any Tokio context.
+            drop(error.0.core);
+            return STATUS_INTERNAL;
+        }
+        match receiver {
+            Some(receiver) => receiver.recv().unwrap_or(STATUS_INTERNAL),
+            None => STATUS_OK,
+        }
+    }
+}
+
+/// Drops one shared-runtime reference away from OCaml's collector and
+/// reports completion when asked. A panic in Core's destructor is contained.
+fn run_shared_runtime_cleanup(receiver: Receiver<SharedRuntimeCleanup>) {
+    let Ok(SharedRuntimeCleanup { core, completed }) = receiver.recv() else {
+        return;
+    };
+    let status = if catch_unwind(AssertUnwindSafe(|| drop(core))).is_ok() {
+        STATUS_OK
+    } else {
+        STATUS_PANIC
+    };
+    if let Some(completed) = completed {
+        let _ = completed.send(status);
+    }
 }
 
 /// One exact-run history observation, polled only by its runtime owner.
@@ -377,11 +1385,11 @@ enum StartRead {
 
 /// Ownership transfer consumed by the runtime's dedicated cleanup thread.
 struct RuntimeCleanup {
-    core: CoreRuntime,
+    core: Arc<SharedCore>,
     client: Option<Connection>,
     worker: Option<PollLanes>,
     replay_worker: Option<ReplayWorker>,
-    /// Aborted asynchronous-start tasks whose join handles must be awaited
+    /// Aborted asynchronous-start and submitted-call tasks whose join handles must be awaited
     /// before the Core runtime and its connection clones are dropped.  The
     /// non-blocking OCaml finalizer transfers these handles here instead of
     /// dropping them on the caller thread, which would detach the tasks.
@@ -395,6 +1403,19 @@ struct RuntimeCleanup {
 struct ClientConfig {
     target_url: String,
     identity: String,
+    /// Distinct exact runs that may be waited on at once (#796). Like the two
+    /// limits below it is optional: the OCaml encoder omits each limit left at
+    /// its default, so a default client sends the pre-#796 document
+    /// unchanged, and [`crate::client_calls::ClientLimits::from_config`]
+    /// checks the ranges again.
+    #[serde(default)]
+    max_pending_waits: Option<u32>,
+    /// Distinct start request IDs that may be in flight at once (#796).
+    #[serde(default)]
+    max_pending_starts: Option<u32>,
+    /// Submitted calls of every kind that may be outstanding at once (#796).
+    #[serde(default)]
+    max_in_flight_calls: Option<u32>,
 }
 
 /// Strict workflow-only Core worker document received from OCaml as JSON.
@@ -409,6 +1430,80 @@ struct WorkerConfigInput {
     max_outstanding_workflow_tasks: u32,
     max_concurrent_workflow_task_polls: u32,
     graceful_shutdown_timeout_ms: u64,
+    /// Task kinds the OCaml registration can execute. Omitted documents keep
+    /// the historical poll-everything behavior; the OCaml encoder always
+    /// sends the field explicitly.
+    #[serde(default)]
+    task_types: WorkerTaskTypesInput,
+    /// Optional Core settings exposed by the public worker options (#498).
+    /// The OCaml encoder omits the member when every setting is at its
+    /// default, so default workers send the pre-#498 document unchanged.
+    #[serde(default)]
+    tuning: WorkerTuningInput,
+}
+
+/// Optional worker settings layered on the original worker document (#498).
+///
+/// Each absent field keeps Temporal Core's default. Durations are whole
+/// milliseconds and rates are tasks per second. Remote and local activity
+/// slot counts are intentionally absent: they stay pinned to the serial OCaml
+/// executor (#777), and the rates here can only lower throughput.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerTuningInput {
+    /// Replaces the fixed workflow poller count with Core autoscaling. Its
+    /// maximum must equal `max_concurrent_workflow_task_polls`, so the
+    /// original field keeps one meaning for every document.
+    #[serde(default)]
+    workflow_task_poller_autoscaling: Option<PollerAutoscalingInput>,
+    /// Sticky-queue schedule-to-start timeout (Core default 10 s).
+    #[serde(default)]
+    sticky_queue_schedule_to_start_timeout_ms: Option<u64>,
+    /// Longest activity heartbeat throttle interval (Core default 60 s).
+    #[serde(default)]
+    max_heartbeat_throttle_interval_ms: Option<u64>,
+    /// Heartbeat throttle interval without a heartbeat timeout (default 30 s).
+    #[serde(default)]
+    default_heartbeat_throttle_interval_ms: Option<u64>,
+    /// Remote activity starts per second for this worker.
+    #[serde(default)]
+    max_worker_activities_per_second: Option<f64>,
+    /// Server-side activity dispatch rate for the whole task queue.
+    #[serde(default)]
+    max_task_queue_activities_per_second: Option<f64>,
+}
+
+/// Core workflow-poller autoscaling bounds carried in [`WorkerTuningInput`].
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PollerAutoscalingInput {
+    /// Polls Core always keeps open while slots are available.
+    minimum: u32,
+    /// Most polls Core ever keeps open.
+    maximum: u32,
+    /// Polls opened before scaling feedback arrives.
+    initial: u32,
+}
+
+/// Task kinds a live worker polls, derived on the OCaml side from whether any
+/// workflow or activity implementation is registered (#805). The mapping to
+/// Core's local/remote/Nexus switches lives in
+/// [`crate::worker_bridge::bridge_task_types`]; at least one kind is required.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerTaskTypesInput {
+    workflows: bool,
+    activities: bool,
+}
+
+impl Default for WorkerTaskTypesInput {
+    /// Preserves the behavior of documents written before the field existed.
+    fn default() -> Self {
+        Self {
+            workflows: true,
+            activities: true,
+        }
+    }
 }
 
 /// Explicit worker-routing mode carried across the OCaml/Rust JSON boundary.
@@ -435,11 +1530,16 @@ enum WorkerVersioningInput {
 impl Runtime {
     /// Starts the cleanup thread before exposing a handle, so every successful
     /// runtime allocation already has a non-blocking GC fallback path.
-    fn new(core: CoreRuntime) -> std::result::Result<Self, Failure> {
+    fn new(core: Arc<SharedCore>) -> std::result::Result<Self, Failure> {
         let (cleanup, receiver) = channel();
         std::thread::Builder::new()
             .name("ocaml-temporal-runtime-cleanup".to_owned())
-            .spawn(move || run_runtime_cleanup(receiver))
+            .spawn(move || {
+                // Dropping a client or worker here can flush or close its
+                // connections.
+                crate::sigpipe::block_current_thread();
+                run_runtime_cleanup(receiver)
+            })
             .map_err(|error| Failure {
                 status: STATUS_INTERNAL,
                 message: format!("could not start Temporal runtime cleanup thread: {error}"),
@@ -455,6 +1555,11 @@ impl Runtime {
             activity_tasks: HashMap::new(),
             pending_starts: HashMap::new(),
             pending_waits: HashMap::new(),
+            call_owner: crate::client_calls::new_owner_id(),
+            pending_calls: HashMap::new(),
+            heartbeat_throttle: Arc::new(HeartbeatThrottle::new()),
+            heartbeat_intervals: CORE_DEFAULT_HEARTBEAT_INTERVALS,
+            client_limits: crate::client_calls::ClientLimits::default(),
             cleanup,
         })
     }
@@ -483,21 +1588,53 @@ impl Runtime {
             });
         }
         validate_identifier("identity", &config.identity)?;
+        let limits = crate::client_calls::ClientLimits::from_config(
+            config.max_pending_waits,
+            config.max_pending_starts,
+            config.max_in_flight_calls,
+        )?;
 
-        let options = ConnectionOptions::new(target)
-            .identity(config.identity)
-            .maybe_metrics_meter(core.telemetry().get_temporal_metric_meter())
-            .build();
+        let options = connection_options(
+            target,
+            config.identity,
+            core.telemetry().get_temporal_metric_meter(),
+        );
+        // Core performs the TCP/TLS connect and then an unretried
+        // `GetSystemInfo`, which is bounded only by Core's 30 s per-call
+        // default. An endpoint that accepts a connection but never answers
+        // (for example a proxy whose accept loop has not yet closed it) would
+        // otherwise hold `Client.create` for that full interval (#824). The
+        // whole handshake is therefore bounded by `CLIENT_CONNECT_TIMEOUT`
+        // and reported as the same typed connection failure.
         let connection = core
             .tokio_handle()
-            .block_on(Connection::connect(options))
-            .map_err(|_error| Failure {
+            .block_on(async {
+                tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, Connection::connect(options)).await
+            })
+            .map_err(|_elapsed| Failure {
                 status: STATUS_CONNECTION,
-                // Core's connection error can contain gRPC status details or
-                // server-provided text.  Only the closed ABI category may
-                // cross into OCaml; detailed diagnostics stay inside Rust.
-                message: "Temporal client connection failed".to_owned(),
+                message: diagnostics::connection_failure_message(
+                    diagnostics::ConnectionCause::Timeout,
+                    CLIENT_CONNECT_TIMEOUT_DETAIL,
+                ),
+            })?
+            .map_err(|error| {
+                // Core's error text can contain server-provided gRPC status
+                // messages or configured header values. Only a closed cause
+                // plus bounded, sanitized local transport detail crosses into
+                // OCaml (#833); see `diagnostics::describe_connect_error`.
+                match diagnostics::describe_connect_error(&error) {
+                    diagnostics::ConnectFailure::Configuration => Failure {
+                        status: STATUS_CONFIGURATION,
+                        message: "Temporal Core rejected the client connection options".to_owned(),
+                    },
+                    diagnostics::ConnectFailure::Connection { cause, detail } => Failure {
+                        status: STATUS_CONNECTION,
+                        message: diagnostics::connection_failure_message(cause, &detail),
+                    },
+                }
             })?;
+        self.client_limits = limits;
         self.client = Some(connection);
         Ok(Vec::new())
     }
@@ -574,52 +1711,14 @@ impl Runtime {
     /// the C stub releases the OCaml runtime lock while Tokio waits, and no
     /// Rust task retains an OCaml pointer after this method returns.
     fn cancel_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_cancel_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::cancel_workflow(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_cancel_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::Cancel, input)
     }
 
     /// Terminates one exact workflow run through the official Temporal
     /// service. The bounded RPC runs on Tokio while the C shim releases the
     /// OCaml runtime lock, and only an owned acknowledgement crosses back.
     fn terminate_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_terminate_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::terminate_workflow(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_terminate_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::Terminate, input)
     }
 
     /// Resets one exact workflow run through Temporal's official workflow
@@ -627,52 +1726,14 @@ impl Runtime {
     /// performs the bounded RPC; no Tokio task or native callback retains an
     /// OCaml pointer after this method returns.
     fn reset_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_reset_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::reset_workflow(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_reset_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::Reset, input)
     }
 
     /// Sends one signal to one exact workflow run through the connected
     /// Temporal client. The request is validated before the connection lookup
     /// and the positive response is revalidated before crossing the ABI.
     fn signal_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_signal_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::signal_workflow(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_signal_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::Signal, input)
     }
 
     /// Executes one output-only query against one exact workflow run. Query
@@ -680,85 +1741,33 @@ impl Runtime {
     /// by cancellation and signal operations; successful payloads are
     /// revalidated before crossing the ABI.
     fn query_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_query_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::query_workflow(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_query_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::Query, input)
     }
 
     /// Starts one named workflow update and returns its durable update handle.
     /// Completion is observed through the separate bounded poll operation.
     fn update_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_update_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::update_workflow(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_update_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::Update, input)
     }
 
     /// Polls one admitted update until completion or the bounded poll budget
     /// expires. A missing outcome is a normal pending result.
     fn poll_update_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request =
-            client_protocol::decode_poll_update_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::poll_workflow_update(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_poll_update_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        self.client_rpc_blocking(ClientCallKind::PollUpdate, input)
     }
 
     /// Lists one bounded visibility page through Temporal's official client.
     /// The Rust owner performs protobuf conversion and returns only the
     /// validated JSON page; no server-owned bytes or handles cross the ABI.
     fn list_visibility_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_visibility_request(text).map_err(protocol_failure)?;
+        self.client_rpc_blocking(ClientCallKind::Visibility, input)
+    }
+
+    /// Returns the connected client and Core's Tokio handle, or the typed
+    /// lifecycle failure every client operation reports without them.
+    fn client_and_handle(
+        &self,
+    ) -> std::result::Result<(Connection, tokio::runtime::Handle), Failure> {
         let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
             status: STATUS_INVALID_STATE,
             message: "Temporal client is not connected".to_owned(),
@@ -771,12 +1780,277 @@ impl Runtime {
                 message: "Temporal runtime is already closed".to_owned(),
             })?
             .tokio_handle();
-        let response = handle
-            .block_on(client_protocol::list_visibility(connection, request))
-            .map_err(client_operation_failure)?;
-        client_protocol::encode_visibility_response(&response)
-            .map(|encoded| encoded.into_bytes())
-            .map_err(protocol_failure)
+        Ok((connection, handle))
+    }
+
+    /// Runs one bounded client RPC to completion on the calling owner thread.
+    ///
+    /// This is the synchronous ABI path kept for direct bridge callers; the
+    /// public OCaml client submits the same operation through
+    /// [`Runtime::submit_client_call`] instead, so its owner Domain never
+    /// waits for the network (#807). The request is validated before the
+    /// connection lookup, matching the asynchronous path.
+    fn client_rpc_blocking(&mut self, kind: ClientCallKind, input: &[u8]) -> Operation {
+        let text = decode_semantic_input(input)?;
+        let rpc =
+            ClientRpc::decode(kind, text)?.bind_async_activity(|| self.async_activity_binding())?;
+        let (connection, handle) = self.client_and_handle()?;
+        handle.block_on(rpc.into_future(connection))
+    }
+
+    /// Submits one client RPC and returns its call identifier at once (#807).
+    ///
+    /// The owner Domain only validates the request, checks capacity,
+    /// registers a completion cell, and spawns one Tokio task that owns a
+    /// connection clone. The handle is returned as ASCII `<owner>.<call>`
+    /// (two decimal numbers); both are needed to await the call.
+    /// The task publishes exactly one outcome (the bytes or failure the
+    /// operation's synchronous symbol would return) into the cell and never
+    /// touches this runtime or OCaml; the submitting caller collects it with
+    /// [`ocaml_temporal_core_v4_client_await_call`] from its own thread.
+    ///
+    /// Starts and waits keep their own limits (distinct request IDs and
+    /// distinct runs, by default 64 each; repeats share a slot) and every
+    /// class shares the in-flight ceiling (by default [`MAX_PENDING_CALLS`]),
+    /// all read from the connection's `client_limits` (#796). Only calls
+    /// still in the completion registry count: a call that was read or
+    /// released stops counting here even if its task is still running, and
+    /// that task is aborted (#1019). Admission
+    /// beyond a limit returns
+    /// `STATUS_RESOURCE_EXHAUSTED` before any task or RPC exists. A start
+    /// whose `request_id` is in flight for a different request is rejected
+    /// with `STATUS_PROTOCOL`, as on the ticket path. Disconnect and close
+    /// release every call: waiters observe the closed failure and the tasks
+    /// are aborted and joined.
+    fn submit_client_call(&mut self, kind: u32, input: &[u8]) -> Operation {
+        let kind = ClientCallKind::try_from(kind)?;
+        let text = decode_semantic_input(input)?;
+        let rpc =
+            ClientRpc::decode(kind, text)?.bind_async_activity(|| self.async_activity_binding())?;
+        let (connection, handle) = self.client_and_handle()?;
+        let limits = self.client_limits;
+        // Dropping a finished task's handle cannot detach live work: its
+        // future, and with it the connection clone, has already completed.
+        self.pending_calls
+            .retain(|_, call| !call.task.is_finished());
+        // A call that left the registry while its task still runs was read
+        // (its task is about to end) or released by an interrupted caller
+        // (#1019). Release already aborts the task, and a read call's task
+        // has already published its outcome, so aborting here is idempotent
+        // and harmless. The handle stays so disconnect can still join it, but
+        // the call no longer holds a start, wait, or in-flight slot.
+        let unregistered = crate::client_calls::unregistered_calls(
+            self.call_owner,
+            self.pending_calls
+                .iter()
+                .filter(|(_, call)| !matches!(call.scope, CallScope::Released))
+                .map(|(id, _)| *id),
+        );
+        for id in unregistered {
+            if let Some(call) = self.pending_calls.get_mut(&id) {
+                call.task.abort();
+                call.scope = CallScope::Released;
+            }
+        }
+        let scope = match &rpc {
+            ClientRpc::Start(request) => {
+                let mut distinct = HashSet::new();
+                for call in self.pending_calls.values() {
+                    if let CallScope::Start(pending) = &call.scope {
+                        if pending.request_id == request.request_id
+                            && !client_protocol::same_start_request(pending, request)
+                        {
+                            return Err(Failure {
+                                status: STATUS_PROTOCOL,
+                                message:
+                                    "start request_id is already pending for a different request"
+                                        .to_owned(),
+                            });
+                        }
+                        distinct.insert(pending.request_id.as_str());
+                    }
+                }
+                if distinct.len() >= limits.pending_starts
+                    && !distinct.contains(request.request_id.as_str())
+                {
+                    return Err(Failure {
+                        status: STATUS_RESOURCE_EXHAUSTED,
+                        message: format!(
+                            "too many Temporal workflow starts are pending (limit {})",
+                            limits.pending_starts
+                        ),
+                    });
+                }
+                CallScope::Start(Arc::clone(request))
+            }
+            ClientRpc::Wait(request) => {
+                let distinct = self
+                    .pending_calls
+                    .values()
+                    .filter_map(|call| match &call.scope {
+                        CallScope::Wait(pending) => Some(pending),
+                        _ => None,
+                    })
+                    .collect::<HashSet<_>>();
+                if distinct.len() >= limits.pending_waits && !distinct.contains(request) {
+                    return Err(Failure {
+                        status: STATUS_RESOURCE_EXHAUSTED,
+                        message: format!(
+                            "too many Temporal workflow waits are pending (limit {})",
+                            limits.pending_waits
+                        ),
+                    });
+                }
+                CallScope::Wait(request.clone())
+            }
+            _ => CallScope::Bounded,
+        };
+        // Hard bound on retained task handles (Codex review on #1077). An
+        // aborted task's handle is only reaped once Tokio has run its
+        // cancellation, so a burst of release-and-resubmit could otherwise
+        // retain released handles (and their request state) without bound.
+        // When the map has reached the in-flight ceiling, join the released
+        // tasks first. They are already aborted, so the join only waits for
+        // their cancellation to run; this happens on the owner thread with
+        // the OCaml runtime lock released, like disconnect's join. Together
+        // with the live-call check below, this keeps
+        // `pending_calls.len() <= in_flight_calls` after every admission.
+        if self.pending_calls.len() >= limits.in_flight_calls {
+            self.reap_released_calls(&handle);
+        }
+        let in_flight = self
+            .pending_calls
+            .values()
+            .filter(|call| !matches!(call.scope, CallScope::Released))
+            .count();
+        if in_flight >= limits.in_flight_calls
+            || crate::client_calls::registered_calls(self.call_owner) >= limits.in_flight_calls
+        {
+            return Err(Failure {
+                status: STATUS_RESOURCE_EXHAUSTED,
+                message: format!(
+                    "too many Temporal client calls are pending (limit {})",
+                    limits.in_flight_calls
+                ),
+            });
+        }
+        // Reserve the task-registry entry before the call exists, so no
+        // allocation can unwind between spawning the task and registering
+        // its handle for shutdown.
+        self.pending_calls.try_reserve(1).map_err(|_| Failure {
+            status: STATUS_INTERNAL,
+            message: "could not reserve a Temporal client call slot".to_owned(),
+        })?;
+        let (call, guard) = crate::client_calls::register(self.call_owner)?;
+        // The handle is `<owner>.<call>`: awaiting requires both, so only the
+        // graph that submitted the call can collect its outcome.
+        let encoded = format!("{}.{call}", self.call_owner).into_bytes();
+        let future = rpc.into_future(connection);
+        let task = handle.spawn(async move {
+            let outcome = future.await;
+            guard.complete(outcome);
+        });
+        // Let a release from any thread abort this task (#1019). This runs
+        // before the handle reaches OCaml, so no release can precede it.
+        crate::client_calls::attach_task(self.call_owner, call, task.abort_handle());
+        self.pending_calls.insert(call, PendingCall { scope, task });
+        Ok(encoded)
+    }
+
+    /// Removes every [`CallScope::Released`] call from the task map and joins
+    /// its already aborted task on `handle`. Joining waits only for Tokio to
+    /// run each cancellation, so it is bounded; it never detaches a task that
+    /// still owns a connection clone.
+    fn reap_released_calls(&mut self, handle: &tokio::runtime::Handle) {
+        let released = self
+            .pending_calls
+            .iter()
+            .filter(|(_, call)| matches!(call.scope, CallScope::Released))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let tasks = released
+            .into_iter()
+            .filter_map(|id| self.pending_calls.remove(&id))
+            .map(|call| call.task)
+            .collect::<Vec<_>>();
+        if tasks.is_empty() {
+            return;
+        }
+        handle.block_on(async {
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
+    }
+
+    /// The worker state an async activity request is bound to on submission;
+    /// fails with `STATUS_INVALID_STATE` without a worker namespace.
+    fn async_activity_binding(&self) -> std::result::Result<AsyncActivityBinding, Failure> {
+        Ok(AsyncActivityBinding {
+            namespace: self
+                .worker_namespace
+                .clone()
+                .ok_or_else(missing_worker_namespace)?,
+            throttle: Arc::clone(&self.heartbeat_throttle),
+            intervals: self.heartbeat_intervals,
+            max_throttled_tokens: self.client_limits.in_flight_calls,
+        })
+    }
+
+    /// Shuts the heartbeat throttle down and installs an empty one, returning
+    /// the aborted driver handles still to join; see
+    /// [`Self::abort_pending_calls`] for `wait`. Runs after the submitted
+    /// calls were released, so no call can admit a heartbeat into the old
+    /// throttle afterwards; one that still could finds it closed and sends
+    /// unthrottled.
+    fn abort_heartbeat_drivers(&mut self, wait: bool) -> Vec<JoinHandle<()>> {
+        let throttle = std::mem::replace(
+            &mut self.heartbeat_throttle,
+            Arc::new(HeartbeatThrottle::new()),
+        );
+        let drivers = throttle.shutdown();
+        match (wait, self.core.as_ref()) {
+            (true, Some(core)) => {
+                core.tokio_handle().block_on(async {
+                    for driver in drivers {
+                        let _ = driver.await;
+                    }
+                });
+                Vec::new()
+            }
+            _ => drivers,
+        }
+    }
+
+    /// Releases every submitted call and returns task handles still to join.
+    ///
+    /// Waiters are woken with the closed failure first, so an aborted task's
+    /// completion guard finds its cell already closed. Explicit disconnect or
+    /// close (`wait = true`) then joins the aborted tasks on the owner thread
+    /// with the OCaml runtime lock released; the GC fallback (`wait = false`)
+    /// hands them to the cleanup thread instead. No task is detached while it
+    /// still owns a connection clone.
+    fn abort_pending_calls(&mut self, wait: bool) -> Vec<JoinHandle<()>> {
+        crate::client_calls::release_owner(self.call_owner);
+        let tasks = self
+            .pending_calls
+            .drain()
+            .map(|(_, call)| call.task)
+            .collect::<Vec<_>>();
+        for task in &tasks {
+            task.abort();
+        }
+        match (wait, self.core.as_ref()) {
+            (true, Some(core)) => {
+                core.tokio_handle().block_on(async {
+                    for task in tasks {
+                        let _ = task.await;
+                    }
+                });
+                Vec::new()
+            }
+            _ => tasks,
+        }
     }
 
     /// Begins one workflow start without waiting for the RPC response.
@@ -824,10 +2098,13 @@ impl Runtime {
                 .map_err(protocol_failure)?
                 .into_bytes());
         }
-        if self.pending_starts.len() >= MAX_PENDING_STARTS {
+        if self.pending_starts.len() >= self.client_limits.pending_starts {
             return Err(Failure {
-                status: STATUS_INVALID_STATE,
-                message: "too many Temporal workflow starts are pending".to_owned(),
+                status: STATUS_RESOURCE_EXHAUSTED,
+                message: format!(
+                    "too many Temporal workflow starts are pending (limit {})",
+                    self.client_limits.pending_starts
+                ),
             });
         }
 
@@ -958,37 +2235,7 @@ impl Runtime {
             pending.task.abort();
         }
 
-        let request_id = pending.request.request_id.clone();
-        let workflow_id = pending.request.workflow_id.clone();
-        let outcome = match result {
-            Some(Ok(response)) => client_protocol::StartWorkflowOutcome::Accepted(response),
-            Some(Err(error)) if error.uncertain_start() => {
-                client_protocol::StartWorkflowOutcome::Unknown {
-                    request_id: request_id.clone(),
-                    workflow_id: workflow_id.clone(),
-                }
-            }
-            Some(Err(error)) => client_protocol::StartWorkflowOutcome::Rejected(error),
-            None => client_protocol::StartWorkflowOutcome::Unknown {
-                request_id: request_id.clone(),
-                workflow_id: workflow_id.clone(),
-            },
-        };
-        // The ticket is already retired. Prefer an always-encodable Unknown
-        // outcome built from the validated request identities over returning a
-        // protocol error that permanently loses an accepted or rejected start.
-        match client_protocol::encode_start_outcome(&outcome) {
-            Ok(encoded) => Ok(encoded.into_bytes()),
-            Err(_) => {
-                let fallback = client_protocol::StartWorkflowOutcome::Unknown {
-                    request_id,
-                    workflow_id,
-                };
-                client_protocol::encode_start_outcome(&fallback)
-                    .map(|encoded| encoded.into_bytes())
-                    .map_err(protocol_failure)
-            }
-        }
+        start_outcome_bytes(&pending.request, result)
     }
 
     /// Aborts every in-flight start and returns handles that need cleanup.
@@ -1042,10 +2289,13 @@ impl Runtime {
             })?
             .tokio_handle();
         if !self.pending_waits.contains_key(&request) {
-            if self.pending_waits.len() >= MAX_PENDING_WAITS {
+            if self.pending_waits.len() >= self.client_limits.pending_waits {
                 return Err(Failure {
-                    status: STATUS_INVALID_STATE,
-                    message: "too many Temporal workflow waits are pending".to_owned(),
+                    status: STATUS_RESOURCE_EXHAUSTED,
+                    message: format!(
+                        "too many Temporal workflow waits are pending (limit {})",
+                        self.client_limits.pending_waits
+                    ),
                 });
             }
             self.pending_waits.try_reserve(1).map_err(|_| Failure {
@@ -1099,6 +2349,8 @@ impl Runtime {
         // command, but Core needs the worker namespace to populate failure
         // metadata consistently when a child is cancelled before it starts.
         let worker_namespace = config.namespace.clone();
+        // The async heartbeat throttle uses the settings handed to Core.
+        let heartbeat_intervals = config.tuning.heartbeat_intervals()?;
         let worker_config = config.into_core()?;
         let core = self.core.as_ref().ok_or_else(|| Failure {
             status: STATUS_INVALID_STATE,
@@ -1122,14 +2374,15 @@ impl Runtime {
         })?;
 
         if handle.block_on(worker.validate()).is_err() {
-            {
-                // Core's synchronous shutdown initiation spawns its server
-                // deregistration task, so it needs the same runtime context
-                // as synchronous worker construction.
-                let _runtime_guard = handle.enter();
-                worker.initiate_shutdown();
-            }
-            handle.block_on(worker.finalize_shutdown());
+            // The unpublished worker is released here and nowhere else. Core
+            // finalization requires both poll APIs to observe `ShutDown`, so
+            // the helper drains them in a runtime task that owns the worker
+            // until finalization completes, waiting only a bounded time here,
+            // instead of awaiting `finalize_shutdown` directly, which hung
+            // forever (issue #770).
+            // `block_on` supplies the runtime context Core's shutdown
+            // initiation needs to spawn its deregistration task.
+            handle.block_on(crate::worker_bridge::release_unvalidated_worker(worker));
             return Err(Failure {
                 status: STATUS_WORKER,
                 // Validation performs Core/Server work, so its diagnostic is
@@ -1139,6 +2392,7 @@ impl Runtime {
         }
         self.worker = Some(PollLanes::start(worker, &handle));
         self.worker_namespace = Some(worker_namespace);
+        self.heartbeat_intervals = heartbeat_intervals;
         Ok(Vec::new())
     }
 
@@ -1170,7 +2424,61 @@ impl Runtime {
         Ok(Vec::new())
     }
 
-    /// Gracefully finalizes the child worker once; absence is already closed.
+    /// Stops the child worker from taking new tasks while leaving it owned by
+    /// the graph; absence is already stopped (#1028).
+    ///
+    /// OCaml sends this as soon as its run loop observes a stop, before the
+    /// grace period in which running callbacks may still finish. Without it,
+    /// Core kept long-polling the server until [`Self::shutdown_worker`] ran
+    /// after the grace period, taking workflow and activity tasks that no
+    /// OCaml lane would ever run and that the release then had to fail.
+    ///
+    /// [`PollLanes::initiate_shutdown`] moves the ledger to `Draining`, closes
+    /// both readiness signals (queued tasks still drain first), and calls
+    /// Core's `initiate_shutdown`, which stops new polls and starts Core's own
+    /// graceful-shutdown timer. Completions and heartbeats for tasks already
+    /// leased to OCaml remain valid, so a running callback finishes normally.
+    /// The call never blocks on Core or the network.
+    fn initiate_worker_shutdown(&mut self) -> Operation {
+        let Some(worker) = self.worker.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let handle = self
+            .core
+            .as_ref()
+            .expect("a live worker always has its parent runtime")
+            .tokio_handle();
+        // `initiate_shutdown` synchronously calls `tokio::spawn`.
+        let _runtime_guard = handle.enter();
+        worker.initiate_shutdown();
+        Ok(Vec::new())
+    }
+
+    /// Shuts down and finalizes the child worker in bounded time; absence is
+    /// already closed.
+    ///
+    /// By the time OCaml sends this request its run loop has stopped and its
+    /// retained completions are drained, and the supervisor Domain cannot
+    /// deliver another completion while it is inside this call. Every task
+    /// Core still counts as outstanding can therefore only be completed by the
+    /// bridge, and Core's polls do not report `ShutDown` until that happens
+    /// (issue #769). The worker is shut down in three bounded steps:
+    ///
+    /// 1. initiate Core shutdown, unless [`Self::initiate_worker_shutdown`]
+    ///    already did when the run loop stopped (#1028; it is idempotent);
+    /// 2. retire every outstanding task while joining both poll lanes, for at
+    ///    most [`WORKER_SHUTDOWN_DRAIN_TIMEOUT`];
+    /// 3. run Core's finalizer in a task that owns the worker, waiting for at
+    ///    most [`WORKER_FINALIZE_TIMEOUT`].
+    ///
+    /// Contract: tasks that never reached OCaml (queued handoffs, polls in
+    /// flight at shutdown, Core's own cache evictions) are retired silently,
+    /// because OCaml never owned them. When a task *leased* to OCaml had to be
+    /// force-completed, the worker is still finalized and released, but the
+    /// call reports `STATUS_OUTSTANDING_TASKS` so the caller learns that
+    /// language-side work was abandoned. A drain timeout, lane failure, or
+    /// refused finalization keeps the worker in the graph and reports a
+    /// worker failure; runtime close then disposes it.
     fn shutdown_worker(&mut self) -> Operation {
         let Some(worker) = self.worker.as_mut() else {
             return Ok(Vec::new());
@@ -1186,37 +2494,46 @@ impl Runtime {
             let _runtime_guard = handle.enter();
             worker.initiate_shutdown();
         }
-        handle
-            .block_on(worker.join_poll_lanes())
-            .map_err(poll_lane_failure)?;
-        if !worker.can_finalize() {
-            return Err(Failure {
-                status: STATUS_OUTSTANDING_TASKS,
-                message: "Temporal worker is draining outstanding workflow or activity tasks"
-                    .to_owned(),
-            });
-        }
+        let retirement = handle
+            .block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT))
+            .map_err(shutdown_drain_failure)?;
         let worker = self
             .worker
             .take()
-            .expect("checked worker remains owned until terminal finalization");
-        match handle.block_on(worker.finalize()) {
-            Ok(()) => {
-                self.worker_namespace = None;
-                // Semantic handoffs belong to the worker that created them.
-                // Drop them with the worker so a later start on this runtime
-                // cannot treat a recycled run ID or task token as a duplicate.
-                self.workflow_activations.clear();
-                self.activity_tasks.clear();
-                Ok(Vec::new())
+            .expect("drained worker remains owned until terminal finalization");
+        let result = match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+            BoundedFinalize::Refused(worker, error) => {
+                // The bridge would not consume the worker (for example after a
+                // lost poll lease). Keep it owned by the graph so runtime close
+                // performs its last-resort disposal instead of losing it here.
+                self.worker = Some(*worker);
+                return Err(worker_bridge_failure(error));
             }
-            Err((worker, error)) => {
-                // Put the worker back so the language side can finish outstanding
-                // tasks and retry graceful shutdown instead of losing the graph.
-                self.worker = Some(worker);
-                Err(worker_bridge_failure(error))
-            }
-        }
+            BoundedFinalize::Finalized if retirement.abandoned_leases == 0 => Ok(Vec::new()),
+            BoundedFinalize::Finalized => Err(Failure {
+                status: STATUS_OUTSTANDING_TASKS,
+                message: "Temporal worker shutdown force-completed tasks that were never completed by the worker".to_owned(),
+            }),
+            BoundedFinalize::Panicked => Err(Failure {
+                status: STATUS_WORKER,
+                message: "Temporal worker finalization failed".to_owned(),
+            }),
+            BoundedFinalize::Detached => Err(Failure {
+                status: STATUS_WORKER,
+                message: "Temporal worker finalization did not finish within the shutdown bound"
+                    .to_owned(),
+            }),
+        };
+        // In every remaining outcome the graph no longer owns the worker: it
+        // was finalized, released while unwinding, or is still being finalized
+        // by a task that owns it.
+        self.worker_namespace = None;
+        // Semantic handoffs belong to the worker that created them. Drop them
+        // with the worker so a later start on this runtime cannot treat a
+        // recycled run ID or task token as a duplicate.
+        self.workflow_activations.clear();
+        self.activity_tasks.clear();
+        result
     }
 
     /// Takes one workflow activation from the Rust lane without waiting.
@@ -1576,14 +2893,26 @@ impl Runtime {
 
     /// Revalidates and retires the exact workflow activation whose OCaml
     /// semantic decode failed after Rust handed off its lease.
+    ///
+    /// Success is local task progress, as for a Rust conversion failure: the
+    /// OCaml supervisor reports an empty poll and keeps polling (issue #801).
+    /// The static diagnostic and the redelivery backoff of
+    /// [`Self::reject_unrepresentable_workflow_delivery`] apply here too,
+    /// because Core may redeliver the failed workflow task at once.
     fn reject_polled_workflow(&mut self, input: &[u8]) -> Operation {
+        const REASON: &str = "OCaml semantic workflow activation decoding failed";
         let run_id = workflow_rejection_run_id(&self.workflow_activations, input)?;
         // reject_workflow_delivery retires the ledger even when Core rejects
         // the generated failure. Remove the semantic handoff on the same path
         // so a Core error cannot leave a stale run_id that blocks later work.
-        let rejection = self.reject_workflow_delivery(&run_id);
+        let rejection = self.reject_workflow_delivery_with_reason(&run_id, REASON);
         self.workflow_activations.remove(&run_id);
         rejection?;
+        write_rejected_workflow_diagnostic(std::io::stderr().lock(), REASON);
+        self.worker
+            .as_ref()
+            .expect("rejected workflow delivery retains worker")
+            .wait_workflow_delivery_rejection_backoff();
         Ok(Vec::new())
     }
 
@@ -1608,20 +2937,17 @@ impl Runtime {
             .map_err(poll_lane_failure)?;
         let semantic = match activity_protocol::task_from_core(&task) {
             Ok(semantic) => semantic,
-            Err(error) => {
-                self.reject_unrepresentable_activity(&task)?;
-                return Err(core_conversion_failure(error));
-            }
+            Err(error) => return self.reject_unrepresentable_activity(&task, error.message),
         };
         match activity_protocol::encode_task(&semantic) {
             Ok(encoded) => {
                 retain_activity_task(&mut self.activity_tasks, task.task_token.clone(), semantic);
                 Ok(encoded.into_bytes())
             }
-            Err(error) => {
-                self.reject_unrepresentable_activity(&task)?;
-                Err(protocol_failure(error))
-            }
+            Err(_error) => self.reject_unrepresentable_activity(
+                &task,
+                "semantic activity task JSON encoding failed",
+            ),
         }
     }
 
@@ -1632,15 +2958,26 @@ impl Runtime {
     /// Cancel variant is only an update to that Start; it has no independent
     /// completion to fail, so dropping a malformed update preserves the
     /// in-flight Start lease for the activity implementation.
+    ///
+    /// A handled rejection is local task progress, not a worker failure: one
+    /// task the bridge cannot represent (for example a standalone activity
+    /// with no workflow, or a header key another SDK allowed) must not end
+    /// `Worker.run` for every task on the queue (issue #801). After Core
+    /// accepts the generated non-retryable failure, the bounded static
+    /// `reason` is written to stderr and the poll returns `STATUS_NOT_READY`
+    /// so the worker keeps polling. A Core rejection error remains fatal
+    /// through the `?` below. No backoff is needed, unlike the workflow lane:
+    /// the failure is non-retryable, so the server does not redeliver it.
     fn reject_unrepresentable_activity(
         &self,
         task: &CoreActivityTask,
-    ) -> std::result::Result<(), Failure> {
+        reason: &'static str,
+    ) -> Operation {
         if activity_task_owns_completion_debt(task) {
-            self.reject_activity_delivery(&task.task_token)
-        } else {
-            Ok(())
+            self.reject_activity_delivery(&task.task_token, reason)?;
         }
+        write_rejected_activity_diagnostic(std::io::stderr().lock(), reason);
+        Err(not_ready())
     }
 
     /// Waits for remote-activity-lane readiness without consuming its task.
@@ -1666,6 +3003,32 @@ impl Runtime {
         }
     }
 
+    /// Waits for readiness on either live-worker lane without consuming a task.
+    ///
+    /// The worker loop uses this for its single idle native wait so a task on
+    /// the lane it did not expect wakes the supervisor at once rather than
+    /// after the bounded timeout (#806). Statuses match the lane-specific
+    /// waits: `STATUS_NOT_READY` on timeout and `STATUS_INVALID_STATE` once a
+    /// lane has closed without queued work.
+    fn wait_any(&self) -> Operation {
+        let worker = self.worker.as_ref().ok_or_else(|| Failure {
+            status: STATUS_INVALID_STATE,
+            message: "Temporal worker is not running".to_owned(),
+        })?;
+        match worker.wait_any() {
+            ReadinessWait::Ready => Ok(Vec::new()),
+            ReadinessWait::TimedOut => Err(Failure {
+                status: STATUS_NOT_READY,
+                message: "Temporal worker readiness wait timed out; retry".to_owned(),
+            }),
+            ReadinessWait::Shutdown => Err(Failure {
+                status: STATUS_INVALID_STATE,
+                message: "Temporal worker readiness wait ended during worker shutdown".to_owned(),
+            }),
+            ReadinessWait::Error(error) => Err(poll_lane_failure(error)),
+        }
+    }
+
     /// Applies the fixed native backoff used only after an explicitly
     /// retryable activity-completion outcome.
     ///
@@ -1682,14 +3045,6 @@ impl Runtime {
         };
         worker.wait_activity_completion_retry_backoff();
         Ok(Vec::new())
-    }
-
-    /// Fails and retires a workflow activation that was never exposed to OCaml.
-    fn reject_workflow_delivery(&self, run_id: &str) -> std::result::Result<(), Failure> {
-        self.reject_workflow_delivery_with_reason(
-            run_id,
-            "semantic workflow activation conversion failed",
-        )
     }
 
     /// Fails and retires a workflow activation with a static diagnostic
@@ -1731,8 +3086,13 @@ impl Runtime {
         Err(not_ready())
     }
 
-    /// Fails and retires an activity task that was never exposed to OCaml.
-    fn reject_activity_delivery(&self, task_token: &[u8]) -> std::result::Result<(), Failure> {
+    /// Fails and retires an activity task that was never exposed to OCaml,
+    /// reporting the static `reason` in the non-retryable Core failure.
+    fn reject_activity_delivery(
+        &self,
+        task_token: &[u8],
+        reason: &'static str,
+    ) -> std::result::Result<(), Failure> {
         let worker = self.worker.as_ref().ok_or_else(|| Failure {
             status: STATUS_INVALID_STATE,
             message: "Temporal worker is not running".to_owned(),
@@ -1743,7 +3103,7 @@ impl Runtime {
             .expect("worker retains parent runtime")
             .tokio_handle();
         handle
-            .block_on(worker.reject_activity_delivery(task_token))
+            .block_on(worker.reject_activity_delivery(task_token, reason))
             .map_err(worker_bridge_failure)
     }
 
@@ -1815,48 +3175,21 @@ impl Runtime {
             status: STATUS_INVALID_STATE,
             message: "Temporal client is not connected".to_owned(),
         })?;
-        let namespace = self.worker_namespace.clone().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker namespace is not available".to_owned(),
-        })?;
-        Client::new(connection, ClientOptions::new(namespace).build()).map_err(|_| Failure {
-            status: STATUS_CONNECTION,
-            message: "Temporal asynchronous activity client could not be created".to_owned(),
-        })
+        let namespace = self
+            .worker_namespace
+            .clone()
+            .ok_or_else(missing_worker_namespace)?;
+        async_activity_client_for(connection, namespace)
     }
 
-    /// Converts ordered semantic payloads into the optional protobuf collection
-    /// accepted by Core's asynchronous activity handle.
-    fn async_payloads(
-        values: &[workflow_protocol::Payload],
-    ) -> std::result::Result<Option<api_common::Payloads>, Failure> {
-        if values.is_empty() {
-            return Ok(None);
-        }
-        let payloads = values
-            .iter()
-            .map(workflow_protocol::payload_to_core)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(core_conversion_failure)?;
-        Ok(Some(api_common::Payloads { payloads }))
-    }
-
-    /// Completes a previously accepted asynchronous activity through Core's
-    /// namespace-bound client API.
-    ///
-    /// The semantic decoder is intentionally shared with worker completions,
-    /// but this endpoint rejects `will_complete_async`: that marker is the
-    /// worker-to-client handoff, not a terminal client operation. No entry in
-    /// `self.activity_tasks` is read or retired here; the OCaml async lease
-    /// owns the capability until Core accepts a terminal request.
-    fn complete_async_activity(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let semantic = activity_protocol::decode_completion(text).map_err(protocol_failure)?;
-        let task_token =
-            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
+    /// Runs one validated async activity request to completion on the
+    /// calling owner thread. This is the synchronous ABI path kept for direct
+    /// bridge callers; the OCaml worker submits the same request as a client
+    /// call instead, so its owner Domain never waits for the server (#1025).
+    /// Its heartbeats are not throttled, but its terminal requests evict their
+    /// token from the heartbeat throttle like submitted ones.
+    fn async_activity_blocking(&mut self, request: AsyncActivityRequest) -> Operation {
         let client = self.async_activity_client()?;
-        let activity =
-            client.get_async_activity_handle(ActivityIdentifier::TaskToken(TaskToken(task_token)));
         let handle = self
             .core
             .as_ref()
@@ -1865,71 +3198,27 @@ impl Runtime {
                 message: "Temporal runtime is already closed".to_owned(),
             })?
             .tokio_handle();
-        let operation = match &semantic.result {
-            activity_protocol::ActivityCompletionResult::Completed { result } => {
-                let payloads = result
-                    .as_ref()
-                    .map(|payload| Self::async_payloads(std::slice::from_ref(payload)))
-                    .transpose()?
-                    .flatten();
-                handle.block_on(activity.complete(payloads))
-            }
-            activity_protocol::ActivityCompletionResult::Failed { failure } => {
-                let failure =
-                    workflow_protocol::failure_to_core(failure).map_err(core_conversion_failure)?;
-                handle.block_on(activity.fail(failure, None))
-            }
-            activity_protocol::ActivityCompletionResult::Cancelled { failure } => {
-                let details = match &failure.info {
-                    workflow_protocol::FailureInfo::Canceled { details, .. } => {
-                        Self::async_payloads(details)?
-                    }
-                    _ => {
-                        return Err(Failure {
-                            status: STATUS_PROTOCOL,
-                            message:
-                                "asynchronous activity cancellation must use a canceled failure"
-                                    .to_owned(),
-                        });
-                    }
-                };
-                handle.block_on(activity.report_cancelation(details))
-            }
-            activity_protocol::ActivityCompletionResult::WillCompleteAsync => {
-                return Err(Failure {
-                    status: STATUS_PROTOCOL,
-                    message: "asynchronous activity completion cannot defer again".to_owned(),
-                });
-            }
-        };
-        operation
-            .map_err(|error| async_activity_failure(AsyncActivityOperation::Completion, error))?;
+        handle.block_on(request.send_evicting(client, &self.heartbeat_throttle))?;
         Ok(Vec::new())
+    }
+
+    /// Completes a previously accepted asynchronous activity through Core's
+    /// namespace-bound client API; see
+    /// [`AsyncActivityRequest::decode_completion`] for the accepted input.
+    /// No entry in the worker ledger is read or retired here; the OCaml async
+    /// lease owns the capability until Core accepts a terminal request.
+    fn complete_async_activity(&mut self, input: &[u8]) -> Operation {
+        let text = decode_semantic_input(input)?;
+        let request = AsyncActivityRequest::decode_completion(text)?;
+        self.async_activity_blocking(request)
     }
 
     /// Records a heartbeat for an asynchronously completed activity through
     /// the same namespace-bound client handle used for terminal operations.
     fn record_async_activity_heartbeat(&mut self, input: &[u8]) -> Operation {
         let text = decode_semantic_input(input)?;
-        let semantic = activity_protocol::decode_heartbeat(text).map_err(protocol_failure)?;
-        let task_token =
-            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
-        let details = Self::async_payloads(&semantic.details)?;
-        let client = self.async_activity_client()?;
-        let activity =
-            client.get_async_activity_handle(ActivityIdentifier::TaskToken(TaskToken(task_token)));
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
-            .tokio_handle();
-        handle
-            .block_on(activity.heartbeat(details))
-            .map_err(|error| async_activity_failure(AsyncActivityOperation::Heartbeat, error))?;
-        Ok(Vec::new())
+        let request = AsyncActivityRequest::decode_heartbeat(text)?;
+        self.async_activity_blocking(request)
     }
 
     /// Revalidates Rust-produced task JSON and removes only the rejected
@@ -1940,7 +3229,12 @@ impl Runtime {
     /// native lease. A cancellation is only an update attached to the same
     /// token. If its JSON cannot be decoded, dropping that one update must not
     /// retire the start lease that another OCaml call still has to complete.
+    ///
+    /// Success means the task was handled locally (issue #801): the OCaml
+    /// supervisor then reports an empty poll and keeps polling. The static
+    /// diagnostic is written only after the rejection succeeded.
     fn reject_polled_activity(&mut self, input: &[u8]) -> Operation {
+        const REASON: &str = "OCaml semantic activity task decoding failed";
         let rejection = activity_rejection_task(&self.activity_tasks, input)?;
         let owns_completion_debt = matches!(
             &rejection.task.variant,
@@ -1950,7 +3244,7 @@ impl Runtime {
         // Cancel has no independent completion to reject; removing just its
         // retained document preserves the shared Start debt.
         let native_rejection = if owns_completion_debt {
-            self.reject_activity_delivery(&rejection.task_token)
+            self.reject_activity_delivery(&rejection.task_token, REASON)
         } else {
             Ok(())
         };
@@ -1960,11 +3254,22 @@ impl Runtime {
             &rejection.task,
         );
         native_rejection?;
+        write_rejected_activity_diagnostic(std::io::stderr().lock(), REASON);
         Ok(Vec::new())
     }
 
-    /// Cancels retained history waits and drops the client after its worker
-    /// child and workflow starts are absent.
+    /// Cancels retained history waits, aborts in-flight workflow starts, and
+    /// drops the client after its worker child is absent.
+    ///
+    /// A start ticket that is still pending here has already handed its
+    /// request to a Tokio task, so Temporal may or may not have accepted it.
+    /// Disconnect is part of explicit SDK shutdown, which must not fail merely
+    /// because another caller Domain is still awaiting that ticket: the ticket
+    /// is retired exactly once by draining the registry, its task is aborted
+    /// and joined (the C stub has released the OCaml runtime lock), and the
+    /// waiting OCaml caller reports the start as outcome-unknown when it next
+    /// observes the closed client. No result for a retired ticket is ever
+    /// fabricated as accepted or rejected.
     fn disconnect_client(&mut self) -> Operation {
         if self.worker.is_some() {
             return Err(Failure {
@@ -1972,15 +3277,25 @@ impl Runtime {
                 message: "Temporal client cannot disconnect while its worker is running".to_owned(),
             });
         }
-        if !self.pending_starts.is_empty() {
-            return Err(Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal client cannot disconnect while workflow starts are pending"
-                    .to_owned(),
-            });
-        }
         self.pending_waits.clear();
+        // `core` is only taken by `close`, which consumes the runtime, so the
+        // waiting abort always joins every task on this owner thread and
+        // returns no deferred handles for the cleanup thread.
+        let remaining = self.abort_pending_starts(true);
+        debug_assert!(remaining.is_empty());
+        // Submitted calls are released the same way: their waiters observe
+        // the closed failure and their tasks are joined before the
+        // connection is dropped (#807).
+        let remaining = self.abort_pending_calls(true);
+        debug_assert!(remaining.is_empty());
+        // Heartbeat drivers hold connection clones too (#1025).
+        let remaining = self.abort_heartbeat_drivers(true);
+        debug_assert!(remaining.is_empty());
         self.client.take();
+        // Limits belong to the connection they were configured with (#796):
+        // a runtime without a connection reports the defaults again, and a
+        // later connect installs its own.
+        self.client_limits = crate::client_calls::ClientLimits::default();
         Ok(Vec::new())
     }
 
@@ -1993,7 +3308,12 @@ impl Runtime {
         // Cancel borrowed history futures before transferring their executor
         // and connection to the cleanup thread, including GC fallback close.
         self.pending_waits.clear();
-        let pending_start_tasks = self.abort_pending_starts(wait);
+        let mut pending_start_tasks = self.abort_pending_starts(wait);
+        // Submitted client calls follow the same abort/join rule; their
+        // unjoined handles share the cleanup thread's join list (#807).
+        pending_start_tasks.extend(self.abort_pending_calls(wait));
+        // So do async heartbeat drivers (#1025).
+        pending_start_tasks.extend(self.abort_heartbeat_drivers(wait));
         let Some(core) = self.core.take() else {
             return STATUS_OK;
         };
@@ -2069,20 +3389,24 @@ fn run_runtime_cleanup(receiver: Receiver<RuntimeCleanup>) {
     } else {
         STATUS_PANIC
     };
-    // Release publishes completion after Core's destructor has returned. The
-    // matching Acquire load is used only by the isolated ownership test.
+    // When this graph held Core's last reference, `drop_runtime_graph` has
+    // already dropped Core and then closed its log writer (see the field
+    // order of `SharedCore`); otherwise Core stays alive for its other
+    // holders. Release publishes completion after that drop has returned.
+    // The matching Acquire load is used only by the isolated ownership test.
     RUNTIMES_CLEANED.fetch_add(1, Ordering::Release);
     if let Some(completed) = completed {
         let _ = completed.send(status);
     }
 }
 
-/// Releases aborted start tasks, then worker, client, and Core on the runtime
-/// cleanup thread.  Awaiting the transferred handles is essential: dropping a
+/// Releases aborted start tasks, then worker, client, and this graph's Core
+/// reference on the runtime cleanup thread (Core itself is destroyed only if
+/// that was its last reference).  Awaiting the transferred handles is essential: dropping a
 /// Tokio [`JoinHandle`] after `abort` would detach its task, allowing the task
 /// to retain a cloned `Connection` beyond the lifetime of the runtime graph.
 fn drop_runtime_graph(
-    core: CoreRuntime,
+    core: Arc<SharedCore>,
     client: Option<Connection>,
     worker: Option<PollLanes>,
     replay_worker: Option<ReplayWorker>,
@@ -2106,20 +3430,28 @@ fn drop_runtime_graph(
         // outstanding. Force-fail every still-owned debt before joining the
         // lanes so dispose cannot block forever waiting for OCaml.
         handle.block_on(worker.force_complete_outstanding_for_dispose());
-        let _ = handle.block_on(worker.join_poll_lanes());
+        // The join keeps completing tasks that polls already in flight publish
+        // while the lanes stop, and is bounded so dispose cannot hang on a
+        // debt Core keeps outstanding (issue #769). A timeout leaves the
+        // worker unfinalizable, which the match below handles.
+        let _ = handle.block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT));
         // A poll that was already inside Core can return after the first drain
         // and publish a new ready task before its lane exits.  The joins above
         // establish that no producer remains; a final pass therefore closes
         // the only window in which a late task could otherwise be dropped with
         // an outstanding Core completion debt.
         handle.block_on(worker.force_complete_outstanding_for_dispose());
-        match handle.block_on(worker.finalize()) {
-            Ok(()) => {}
-            Err((worker, _)) => {
+        match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+            BoundedFinalize::Refused(worker, _) => {
                 // Dispose cannot wait for OCaml. Dropping after force-complete
                 // is the last-resort reclaim path.
                 drop(worker);
             }
+            // A detached finalizer still owns the worker; dropping the last
+            // Core reference shuts down its Tokio runtime, which ends that
+            // task. On a shared runtime the task ends when the last holder
+            // releases Core, still bounded by that runtime's lifetime.
+            BoundedFinalize::Finalized | BoundedFinalize::Panicked | BoundedFinalize::Detached => {}
         }
     }
     if let Some(worker) = replay_worker {
@@ -2169,10 +3501,8 @@ fn replay_worker_failure(error: ReplayWorkerError) -> Failure {
             STATUS_OUTSTANDING_TASKS,
             "Temporal replay worker has not drained all input",
         ),
-        ReplayWorkerError::InvalidHistory(_) => (
-            STATUS_PROTOCOL,
-            "Temporal replay history failed strict validation",
-        ),
+        // Each input category maps to a static, input-free sentence.
+        ReplayWorkerError::InvalidHistory(input) => (STATUS_PROTOCOL, input.abi_message()),
         ReplayWorkerError::CoreInitialization => {
             (STATUS_WORKER, "Temporal replay worker construction failed")
         }
@@ -2180,6 +3510,10 @@ fn replay_worker_failure(error: ReplayWorkerError) -> Failure {
         ReplayWorkerError::Finalization(_) => {
             (STATUS_WORKER, "Temporal replay worker finalization failed")
         }
+        ReplayWorkerError::TimedOut(_) => (
+            STATUS_WORKER,
+            "Temporal replay worker did not respond within its bound",
+        ),
     };
     Failure {
         status,
@@ -2193,7 +3527,10 @@ fn replay_worker_failure(error: ReplayWorkerError) -> Failure {
 fn client_operation_failure(error: client_protocol::ClientOperationError) -> Failure {
     let status = match &error {
         client_protocol::ClientOperationError::AlreadyStarted { .. } => STATUS_ALREADY_STARTED,
-        client_protocol::ClientOperationError::Rpc { .. } => STATUS_CONNECTION,
+        // A query handler failure reaches the bridge as an RPC status, so it
+        // shares the RPC status; its JSON `kind` carries the distinction.
+        client_protocol::ClientOperationError::Rpc { .. }
+        | client_protocol::ClientOperationError::QueryFailed { .. } => STATUS_CONNECTION,
         client_protocol::ClientOperationError::Core(_) => STATUS_PROTOCOL,
     };
     Failure {
@@ -2207,6 +3544,18 @@ fn poll_lane_failure(error: PollLaneError) -> Failure {
     Failure {
         status: STATUS_WORKER,
         message: public_poll_lane_error_message(&error).to_owned(),
+    }
+}
+
+/// Maps a failed bounded shutdown drain to a closed worker failure. The worker
+/// stays in the runtime graph in both cases, so runtime close disposes it.
+fn shutdown_drain_failure(error: ShutdownDrainError) -> Failure {
+    match error {
+        ShutdownDrainError::Lane(error) => poll_lane_failure(error),
+        ShutdownDrainError::TimedOut => Failure {
+            status: STATUS_WORKER,
+            message: "Temporal worker poll lanes did not stop within the shutdown bound".to_owned(),
+        },
     }
 }
 
@@ -2225,6 +3574,14 @@ fn write_rejected_workflow_diagnostic(mut output: impl Write, reason: &'static s
         output,
         "ocaml-temporal: rejected workflow delivery: {reason}"
     );
+}
+
+/// Best-effort stderr diagnostic after an unrepresentable activity task was
+/// handled locally. As for workflows, only the static category is written;
+/// no task token, identifier, header, or payload reaches the log, and a closed
+/// stderr cannot turn the handled task into an ABI panic.
+fn write_rejected_activity_diagnostic(mut output: impl Write, reason: &'static str) {
+    let _ = writeln!(output, "ocaml-temporal: rejected activity task: {reason}");
 }
 
 /// Reports an exact-run wait that must be retried without exposing a fake
@@ -2475,15 +3832,33 @@ impl WorkerConfigInput {
                                 .to_owned(),
                     });
                 }
+                // Every successful completion leaves the per-workflow
+                // behavior UNSPECIFIED because the OCaml SDK has no
+                // per-workflow behavior API, and pinned Core substitutes only
+                // a configured worker default. A versioned worker without a
+                // default would therefore declare every workflow unversioned,
+                // which Temporal defines as invalid for versioned workers.
+                if use_worker_versioning && default_versioning_behavior.is_none() {
+                    return Err(Failure {
+                        status: STATUS_CONFIGURATION,
+                        message: "versioning.use_worker_versioning requires \
+                                  default_versioning_behavior"
+                            .to_owned(),
+                    });
+                }
+                // Core 1.x marks both structs non-exhaustive, so they are
+                // assembled through Core's builders; every field is still set
+                // explicitly from validated input.
                 WorkerVersioningStrategy::WorkerDeploymentBased(
-                    temporalio_common::worker::WorkerDeploymentOptions {
-                        version: temporalio_common::worker::WorkerDeploymentVersion {
-                            deployment_name,
-                            build_id,
-                        },
-                        use_worker_versioning,
-                        default_versioning_behavior,
-                    },
+                    WorkerDeploymentOptions::new(
+                        WorkerDeploymentVersion::builder()
+                            .deployment_name(deployment_name)
+                            .build_id(build_id)
+                            .build(),
+                    )
+                    .use_worker_versioning(use_worker_versioning)
+                    .maybe_default_versioning_behavior(default_versioning_behavior)
+                    .build(),
                 )
             }
         };
@@ -2498,7 +3873,11 @@ impl WorkerConfigInput {
             self.max_concurrent_workflow_task_polls,
             false,
         )?;
+        // Core's `wft_poller_behavior` splits only `SimpleMaximum` between the
+        // sticky and normal buffers; an autoscaling behavior is given to each
+        // buffer unchanged, so a caching worker always has two pollers.
         if self.max_cached_workflows > 0
+            && self.tuning.workflow_task_poller_autoscaling.is_none()
             && self.max_concurrent_workflow_task_polls < MIN_CACHED_WORKFLOW_POLLS
         {
             return Err(Failure {
@@ -2513,10 +3892,13 @@ impl WorkerConfigInput {
             });
         }
 
-        // Pinned Core caps cache-enabled permit acquisition at max(cache, 2),
-        // but its sticky/normal poller balancer reads the supplier's slot count.
-        // Give both the same effective capacity so idle sticky polls cannot
-        // reserve the slots needed to discover new workflows on the normal queue.
+        // Core caps cache-enabled permit acquisition at max(cache, 2). Before
+        // Core v1.1.0 its sticky/normal poller balancer read the supplier's
+        // slot count instead, so idle sticky polls could reserve the slots
+        // needed to discover new workflows on the normal queue. The pinned
+        // balancer (v1.1.0) bounds itself by the same cap, so this clamp now
+        // only keeps the advertised capacity equal to what Core enforces; it
+        // is retained so slot metrics and the #555 regression stay unchanged.
         // Preserve stricter caller limits and the uncached worker behavior.
         let workflow_task_slots = if self.max_cached_workflows == 0 {
             self.max_outstanding_workflow_tasks
@@ -2529,27 +3911,251 @@ impl WorkerConfigInput {
             status: STATUS_CONFIGURATION,
             message: "max_outstanding_workflow_tasks exceeds platform capacity".to_owned(),
         })?;
+        let workflow_task_poller_behavior = self
+            .tuning
+            .workflow_task_poller_behavior(self.max_concurrent_workflow_task_polls)?;
+        let tuning = self.tuning.validated()?;
 
         WorkerConfig::builder()
             .namespace(self.namespace)
             .task_queue(self.task_queue)
-            .max_cached_workflows(self.max_cached_workflows as usize)
+            .max_cached_workflows(to_usize("max_cached_workflows", self.max_cached_workflows)?)
             .max_outstanding_workflow_tasks(workflow_task_slots)
-            .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(
-                self.max_concurrent_workflow_task_polls as usize,
-            ))
+            .workflow_task_poller_behavior(workflow_task_poller_behavior)
+            .sticky_queue_schedule_to_start_timeout(tuning.sticky_queue_schedule_to_start_timeout)
+            .max_heartbeat_throttle_interval(tuning.max_heartbeat_throttle_interval)
+            .default_heartbeat_throttle_interval(tuning.default_heartbeat_throttle_interval)
+            .maybe_max_worker_activities_per_second(tuning.max_worker_activities_per_second)
+            .maybe_max_task_queue_activities_per_second(tuning.max_task_queue_activities_per_second)
             .graceful_shutdown_period(Duration::from_millis(self.graceful_shutdown_timeout_ms))
             .versioning_strategy(versioning_strategy)
             .max_outstanding_activities(DEFAULT_MAX_OUTSTANDING_ACTIVITIES)
+            .max_outstanding_local_activities(DEFAULT_MAX_OUTSTANDING_LOCAL_ACTIVITIES)
             .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(
                 DEFAULT_MAX_CONCURRENT_ACTIVITY_POLLS,
             ))
-            .task_types(crate::worker_bridge::bridge_task_types())
+            .task_types(
+                crate::worker_bridge::bridge_task_types(
+                    self.task_types.workflows,
+                    self.task_types.activities,
+                )
+                .map_err(|message| Failure {
+                    status: STATUS_CONFIGURATION,
+                    message: message.to_owned(),
+                })?,
+            )
             .build()
             .map_err(|message| Failure {
                 status: STATUS_CONFIGURATION,
                 message: format!("Temporal workflow worker configuration is invalid: {message}"),
             })
+    }
+}
+
+/// Core's default sticky-queue schedule-to-start timeout, restated so an
+/// absent setting still reaches the builder as an explicit, testable value.
+const CORE_DEFAULT_STICKY_QUEUE_SCHEDULE_TO_START_MS: u64 = 10_000;
+/// Core's default longest heartbeat throttle interval.
+const CORE_DEFAULT_MAX_HEARTBEAT_THROTTLE_MS: u64 = 60_000;
+/// Core's default heartbeat throttle interval without a heartbeat timeout.
+const CORE_DEFAULT_HEARTBEAT_THROTTLE_MS: u64 = 30_000;
+/// Async heartbeat throttle settings of a runtime that has not started a
+/// worker; such a runtime has no namespace, so they are never used.
+const CORE_DEFAULT_HEARTBEAT_INTERVALS: HeartbeatIntervals = HeartbeatIntervals {
+    max: Duration::from_millis(CORE_DEFAULT_MAX_HEARTBEAT_THROTTLE_MS),
+    default: Duration::from_millis(CORE_DEFAULT_HEARTBEAT_THROTTLE_MS),
+};
+
+/// Tuning values after bridge validation, ready for the Core builder.
+struct ValidatedTuning {
+    /// Sticky-queue schedule-to-start timeout handed to Core.
+    sticky_queue_schedule_to_start_timeout: Duration,
+    /// Longest heartbeat throttle interval handed to Core.
+    max_heartbeat_throttle_interval: Duration,
+    /// Default heartbeat throttle interval handed to Core.
+    default_heartbeat_throttle_interval: Duration,
+    /// Per-worker remote activity rate, when limited.
+    max_worker_activities_per_second: Option<f64>,
+    /// Task-queue activity dispatch rate, when requested.
+    max_task_queue_activities_per_second: Option<f64>,
+}
+
+impl WorkerTuningInput {
+    /// Selects Core's workflow poller behavior. Without autoscaling this is
+    /// the historical fixed maximum; with it, the bounds must be ordered and
+    /// the maximum must equal the document's `max_concurrent_workflow_task_polls`
+    /// so the cache-poller invariant checked on that field still applies.
+    fn workflow_task_poller_behavior(
+        &self,
+        max_concurrent_workflow_task_polls: u32,
+    ) -> std::result::Result<PollerBehavior, Failure> {
+        let Some(autoscaling) = self.workflow_task_poller_autoscaling else {
+            return Ok(PollerBehavior::SimpleMaximum(to_usize(
+                "max_concurrent_workflow_task_polls",
+                max_concurrent_workflow_task_polls,
+            )?));
+        };
+        validate_count(
+            "workflow_task_poller_autoscaling.minimum",
+            autoscaling.minimum,
+            false,
+        )?;
+        validate_count(
+            "workflow_task_poller_autoscaling.maximum",
+            autoscaling.maximum,
+            false,
+        )?;
+        if autoscaling.maximum < autoscaling.minimum {
+            return Err(configuration_failure(
+                "workflow_task_poller_autoscaling.maximum must be at least minimum",
+            ));
+        }
+        if autoscaling.initial < autoscaling.minimum || autoscaling.initial > autoscaling.maximum {
+            return Err(configuration_failure(
+                "workflow_task_poller_autoscaling.initial must be between minimum and maximum",
+            ));
+        }
+        if autoscaling.maximum != max_concurrent_workflow_task_polls {
+            return Err(configuration_failure(
+                "workflow_task_poller_autoscaling.maximum must equal max_concurrent_workflow_task_polls",
+            ));
+        }
+        Ok(PollerBehavior::Autoscaling {
+            minimum: to_usize(
+                "workflow_task_poller_autoscaling.minimum",
+                autoscaling.minimum,
+            )?,
+            maximum: to_usize(
+                "workflow_task_poller_autoscaling.maximum",
+                autoscaling.maximum,
+            )?,
+            initial: to_usize(
+                "workflow_task_poller_autoscaling.initial",
+                autoscaling.initial,
+            )?,
+        })
+    }
+
+    /// The validated heartbeat throttle settings, exactly as handed to Core,
+    /// for the async heartbeat throttle (#1025).
+    fn heartbeat_intervals(&self) -> std::result::Result<HeartbeatIntervals, Failure> {
+        let tuning = self.validated()?;
+        Ok(HeartbeatIntervals {
+            max: tuning.max_heartbeat_throttle_interval,
+            default: tuning.default_heartbeat_throttle_interval,
+        })
+    }
+
+    /// Validates every duration and rate, filling Core's defaults for absent
+    /// durations. Core clips the default heartbeat interval to the maximum
+    /// silently; an explicit contradiction is rejected instead. Core rejects
+    /// a non-normal worker rate only at build time and never checks the task
+    /// queue rate, so both are checked here with the same rule.
+    fn validated(&self) -> std::result::Result<ValidatedTuning, Failure> {
+        let sticky = tuning_duration(
+            "sticky_queue_schedule_to_start_timeout_ms",
+            self.sticky_queue_schedule_to_start_timeout_ms,
+            CORE_DEFAULT_STICKY_QUEUE_SCHEDULE_TO_START_MS,
+        )?;
+        let max_heartbeat = tuning_duration(
+            "max_heartbeat_throttle_interval_ms",
+            self.max_heartbeat_throttle_interval_ms,
+            CORE_DEFAULT_MAX_HEARTBEAT_THROTTLE_MS,
+        )?;
+        let default_heartbeat = tuning_duration(
+            "default_heartbeat_throttle_interval_ms",
+            self.default_heartbeat_throttle_interval_ms,
+            CORE_DEFAULT_HEARTBEAT_THROTTLE_MS,
+        )?;
+        if let (Some(default), Some(maximum)) = (
+            self.default_heartbeat_throttle_interval_ms,
+            self.max_heartbeat_throttle_interval_ms,
+        ) && default > maximum
+        {
+            return Err(configuration_failure(
+                "default_heartbeat_throttle_interval_ms must not exceed max_heartbeat_throttle_interval_ms",
+            ));
+        }
+        Ok(ValidatedTuning {
+            sticky_queue_schedule_to_start_timeout: sticky,
+            max_heartbeat_throttle_interval: max_heartbeat,
+            default_heartbeat_throttle_interval: default_heartbeat,
+            max_worker_activities_per_second: worker_rate(
+                "max_worker_activities_per_second",
+                self.max_worker_activities_per_second,
+            )?,
+            max_task_queue_activities_per_second: tuning_rate(
+                "max_task_queue_activities_per_second",
+                self.max_task_queue_activities_per_second,
+            )?,
+        })
+    }
+}
+
+/// Builds a configuration failure with a static message.
+fn configuration_failure(message: &str) -> Failure {
+    Failure {
+        status: STATUS_CONFIGURATION,
+        message: message.to_owned(),
+    }
+}
+
+/// Converts a validated JSON count to Core's `usize` without a lossy cast.
+fn to_usize(name: &str, value: u32) -> std::result::Result<usize, Failure> {
+    usize::try_from(value).map_err(|_| Failure {
+        status: STATUS_CONFIGURATION,
+        message: format!("{name} exceeds platform capacity"),
+    })
+}
+
+/// Validates one optional tuning duration (1 ms to one day) or returns the
+/// Core default when it is absent.
+fn tuning_duration(
+    name: &str,
+    value: Option<u64>,
+    default_ms: u64,
+) -> std::result::Result<Duration, Failure> {
+    match value {
+        None => Ok(Duration::from_millis(default_ms)),
+        Some(milliseconds) if (1..=MAX_WORKER_TUNING_DURATION_MS).contains(&milliseconds) => {
+            Ok(Duration::from_millis(milliseconds))
+        }
+        Some(_) => Err(Failure {
+            status: STATUS_CONFIGURATION,
+            message: format!("{name} must be between 1 and {MAX_WORKER_TUNING_DURATION_MS}"),
+        }),
+    }
+}
+
+/// Accepts only positive, finite, normal rates.
+fn tuning_rate(name: &str, value: Option<f64>) -> std::result::Result<Option<f64>, Failure> {
+    match value {
+        None => Ok(None),
+        Some(rate) if rate.is_normal() && rate.is_sign_positive() => Ok(Some(rate)),
+        Some(_) => Err(Failure {
+            status: STATUS_CONFIGURATION,
+            message: format!("{name} must be a positive finite number"),
+        }),
+    }
+}
+
+/// Smallest accepted per-worker activity rate: one poll per day. Its
+/// reciprocal (about 86400 s) is far inside `Duration`'s range.
+const MIN_WORKER_ACTIVITIES_PER_SECOND: f64 = 1.0 / 86_400.0;
+
+/// Validates the per-worker activity rate. Core's `PollRateLimiter::new`
+/// computes `Duration::from_secs_f64(rate.recip())`, which panics inside
+/// worker construction when the reciprocal overflows `Duration`; bounding the
+/// reciprocal to one day keeps that conversion total. The task-queue rate is
+/// only forwarded to the server and needs no such bound.
+fn worker_rate(name: &str, value: Option<f64>) -> std::result::Result<Option<f64>, Failure> {
+    let rate = tuning_rate(name, value)?;
+    match rate {
+        Some(rate) if rate < MIN_WORKER_ACTIVITIES_PER_SECOND => Err(Failure {
+            status: STATUS_CONFIGURATION,
+            message: format!("{name} must be at least one per day (1/86400)"),
+        }),
+        _ => Ok(rate),
     }
 }
 
@@ -2591,7 +4197,7 @@ fn validate_count(name: &str, value: u32, allow_zero: bool) -> std::result::Resu
 }
 
 /// Byte-producing operation accepted by the shared panic/ownership wrapper.
-type Operation = std::result::Result<Vec<u8>, Failure>;
+pub(crate) type Operation = std::result::Result<Vec<u8>, Failure>;
 
 /// Constructs the only valid successful result shape.
 fn success(value: Vec<u8>) -> Result {
@@ -2611,10 +4217,13 @@ fn failure(status: Status, message: impl Into<String>) -> Result {
     }
 }
 
-/// Initializes output, contains panics, and commits one fully formed result.
+/// Initializes output, contains panics and SIGPIPE, and commits one fully
+/// formed result.
 ///
 /// Writing the empty result before executing user logic ensures every non-null
-/// output is safe to free even when the operation panics.
+/// output is safe to free even when the operation panics. SIGPIPE is blocked
+/// on the calling thread for the duration of the operation; see
+/// [`crate::sigpipe`].
 unsafe fn invoke(output: *mut Result, operation: impl FnOnce() -> Operation) -> Status {
     if output.is_null() {
         return STATUS_INVALID_ARGUMENT;
@@ -2624,6 +4233,12 @@ unsafe fn invoke(output: *mut Result, operation: impl FnOnce() -> Operation) -> 
     // be valid and writable. `ptr::write` also permits uninitialized storage.
     unsafe { ptr::write(output, Result::default()) };
 
+    // The caller's thread belongs to the application, and `block_on` can
+    // drive socket writes (for example a TLS handshake) on it. Hold SIGPIPE
+    // blocked for the call so a peer reset surfaces as `EPIPE` rather than
+    // terminating the process, then restore the caller's mask (#1041). The
+    // guard outlives the panic boundary, so a contained panic restores too.
+    let _sigpipe = crate::sigpipe::CallerGuard::enter();
     let result = match catch_unwind(AssertUnwindSafe(operation)) {
         Ok(Ok(value)) => success(value),
         Ok(Err(error)) => failure(error.status, error.message),
@@ -2638,6 +4253,67 @@ unsafe fn invoke(output: *mut Result, operation: impl FnOnce() -> Operation) -> 
     // (empty) value is retained.
     unsafe { ptr::write(output, result) };
     status
+}
+
+/// Runs one runtime operation over a bounded strict-document input span.
+///
+/// This is the common shape of the JSON-document entry points: the input span
+/// is checked against [`crate::protocol::MAX_DOCUMENT_BYTES`] before the
+/// runtime handle, preserving the established failure precedence, and the
+/// whole operation runs inside [`invoke`]'s panic and result boundary.
+///
+/// # Safety
+///
+/// `runtime` follows [`runtime_mut`]'s contract, the input span follows
+/// [`input_span`]'s contract, and `output` follows [`invoke`]'s contract.
+unsafe fn invoke_runtime_document(
+    output: *mut Result,
+    runtime: *mut Runtime,
+    input: *const u8,
+    input_len: usize,
+    operation: impl FnOnce(&mut Runtime, &[u8]) -> Operation,
+) -> Status {
+    // SAFETY: The caller supplies the pointer and span contracts documented
+    // above; `invoke` validates `output` before running the closure.
+    unsafe {
+        invoke(output, || {
+            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
+            operation(runtime_mut(runtime)?, input)
+        })
+    }
+}
+
+/// Borrows one opaque runtime handle exclusively, refusing a null pointer.
+///
+/// # Safety
+///
+/// A non-null `runtime` must identify a live handle created by
+/// [`ocaml_temporal_core_v4_runtime_new`] that no other reference aliases for
+/// `'a`.
+unsafe fn runtime_mut<'a>(runtime: *mut Runtime) -> std::result::Result<&'a mut Runtime, Failure> {
+    // SAFETY: Upheld by the caller as documented above.
+    unsafe { runtime.as_mut() }.ok_or_else(null_runtime)
+}
+
+/// Borrows one opaque runtime handle for shared access, refusing a null
+/// pointer. Used by entry points, such as the blocking waits, whose runtime
+/// operation needs only `&Runtime`.
+///
+/// # Safety
+///
+/// A non-null `runtime` must identify a live runtime handle that is not
+/// mutably aliased for `'a`.
+unsafe fn runtime_ref<'a>(runtime: *const Runtime) -> std::result::Result<&'a Runtime, Failure> {
+    // SAFETY: Upheld by the caller as documented above.
+    unsafe { runtime.as_ref() }.ok_or_else(null_runtime)
+}
+
+/// Reports a null runtime handle passed across the native ABI.
+fn null_runtime() -> Failure {
+    Failure {
+        status: STATUS_INVALID_ARGUMENT,
+        message: "runtime pointer is null".to_owned(),
+    }
 }
 
 /// Decodes one bounded strict UTF-8 JSON lifecycle configuration.
@@ -2725,14 +4401,14 @@ unsafe fn free_buffer(buffer: &mut Buffer) {
     *buffer = Buffer::default();
 }
 
-/// Negotiate ABI version 2.
+/// Negotiate ABI version 4.
 ///
 /// # Safety
 ///
 /// `output` must be null or point to writable storage for one [`Result`]. It
 /// must not contain live bridge-owned allocations when this function starts.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_check_abi_version(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_check_abi_version(
     requested_version: u32,
     output: *mut Result,
 ) -> Status {
@@ -2763,9 +4439,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_check_abi_version(
 ///
 /// When `input_len` is nonzero, `input` must point to that many readable bytes.
 /// `output` follows the same contract as
-/// [`ocaml_temporal_core_v2_check_abi_version`] and must not overlap `input`.
+/// [`ocaml_temporal_core_v4_check_abi_version`] and must not overlap `input`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_echo(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_echo(
     input: *const u8,
     input_len: usize,
     output: *mut Result,
@@ -2800,9 +4476,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_echo(
 /// # Safety
 ///
 /// `output` follows the same contract as
-/// [`ocaml_temporal_core_v2_check_abi_version`].
+/// [`ocaml_temporal_core_v4_check_abi_version`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_conformance_wait_ms(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_conformance_wait_ms(
     milliseconds: u32,
     output: *mut Result,
 ) -> Status {
@@ -2821,19 +4497,209 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_conformance_wait_ms(
     }
 }
 
+/// Longest sleep, in nanoseconds, that
+/// [`ocaml_temporal_core_v4_pacing_sleep_ns`] performs. Worker idle pacing
+/// never asks for more than its 10 ms cap; the bound keeps an accidental huge
+/// request from parking a worker lane indefinitely.
+pub const MAX_PACING_SLEEP_NS: u64 = 1_000_000_000;
+
+/// Sleeps the calling thread for `nanoseconds`, clamped to
+/// [`MAX_PACING_SLEEP_NS`], for worker idle pacing (#1008).
+///
+/// The OCaml worker lanes back off from 0.1 ms to 10 ms between nonblocking
+/// polls while the sibling lane is busy. OCaml's `Thread.delay` passes whole
+/// milliseconds to the Windows `Sleep`, which then lasts until a 15.6 ms
+/// system timer tick, so that backoff could not go below one tick there.
+/// `std::thread::sleep` instead uses a per-timer high-resolution waitable
+/// timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10 1803 and later)
+/// and falls back to `Sleep` only where that is unavailable. Unlike
+/// `timeBeginPeriod`, it changes no process- or system-wide timer resolution.
+/// On Unix-like targets it is `nanosleep`, like `Thread.delay`.
+///
+/// A zero request returns at once without yielding the thread. The call
+/// touches no shared bridge state and owns no handle beyond the sleep, so it
+/// is safe from any thread; the OCaml stub calls it with the runtime lock
+/// released. It is not a workflow timer and has no effect on determinism.
+///
+/// Returns `STATUS_OK`, or `STATUS_PANIC` if a panic was contained. There is
+/// no result object, so the hot idle path allocates nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn ocaml_temporal_core_v4_pacing_sleep_ns(nanoseconds: u64) -> Status {
+    if nanoseconds == 0 {
+        return STATUS_OK;
+    }
+    let duration = Duration::from_nanos(nanoseconds.min(MAX_PACING_SLEEP_NS));
+    // `std::thread::sleep` does not panic for a bounded duration; containment
+    // keeps any future unwind from crossing the C boundary, which would abort.
+    match catch_unwind(|| std::thread::sleep(duration)) {
+        Ok(()) => STATUS_OK,
+        Err(_) => STATUS_PANIC,
+    }
+}
+
+/// Builds Core and the runtime owner, forwarding Core's own log records at
+/// `log_level` (none when `off`) instead of discarding them (#833).
+///
+/// `spawn_log` creates the writer thread only when logging is enabled. The
+/// Core consumer merely formats and enqueues without blocking; the writer
+/// performs the stderr I/O and never calls OCaml (see
+/// [`diagnostics::CoreLogWriter`]). If a later step fails, dropping the
+/// writer runs its bounded close, so no thread outlives a failed constructor.
+fn create_runtime(
+    log_level: Option<diagnostics::CoreLogLevel>,
+    worker_threads: usize,
+    spawn_log: impl FnOnce() -> std::io::Result<diagnostics::CoreLogWriter>,
+) -> std::result::Result<Runtime, Failure> {
+    let core = create_shared_core(
+        log_level,
+        worker_threads,
+        &telemetry::TelemetryConfig::default(),
+        spawn_log,
+    )?;
+    Runtime::new(Arc::new(core))
+}
+
+/// Builds one Core runtime and its optional log writer without any instance
+/// graph; see [`create_runtime`] for the logging and failure contract.
+///
+/// `telemetry_config` selects an optional metrics exporter (#500). It is started
+/// after Core exists (it needs Core's Tokio pool) and before the runtime is
+/// returned, so every client and worker later created on it receives the
+/// meter. A failed exporter start drops the just-built Core here, and with
+/// it the log writer, so no thread or socket outlives the failure.
+fn create_shared_core(
+    log_level: Option<diagnostics::CoreLogLevel>,
+    worker_threads: usize,
+    telemetry_config: &telemetry::TelemetryConfig,
+    spawn_log: impl FnOnce() -> std::io::Result<diagnostics::CoreLogWriter>,
+) -> std::result::Result<SharedCore, Failure> {
+    let core_log = match log_level {
+        Some(level) => {
+            let writer = spawn_log().map_err(|error| Failure {
+                status: STATUS_INTERNAL,
+                message: format!("could not start Temporal Core log writer thread: {error}"),
+            })?;
+            Some((level, writer))
+        }
+        None => None,
+    };
+    let telemetry = TelemetryOptions::builder()
+        .maybe_logging(
+            core_log
+                .as_ref()
+                .map(|(level, writer)| diagnostics::core_logger(*level, writer.queue())),
+        )
+        .build();
+    // Core 1.x attaches detected hosting-environment and platform details to
+    // worker heartbeats by default, labelling the runtime as native Rust. The
+    // previous pin sent none, and the OCaml SDK offers no option to describe
+    // or opt into that disclosure, so it stays off.
+    let options = RuntimeOptions::builder()
+        .telemetry_options(telemetry)
+        .disable_environment_info(true)
+        .build()
+        .map_err(|_message| Failure {
+            status: STATUS_INTERNAL,
+            // Core runtime-option validation may change with the linked Core
+            // revision; expose only its stable category.
+            message: "could not configure Temporal Core runtime".to_owned(),
+        })?;
+    // Start from Core's own builder so its multi-thread flavor and thread-start
+    // hook are preserved; only the worker count differs from the default.
+    let mut tokio_builder = TokioRuntimeBuilder::default();
+    tokio_builder.inner.worker_threads(worker_threads);
+    // Core layers this hook after its own telemetry hook on every worker and
+    // blocking-pool thread. Those threads perform all of Core's socket I/O,
+    // including the vectored writes that raise SIGPIPE on Linux (#1041).
+    let block_sigpipe: Box<dyn Fn() + Send + Sync> = Box::new(crate::sigpipe::block_current_thread);
+    tokio_builder.lang_on_thread_start = Some(block_sigpipe);
+    let mut core = CoreRuntime::new(options, tokio_builder).map_err(|_error| {
+        Failure {
+            status: STATUS_INTERNAL,
+            // Runtime construction errors can contain Core or Tokio
+            // diagnostics. Keep the C result a closed category just like
+            // worker construction and poll failures.
+            message: "could not create Temporal Core runtime".to_owned(),
+        }
+    })?;
+    let metrics = telemetry::start_metrics(&mut core, telemetry_config)?;
+    Ok(SharedCore {
+        metrics,
+        core,
+        core_log: std::sync::Mutex::new(core_log.map(|(_, writer)| writer)),
+        _dropped: CoreDropMarker,
+    })
+}
+
+/// Resolves the Tokio worker-thread count for one runtime (#832).
+///
+/// `0` selects the bridge default: the host's available parallelism capped at
+/// [`DEFAULT_RUNTIME_WORKER_THREADS_CAP`], or one thread when parallelism
+/// cannot be queried. `1..=MAX_RUNTIME_WORKER_THREADS` is used unchanged; any
+/// larger value is an invalid argument. Resolution allocates nothing, so a
+/// rejected count leaves no partially created runtime behind.
+fn runtime_worker_threads(requested: u32) -> std::result::Result<usize, Failure> {
+    let unrepresentable = || Failure {
+        status: STATUS_INVALID_ARGUMENT,
+        message: "runtime worker thread count does not fit this platform".to_owned(),
+    };
+    match requested {
+        0 => {
+            let cap = usize::try_from(DEFAULT_RUNTIME_WORKER_THREADS_CAP)
+                .map_err(|_| unrepresentable())?;
+            Ok(std::thread::available_parallelism()
+                .map_or(1, std::num::NonZeroUsize::get)
+                .min(cap))
+        }
+        1..=MAX_RUNTIME_WORKER_THREADS => usize::try_from(requested).map_err(|_| unrepresentable()),
+        _ => Err(Failure {
+            status: STATUS_INVALID_ARGUMENT,
+            message: format!(
+                "runtime worker thread count must be between 1 and \
+                 {MAX_RUNTIME_WORKER_THREADS}, or 0 for the default"
+            ),
+        }),
+    }
+}
+
+/// Create the native runtime that will own later Core clients and workers,
+/// with the bridge's default Tokio worker-thread count.
+///
+/// This is [`ocaml_temporal_core_v4_runtime_new_with_worker_threads`] with a
+/// `worker_threads` of `0`; see that function for the ownership contract.
+///
+/// # Safety
+///
+/// As for [`ocaml_temporal_core_v4_runtime_new_with_worker_threads`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_new(
+    runtime: *mut *mut Runtime,
+    output: *mut Result,
+) -> Status {
+    // SAFETY: The pointer contracts are forwarded unchanged.
+    unsafe { ocaml_temporal_core_v4_runtime_new_with_worker_threads(0, runtime, output) }
+}
+
 /// Create the native runtime that will own later Core clients and workers.
 ///
+/// `worker_threads` bounds the runtime's Tokio worker pool (#832): `0`
+/// selects the bridge default (available parallelism capped at
+/// [`DEFAULT_RUNTIME_WORKER_THREADS_CAP`]), `1..=`[`MAX_RUNTIME_WORKER_THREADS`]
+/// is used unchanged, and a larger value fails with
+/// `STATUS_INVALID_ARGUMENT` before anything is allocated.
+///
 /// On success, `runtime` receives one owned opaque handle. The caller must
-/// eventually pass that same slot to [`ocaml_temporal_core_v2_runtime_free`].
+/// eventually pass that same slot to [`ocaml_temporal_core_v4_runtime_free`].
 ///
 /// # Safety
 ///
 /// `runtime` must be null or point to writable storage for one runtime pointer.
 /// `output` follows the result contract of
-/// [`ocaml_temporal_core_v2_check_abi_version`]. A non-null runtime slot must
+/// [`ocaml_temporal_core_v4_check_abi_version`]. A non-null runtime slot must
 /// not already contain a live handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_new(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_new_with_worker_threads(
+    worker_threads: u32,
     runtime: *mut *mut Runtime,
     output: *mut Result,
 ) -> Status {
@@ -2863,25 +4729,17 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_new(
     // SAFETY: Both output locations were validated above.
     unsafe {
         invoke(output, || {
-            let options = RuntimeOptions::builder()
-                .build()
-                .map_err(|_message| Failure {
-                    status: STATUS_INTERNAL,
-                    // Core runtime-option validation may change with the
-                    // linked Core revision; expose only its stable category.
-                    message: "could not configure Temporal Core runtime".to_owned(),
-                })?;
-            let core =
-                CoreRuntime::new(options, TokioRuntimeBuilder::default()).map_err(|_error| {
-                    Failure {
-                        status: STATUS_INTERNAL,
-                        // Runtime construction errors can contain Core or Tokio
-                        // diagnostics. Keep the C result a closed category just
-                        // like worker construction and poll failures.
-                        message: "could not create Temporal Core runtime".to_owned(),
-                    }
-                })?;
-            let owned = Box::into_raw(Box::new(Runtime::new(core)?));
+            let worker_threads = runtime_worker_threads(worker_threads)?;
+            let log_level = diagnostics::core_log_level_from_env().map_err(|message| Failure {
+                status: STATUS_CONFIGURATION,
+                message,
+            })?;
+            let created = create_runtime(
+                log_level,
+                worker_threads,
+                diagnostics::CoreLogWriter::spawn_stderr,
+            )?;
+            let owned = Box::into_raw(Box::new(created));
 
             // SAFETY: The runtime slot remains exclusively owned by this call
             // until it returns and was validated before invoking the closure.
@@ -2891,6 +4749,448 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_new(
     }
 }
 
+/// Create a Core runtime that several instance graphs can share (#832).
+///
+/// `worker_threads` has exactly the contract of
+/// [`ocaml_temporal_core_v4_runtime_new_with_worker_threads`]; an invalid
+/// count fails before anything is allocated. On success, `shared` receives
+/// one owned opaque handle that must eventually be passed to
+/// [`ocaml_temporal_core_v4_shared_runtime_free`] (or, from a GC finalizer,
+/// [`ocaml_temporal_core_v4_shared_runtime_dispose`]). The handle carries no
+/// client or worker; graphs are created on it with
+/// [`ocaml_temporal_core_v4_runtime_new_attached`].
+///
+/// # Safety
+///
+/// `shared` must be null or point to writable storage for one handle pointer
+/// that does not already contain a live handle. `output` follows the result
+/// contract of [`ocaml_temporal_core_v4_check_abi_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new(
+    worker_threads: u32,
+    shared: *mut *mut SharedRuntime,
+    output: *mut Result,
+) -> Status {
+    const NO_TELEMETRY: &[u8] = b"{}";
+    // SAFETY: `NO_TELEMETRY` is a readable static span; the remaining
+    // pointer contracts are forwarded unchanged.
+    unsafe {
+        ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(
+            worker_threads,
+            NO_TELEMETRY.as_ptr(),
+            NO_TELEMETRY.len(),
+            shared,
+            output,
+        )
+    }
+}
+
+/// Upper bound on a runtime telemetry document. The largest valid document
+/// (sixteen maximal global tags) is well below this.
+const MAX_TELEMETRY_CONFIG_BYTES: usize = 16 * 1024;
+
+/// Create a shareable Core runtime with opt-in telemetry export (#500).
+///
+/// This is [`ocaml_temporal_core_v4_shared_runtime_new`] plus a strict JSON
+/// telemetry document (see `docs/reference/core-bridge.md`). `{}` configures
+/// no exporter. With a `prometheus` member, Core's built-in worker and client
+/// metrics are served at `http://<bind_address>/metrics` from a scrape server
+/// on the runtime's own Tokio pool; the server stops when Core is destroyed,
+/// that is, when the last of the shared handle and its attached graphs is
+/// released.
+///
+/// The document is validated, and the endpoint bound, before the handle is
+/// published: an invalid document or an unusable address fails with
+/// `STATUS_CONFIGURATION` and leaves `*shared` null with nothing running. On
+/// success the result value is the UTF-8 socket address the endpoint
+/// actually listens on (an ephemeral port `0` is resolved), or empty when no
+/// exporter was configured.
+///
+/// # Safety
+///
+/// `input` must be readable for `input_len` bytes for this call (it may be
+/// null only when `input_len` is zero). `shared` and `output` follow
+/// [`ocaml_temporal_core_v4_shared_runtime_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(
+    worker_threads: u32,
+    input: *const u8,
+    input_len: usize,
+    shared: *mut *mut SharedRuntime,
+    output: *mut Result,
+) -> Status {
+    // Canonicalize the slot first, as in `runtime_new_with_worker_threads`,
+    // so every failing return leaves a known null value.
+    if !shared.is_null() {
+        // SAFETY: A non-null slot promises writable pointer storage.
+        unsafe { ptr::write(shared, ptr::null_mut()) };
+    }
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: The result pointer was checked above; the slot and the input
+    // span are checked in the closure before use.
+    unsafe {
+        invoke(output, || {
+            if shared.is_null() {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "shared runtime output pointer is null".to_owned(),
+                });
+            }
+            if input_len > MAX_TELEMETRY_CONFIG_BYTES {
+                return Err(Failure {
+                    status: STATUS_CONFIGURATION,
+                    message: format!(
+                        "runtime telemetry configuration exceeds {MAX_TELEMETRY_CONFIG_BYTES} bytes"
+                    ),
+                });
+            }
+            if input_len != 0 && input.is_null() {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "telemetry input is null but input_len is nonzero".to_owned(),
+                });
+            }
+            let bytes = if input_len == 0 {
+                &[]
+            } else {
+                // SAFETY: The caller promises the readable span documented
+                // above; the nonempty null case was rejected.
+                std::slice::from_raw_parts(input, input_len)
+            };
+            // Validate everything that allocates nothing before building Core.
+            let telemetry = telemetry::parse_telemetry_config(bytes)?;
+            let worker_threads = runtime_worker_threads(worker_threads)?;
+            let log_level = diagnostics::core_log_level_from_env().map_err(|message| Failure {
+                status: STATUS_CONFIGURATION,
+                message,
+            })?;
+            let core = create_shared_core(
+                log_level,
+                worker_threads,
+                &telemetry,
+                diagnostics::CoreLogWriter::spawn_stderr,
+            )?;
+            let address = core
+                .metrics
+                .as_ref()
+                .map(|exporter| exporter.bound_address().to_string())
+                .unwrap_or_default();
+            let owned = Box::into_raw(Box::new(SharedRuntime::new(core)?));
+            // SAFETY: The slot was validated above and is exclusively owned
+            // by this call until it returns.
+            ptr::write(shared, owned);
+            Ok(address.into_bytes())
+        })
+    }
+}
+
+/// Create an instance graph that runs on a shared Core runtime (#832).
+///
+/// The new graph behaves exactly like one from
+/// [`ocaml_temporal_core_v4_runtime_new`] (one client, one worker, its own
+/// cleanup thread, released through
+/// [`ocaml_temporal_core_v4_runtime_free`]), except that it holds a
+/// reference to `shared`'s Core instead of building its own. That reference
+/// keeps Core alive until the graph is released, even if `shared` is
+/// released first. A `shared` handle that was already released fails with
+/// `STATUS_INVALID_STATE`; a null one with `STATUS_INVALID_ARGUMENT`.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle from
+/// [`ocaml_temporal_core_v4_shared_runtime_new`] that is not concurrently
+/// released; concurrent attaches on one handle are permitted. `runtime` and
+/// `output` follow [`ocaml_temporal_core_v4_runtime_new_with_worker_threads`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_new_attached(
+    shared: *const SharedRuntime,
+    runtime: *mut *mut Runtime,
+    output: *mut Result,
+) -> Status {
+    if !runtime.is_null() {
+        // SAFETY: A non-null runtime argument promises writable pointer storage.
+        unsafe { ptr::write(runtime, ptr::null_mut()) };
+    }
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: The result pointer was checked above; both input pointers are
+    // checked in the closure before use.
+    unsafe {
+        invoke(output, || {
+            if runtime.is_null() {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "runtime output pointer is null".to_owned(),
+                });
+            }
+            // SAFETY: The caller promises a null or live, unreleased handle.
+            let shared = shared.as_ref().ok_or_else(|| Failure {
+                status: STATUS_INVALID_ARGUMENT,
+                message: "shared runtime handle is null".to_owned(),
+            })?;
+            let owned = Box::into_raw(Box::new(shared.attach()?));
+            // SAFETY: The slot was validated above.
+            ptr::write(runtime, owned);
+            Ok(Vec::new())
+        })
+    }
+}
+
+/// Release a shared-runtime handle and clear the caller's slot, waiting
+/// until its Core reference has been dropped.
+///
+/// When no attached graph remains, this destroys Core (and its Tokio pool)
+/// before returning. When graphs are still attached, it only releases this
+/// handle's reference and Core is destroyed by the last graph's release.
+/// Calling again with the now-null slot is safe.
+///
+/// # Safety
+///
+/// `shared` must be null or point to a slot initialized by
+/// [`ocaml_temporal_core_v4_shared_runtime_new`]. The slot must not be
+/// accessed concurrently, and the caller must not be on a Tokio worker.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_free(
+    shared: *mut *mut SharedRuntime,
+) -> Status {
+    // SAFETY: The slot contract is forwarded unchanged.
+    unsafe { release_shared_runtime_slot(shared, true) }
+}
+
+/// Transfer a shared-runtime handle's reference to its cleanup thread
+/// without waiting. Reserved for the OCaml custom-block finalizer.
+///
+/// # Safety
+///
+/// As for [`ocaml_temporal_core_v4_shared_runtime_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_dispose(
+    shared: *mut *mut SharedRuntime,
+) -> Status {
+    // SAFETY: The slot contract is forwarded unchanged.
+    unsafe { release_shared_runtime_slot(shared, false) }
+}
+
+/// Shared body of the two shared-runtime release exports: clears the slot
+/// before releasing, contains panics, and is idempotent on a null slot.
+///
+/// # Safety
+///
+/// As for [`ocaml_temporal_core_v4_shared_runtime_free`].
+unsafe fn release_shared_runtime_slot(shared: *mut *mut SharedRuntime, wait: bool) -> Status {
+    if shared.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: The caller guarantees exclusive writable access to the slot.
+        let owned = unsafe { ptr::replace(shared, ptr::null_mut()) };
+        if owned.is_null() {
+            STATUS_OK
+        } else {
+            // SAFETY: Non-null values in this slot originate from
+            // `Box::into_raw` in `shared_runtime_new` and are consumed once.
+            let shared = unsafe { Box::from_raw(owned) };
+            shared.release(wait)
+        }
+    }));
+    outcome.unwrap_or(STATUS_PANIC)
+}
+
+/// Create an SDK metrics recorder over a shared runtime's Core meter (#500).
+///
+/// Some worker states exist only in the OCaml SDK (activity-lane occupancy,
+/// refused tasks, retained-completion retries, shutdown outcomes, expired
+/// asynchronous leases), so Core cannot instrument them. The returned
+/// [`MetricMeter`] lets the SDK record them into the same Prometheus
+/// registry as Core's own metrics; see `docs/reference/core-bridge.md`.
+///
+/// On success `*meter` receives one owned handle, or stays null when the
+/// runtime was created without a metrics exporter, in which case the caller
+/// records nothing at all. The handle references Core's meter, not Core, so
+/// it may outlive the shared handle and every attached graph; it must be
+/// released exactly once with [`ocaml_temporal_core_v4_metric_meter_free`].
+/// A null `shared` fails with `STATUS_INVALID_ARGUMENT`, a released one with
+/// `STATUS_INVALID_STATE`.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle from
+/// [`ocaml_temporal_core_v4_shared_runtime_new`] that is not concurrently
+/// released. `meter` must be null or point to writable storage for one
+/// handle pointer that does not already contain a live handle. `output`
+/// follows the result contract of [`ocaml_temporal_core_v4_check_abi_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_metric_meter(
+    shared: *const SharedRuntime,
+    meter: *mut *mut MetricMeter,
+    output: *mut Result,
+) -> Status {
+    if !meter.is_null() {
+        // SAFETY: A non-null slot promises writable pointer storage.
+        unsafe { ptr::write(meter, ptr::null_mut()) };
+    }
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: The result pointer was checked above; the other pointers are
+    // checked in the closure before use.
+    unsafe {
+        invoke(output, || {
+            if meter.is_null() {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "metric meter output pointer is null".to_owned(),
+                });
+            }
+            // SAFETY: The caller promises a null or live, unreleased handle.
+            let shared = shared.as_ref().ok_or_else(|| Failure {
+                status: STATUS_INVALID_ARGUMENT,
+                message: "shared runtime handle is null".to_owned(),
+            })?;
+            let core = shared.core.as_ref().ok_or_else(|| Failure {
+                status: STATUS_INVALID_STATE,
+                message: "shared Temporal runtime is already released".to_owned(),
+            })?;
+            if let Some(temporal_meter) = core.telemetry().get_temporal_metric_meter() {
+                let global_tag_names = core
+                    .metrics
+                    .as_ref()
+                    .map(|exporter| exporter.global_tag_names().to_vec())
+                    .unwrap_or_default();
+                let owned =
+                    Box::into_raw(Box::new(MetricMeter::new(temporal_meter, global_tag_names)));
+                // SAFETY: The slot was validated above and is exclusively
+                // owned by this call until it returns.
+                ptr::write(meter, owned);
+            }
+            Ok(Vec::new())
+        })
+    }
+}
+
+/// Register one SDK metric series from strict JSON and return its identifier
+/// in `*id` (#500).
+///
+/// The document is `{"kind": K, "name": N, "description": D, "labels":
+/// [{"name": L, "value": V}, ...]}`, where `K` is `counter`,
+/// `up_down_counter`, `gauge`, `histogram`, or `duration_histogram`; see
+/// `docs/reference/core-bridge.md` for the bounds. Registering an identical
+/// series again returns the same identifier. A rejected document fails with
+/// `STATUS_CONFIGURATION` and leaves `*id` at `u32::MAX`.
+///
+/// # Safety
+///
+/// `meter` must be null or a live handle from
+/// [`ocaml_temporal_core_v4_shared_runtime_metric_meter`]; concurrent calls
+/// on one handle are permitted. `input` must be readable for `input_len`
+/// bytes (it may be null only when `input_len` is zero). `id` must be null
+/// or writable. `output` follows the result contract of
+/// [`ocaml_temporal_core_v4_check_abi_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_register_json(
+    meter: *const MetricMeter,
+    input: *const u8,
+    input_len: usize,
+    id: *mut u32,
+    output: *mut Result,
+) -> Status {
+    if !id.is_null() {
+        // SAFETY: A non-null slot promises writable storage.
+        unsafe { ptr::write(id, u32::MAX) };
+    }
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: The result pointer was checked above; the other pointers are
+    // checked in the closure before use.
+    unsafe {
+        invoke(output, || {
+            if id.is_null() {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: "metric identifier output pointer is null".to_owned(),
+                });
+            }
+            // SAFETY: The caller promises a null or live handle.
+            let meter = meter.as_ref().ok_or_else(|| Failure {
+                status: STATUS_INVALID_ARGUMENT,
+                message: "metric meter handle is null".to_owned(),
+            })?;
+            // SAFETY: The caller promises the readable span documented above.
+            let bytes = input_span(
+                input,
+                input_len,
+                telemetry::MAX_SDK_INSTRUMENT_DOCUMENT_BYTES,
+            )?;
+            let registered = meter.register(bytes)?;
+            // SAFETY: The slot was validated above.
+            ptr::write(id, registered);
+            Ok(Vec::new())
+        })
+    }
+}
+
+/// Record `value` into the SDK metric series `id` (#500).
+///
+/// This is the hot path: it allocates no result and takes only a read lock,
+/// so the OCaml stub calls it without releasing the runtime lock. A counter,
+/// gauge or histogram requires `value >= 0`; an up-down counter adds the
+/// signed delta; a duration histogram reads microseconds. A null handle, an
+/// unknown identifier, or a negative unsigned value returns
+/// `STATUS_INVALID_ARGUMENT` and records nothing; a contained panic returns
+/// `STATUS_PANIC`.
+///
+/// # Safety
+///
+/// `meter` must be null or a live handle from
+/// [`ocaml_temporal_core_v4_shared_runtime_metric_meter`]; concurrent calls
+/// on one handle, from any thread, are permitted.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_record(
+    meter: *const MetricMeter,
+    id: u32,
+    value: i64,
+) -> Status {
+    // SAFETY: The caller promises a null or live handle.
+    let Some(meter) = (unsafe { meter.as_ref() }) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    catch_unwind(AssertUnwindSafe(|| meter.record(id, value))).unwrap_or(STATUS_PANIC)
+}
+
+/// Release an SDK metrics recorder and clear the caller's slot. Dropping it
+/// touches only memory (never Core or Tokio), so this is safe from a GC
+/// finalizer and on any thread. Calling again with the now-null slot is safe.
+///
+/// # Safety
+///
+/// `meter` must be null or point to a slot initialized by
+/// [`ocaml_temporal_core_v4_shared_runtime_metric_meter`]. No other call on
+/// the handle may be running or start afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_free(
+    meter: *mut *mut MetricMeter,
+) -> Status {
+    if meter.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: The caller guarantees exclusive writable access to the slot.
+        let owned = unsafe { ptr::replace(meter, ptr::null_mut()) };
+        if !owned.is_null() {
+            // SAFETY: Non-null values in this slot originate from
+            // `Box::into_raw` in `shared_runtime_metric_meter` and are
+            // consumed once.
+            drop(unsafe { Box::from_raw(owned) });
+        }
+        STATUS_OK
+    }));
+    outcome.unwrap_or(STATUS_PANIC)
+}
+
 /// Connect the runtime graph's single official Temporal client from strict
 /// JSON. Successful return publishes the client; every failure leaves the
 /// graph without a newly constructed child.
@@ -2898,11 +5198,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_new(
 /// # Safety
 ///
 /// `runtime` must be a live handle created by
-/// [`ocaml_temporal_core_v2_runtime_new`] and exclusively owned for this call.
+/// [`ocaml_temporal_core_v4_runtime_new`] and exclusively owned for this call.
 /// `input` follows [`decode_config`]'s byte-span contract, while `output`
-/// follows [`ocaml_temporal_core_v2_check_abi_version`]'s result contract.
+/// follows [`ocaml_temporal_core_v4_check_abi_version`]'s result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_connect_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_connect_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -2912,10 +5212,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_connect_json(
     // before dereferencing and forwards the documented input span to decoding.
     unsafe {
         invoke(output, || {
-            let runtime = runtime.as_mut().ok_or_else(|| Failure {
-                status: STATUS_INVALID_ARGUMENT,
-                message: "runtime pointer is null".to_owned(),
-            })?;
+            let runtime = runtime_mut(runtime)?;
             let config = decode_config::<ClientConfig>(input, input_len)?;
             runtime.connect_client(config)
         })
@@ -2934,22 +5231,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_connect_json(
 /// span is borrowed only for this synchronous call and `output` follows the
 /// standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_start_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_start_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .start_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.start_workflow_json(input)
         })
     }
 }
@@ -2966,22 +5256,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_start_workflow_json(
 /// is borrowed only for this synchronous call and `output` follows the normal
 /// initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_cancel_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_cancel_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .cancel_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.cancel_workflow_json(input)
         })
     }
 }
@@ -2997,22 +5280,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_cancel_workflow_json(
 /// the input before releasing the OCaml runtime lock and owns the returned
 /// allocation through the normal result-release function.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_terminate_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_terminate_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .terminate_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.terminate_workflow_json(input)
         })
     }
 }
@@ -3029,22 +5305,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_terminate_workflow_json(
 /// is borrowed only for this synchronous call and `output` follows the normal
 /// initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_reset_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_reset_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .reset_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.reset_workflow_json(input)
         })
     }
 }
@@ -3061,22 +5330,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_reset_workflow_json(
 /// is borrowed only for this synchronous call and `output` follows the normal
 /// initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_signal_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_signal_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .signal_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.signal_workflow_json(input)
         })
     }
 }
@@ -3093,22 +5355,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_signal_workflow_json(
 /// is borrowed only for this synchronous call and `output` follows the normal
 /// initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_query_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_query_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .query_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.query_workflow_json(input)
         })
     }
 }
@@ -3121,22 +5376,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_query_workflow_json(
 /// must remain readable for this synchronous call and `output` must point to
 /// writable result storage owned by the caller.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_update_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_update_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .update_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.update_workflow_json(input)
         })
     }
 }
@@ -3149,22 +5397,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_update_workflow_json(
 /// must remain readable for this synchronous call and `output` must point to
 /// writable result storage owned by the caller.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_poll_update_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_poll_update_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .poll_update_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.poll_update_workflow_json(input)
         })
     }
 }
@@ -3180,22 +5421,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_poll_update_workflow_json
 /// The caller owns the returned result and must release it with the matching
 /// bridge free function, even when the status reports an error.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_list_visibility_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_list_visibility_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .list_visibility_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.list_visibility_json(input)
         })
     }
 }
@@ -3213,22 +5447,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_list_visibility_json(
 /// is borrowed only for this admission call and `output` follows the standard
 /// initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_begin_start_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_begin_start_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .begin_start_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.begin_start_workflow_json(input)
         })
     }
 }
@@ -3243,24 +5470,17 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_begin_start_workflow_json
 /// # Safety
 ///
 /// The runtime, input, and output contracts match
-/// [`ocaml_temporal_core_v2_client_begin_start_workflow_json`].
+/// [`ocaml_temporal_core_v4_client_begin_start_workflow_json`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_poll_start_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_poll_start_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .poll_start_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.poll_start_workflow_json(input)
         })
     }
 }
@@ -3275,24 +5495,17 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_poll_start_workflow_json(
 /// # Safety
 ///
 /// The runtime, input, and output contracts match
-/// [`ocaml_temporal_core_v2_client_begin_start_workflow_json`].
+/// [`ocaml_temporal_core_v4_client_begin_start_workflow_json`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_wait_start_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_wait_start_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_start_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.wait_start_workflow_json(input)
         })
     }
 }
@@ -3309,8 +5522,42 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_wait_start_workflow_json(
 /// span is borrowed only for this synchronous call and `output` follows the
 /// standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_wait_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_wait_workflow_json(
     runtime: *mut Runtime,
+    input: *const u8,
+    input_len: usize,
+    output: *mut Result,
+) -> Status {
+    unsafe {
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.wait_workflow_json(input)
+        })
+    }
+}
+
+/// Submit one client RPC without waiting for Temporal (#807).
+///
+/// `kind` selects the operation with the closed values documented in the C
+/// header (`1` start through `10` visibility) and `input` is that
+/// operation's usual request document. On success the value is the call
+/// handle `<owner>.<call>` in ASCII decimal: the identity of this runtime
+/// graph and the call identifier. The RPC then runs on a Tokio task and
+/// its outcome is collected with
+/// [`ocaml_temporal_core_v4_client_await_call`]. The call returns as soon as
+/// the task is spawned, so the owner Domain never waits for the network.
+/// A start's outcome is the closed accepted/rejected/unknown document of the
+/// ticket path; every other outcome is exactly what the operation's
+/// synchronous symbol returns.
+///
+/// # Safety
+///
+/// `runtime` must be a live runtime handle used only by its owner thread.
+/// The input span is borrowed only for this call and `output` follows the
+/// standard initialized-result contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_submit_json(
+    runtime: *mut Runtime,
+    kind: u32,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
@@ -3318,13 +5565,81 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_wait_workflow_json(
     unsafe {
         invoke(output, || {
             let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
+            runtime_mut(runtime)?.submit_client_call(kind, input)
+        })
+    }
+}
+
+/// Wait at most `timeout_ms` for a submitted client call's outcome (#807).
+///
+/// This symbol takes no runtime: `(owner, call)`, both from the submission
+/// handle, names a process-wide completion cell, so the submitting caller
+/// may await its call from any thread while the runtime owner keeps serving
+/// other requests. The first terminal result retires the call and is
+/// returned unchanged: the operation's value or failure. `STATUS_NOT_READY`
+/// means the interval elapsed and the call may be awaited again.
+/// `STATUS_INVALID_STATE` means the call can no longer complete: its runtime
+/// disconnected or closed, the identifier was already consumed or never
+/// issued, or `owner` is not the graph that submitted it. These cases are
+/// indistinguishable, and a mismatched owner leaves the call untouched.
+/// `timeout_ms` above one minute is rejected.
+///
+/// # Safety
+///
+/// `output` follows the same contract as
+/// [`ocaml_temporal_core_v4_check_abi_version`]. The caller should release
+/// any language runtime lock, since the call blocks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_await_call(
+    owner: u64,
+    call: u64,
+    timeout_ms: u32,
+    output: *mut Result,
+) -> Status {
+    // SAFETY: The output-pointer contract is forwarded unchanged to `invoke`.
+    unsafe {
+        invoke(output, || {
+            if timeout_ms > MAX_CALL_AWAIT_MS {
+                return Err(Failure {
                     status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_workflow_json(input)
+                    message: "client call await cannot exceed 60000 ms".to_owned(),
+                });
+            }
+            crate::client_calls::await_call(
+                owner,
+                call,
+                Duration::from_millis(u64::from(timeout_ms)),
+            )
+        })
+    }
+}
+
+/// Abandon one submitted client call without reading its outcome (#807).
+///
+/// The OCaml await loop calls this when it is interrupted before the terminal
+/// read, so an abandoned call does not keep counting against its runtime's
+/// ceiling. The completion cell is unregistered and closed and any published
+/// outcome is dropped; a still-running task finishes into the closed cell at
+/// its own RPC deadline or is aborted at shutdown. Like the await symbol it
+/// takes no runtime, and a mismatched owner, retired call, or unknown
+/// identifier is a successful no-op, so it reveals nothing about other
+/// owners' calls.
+///
+/// # Safety
+///
+/// `output` follows the same contract as
+/// [`ocaml_temporal_core_v4_check_abi_version`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_release_call(
+    owner: u64,
+    call: u64,
+    output: *mut Result,
+) -> Status {
+    // SAFETY: The output-pointer contract is forwarded unchanged to `invoke`.
+    unsafe {
+        invoke(output, || {
+            crate::client_calls::release_call(owner, call);
+            Ok(Vec::new())
         })
     }
 }
@@ -3335,9 +5650,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_wait_workflow_json(
 /// # Safety
 ///
 /// The runtime, input, and output contracts match
-/// [`ocaml_temporal_core_v2_client_connect_json`].
+/// [`ocaml_temporal_core_v4_client_connect_json`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_start_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_start_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3347,10 +5662,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_start_json(
     // preconditions before the runtime graph is mutated.
     unsafe {
         invoke(output, || {
-            let runtime = runtime.as_mut().ok_or_else(|| Failure {
-                status: STATUS_INVALID_ARGUMENT,
-                message: "runtime pointer is null".to_owned(),
-            })?;
+            let runtime = runtime_mut(runtime)?;
             let config = decode_config::<WorkerConfigInput>(input, input_len)?;
             runtime.start_worker(config)
         })
@@ -3364,9 +5676,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_start_json(
 /// # Safety
 ///
 /// The runtime, input, and output contracts match
-/// [`ocaml_temporal_core_v2_worker_start_json`].
+/// [`ocaml_temporal_core_v4_worker_start_json`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_start_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_start_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
@@ -3374,10 +5686,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_start_json(
 ) -> Status {
     unsafe {
         invoke(output, || {
-            let runtime = runtime.as_mut().ok_or_else(|| Failure {
-                status: STATUS_INVALID_ARGUMENT,
-                message: "runtime pointer is null".to_owned(),
-            })?;
+            let runtime = runtime_mut(runtime)?;
             let config = decode_config::<WorkerConfigInput>(input, input_len)?;
             runtime.start_replay_worker(config)
         })
@@ -3391,22 +5700,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_start_json(
 /// The runtime and output contracts match the workflow poll operation. The
 /// input span is borrowed only for this synchronous call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_feed_history_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_feed_history_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .feed_replay_history_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.feed_replay_history_json(input)
         })
     }
 }
@@ -3418,21 +5720,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_feed_history_json(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_finish_input(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_finish_input(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .finish_replay_input()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.finish_replay_input()) }
 }
 
 /// Non-blockingly take one validated replay activation JSON document.
@@ -3442,21 +5734,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_finish_input(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_try_poll_workflow(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_try_poll_workflow(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .try_poll_replay_workflow()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.try_poll_replay_workflow()) }
 }
 
 /// Wait for replay workflow readiness with the same bounded lock-release
@@ -3467,21 +5749,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_try_poll_workflow(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_wait_workflow(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_wait_workflow(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_replay_workflow()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.wait_replay_workflow()) }
 }
 
 /// Validate and submit one replay workflow completion JSON document.
@@ -3489,24 +5761,17 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_wait_workflow(
 /// # Safety
 ///
 /// The runtime, input, and output contracts match
-/// [`ocaml_temporal_core_v2_worker_complete_workflow_json`].
+/// [`ocaml_temporal_core_v4_worker_complete_workflow_json`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_complete_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_complete_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .complete_replay_workflow(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.complete_replay_workflow(input)
         })
     }
 }
@@ -3516,24 +5781,17 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_complete_workflow_
 /// # Safety
 ///
 /// The runtime, input, and output contracts match
-/// [`ocaml_temporal_core_v2_worker_reject_workflow_json`].
+/// [`ocaml_temporal_core_v4_worker_reject_workflow_json`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_reject_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_reject_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .reject_replay_workflow(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.reject_replay_workflow(input)
         })
     }
 }
@@ -3546,21 +5804,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_reject_workflow_js
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_finalize(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_finalize(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .finalize_replay()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.finalize_replay()) }
 }
 
 /// Explicitly abandon replay with Core's shutdown-safe empty completions and
@@ -3573,21 +5821,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_finalize(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_dispose(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_dispose(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .dispose_replay()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.dispose_replay()) }
 }
 
 /// Non-blockingly take one validated workflow activation JSON document.
@@ -3597,21 +5835,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_replay_worker_dispose(
 /// `runtime` must be a live exclusively owned runtime handle and `output`
 /// must satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_try_poll_workflow(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_try_poll_workflow(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .try_poll_workflow()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.try_poll_workflow()) }
 }
 
 /// Wait for workflow-lane readiness without consuming the queued activation.
@@ -3625,21 +5853,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_try_poll_workflow(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_workflow(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_wait_workflow(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_ref()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_workflow()
-        })
-    }
+    unsafe { invoke(output, || runtime_ref(runtime)?.wait_workflow()) }
 }
 
 /// Validate and submit one workflow completion JSON document.
@@ -3649,22 +5867,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_workflow(
 /// The runtime and output contracts match the workflow poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_complete_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_complete_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .complete_workflow(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.complete_workflow(input)
         })
     }
 }
@@ -3679,22 +5890,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_complete_workflow_json(
 /// The runtime and output contracts match the workflow poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_reject_workflow_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_reject_workflow_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .reject_polled_workflow(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.reject_polled_workflow(input)
         })
     }
 }
@@ -3706,21 +5910,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_reject_workflow_json(
 /// `runtime` must be a live exclusively owned runtime handle and `output`
 /// must satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_try_poll_activity(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_try_poll_activity(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .try_poll_activity()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.try_poll_activity()) }
 }
 
 /// Wait for remote-activity-lane readiness without consuming the queued task.
@@ -3734,21 +5928,29 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_try_poll_activity(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_activity(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_wait_activity(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_ref()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_activity()
-        })
-    }
+    unsafe { invoke(output, || runtime_ref(runtime)?.wait_activity()) }
+}
+
+/// Wait for readiness on either worker lane without consuming a queued task.
+///
+/// The caller must release the OCaml runtime lock around this operation. It
+/// has the same bounded timeout and status contract as the lane-specific
+/// waits, but any queued workflow activation or activity task ends it.
+///
+/// # Safety
+///
+/// `runtime` must be a live exclusively owned runtime handle and `output` must
+/// satisfy the standard initialized-result contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_wait_any(
+    runtime: *mut Runtime,
+    output: *mut Result,
+) -> Status {
+    unsafe { invoke(output, || runtime_ref(runtime)?.wait_any()) }
 }
 
 /// Apply the bounded native delay used before retrying an explicitly
@@ -3764,19 +5966,13 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_activity(
 /// `runtime` must be a live exclusively owned runtime handle and `output` must
 /// satisfy the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_activity_completion_retry_backoff(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_wait_activity_completion_retry_backoff(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
     unsafe {
         invoke(output, || {
-            runtime
-                .as_ref()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_activity_completion_retry_backoff()
+            runtime_ref(runtime)?.wait_activity_completion_retry_backoff()
         })
     }
 }
@@ -3788,22 +5984,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_wait_activity_completion_
 /// The runtime and output contracts match the activity poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_complete_activity_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_complete_activity_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .complete_activity(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.complete_activity(input)
         })
     }
 }
@@ -3820,22 +6009,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_complete_activity_json(
 /// The runtime and output contracts match the activity poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_record_activity_heartbeat_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_record_activity_heartbeat_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .record_activity_heartbeat(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.record_activity_heartbeat(input)
         })
     }
 }
@@ -3850,50 +6032,38 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_record_activity_heartbeat
 /// The runtime and output contracts match the activity poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_complete_async_activity_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_complete_async_activity_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .complete_async_activity(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.complete_async_activity(input)
         })
     }
 }
 
 /// Record a heartbeat for an activity that previously accepted asynchronous
-/// completion.
+/// completion. Every call is one blocking RPC and is not throttled; the
+/// OCaml worker submits the throttled `AsyncActivityHeartbeat` client call
+/// instead (#1025).
 ///
 /// # Safety
 ///
 /// The runtime and output contracts match the activity poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_record_async_activity_heartbeat_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_record_async_activity_heartbeat_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .record_async_activity_heartbeat(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.record_async_activity_heartbeat(input)
         })
     }
 }
@@ -3909,24 +6079,40 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_record_async_activity_hea
 /// The runtime and output contracts match the activity poll operation. A
 /// nonzero input length requires that many readable bytes for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_reject_activity_json(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_reject_activity_json(
     runtime: *mut Runtime,
     input: *const u8,
     input_len: usize,
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .reject_polled_activity(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.reject_polled_activity(input)
         })
     }
+}
+
+/// Stop the runtime graph's worker from taking new tasks, without releasing
+/// it (#1028).
+///
+/// Closes the bridge's admission and readiness signals and asks Core to stop
+/// polling the server. Outstanding tasks stay owned by the worker: OCaml may
+/// still complete or heartbeat them until
+/// [`ocaml_temporal_core_v4_worker_shutdown`] releases the worker, and Core's
+/// own graceful-shutdown timer starts now. Idempotent, and a success when no
+/// worker exists.
+///
+/// # Safety
+///
+/// The pointer contracts match [`ocaml_temporal_core_v4_worker_shutdown`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_initiate_shutdown(
+    runtime: *mut Runtime,
+    output: *mut Result,
+) -> Status {
+    // SAFETY: `invoke` validates the result before the closure checks and uses
+    // the opaque runtime pointer.
+    unsafe { invoke(output, || runtime_mut(runtime)?.initiate_worker_shutdown()) }
 }
 
 /// Gracefully stop and remove the runtime graph's workflow worker.
@@ -3938,23 +6124,13 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_reject_activity_json(
 /// `runtime` must be a live exclusively owned runtime handle. `output` follows
 /// the standard initialized-result contract.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_shutdown(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_shutdown(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
     // SAFETY: `invoke` validates the result before the closure checks and uses
     // the opaque runtime pointer.
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .shutdown_worker()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.shutdown_worker()) }
 }
 
 /// Remove the connected client after its worker child has stopped.
@@ -3963,25 +6139,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_worker_shutdown(
 ///
 /// # Safety
 ///
-/// The pointer contracts match [`ocaml_temporal_core_v2_worker_shutdown`].
+/// The pointer contracts match [`ocaml_temporal_core_v4_worker_shutdown`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_client_disconnect(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_client_disconnect(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
     // SAFETY: `invoke` validates output and the opaque handle is checked for
     // null before producing the unique mutable reference required by graph use.
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .disconnect_client()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.disconnect_client()) }
 }
 
 /// Destroy one native runtime and clear the caller's slot.
@@ -3992,10 +6158,10 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_client_disconnect(
 /// # Safety
 ///
 /// `runtime` must be null or point to a slot initialized by
-/// [`ocaml_temporal_core_v2_runtime_new`]. The slot must not be accessed
+/// [`ocaml_temporal_core_v4_runtime_new`]. The slot must not be accessed
 /// concurrently, and all future child handles must be closed first.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_free(runtime: *mut *mut Runtime) -> Status {
+pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_free(runtime: *mut *mut Runtime) -> Status {
     if runtime.is_null() {
         return STATUS_INVALID_ARGUMENT;
     }
@@ -4024,15 +6190,15 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_free(runtime: *mut *mut 
 /// Transfer a runtime to its cleanup thread without waiting for destruction.
 ///
 /// This is reserved for the OCaml custom-block finalizer. Normal supervisor
-/// shutdown uses [`ocaml_temporal_core_v2_runtime_free`] and waits while the
+/// shutdown uses [`ocaml_temporal_core_v4_runtime_free`] and waits while the
 /// OCaml runtime lock is released.
 ///
 /// # Safety
 ///
 /// `runtime` has the same exclusive slot contract as
-/// [`ocaml_temporal_core_v2_runtime_free`].
+/// [`ocaml_temporal_core_v4_runtime_free`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_dispose(
+pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_dispose(
     runtime: *mut *mut Runtime,
 ) -> Status {
     if runtime.is_null() {
@@ -4068,7 +6234,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_runtime_dispose(
 /// `result` must be null or point to a result initialized by this ABI. The
 /// caller must not mutate its pointer or length fields.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v2_result_free(result: *mut Result) -> Status {
+pub unsafe extern "C" fn ocaml_temporal_core_v4_result_free(result: *mut Result) -> Status {
     if result.is_null() {
         return STATUS_INVALID_ARGUMENT;
     }
@@ -4100,7 +6266,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v2_result_free(result: *mut Result)
 /// # Safety
 ///
 /// `output` follows the same contract as
-/// [`ocaml_temporal_core_v2_check_abi_version`].
+/// [`ocaml_temporal_core_v4_check_abi_version`].
 #[doc(hidden)]
 pub unsafe fn test_invoke_panic(output: *mut Result) -> Status {
     // SAFETY: The pointer contract is forwarded unchanged to `invoke`.
@@ -4120,6 +6286,210 @@ pub fn test_runtime_cleanup_counts() -> (u64, u64) {
     )
 }
 
+/// Returns the number of task tokens the async heartbeat throttle tracks and
+/// of driver tasks it retains (finished drivers reaped first), or `None` for
+/// a null handle. Not part of the C ABI; it lets tests prove the throttle's
+/// state is bounded and released (#1025).
+///
+/// # Safety
+///
+/// `runtime` must be null or a live handle not used concurrently.
+#[doc(hidden)]
+pub unsafe fn test_heartbeat_throttle_counts(runtime: *const Runtime) -> Option<(usize, usize)> {
+    // SAFETY: The caller promises a null or live, unshared handle.
+    let runtime = unsafe { runtime.as_ref()? };
+    Some(runtime.heartbeat_throttle.counts())
+}
+
+/// Returns the number of submitted client calls registered process-wide,
+/// across every runtime graph: submitted and not yet read, released, or
+/// closed (#807, #1019). Not part of the C ABI; the concurrent live stress
+/// uses it to prove that no call registration outlives its runtime.
+#[doc(hidden)]
+pub fn test_registered_client_calls() -> usize {
+    crate::client_calls::registered_call_total()
+}
+
+/// Returns process-local shared-runtime counts for the isolated sharing
+/// test: shared handles created, and Core runtimes whose destructor (and log
+/// writer close) returned. Not part of the C ABI.
+#[doc(hidden)]
+pub fn test_core_runtime_counts() -> (u64, u64) {
+    (
+        SHARED_RUNTIMES_CREATED.load(Ordering::Acquire),
+        CORE_RUNTIMES_DROPPED.load(Ordering::Acquire),
+    )
+}
+
+/// Reports whether two live instance graphs run on the same Core runtime,
+/// or `None` if either handle is null or already released. Not part of the
+/// C ABI; it lets tests prove attachment shares rather than copies Core.
+///
+/// # Safety
+///
+/// Both pointers must be null or live handles not used concurrently.
+#[doc(hidden)]
+pub unsafe fn test_runtimes_share_core(
+    left: *const Runtime,
+    right: *const Runtime,
+) -> Option<bool> {
+    // SAFETY: The caller promises null or live, unshared handles.
+    let (left, right) = unsafe { (left.as_ref()?, right.as_ref()?) };
+    Some(Arc::ptr_eq(left.core.as_ref()?, right.core.as_ref()?))
+}
+
+/// Reports whether a live instance graph's Core carries a metrics meter, so
+/// a client or worker created on it would record Core's built-in metrics
+/// (#500). `None` for a null or released handle. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `runtime` must be null or a live handle not used concurrently.
+#[doc(hidden)]
+pub unsafe fn test_runtime_has_metrics_meter(runtime: *const Runtime) -> Option<bool> {
+    // SAFETY: The caller promises a null or live, unshared handle.
+    let runtime = unsafe { runtime.as_ref()? };
+    let core = runtime.core.as_ref()?;
+    Some(core.telemetry().get_temporal_metric_meter().is_some())
+}
+
+/// Stops Core's own Prometheus scrape server on a shared handle while the
+/// bridge's public accept loop keeps running, reproducing the state an accept
+/// error on Core's private listener leaves behind (#1030). Returns whether
+/// the handle had an exporter. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle that is not released concurrently.
+#[doc(hidden)]
+pub unsafe fn test_shared_runtime_stop_core_metrics_server(shared: *const SharedRuntime) -> bool {
+    // SAFETY: The caller promises a null or live handle.
+    let Some(shared) = (unsafe { shared.as_ref() }) else {
+        return false;
+    };
+    match shared.core.as_ref().and_then(|core| core.metrics.as_ref()) {
+        Some(exporter) => {
+            exporter.stop_core_server();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Reports whether Core's own Prometheus scrape server on a shared handle has
+/// stopped (#1030); `None` for a null or released handle or one without an
+/// exporter. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle that is not released concurrently.
+#[doc(hidden)]
+pub unsafe fn test_shared_runtime_core_metrics_server_stopped(
+    shared: *const SharedRuntime,
+) -> Option<bool> {
+    // SAFETY: The caller promises a null or live handle.
+    let shared = unsafe { shared.as_ref() }?;
+    let exporter = shared.core.as_ref()?.metrics.as_ref()?;
+    Some(exporter.core_server_stopped())
+}
+
+/// Returns the number of live references to a shared handle's Core (the
+/// handle's own plus one per attached graph), or `None` for a null or
+/// released handle. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `shared` must be null or a live handle that is not released concurrently.
+#[doc(hidden)]
+pub unsafe fn test_shared_runtime_references(shared: *const SharedRuntime) -> Option<usize> {
+    // SAFETY: The caller promises a null or live handle.
+    let shared = unsafe { shared.as_ref() }?;
+    shared.core.as_ref().map(Arc::strong_count)
+}
+
+/// Creates a runtime whose Core log writer drains into `sink` instead of
+/// stderr, returning the owned handle and a producer for its log queue.
+///
+/// This is intentionally not part of the C ABI. It lets integration tests
+/// block the writer deterministically and prove that runtime close still
+/// completes. The handle must be released with
+/// [`ocaml_temporal_core_v4_runtime_free`].
+#[doc(hidden)]
+pub fn test_runtime_new_with_core_log_sink(
+    sink: Box<dyn std::io::Write + Send>,
+    capacity: usize,
+) -> std::result::Result<(*mut Runtime, diagnostics::CoreLogQueue), String> {
+    let worker_threads = runtime_worker_threads(0).map_err(|failure| failure.message)?;
+    let runtime = create_runtime(
+        Some(diagnostics::CoreLogLevel::Warn),
+        worker_threads,
+        || diagnostics::CoreLogWriter::spawn(sink, capacity),
+    )
+    .map_err(|failure| failure.message)?;
+    let queue = runtime
+        .core
+        .as_ref()
+        .and_then(|core| {
+            core.core_log
+                .lock()
+                .ok()
+                .and_then(|writer| writer.as_ref().map(diagnostics::CoreLogWriter::queue))
+        })
+        .ok_or_else(|| "runtime has no Core log writer".to_owned())?;
+    Ok((Box::into_raw(Box::new(runtime)), queue))
+}
+
+/// Returns the number of Tokio worker threads driving a live runtime, or
+/// `None` for a null handle or one whose Core runtime was already released.
+///
+/// This is intentionally not part of the C ABI. It lets integration tests
+/// prove that the configured count reaches Tokio (#832) without counting OS
+/// threads, which is platform-specific and racy.
+///
+/// # Safety
+///
+/// `runtime` must be null or a live handle that is not used concurrently.
+#[doc(hidden)]
+pub unsafe fn test_runtime_worker_threads(runtime: *const Runtime) -> Option<usize> {
+    // SAFETY: The caller promises a null or live, unshared handle.
+    let runtime = unsafe { runtime.as_ref() }?;
+    runtime
+        .core
+        .as_ref()
+        .map(|core| core.tokio_handle().metrics().num_workers())
+}
+
+/// Reports whether SIGPIPE is blocked on Core's Tokio threads (#1041), as
+/// `(worker_thread, blocking_pool_thread)`.
+///
+/// `None` for a null handle or one whose Core runtime was already released.
+/// One probe task runs on a runtime worker and one on the blocking pool; each
+/// reads its own thread's signal mask. Not part of the C ABI.
+///
+/// # Safety
+///
+/// `runtime` must be null or a live handle that is not used concurrently.
+#[doc(hidden)]
+pub unsafe fn test_runtime_threads_block_sigpipe(runtime: *const Runtime) -> Option<(bool, bool)> {
+    // SAFETY: The caller promises a null or live, unshared handle.
+    let runtime = unsafe { runtime.as_ref() }?;
+    let handle = runtime.core.as_ref()?.tokio_handle();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker_sender = sender.clone();
+    handle.spawn(async move {
+        let _ = worker_sender.send((0, crate::sigpipe::blocked_in_current_thread()));
+    });
+    handle.spawn_blocking(move || {
+        let _ = sender.send((1, crate::sigpipe::blocked_in_current_thread()));
+    });
+    let mut observed = [None, None];
+    for _ in 0..2 {
+        let (index, blocked) = receiver.recv_timeout(Duration::from_secs(10)).ok()?;
+        observed[index] = Some(blocked);
+    }
+    Some((observed[0]?, observed[1]?))
+}
+
 /// Returns the ABI category used for a worker error without exposing the
 /// mapping function itself as part of the C ABI. Integration tests use this
 /// helper to lock the bilateral retry classification to the explicit Rust
@@ -4135,7 +6505,7 @@ mod rejection_tests;
 
 #[cfg(test)]
 mod rejection_diagnostic_tests {
-    use super::write_rejected_workflow_diagnostic;
+    use super::{write_rejected_activity_diagnostic, write_rejected_workflow_diagnostic};
     use std::io::{self, Write};
 
     /// Models a closed stderr stream without changing process-wide descriptors.
@@ -4159,6 +6529,14 @@ mod rejection_diagnostic_tests {
         write_rejected_workflow_diagnostic(&mut stderr, "unsupported Core failure category");
         assert_eq!(stderr.0, 1);
     }
+
+    /// The activity rejection diagnostic is equally best effort (issue #801).
+    #[test]
+    fn closed_stderr_does_not_panic_after_activity_rejection() {
+        let mut stderr = BrokenStderr(0);
+        write_rejected_activity_diagnostic(&mut stderr, "activity task header key is empty");
+        assert_eq!(stderr.0, 1);
+    }
 }
 
 #[cfg(test)]
@@ -4168,6 +6546,10 @@ mod persistent_client_wait_tests;
 #[cfg(test)]
 #[path = "../tests/support/client_start.rs"]
 mod client_start_retry_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/client_calls.rs"]
+mod submitted_client_call_tests;
 
 #[cfg(test)]
 mod async_activity_error_tests {
@@ -4196,9 +6578,8 @@ mod async_activity_error_tests {
         );
     }
 
-    /// A generic RPC failure stays Connection. The OCaml heartbeat policy may
-    /// retain its nonterminal handle, while the completion policy remains
-    /// fail-closed; Rust must not claim a bilateral completion retry lease.
+    /// A generic RPC failure stays Connection: the request may or may not have
+    /// been applied, so OCaml keeps the live handle and lease.
     #[test]
     fn heartbeat_rpc_failure_is_connection() {
         let failure = async_activity_failure(
@@ -4229,18 +6610,32 @@ mod async_activity_error_tests {
         );
     }
 
+    /// Codes that prove the server answered without applying the request.
+    const DEFINITIVE_REJECTIONS: [Code; 6] = [
+        Code::InvalidArgument,
+        Code::PermissionDenied,
+        Code::FailedPrecondition,
+        Code::OutOfRange,
+        Code::Unimplemented,
+        Code::Unauthenticated,
+    ];
+
+    /// Codes for which the server may or may not have applied the request.
+    const AMBIGUOUS_FAILURES: [Code; 7] = [
+        Code::Unavailable,
+        Code::DeadlineExceeded,
+        Code::ResourceExhausted,
+        Code::Cancelled,
+        Code::Aborted,
+        Code::Unknown,
+        Code::Internal,
+    ];
+
     /// A definitive heartbeat RPC rejection does not consume the live activity
     /// capability; the OCaml caller may correct this request or complete it.
     #[test]
     fn definitive_heartbeat_rpc_rejection_keeps_live_capability() {
-        for code in [
-            Code::InvalidArgument,
-            Code::PermissionDenied,
-            Code::FailedPrecondition,
-            Code::OutOfRange,
-            Code::Unimplemented,
-            Code::Unauthenticated,
-        ] {
+        for code in DEFINITIVE_REJECTIONS {
             let failure = async_activity_failure(
                 AsyncActivityOperation::Heartbeat,
                 AsyncActivityError::Rpc(Status::new(code, "discard this remote text")),
@@ -4253,35 +6648,41 @@ mod async_activity_error_tests {
         }
     }
 
-    /// Only heartbeats receive the rejected-but-live outcome. Completion
-    /// failures still have no bilateral proof that a terminal request was not
-    /// consumed and must remain generic Connection errors.
+    /// A definitive rejection of complete/fail/cancel (for example cancel
+    /// without a cancel request, or an oversized result) leaves the activity
+    /// live so the caller can submit a different terminal operation (#821).
     #[test]
-    fn definitive_rpc_completion_stays_connection() {
-        let failure = async_activity_failure(
-            AsyncActivityOperation::Completion,
-            AsyncActivityError::Rpc(Status::invalid_argument("discard this remote text")),
-        );
-        assert_eq!(failure.status, STATUS_CONNECTION);
+    fn definitive_completion_rpc_rejection_keeps_live_capability() {
+        for code in DEFINITIVE_REJECTIONS {
+            let failure = async_activity_failure(
+                AsyncActivityOperation::Completion,
+                AsyncActivityError::Rpc(Status::new(code, "discard this remote text")),
+            );
+            assert_eq!(failure.status, STATUS_ASYNC_HEARTBEAT_REJECTED, "{code:?}");
+            assert_eq!(
+                failure.message,
+                "Temporal asynchronous activity completion request was rejected"
+            );
+        }
     }
 
     /// Deadline, transport, and other ambiguous RPC outcomes may occur after
-    /// a heartbeat was applied, so the exact request must remain pending.
+    /// the server applied the request. They stay Connection for both
+    /// operations, so OCaml retains the lease instead of closing the handle.
     #[test]
-    fn ambiguous_heartbeat_rpc_failure_stays_connection() {
-        for code in [
-            Code::Unavailable,
-            Code::DeadlineExceeded,
-            Code::ResourceExhausted,
-            Code::Cancelled,
-            Code::Unknown,
-            Code::Internal,
+    fn ambiguous_rpc_failure_stays_connection() {
+        for operation in [
+            AsyncActivityOperation::Heartbeat,
+            AsyncActivityOperation::Completion,
         ] {
-            let failure = async_activity_failure(
-                AsyncActivityOperation::Heartbeat,
-                AsyncActivityError::Rpc(Status::new(code, "discard this remote text")),
-            );
-            assert_eq!(failure.status, STATUS_CONNECTION, "{code:?}");
+            for code in AMBIGUOUS_FAILURES {
+                let failure = async_activity_failure(
+                    operation,
+                    AsyncActivityError::Rpc(Status::new(code, "discard this remote text")),
+                );
+                assert_eq!(failure.status, STATUS_CONNECTION, "{code:?}");
+                assert!(!failure.message.contains("discard"));
+            }
         }
     }
 }
@@ -4330,6 +6731,8 @@ mod worker_config_tests {
             max_outstanding_workflow_tasks: 100,
             max_concurrent_workflow_task_polls: pollers,
             graceful_shutdown_timeout_ms: 1_000,
+            task_types: Default::default(),
+            tuning: Default::default(),
         }
     }
 
@@ -4347,6 +6750,18 @@ mod worker_config_tests {
                 .message
                 .contains("max_concurrent_workflow_task_polls must be at least 2")
         );
+    }
+
+    /// Core must never be given more activity slots than the serial OCaml
+    /// executor can run (#777); surplus slots let the server start tasks
+    /// whose timeouts then expire while they wait in the bridge queue.
+    #[test]
+    fn activity_slots_match_serial_executor() {
+        let core = config(MIN_CACHED_WORKFLOW_POLLS)
+            .into_core()
+            .expect("default worker configuration should be valid");
+        assert_eq!(core.max_outstanding_activities, Some(1));
+        assert_eq!(core.max_outstanding_local_activities, Some(1));
     }
 
     /// Accepts the public default poller count before any runtime or network
@@ -4456,6 +6871,54 @@ mod worker_config_tests {
                 .contains("default_versioning_behavior requires use_worker_versioning")
         );
     }
+
+    /// Rejects an enabled versioned worker without a default behavior. The
+    /// bridge never sends a per-workflow behavior, so Core would otherwise
+    /// stamp UNSPECIFIED on every workflow-task completion of a versioned
+    /// deployment (issue #817).
+    #[test]
+    fn worker_versioning_requires_default_behavior() {
+        let mut worker = config(MIN_CACHED_WORKFLOW_POLLS);
+        worker.versioning = super::WorkerVersioningInput::DeploymentBased {
+            deployment_name: "agents".to_owned(),
+            build_id: worker.build_id.clone(),
+            use_worker_versioning: true,
+            default_versioning_behavior: None,
+        };
+        let failure = match worker.into_core() {
+            Err(failure) => failure,
+            Ok(_) => panic!("versioned workers must not complete with UNSPECIFIED behavior"),
+        };
+        assert_eq!(failure.status, STATUS_CONFIGURATION);
+        assert_eq!(
+            failure.message,
+            "versioning.use_worker_versioning requires default_versioning_behavior"
+        );
+    }
+
+    /// Keeps the opted-out deployment form valid: without worker versioning
+    /// Core does not route by deployment, so UNSPECIFIED is the correct
+    /// completion behavior and no default may be supplied.
+    #[test]
+    fn deployment_without_worker_versioning_accepts_no_behavior() {
+        let mut worker = config(MIN_CACHED_WORKFLOW_POLLS);
+        worker.versioning = super::WorkerVersioningInput::DeploymentBased {
+            deployment_name: "agents".to_owned(),
+            build_id: worker.build_id.clone(),
+            use_worker_versioning: false,
+            default_versioning_behavior: None,
+        };
+        let core = worker
+            .into_core()
+            .expect("unversioned deployment metadata should be accepted");
+        match core.versioning_strategy {
+            temporalio_sdk_core::WorkerVersioningStrategy::WorkerDeploymentBased(options) => {
+                assert!(!options.use_worker_versioning);
+                assert_eq!(options.default_versioning_behavior, None);
+            }
+            other => panic!("unexpected Core versioning strategy: {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4465,3 +6928,70 @@ mod pending_start_cleanup_tests;
 #[cfg(test)]
 #[path = "../tests/support/worker_slot_limits.rs"]
 mod worker_slot_limits;
+
+#[cfg(test)]
+#[path = "../tests/support/worker_task_types.rs"]
+mod worker_task_types;
+
+#[cfg(test)]
+#[path = "../tests/support/worker_tuning.rs"]
+mod worker_tuning;
+
+/// SDK name reported to Temporal as the `client-name` RPC header and recorded
+/// in `WorkflowTaskCompleted.sdk_metadata`. Core would otherwise attribute
+/// every OCaml client and worker to the official Rust SDK (`temporal-rust`).
+/// This value is durable in workflow histories, so it must stay stable.
+const SDK_NAME: &str = "temporal-ocaml";
+/// SDK version reported with [`SDK_NAME`]. It is the package version from
+/// `.release-version` in SemVer spelling (`~` becomes `-`); the release
+/// preflight gate rejects a release whose metadata disagrees with it.
+const SDK_VERSION: &str = "0.1.0-rc.1";
+
+/// Upper bound on establishing a client connection: transport connect, TLS,
+/// and Core's initial `GetSystemInfo` together. Healthy local and WAN
+/// handshakes finish well inside it; it only cuts short an endpoint that
+/// accepts and then stays silent, which Core would wait on for 30 s.
+const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Fixed, server-independent detail reported when [`CLIENT_CONNECT_TIMEOUT`]
+/// expires.
+const CLIENT_CONNECT_TIMEOUT_DETAIL: &str = "connection handshake did not complete within 10 s";
+
+/// Builds Core connection options with this SDK's identity rather than Core's
+/// `temporal-rust` default, so server metrics, histories, and the Web UI
+/// attribute calls to the OCaml SDK and its own version.
+fn connection_options(
+    target: temporalio_sdk_core::Url,
+    identity: String,
+    meter: Option<temporalio_common::telemetry::metrics::TemporalMeter>,
+) -> ConnectionOptions {
+    ConnectionOptions::new(target)
+        .identity(identity)
+        .client_name(SDK_NAME.to_owned())
+        .client_version(SDK_VERSION.to_owned())
+        .maybe_metrics_meter(meter)
+        // Core 1.x exposes a transport connect timeout (unset by default).
+        // Setting it lets a black-holed address fail with Core's own
+        // transport error inside the overall handshake bound.
+        .connect_timeout(CLIENT_CONNECT_TIMEOUT)
+        .build()
+}
+
+#[cfg(test)]
+mod connection_identity_tests {
+    /// Every connection reports this SDK's own name and package version
+    /// instead of Core's `temporal-rust` default (#816).
+    #[test]
+    fn connections_report_ocaml_sdk_identity() {
+        let target = temporalio_sdk_core::Url::parse("http://localhost:7233").unwrap();
+        let options = super::connection_options(target, "worker@host".to_owned(), None);
+        assert_eq!(options.get_client_name(), "temporal-ocaml");
+        assert_eq!(options.get_client_version(), super::SDK_VERSION);
+        assert_eq!(
+            super::SDK_VERSION,
+            include_str!("../../../.release-version")
+                .trim()
+                .replacen('~', "-", 1)
+        );
+    }
+}

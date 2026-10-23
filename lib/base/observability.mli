@@ -25,6 +25,34 @@ module Tag : sig
   (** Registered Temporal workflow type, truncated to a bounded tag length. *)
   val workflow_type : string Logs.Tag.def
 
+  (** Temporal workflow ID, truncated to a bounded tag length. Used only by
+      operational diagnostics that must name one execution, such as the
+      non-yielding activation watchdog. *)
+  val workflow_id : string Logs.Tag.def
+
+  (** Temporal workflow run ID, truncated to a bounded tag length. *)
+  val run_id : string Logs.Tag.def
+
+  (** Whether the activation being reported was replaying history (#500).
+      Replayed work re-runs code whose effects were already recorded, so a
+      reporter can use this to avoid counting a replayed completion as new
+      business progress. *)
+  val replaying : bool Logs.Tag.def
+
+  (** Temporal activity ID, truncated to a bounded tag length. Attached only
+      to activity lease records that name one attempt (#500); like the
+      workflow and run IDs it is an execution identifier, never a metric
+      label. *)
+  val activity_id : string Logs.Tag.def
+
+  (** Registered Temporal activity type, truncated to a bounded tag length. *)
+  val activity_type : string Logs.Tag.def
+
+  (** Non-negative activity attempt number as reported by Core (one-based for
+      real tasks). It distinguishes records for successive retries of the same
+      activity ID. *)
+  val attempt : int Logs.Tag.def
+
   (** Non-negative number of jobs supplied in one activation. *)
   val job_count : int Logs.Tag.def
 
@@ -40,12 +68,18 @@ end
 
 (** [tags ~operation ()] constructs metadata shared by current SDK boundaries.
     String values are bounded before they reach an application reporter without
-    splitting valid UTF-8 characters. Negative counts and negative, NaN, or
-    infinite durations become zero. *)
+    splitting valid UTF-8 characters. Negative counts and attempts, and
+    negative, NaN, or infinite durations, become zero. *)
 val tags :
   operation:string ->
   ?duration_ms:float ->
   ?workflow_type:string ->
+  ?workflow_id:string ->
+  ?run_id:string ->
+  ?replaying:bool ->
+  ?activity_id:string ->
+  ?activity_type:string ->
+  ?attempt:int ->
   ?job_count:int ->
   ?command_count:int ->
   ?bridge_status:string ->
@@ -57,6 +91,17 @@ val tags :
     in milliseconds. It is diagnostic only and must never affect workflow
     commands or other deterministic decisions. *)
 val measure_ms : (unit -> 'value) -> 'value * float
+
+(** [debug_timed ~src ~operation action] returns [action ()]. Only while
+    [src] reports at [Debug] does it read the clock around [action] and emit
+    one [Debug] record carrying [operation] and [duration_ms]. Otherwise it
+    calls [action] directly, so disabled instrumentation costs one source
+    level check (and the caller's closure), with no clock read or record.
+    Benchmarks use it to attribute protocol codec time inside a live worker
+    (#528). If [action] raises, the exception propagates and no record is
+    emitted. Like {!measure_ms}, the duration is diagnostic only. *)
+val debug_timed :
+  src:Logs.src -> operation:string -> (unit -> 'value) -> 'value
 
 (** [report ~src level ~tags message] submits one bounded constant SDK message.
     Any exception raised by the application-selected reporter or formatter is

@@ -50,14 +50,21 @@ module Definitions = struct
   (** The stable workflow type name used by the workflow worker and client. *)
   let compose_message_name = "ocaml-temporal-example.compose-message"
 
+  (** Creates the terminal business failure returned when workflow input is
+      invalid. The [`Workflow] category fails the workflow execution so the
+      client observes a failed result. [Temporal.Error.defect] must not be used
+      here: a propagated defect fails only the workflow task, which Temporal
+      retries indefinitely while the run stays open. [non_retryable] prevents
+      a configured workflow retry policy from rerunning the same bad input. *)
+  let invalid_input message =
+    Temporal.Error.make ~category:`Workflow ~non_retryable:true ~message ()
+
   (** Builds one activity input without allowing an ambiguous delimiter in the
       name. This function runs in deterministic workflow code, so it only
       performs pure string validation and construction. *)
   let render_request style name =
     if String.contains name ':' then
-      Error
-        (Temporal.Error.defect
-           ~message:"example names must not contain ':'")
+      Error (invalid_input "example names must not contain ':'")
     else Ok (style ^ ":" ^ name)
 
   (** Decodes the compact activity input used by this small example. Real
@@ -110,7 +117,7 @@ module Definitions = struct
     let open Temporal.Result_syntax in
     let normalized_name = String.trim name in
     if String.equal normalized_name "" then
-      Error (Temporal.Error.defect ~message:"a name is required")
+      Error (invalid_input "a name is required")
     else
       let* greeting_input = render_request "greeting" normalized_name in
       let* next_step_input = render_request "next-step" normalized_name in
@@ -159,32 +166,20 @@ module Lifecycle = struct
                 (Printexc.to_string exception_)))
 
   (** Runs a worker until it is stopped, translating [SIGINT] and [SIGTERM]
-      into the public idempotent shutdown call. Signal handlers only set an
-      atomic flag; a dedicated Domain performs all SDK work outside signal
-      context, then the final shutdown call closes the supervisor-owned native
+      into [Temporal.Worker.request_shutdown]. That call is only an atomic
+      write, so it is safe in a signal handler even when the runtime runs the
+      handler on this thread, which is also the thread blocked in
+      [Temporal.Worker.run] (#830). Once [run] returns, the final shutdown call
+      drains outstanding completions and closes the supervisor-owned native
       graph exactly once. *)
   let run_worker worker =
-    let stop_requested = Atomic.make false in
-    let watcher_finished = Atomic.make false in
-    let request_stop _signal = Atomic.set stop_requested true in
+    let request_stop _signal = Temporal.Worker.request_shutdown worker in
     let previous_term =
       Sys.signal Sys.sigterm (Sys.Signal_handle request_stop)
     in
     let previous_int = Sys.signal Sys.sigint (Sys.Signal_handle request_stop) in
-    let watcher =
-      Domain.spawn (fun () ->
-          while not (Atomic.get watcher_finished) do
-            if Atomic.get stop_requested then begin
-              ignore (Temporal.Worker.shutdown worker);
-              Atomic.set watcher_finished true
-            end
-            else Unix.sleepf 0.05
-          done)
-    in
     Fun.protect
       ~finally:(fun () ->
-        Atomic.set watcher_finished true;
-        Domain.join watcher;
         Sys.set_signal Sys.sigterm previous_term;
         Sys.set_signal Sys.sigint previous_int)
       (fun () ->

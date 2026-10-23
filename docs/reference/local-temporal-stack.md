@@ -114,7 +114,7 @@ driver's successful `client_shutdown` phase provides the corresponding client
 teardown evidence.
 
 This is a real workflow-result acceptance fixture, not only a lifecycle test.
-The complete [PR #253 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471)
+The complete [PR #253 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471)
 has live evidence for fan-out, timer/activity, parent/child success and
 failure/cancellation, ordinary, heartbeat-detail, and timeout-triggered
 activity retry, delayed asynchronous activity completion, continue-as-new
@@ -154,9 +154,9 @@ replacement, observes `is_replaying=true` from generation two, and removes the
 project's PostgreSQL volume during teardown. The legacy snapshots must contain
 zero patch markers; the active snapshots must contain exactly one false marker,
 and the removal snapshots exactly one true marker. The complete [PR #348 CI
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29411260374) records a
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29411260374) records a
 successful invocation of the two original scenarios; the complete [PR #356
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29469232271) records
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29469232271) records
 the active-to-deprecated and deprecated-to-removed scenarios as well.
 
 ## Parent/child restart and replay acceptance
@@ -187,8 +187,9 @@ logs automatically before cleanup when a readiness command fails.
 
 ## Image and platform policy
 
-The stack pins official PostgreSQL 16.13 Bookworm and Temporal 1.31.0 Server
-and admin-tools OCI manifests. All three manifest indexes contain native Linux
+The stack pins official PostgreSQL 18.6 Bookworm and Temporal 1.32.0 Server
+and admin-tools OCI manifests by immutable digest in
+[`compose.yaml`](../../test/integration/temporal/compose.yaml). All three manifest indexes contain native Linux
 `amd64` and `arm64` images. Version upgrades require rerunning the clean smoke,
 the stop/start persistence path, manifest inspection, and the dependency and
 license review.

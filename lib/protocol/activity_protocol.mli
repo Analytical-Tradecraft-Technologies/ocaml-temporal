@@ -56,6 +56,12 @@ type application_failure_category = Workflow_protocol.application_failure_catego
   | Application_category_unspecified
   | Application_category_benign
 
+(** Retry override attached to a Nexus handler error. *)
+type nexus_handler_retry_behavior = Workflow_protocol.nexus_handler_retry_behavior =
+  | Nexus_retry_unspecified
+  | Nexus_retry_retryable
+  | Nexus_retry_non_retryable
+
 (** Supported closed set of structured Temporal failure details. *)
 type failure_info = Workflow_protocol.failure_info =
   | Application of {
@@ -88,6 +94,21 @@ type failure_info = Workflow_protocol.failure_info =
       timeout_type : timeout_type;
       last_heartbeat_details : payload list;
     }
+  | Server of { non_retryable : bool }
+  | Reset_workflow of { last_heartbeat_details : payload list }
+  | Nexus_operation of {
+      scheduled_event_id : int64;
+      endpoint : string;
+      service : string;
+      operation : string;
+      operation_id : string;
+      operation_token : string;
+    }
+  | Nexus_handler of {
+      type_name : string;
+      retry_behavior : nexus_handler_retry_behavior;
+    }
+  | Absent
 
 (** Recursive Temporal failure shared with workflow activation semantics. *)
 type failure = Workflow_protocol.failure = {
@@ -168,9 +189,12 @@ type task_variant = Start of activity_start | Cancel of activity_cancel
     and must be copied unchanged into its completion. *)
 type task = { task_token : bytes; variant : task_variant }
 
-(** Terminal outcomes accepted by Temporal Core for an activity attempt. *)
+(** Terminal outcomes accepted by Temporal Core for an activity attempt.
+    [Completed] always carries a payload: Core rejects a successful completion
+    without one, so a void result is an encoded payload whose data may be
+    empty, and the wire form never accepts [null] (issue #954). *)
 type completion_result =
-  | Completed of payload option
+  | Completed of payload
   | Failed of failure
   | Cancelled of failure
   | Will_complete_async
@@ -180,6 +204,26 @@ type completion = { task_token : bytes; result : completion_result }
 
 (** Progress details for one currently leased activity attempt. *)
 type heartbeat = { task_token : bytes; details : payload list }
+
+(** A heartbeat for an activity handed off with [WillCompleteAsync], carried
+    with its attempt's heartbeat timeout as copied from the start task
+    (#1025). The bridge throttles these heartbeats per task token as Core
+    throttles a running activity's heartbeats, and derives the throttle
+    interval from the timeout ([None] selects the worker's default). On the
+    wire the heartbeat's two members are joined by a required, nullable
+    [heartbeat_timeout] member. *)
+type async_heartbeat = { heartbeat : heartbeat; heartbeat_timeout : duration option }
+
+(** The outcome of an accepted async heartbeat call: the server's state of
+    the activity as of the latest send for its token, which may precede the
+    call when the call was throttled. When several flags are set the bridge
+    reports cancellation first, then reset, then pause, the precedence Core
+    uses for a running activity. *)
+type async_heartbeat_response =
+  | Heartbeat_recorded  (** No cancellation, pause, or reset was reported. *)
+  | Heartbeat_cancel_requested  (** The workflow requested cancellation. *)
+  | Heartbeat_paused  (** The activity was paused. *)
+  | Heartbeat_reset  (** The activity was reset. *)
 
 type error
 (** Opaque semantic or strict-JSON validation failure. *)
@@ -194,16 +238,30 @@ val decode_task : string -> (task, error) result
 (** Strictly decodes and validates one activity-task document. *)
 
 val encode_task : task -> (string, error) result
-(** Validates, normalizes, and semantically reparses an outgoing task. *)
+(** Validates, normalizes, and serializes an outgoing task, then applies the
+    decoder's semantic rules to the validated value. *)
 
 val decode_completion : string -> (completion, error) result
 (** Strictly decodes and validates one activity-completion document. *)
 
 val encode_completion : completion -> (string, error) result
-(** Validates, normalizes, and semantically reparses an outgoing completion. *)
+(** Validates, normalizes, and serializes an outgoing completion, then applies the
+    decoder's semantic rules to the validated value. *)
 
 val decode_heartbeat : string -> (heartbeat, error) result
 (** Strictly decodes and validates one activity heartbeat document. *)
 
 val encode_heartbeat : heartbeat -> (string, error) result
-(** Validates, normalizes, and semantically reparses an outgoing heartbeat. *)
+(** Validates, normalizes, and serializes an outgoing heartbeat, then applies the
+    decoder's semantic rules to the validated value. *)
+
+val decode_async_heartbeat : string -> (async_heartbeat, error) result
+(** Strictly decodes and validates one async-activity heartbeat document. *)
+
+val encode_async_heartbeat : async_heartbeat -> (string, error) result
+(** Validates, normalizes, and serializes an outgoing async heartbeat, then
+    applies the decoder's semantic rules to the validated value. *)
+
+val async_heartbeat_response_of_string : string -> async_heartbeat_response option
+(** Decodes the bridge's fixed async-heartbeat outcome body: empty,
+    [cancel_requested], [paused], or [reset]. Any other body is [None]. *)

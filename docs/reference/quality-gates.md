@@ -46,30 +46,35 @@ with checksum validation enabled and fallback installation disabled, and the
 native lanes pin
 [`ocaml/setup-ocaml`](https://github.com/ocaml/setup-ocaml) rather than following
 its mutable `v3` reference. The quality action installs the same exact tool
-versions and then invokes `make quality`. The job runs once for each code pull
-request or merge group and once per scheduled run; it is not repeated for
-every OCaml matrix cell. Documentation-only changes skip the code jobs,
-including the standalone license audit.
+versions and then invokes `make quality`. The job runs once for each pull
+request, merge group, `master` push, scheduled run, or manual Build dispatch;
+it is not repeated for every OCaml matrix cell. Documentation-only PRs run
+this job and the full required build graph.
 
 ## CI matrix policy
 
-PRs and merge groups use a representative compatibility sample: Linux amd64
-on OCaml 5.2 and 5.5, Linux arm64, macOS ARM64, and Windows x64 on OCaml 5.5,
-and a live Temporal/PostgreSQL smoke on Linux amd64 with OCaml 5.5.
-All these jobs and the quality/license jobs share a single changed-code gate.
+The Build workflow runs for every PR and merge group through
+`.github/workflows/build-pr.yml`. A push to `master`, the daily 19:00 UTC
+scheduled run, and a manual dispatch run `.github/workflows/build.yml`, which
+calls the same workflow with the `master` matrix tier.
 
-Markdown and legal-documentation-only changes skip the code jobs. GitHub
-workflows, composite actions, and protocol schemas under `docs/schemas/`
-always count as code. Other paths, including unknown inputs and live test
-fixtures, also trigger all code jobs. The required path-detection job always
-runs; a failed diff fails that job. PRs compare against their merge base to
-exclude unrelated master changes, and merge groups include every queued
-change relative to the group's base. Renames include both old and new paths.
-The separate release metadata/SBOM workflow still runs without compiling code.
+| Event | Linux OCaml matrix | Native OCaml matrix | Other build jobs |
+| --- | --- | --- | --- |
+| PR or merge group | amd64 5.2 and 5.5; arm64 5.5 | macOS ARM64 and Windows x64 on 5.5 | Four Rust producers, quality, standalone license audit, and the live Temporal/PostgreSQL smoke on Linux amd64/5.5 |
+| `master` push, schedule, or manual Build dispatch | amd64 and arm64 on 5.2, 5.3, 5.4, and 5.5 | macOS ARM64 and Windows x64 on 5.5 | The same Rust, quality, license, and live smoke jobs |
 
-Scheduled runs retain the exhaustive OCaml 5.2–5.5 Linux matrix plus both
-native platforms. Intermediate-compiler regressions outside the PR sample
-are caught by the next scheduled run. Pushes to `master` do not run CI.
+The required PR and merge-group graph runs even for documentation-only,
+fixture-only, or empty effective diffs. The `changes` job validates the
+base-to-head comparison and then emits `code=true` for every valid event; a
+failed comparison fails the job. The four Rust producers, Linux and native
+matrices, quality, license audit, and live smoke therefore have no path-based
+skip. PRs compare against their merge base, and merge groups compare against
+the group's base. The separate release metadata/SBOM workflow also runs for
+PRs and merge groups without compiling the SDK.
+
+The broader `master` matrix catches intermediate-compiler regressions outside
+the PR sample. These entries describe configured jobs, not evidence that a
+particular Actions run completed.
 
 ## Rust artifact sharing
 
@@ -93,7 +98,13 @@ Windows additionally bundles the required MinGW import archives; the consumer
 regenerates their search path after relocation. Producers disable incremental
 state and use line-table debug information, retaining file/line backtraces,
 debug assertions, and the development optimization level while reducing
-artifact size. Normal local source builds keep their existing Cargo profiles.
+artifact size. Release bundles instead package Cargo's `[profile.release]`
+(thin LTO, one codegen unit, stripped debug information, unwinding panics);
+their Rust tests use the same optimization level without debug assertions or
+overflow checks. Local source builds follow Dune's profile: `opam install`,
+`dune build -p`, and `--profile release` link Cargo's release profile, while
+Dune's default dev profile links Cargo's unoptimized dev profile for fast
+iteration. `test/smoke/test_rust_bridge_profile.sh` checks that selection.
 
 Only the finished bundle is cached, never Cargo's registry or target tree.
 Keys include platform, the complete Rust source/header/test/lockfile tree,
@@ -109,14 +120,16 @@ build directory.
 The existing required OCaml and live-smoke checks explicitly fail when their
 Rust producers fail. Their job conditions override GitHub's default dependency
 skipping, because a skipped required job would otherwise count as successful.
-Documentation-only PRs retain the existing path-based skips.
+Documentation-only PRs run the same required Rust and OCaml graph.
 
-Only successful Rust producers on scheduled `master` runs save shared
-caches. PR and merge-queue jobs can restore these default-branch caches without
-write credentials. OCaml-only changes therefore reuse the same Rust bundle
-across PR, queue, and scheduled runs even though their commit IDs differ. A change to
-Rust or its build inputs needs a fresh producer on each event until a scheduled run
-seeds the new key. This deliberately does not promote PR artifacts into
+On a cache miss, successful Rust producers save shared caches only on `master`
+pushes or scheduled runs. PR and merge-queue jobs can restore these
+default-branch caches without write credentials. OCaml-only changes therefore
+reuse the same Rust bundle
+across PR, queue, `master` push, and scheduled runs even though their commit IDs
+differ. A change to Rust or its build inputs needs a fresh producer on each
+event until a `master` push or scheduled run seeds the new key. This
+deliberately does not promote PR artifacts into
 master: GitHub scopes PR caches to their merge ref. Cache eviction or a new
 native runner image also causes a normal rebuild. Live dependency-advisory and
 license checks continue independently on every applicable workflow run.
@@ -160,11 +173,13 @@ queued Actions run does not make the local verification boundary ambiguous:
 
 | CI job | Workflow command | Local command | What the local result proves |
 | --- | --- | --- | --- |
-| `verify` | `make verify OCAML_VERSION=<matrix version>` with the verified bridge bundle | `make verify OCAML_VERSION=5.2` (or another locally available image) | Docker-backed OCaml build/lint, bridge/install tests, and repository quality contracts. CI gets Rust validation from its producer; the default local command also runs Rust tests. PRs use the representative cells; scheduled runs use the exhaustive matrix. |
-| `quality` | `make quality` | `make quality` | The pinned native `cargo-deny`, `cargo-machete`, and `typos` scans. The exact binaries must be installed on the host. |
-| `license-audit` | `make license-check OCAML_VERSION=5.2`, plus the two isolated Python Cargo-license checks | `make license-check OCAML_VERSION=5.2` | The package/OCaml dependency license policy. The locked Cargo license scanner remains a single CI-only step and is not repeated in the OCaml matrix. |
-| `native` (scheduled) / `native-macos`, `native-windows` (PR) | `make native-verify` | `make native-verify` on a matching native host | The OCaml 5.5 and Rust native link, format, lint, install, and test path. macOS ARM64 runs for every code PR; Windows x64 uses the same code gate; scheduled runs cover both platforms. |
-| `temporal-integration` | `make test-temporal-integration`, `make test-temporal-worker-restart`, `make test-temporal-worker-crash-recovery`, `make test-temporal-worker-cache-eviction`, `make test-temporal-workflow-patching`, `make test-temporal-parent-child-restart`, and `make test-temporal-parent-child-failure-replay` | Run the corresponding target when Docker and network access are available | Seven sequential live controllers reuse one job's checkout/build cache while each owns a fresh Temporal/PostgreSQL lifecycle. The 45-minute CI ceiling includes the bilateral parent/child recovery gates; contract-only results are not live evidence. |
+| `verify` | `make verify OCAML_VERSION=<matrix version>` with the verified bridge bundle | `make verify OCAML_VERSION=5.2` (or another supported series; each selects the digest-pinned base image in `docker/ocaml-<series>/Dockerfile`) | Docker-backed OCaml build/lint against the exact locked OPAM closure (the image build fails on drift), bridge/install tests, and repository quality contracts. CI gets Rust validation from its producer; the default local command also runs Rust tests. PRs use the representative cells; the `master` tier uses the exhaustive matrix. |
+| `verify` (OCaml 5.2, amd64 only) | `make docs OCAML_VERSION=5.2.1` after `make verify` | `make docs` | The odoc API documentation and package landing page build without any odoc warning, using the exact CI-only odoc closure. |
+| `quality` | `make test-ci-artifacts`, then `make quality` | `make quality` | CI checks matrix selection and artifact failure cases before running the pinned native `cargo-deny`, `cargo-machete`, and `typos` scans. The exact binaries must be installed on the host. |
+| `license-audit` | `make license-check OCAML_VERSION=5.2`, `make test-dependency-inventory-contract`, plus the two isolated Python Cargo-license checks | `make license-check OCAML_VERSION=5.2` | The package/OCaml dependency license policy, after `make check-dependency-inventory` confirms that [the dependency inventory](../dependencies.md#keeping-this-inventory-current) still matches every lock file, image digest, action pin, and CI tool version. The locked Cargo license scanner remains a single CI-only step and is not repeated in the OCaml matrix. |
+| `native-macos`, `native-windows` | `sh scripts/opam-locked-deps.sh install --assume-depexts`, then `make native-verify` | the same two commands on a matching native host | The OCaml 5.5 and Rust native link, format, lint, install, and test path. Both platforms run for every PR and merge group and in the `master` tier. |
+| `temporal-integration` | `make test-temporal-start-metadata-live`, `make test-temporal-task-failure-live`, then `make test-temporal-live-ci` | Run the corresponding target when Docker and network access are available | The live CI target runs seven sequential controllers, the fixed-bug live regression suites (`make test-temporal-live-regressions`), and the shipped three-process example application and the self-checking cooperative cancellation example (`make test-temporal-examples-live`), in addition to the workflow-start metadata and task-failure recovery scenarios. Each owns a fresh Temporal/PostgreSQL lifecycle. The 93-minute CI ceiling includes the bilateral parent/child recovery gates and is at least the sum of the per-step timeouts, so evidence uploads still run after a step times out; contract-only results are not live evidence. |
+| `stress` (scheduled `stress.yml`, weekly and on dispatch; not a PR check) | `make stress-qualification` with one seed for every target | `make stress-qualification` (or the individual `test-parser-fuzz`, `test-decoder-fuzz`, `test-lifecycle-stress`, and `test-concurrent-stress` targets) | Every fuzzer and lifecycle stress with long budgets: 20,000 cases per decoder, 1,000 lifecycle cases, and 300 concurrent rounds. A failure keeps every reproduction directory for 30 days. See [decoder fuzzing](bridge-decoder-fuzz.md#scheduled-qualification). |
 
 `make check OCAML_VERSION=5.2` is a convenient Docker-backed local baseline:
 it combines `make verify` and `make license-check`. It does not run
@@ -230,14 +245,41 @@ narrow dictionary exception only for an intentional project term or external
 proper name; do not suppress a file or directory merely to silence a genuine
 documentation defect.
 
+## Rendered API documentation
+
+ocaml.org renders the package's API documentation with
+[`odoc`](https://github.com/ocaml/odoc) when it is published to opam, so broken
+doc comments become broken public documentation. `make docs` runs
+`dune build @doc` and fails on any odoc warning: the root `dune` file makes
+odoc warnings fatal in the `dev` profile (release builds such as
+`dune build -p` keep odoc's default, so a newer odoc cannot break a consumer).
+The check covers the `.mli` doc comments of every library in the package,
+including unresolved or ambiguous `{!...}` references, unterminated `[...]`
+code spans, and the `lib/public/index.mld` package landing page. The HTML is
+written to `_build/default/_doc/_html`.
+
+odoc is a CI-only documentation tool, not a package dependency. It is absent
+from `temporal-sdk.opam`, its lock, and every SDK build. `make docs` runs in
+the Compose `docs` service, whose `docs` stage of `Dockerfile.dev` extends the
+ordinary development image with the exact odoc closure in
+`scripts/docs-tools.locked`; the stage fails if any installed version differs
+and re-checks the locked SDK closure. CI runs `make docs` once, in the
+OCaml 5.2/amd64 `verify` lane present in every tier, because the rendered
+documentation does not depend on the compiler series or architecture.
+
+odoc 3.2.1 is ISC, but its closure contains `tyxml`, `re`, and `camlp-streams`
+under LGPL-2.1 with the OCaml linking exception. This is acceptable only
+because no package in that closure is linked into, shipped with, or required
+to build the SDK: it renders HTML in a disposable CI image, like the pinned
+Python container that runs the Cargo licence scanner. The dependency licence
+policy and its exact linking exceptions in `docs/dependencies.md` are
+unchanged and still govern everything the SDK builds or ships; this
+tool-only decision must not be cited to admit those packages, or any other
+LGPL package, as an SDK dependency.
+
 ## Evaluated OCaml alternatives
 
 No separate OCaml semantic linter was added. The maintained compiler and Dune
 checks already cover type errors, exhaustiveness, unused declarations, and
-configured warnings. The OCaml Platform's
-[`odoc`](https://github.com/ocaml/odoc) would add valuable documentation-link
-validation, but version 3.2.1 has an ordinary `tyxml` dependency licensed under
-LGPL with the OCaml linking exception. That dependency is outside this
-repository's exact approved exceptions, so adding odoc would violate policy.
-The decision can be revisited if a future permissive dependency closure is
-available.
+configured warnings. Documentation-link validation is provided by the
+odoc gate above.

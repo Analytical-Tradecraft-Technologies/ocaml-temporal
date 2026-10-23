@@ -51,7 +51,7 @@ let execution : Protocol.execution =
 (** Cancellation requests retain a stable operation identifier so a caller can
     retry a transport timeout without creating a second logical request. *)
 let cancel_request : Protocol.cancel_request =
-  { execution; request_id = "cancel-1"; reason = "operator requested cancellation" }
+  { execution; request_id = "cancel-1"; reason = "operator requested cancellation"; rpc_deadline = None }
 
 (** Reset requests identify the exact workflow-task boundary from which
     Temporal should rebuild a new run. The event ID is intentionally kept as an
@@ -62,6 +62,7 @@ let reset_request : Protocol.reset_request =
     request_id = "reset-1";
     reason = "replay from workflow task";
     workflow_task_finish_event_id = 4L;
+    rpc_deadline = None;
   }
 
 (** Signal requests carry the exact run, stable operation ID, and ordered
@@ -72,12 +73,13 @@ let signal_request : Protocol.signal_request =
     signal_name = "add_document";
     request_id = "signal-1";
     input = [];
+    rpc_deadline = None;
   }
 
 (** Output-only query request used to exercise exact-run and query-name
     validation in the OCaml half of the closed bridge protocol. *)
 let query_request : Protocol.query_request =
-  { execution; query_type = "current_state"; input = [] }
+  { execution; query_type = "current_state"; input = []; rpc_deadline = None }
 
 (** Start requests use the same workflow identity as the response fixtures. *)
 let start_request : Protocol.start_request =
@@ -90,6 +92,13 @@ let start_request : Protocol.start_request =
     input = [];
     memo = [];
     search_attributes = [];
+    id_conflict_policy = Protocol.Fail;
+    id_reuse_policy = Protocol.Allow_duplicate;
+    execution_timeout_ms = None;
+    run_timeout_ms = None;
+    task_timeout_ms = None;
+    retry_policy = None;
+    rpc_deadline = None;
   }
 
 (** The canonical payload wrapper for the bytes [ok]. *)
@@ -235,7 +244,7 @@ let test_request_validation () =
     (fun request -> require_error (Protocol.encode_cancel_request request))
     [
       { cancel_request with execution = { execution with namespace = "" } };
-      { cancel_request with execution = { execution with run_id = "" } };
+      { cancel_request with execution = { execution with run_id = "a\000b" } };
       { cancel_request with request_id = "contains\000nul" };
       { cancel_request with reason = String.make 65_537 'x' };
       { cancel_request with reason = "contains\000nul" };
@@ -253,7 +262,7 @@ let test_request_validation () =
     (fun request -> require_error (Protocol.encode_signal_request request))
     [
       { signal_request with execution = { execution with namespace = "" } };
-      { signal_request with execution = { execution with run_id = "" } };
+      { signal_request with execution = { execution with run_id = "a\000b" } };
       { signal_request with signal_name = "" };
       { signal_request with request_id = "contains\000nul" };
     ]
@@ -316,7 +325,7 @@ let test_reset_protocol () =
     Temporal's terminate RPC does not expose one. *)
 let test_termination_protocol () =
   let request : Protocol.terminate_request =
-    { execution; reason = "operator test" }
+    { execution; reason = "operator test"; rpc_deadline = None }
   in
   let encoded = unwrap (Protocol.encode_terminate_request request) in
   require_fragment "terminate reason" "operator test" encoded;
@@ -354,6 +363,55 @@ let test_signal_protocol () =
   | Protocol.Rpc { code = "unavailable" } -> ()
   | _ -> failwith "signal RPC error was not typed")
 
+(** Issue #823: a failed query handler is a distinct, query-only error kind
+    whose bounded message survives decoding; every other operation, a
+    malformed message, and an extra member are rejected. *)
+let test_query_failed_error () =
+  let document = {|{"kind":"query_failed","message":"no handler for \"state\""}|} in
+  (match unwrap (Protocol.decode_query_error document) with
+  | Protocol.Query_failed { message = {|no handler for "state"|} } -> ()
+  | _ -> failwith "query handler failure was not typed");
+  (match
+     unwrap (Protocol.decode_query_error {|{"kind":"query_failed","message":""}|})
+   with
+  | Protocol.Query_failed { message = "" } -> ()
+  | _ -> failwith "empty query handler message was rejected");
+  let at_limit = String.make 4096 'x' in
+  (match
+     unwrap
+       (Protocol.decode_query_error
+          (Printf.sprintf {|{"kind":"query_failed","message":"%s"}|} at_limit))
+   with
+  | Protocol.Query_failed { message } when String.equal message at_limit -> ()
+  | _ -> failwith "query handler message at the limit was rejected");
+  (* The encoder validates the message too, and a start outcome can never
+     carry a query-only failure. *)
+  require_error
+    (Protocol.encode_start_outcome
+       (Protocol.Rejected (Protocol.Query_failed { message = "x" })));
+  List.iter
+    (fun document -> require_error (Protocol.decode_query_error document))
+    [
+      Printf.sprintf {|{"kind":"query_failed","message":"%s"}|}
+        (String.make 4097 'x');
+      {|{"kind":"query_failed","message":"nul\u0000byte"}|};
+      "{\"kind\":\"query_failed\",\"message\":\"\xff\"}";
+      {|{"kind":"query_failed"}|};
+      {|{"kind":"query_failed","message":1}|};
+      {|{"kind":"query_failed","message":"x","code":"invalid_argument"}|};
+    ];
+  require_error (Protocol.decode_signal_error document);
+  require_error (Protocol.decode_cancel_error document);
+  require_error (Protocol.decode_reset_error document);
+  require_error (Protocol.decode_update_error document);
+  require_error (Protocol.decode_wait_error ~request:execution document);
+  require_error (Protocol.decode_start_error ~request:start_request document);
+  match
+    unwrap (Protocol.decode_update_error {|{"kind":"rpc","code":"not_found"}|})
+  with
+  | Protocol.Rpc { code = "not_found" } -> ()
+  | _ -> failwith "update RPC error was not typed"
+
 (** Checks the output-only query request/response contract and rejects the
     start-only error category before any native operation is attempted. *)
 let test_query_protocol () =
@@ -371,17 +429,18 @@ let test_query_protocol () =
     (fun request -> require_error (Protocol.encode_query_request request))
     [
       { query_request with execution = { execution with namespace = "" } };
-      { query_request with execution = { execution with run_id = "" } };
+      { query_request with execution = { execution with run_id = "a\000b" } };
       { query_request with query_type = "" };
     ];
   require_error
     (Protocol.decode_query_error
        {|{"kind":"already_started","workflow_id":"workflow-1","existing_run_id":null}|});
-  match
-    unwrap (Protocol.decode_query_error {|{"kind":"rpc","code":"failed_precondition"}|})
-  with
+  (match
+     unwrap (Protocol.decode_query_error {|{"kind":"rpc","code":"failed_precondition"}|})
+   with
   | Protocol.Rpc { code = "failed_precondition" } -> ()
-  | _ -> failwith "query rejection was not typed as failed_precondition"
+  | _ -> failwith "query rejection was not typed as failed_precondition");
+  test_query_failed_error ()
 
 (** Visibility pages use an exact row schema and preserve opaque continuation
     tokens without allowing unknown fields or malformed rows through. *)
@@ -392,6 +451,7 @@ let test_visibility_protocol () =
       query = "WorkflowType = 'Smoke'";
       page_size = 25;
       next_page_token = None;
+      rpc_deadline = None;
     }
   in
   let encoded = unwrap (Protocol.encode_visibility_request request) in
@@ -403,15 +463,55 @@ let test_visibility_protocol () =
   (match unwrap (Protocol.decode_visibility_response response) with
   | { executions = [ row ]; next_page_token = Some "dG9rZW4=" } ->
       assert (String.equal row.workflow_id "workflow-1");
-      assert (String.equal row.status "running")
+      assert (row.status = `Running)
   | _ -> failwith "visibility response changed shape");
+  let row_with_status status =
+    Printf.sprintf
+      {|{"executions":[{"workflow_id":"workflow-1","run_id":"run-1","workflow_type":"Smoke","task_queue":"queue","status":%S}],"next_page_token":null}|}
+      status
+  in
+  (* A status a newer server added arrives as [unknown_<n>] and must not fail
+     the whole page (#1078); the spellings match the Rust encoder's. *)
+  List.iter
+    (fun (name, expected) ->
+      match unwrap (Protocol.decode_visibility_response (row_with_status name)) with
+      | { executions = [ row ]; _ } -> assert (row.status = expected)
+      | _ -> failwith "unknown visibility status changed shape")
+    [
+      ("running", `Running);
+      ("completed", `Completed);
+      ("failed", `Failed);
+      ("canceled", `Canceled);
+      ("terminated", `Terminated);
+      ("continued_as_new", `Continued_as_new);
+      ("timed_out", `Timed_out);
+      ("paused", `Paused);
+      ("unspecified", `Unknown 0);
+      ("unknown_9", `Unknown 9);
+      ("unknown_-1", `Unknown (-1));
+      ("unknown_2147483647", `Unknown 2147483647);
+      ("unknown_-2147483648", `Unknown (-2147483648));
+    ];
   List.iter
     (fun malformed -> require_error (Protocol.decode_visibility_response malformed))
-    [
-      {|{"executions":[],"next_page_token":null,"extra":true}|};
-      {|{"executions":[{"workflow_id":"","run_id":"run-1","workflow_type":"Smoke","task_queue":"queue","status":"running"}],"next_page_token":null}|};
-      {|{"executions":[{"workflow_id":"workflow-1","run_id":"run-1","workflow_type":"Smoke","task_queue":"queue","status":"future_status"}],"next_page_token":null}|};
-    ]
+    ([
+       {|{"executions":[],"next_page_token":null,"extra":true}|};
+       {|{"executions":[{"workflow_id":"","run_id":"run-1","workflow_type":"Smoke","task_queue":"queue","status":"running"}],"next_page_token":null}|};
+     ]
+    @ List.map row_with_status
+        [
+          "future_status";
+          "unknown_";
+          "unknown_0";
+          "unknown_1";
+          "unknown_8";
+          "unknown_09";
+          "unknown_+9";
+          "unknown_-0";
+          "unknown_0x9";
+          "unknown_1_0";
+          "unknown_2147483648";
+        ])
 
 (** Exercises the asynchronous-start capability and all three terminal outcome
     variants. The request-bound ticket is deliberately opaque: this test can
@@ -432,13 +532,13 @@ let test_async_start_protocol () =
   require_error
     (Protocol.decode_start_ticket ~request:start_request {|{"ticket":""}|});
   let accepted_json =
-    {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"}}|}
+    {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-2"},"started":true}|}
   in
   let accepted =
     unwrap (Protocol.decode_start_outcome ~request:start_request accepted_json)
   in
   (match accepted with
-  | Protocol.Accepted { execution = { run_id = "run-2"; _ } } -> ()
+  | Protocol.Accepted { execution = { run_id = "run-2"; _ }; started = true } -> ()
   | _ -> failwith "accepted start outcome changed shape");
   let rejected_json =
     {|{"kind":"rejected","error":{"kind":"already_started","workflow_id":"workflow-1","existing_run_id":"run-existing"}}|}
@@ -475,7 +575,7 @@ let test_async_start_protocol () =
        {|{"kind":"unknown","request_id":"other-request","workflow_id":"workflow-1"}|});
   require_error
     (Protocol.decode_start_outcome ~request:start_request
-       {|{"kind":"accepted","execution":{"namespace":"other","workflow_id":"workflow-1","run_id":"run-2"}}|});
+       {|{"kind":"accepted","execution":{"namespace":"other","workflow_id":"workflow-1","run_id":"run-2"},"started":true}|});
   require_error
     (Protocol.decode_start_outcome ~request:start_request
        {|{"kind":"rejected","error":{"kind":"already_started","workflow_id":"other-workflow","existing_run_id":null}}|})
@@ -484,7 +584,7 @@ let test_async_start_protocol () =
     the JSON foundation or the operation-specific decoder. *)
 let test_closed_response_shape () =
   let valid =
-    {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"}}|}
+    {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"started":true}|}
   in
   ignore (unwrap (Protocol.decode_start_response ~request:start_request valid));
   require_error
@@ -492,7 +592,7 @@ let test_closed_response_shape () =
        {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"extra":true}|});
   check_error_path "nested execution duplicate" "$.execution"
     (Protocol.decode_start_response ~request:start_request
-       {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1","run_id":"run-2"}}|});
+       {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1","run_id":"run-2"},"started":true}|});
   require_error
     (Protocol.decode_wait_response ~request:execution
        {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"outcome":{"kind":"cancelled","details":[],"extra":true}}|})
@@ -501,7 +601,7 @@ let test_closed_response_shape () =
     even when their JSON shape and identifiers are individually valid. *)
 let test_response_execution_correlation () =
   let response =
-    {|{"execution":{"namespace":"default","workflow_id":"other-workflow","run_id":"run-1"}}|}
+    {|{"execution":{"namespace":"default","workflow_id":"other-workflow","run_id":"run-1"},"started":true}|}
   in
   require_error (Protocol.decode_start_response ~request:start_request response);
   let wait_response =
@@ -509,6 +609,72 @@ let test_response_execution_correlation () =
   in
   require_error
     (Protocol.decode_wait_response ~request:execution wait_response)
+
+(** Checks the current-run selector (#791): every request after start
+    accepts an empty run ID, a wait response must echo the selector exactly,
+    and an update response must name a concrete run, adopting the resolved run
+    only for a current-run request. *)
+let test_current_run_protocol () =
+  let current = { execution with run_id = "" } in
+  let encoded = unwrap (Protocol.encode_wait_request current) in
+  require_fragment "current-run wait" {|"run_id":""|} encoded;
+  ignore (unwrap (Protocol.encode_cancel_request { cancel_request with execution = current }));
+  ignore (unwrap (Protocol.encode_reset_request { reset_request with execution = current }));
+  ignore
+    (unwrap
+       (Protocol.encode_terminate_request { execution = current; reason = ""; rpc_deadline = None }));
+  ignore (unwrap (Protocol.encode_signal_request { signal_request with execution = current }));
+  ignore (unwrap (Protocol.encode_query_request { query_request with execution = current }));
+  let update_request : Protocol.update_request =
+    { execution = current; update_id = "update-1"; update_name = "set"; input = []; rpc_deadline = None }
+  in
+  ignore (unwrap (Protocol.encode_update_request update_request));
+  ignore
+    (unwrap
+       (Protocol.encode_poll_update_request
+          { execution = current; update_id = "update-1" }));
+  (* The namespace and workflow ID remain mandatory for a current-run request. *)
+  require_error (Protocol.encode_wait_request { current with workflow_id = "" });
+  require_error
+    (Protocol.encode_update_request
+       { update_request with execution = { current with namespace = "" } });
+  let completed_with_successor run_id =
+    Printf.sprintf
+      {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"%s"},"outcome":{"kind":"completed","result":[],"successor":{"namespace":"default","workflow_id":"workflow-1","run_id":"next-run"}}}|}
+      run_id
+  in
+  let response =
+    unwrap
+      (Protocol.decode_wait_response ~request:current (completed_with_successor ""))
+  in
+  (match response.outcome with
+  | Protocol.Completed { successor = Some { run_id = "next-run"; _ }; _ } -> ()
+  | _ -> failwith "current-run wait lost the completed successor");
+  if response.execution.run_id <> "" then
+    failwith "current-run wait did not echo its selector";
+  (* The echo must equal the request in both directions. *)
+  require_error
+    (Protocol.decode_wait_response ~request:current (completed_with_successor "run-1"));
+  require_error
+    (Protocol.decode_wait_response ~request:execution (completed_with_successor ""));
+  let update_response run_id =
+    Printf.sprintf
+      {|{"update_id":"update-1","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"%s"},"outcome":null}|}
+      run_id
+  in
+  let adopted =
+    unwrap
+      (Protocol.decode_update_response ~request:update_request
+         (update_response "resolved-run"))
+  in
+  if adopted.execution.run_id <> "resolved-run" then
+    failwith "current-run update did not adopt the resolved run";
+  require_error
+    (Protocol.decode_update_response ~request:update_request (update_response ""));
+  require_error
+    (Protocol.decode_update_response
+       ~request:{ update_request with execution }
+       (update_response "resolved-run"))
 
 (** Decodes structured native errors and rejects categories or codes outside
     the bilateral closed vocabulary. *)
@@ -571,6 +737,290 @@ let test_operation_error_correlation () =
   require_error
     (Protocol.decode_wait_error ~request:execution already_started)
 
+(** Checks the explicit conflict-policy wire names and the [started] flag:
+    every request carries its policy, [started = false] is accepted only for
+    a [Use_existing] request (where it names the existing run), and both the
+    synchronous response and asynchronous outcome require the member. *)
+let test_id_conflict_policy_protocol () =
+  List.iter
+    (fun (policy, name) ->
+      let encoded =
+        unwrap
+          (Protocol.encode_start_request
+             { start_request with id_conflict_policy = policy })
+      in
+      require_fragment "conflict policy"
+        ({|"id_conflict_policy":"|} ^ name ^ {|"|})
+        encoded)
+    [
+      (Protocol.Fail, "fail");
+      (Protocol.Use_existing, "use_existing");
+      (Protocol.Terminate_existing, "terminate_existing");
+    ];
+  let use_existing =
+    { start_request with id_conflict_policy = Protocol.Use_existing }
+  in
+  let existing_response =
+    {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-existing"},"started":false}|}
+  in
+  (match
+     unwrap (Protocol.decode_start_response ~request:use_existing existing_response)
+   with
+  | { execution = { run_id = "run-existing"; _ }; started = false } -> ()
+  | _ -> failwith "use_existing response lost the existing run");
+  require_error
+    (Protocol.decode_start_response ~request:start_request existing_response);
+  require_error
+    (Protocol.decode_start_response
+       ~request:{ start_request with id_conflict_policy = Protocol.Terminate_existing }
+       existing_response);
+  require_error
+    (Protocol.decode_start_response ~request:use_existing
+       {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"}}|});
+  require_error
+    (Protocol.decode_start_response ~request:use_existing
+       {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"started":"no"}|});
+  let existing_outcome =
+    {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-existing"},"started":false}|}
+  in
+  let decoded =
+    unwrap (Protocol.decode_start_outcome ~request:use_existing existing_outcome)
+  in
+  (match decoded with
+  | Protocol.Accepted { execution = { run_id = "run-existing"; _ }; started = false }
+    ->
+      ()
+  | _ -> failwith "use_existing outcome lost the existing run");
+  require_fragment "encoded started flag" {|"started":false|}
+    (unwrap (Protocol.encode_start_outcome decoded));
+  require_error
+    (Protocol.decode_start_outcome ~request:start_request existing_outcome);
+  require_error
+    (Protocol.decode_start_outcome ~request:use_existing
+       {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"}}|})
+
+(** Reports whether [fragment] occurs in [value]; the negative counterpart of
+    [require_fragment], used to check that an absent option is omitted. *)
+let contains_fragment value fragment =
+  match require_fragment "" fragment value with
+  | () -> true
+  | exception Failure _ -> false
+
+(** A caller deadline with budget [timeout_ms], created at monotonic time 0;
+    encoders serialize only the budget. *)
+let deadline timeout_ms = Some (Protocol.rpc_deadline ~now_ns:0L ~timeout_ms)
+
+(** Checks the execution-policy members of a start request (#499): the reuse
+    policy is always explicit with closed wire names, timeouts and the retry
+    policy are omitted unless supplied, values cross as exact millisecond
+    integers, and every invalid value or combination is rejected by the
+    encoder at the member Rust would also reject. *)
+let test_start_execution_policy_protocol () =
+  let default = unwrap (Protocol.encode_start_request start_request) in
+  require_fragment "default reuse policy" {|"id_reuse_policy":"allow_duplicate"|}
+    default;
+  List.iter
+    (fun member ->
+      if contains_fragment default member then
+        failwith (member ^ " was sent although it was not supplied"))
+    [
+      "execution_timeout_ms";
+      "run_timeout_ms";
+      "task_timeout_ms";
+      "retry_policy";
+      "rpc_timeout_ms";
+    ];
+  List.iter
+    (fun (policy, name) ->
+      require_fragment "reuse policy"
+        ({|"id_reuse_policy":"|} ^ name ^ {|"|})
+        (unwrap
+           (Protocol.encode_start_request
+              { start_request with id_reuse_policy = policy })))
+    [
+      (Protocol.Allow_duplicate, "allow_duplicate");
+      (Protocol.Allow_duplicate_failed_only, "allow_duplicate_failed_only");
+      (Protocol.Reject_duplicate, "reject_duplicate");
+    ];
+  let retry_policy : Workflow.retry_policy =
+    {
+      initial_interval = { seconds = 1L; nanoseconds = 0 };
+      backoff_coefficient_bits = Int64.to_string (Int64.bits_of_float 2.0);
+      maximum_interval = { seconds = 10L; nanoseconds = 0 };
+      maximum_attempts = 3;
+      non_retryable_error_types = [ "Fatal" ];
+    }
+  in
+  let full =
+    {
+      start_request with
+      execution_timeout_ms = Some Protocol.max_workflow_timeout_ms;
+      run_timeout_ms = Some 180_000L;
+      task_timeout_ms = Some Protocol.max_workflow_task_timeout_ms;
+      retry_policy = Some retry_policy;
+      rpc_deadline = deadline Protocol.max_rpc_timeout_ms;
+    }
+  in
+  let encoded = unwrap (Protocol.encode_start_request full) in
+  List.iter
+    (fun fragment -> require_fragment "start policy" fragment encoded)
+    [
+      {|"execution_timeout_ms":315576000000999|};
+      {|"run_timeout_ms":180000|};
+      {|"task_timeout_ms":120000|};
+      {|"rpc_timeout_ms":60000|};
+      {|"maximum_attempts":3|};
+      {|"non_retryable_error_types":["Fatal"]|};
+    ];
+  let invalid =
+    [
+      ( "zero execution timeout",
+        "$.execution_timeout_ms",
+        { start_request with execution_timeout_ms = Some 0L } );
+      ( "negative run timeout",
+        "$.run_timeout_ms",
+        { start_request with run_timeout_ms = Some (-1L) } );
+      ( "overflowing execution timeout",
+        "$.execution_timeout_ms",
+        {
+          start_request with
+          execution_timeout_ms = Some (Int64.succ Protocol.max_workflow_timeout_ms);
+        } );
+      ( "long task timeout",
+        "$.task_timeout_ms",
+        {
+          start_request with
+          task_timeout_ms = Some (Int64.succ Protocol.max_workflow_task_timeout_ms);
+        } );
+      ( "run longer than execution",
+        "$.run_timeout_ms",
+        {
+          start_request with
+          execution_timeout_ms = Some 1_000L;
+          run_timeout_ms = Some 1_001L;
+        } );
+      ( "task longer than run",
+        "$.task_timeout_ms",
+        {
+          start_request with
+          run_timeout_ms = Some 1_000L;
+          task_timeout_ms = Some 1_001L;
+        } );
+      ( "task longer than execution",
+        "$.task_timeout_ms",
+        {
+          start_request with
+          execution_timeout_ms = Some 1_000L;
+          task_timeout_ms = Some 1_001L;
+        } );
+      ( "zero rpc timeout",
+        "$.rpc_timeout_ms",
+        { start_request with rpc_deadline = deadline 0L } );
+      ( "long rpc timeout",
+        "$.rpc_timeout_ms",
+        {
+          start_request with
+          rpc_deadline = deadline (Int64.succ Protocol.max_rpc_timeout_ms);
+        } );
+    ]
+  in
+  List.iter
+    (fun (label, path, request) ->
+      check_error_path label path (Protocol.encode_start_request request))
+    invalid;
+  require_error
+    (Protocol.encode_start_request
+       {
+         start_request with
+         retry_policy =
+           Some
+             {
+               retry_policy with
+               initial_interval = { seconds = 0L; nanoseconds = 0 };
+             };
+       })
+
+(** A caller deadline resolved at dispatch sends only the budget that
+    remains (#499): rounded up to whole milliseconds, never above the
+    original budget, and absent once the deadline has expired. Readings are
+    arbitrary monotonic nanoseconds. *)
+let test_rpc_deadline_remaining () =
+  let created = Protocol.rpc_deadline ~now_ns:1_000_000_000L ~timeout_ms:250L in
+  if created.expires_at_ns <> 1_250_000_000L then failwith "deadline expiry";
+  let remaining now_ns =
+    Option.map
+      (fun (value : Protocol.rpc_deadline) -> value.timeout_ms)
+      (Protocol.remaining_rpc_deadline ~now_ns created)
+  in
+  List.iter
+    (fun (now_ns, expected) ->
+      if remaining now_ns <> expected then
+        failwith (Printf.sprintf "remaining budget at %Ld" now_ns))
+    [
+      (1_000_000_000L, Some 250L);
+      (* A reading before creation never lengthens the budget. *)
+      (999_000_000L, Some 250L);
+      (1_100_000_000L, Some 150L);
+      (1_249_999_999L, Some 1L);
+      (1_249_000_001L, Some 1L);
+      (1_250_000_000L, None);
+      (2_000_000_000L, None);
+    ]
+
+(** Every bounded client request carries an optional [rpc_timeout_ms]: absent
+    by default, an exact integer when supplied, and rejected outside 1 ms to
+    one minute by each encoder. *)
+let test_rpc_timeout_protocol () =
+  let encoders =
+    [
+      ( "cancel",
+        fun rpc_deadline ->
+          Protocol.encode_cancel_request { cancel_request with rpc_deadline } );
+      ( "reset",
+        fun rpc_deadline ->
+          Protocol.encode_reset_request { reset_request with rpc_deadline } );
+      ( "terminate",
+        fun rpc_deadline ->
+          Protocol.encode_terminate_request
+            { execution; reason = ""; rpc_deadline } );
+      ( "signal",
+        fun rpc_deadline ->
+          Protocol.encode_signal_request { signal_request with rpc_deadline } );
+      ( "query",
+        fun rpc_deadline ->
+          Protocol.encode_query_request { query_request with rpc_deadline } );
+      ( "update",
+        fun rpc_deadline ->
+          Protocol.encode_update_request
+            {
+              execution;
+              update_id = "update-1";
+              update_name = "set";
+              input = [];
+              rpc_deadline;
+            } );
+      ( "visibility",
+        fun rpc_deadline ->
+          Protocol.encode_visibility_request
+            {
+              namespace = "default";
+              query = "";
+              page_size = 10;
+              next_page_token = None;
+              rpc_deadline;
+            } );
+    ]
+  in
+  List.iter
+    (fun (label, encode) ->
+      if contains_fragment (unwrap (encode None)) "rpc_timeout_ms" then
+        failwith (label ^ " sent an rpc timeout that was not supplied");
+      require_fragment label {|"rpc_timeout_ms":250|} (unwrap (encode (deadline 250L)));
+      check_error_path label "$.rpc_timeout_ms" (encode (deadline 0L));
+      check_error_path label "$.rpc_timeout_ms"
+        (encode (deadline (Int64.succ Protocol.max_rpc_timeout_ms))))
+    encoders
+
 (** Runs one protocol test with a stable CI-visible name. *)
 let run name test =
   try
@@ -593,7 +1043,12 @@ let () =
   run "client query protocol" test_query_protocol;
   run "client visibility protocol" test_visibility_protocol;
   run "client asynchronous starts" test_async_start_protocol;
+  run "client id conflict policy" test_id_conflict_policy_protocol;
+  run "client start execution policies" test_start_execution_policy_protocol;
+  run "client rpc timeouts" test_rpc_timeout_protocol;
+  run "client rpc deadline remaining budget" test_rpc_deadline_remaining;
   run "client closed response shape" test_closed_response_shape;
   run "client response correlation" test_response_execution_correlation;
+  run "client current-run selector" test_current_run_protocol;
   run "client structured errors" test_client_errors;
   run "client operation error correlation" test_operation_error_correlation

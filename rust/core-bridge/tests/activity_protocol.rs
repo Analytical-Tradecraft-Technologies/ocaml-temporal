@@ -1,11 +1,12 @@
 use ocaml_temporal_core_bridge::activity_protocol::{
     ActivityCancel, ActivityCancelReason, ActivityCompletion, ActivityCompletionResult,
-    ActivityHeartbeat, ActivityTask, ActivityTaskVariant, completion_to_core, decode_completion,
-    decode_heartbeat, decode_task, encode_completion, encode_heartbeat, encode_task,
-    task_from_core,
+    ActivityHeartbeat, ActivityTask, ActivityTaskVariant, AsyncActivityHeartbeat,
+    completion_to_core, decode_async_heartbeat, decode_completion, decode_heartbeat, decode_task,
+    encode_async_heartbeat, encode_completion, encode_heartbeat, encode_task, task_from_core,
 };
-use ocaml_temporal_core_bridge::workflow_protocol::Payload;
+use ocaml_temporal_core_bridge::workflow_protocol::{Duration, Payload};
 use std::collections::BTreeMap;
+use temporalio_protos::coresdk::activity_result as core_activity_result;
 use temporalio_protos::coresdk::activity_task as core_activity_task;
 
 /// A complete start-task fixture exercises every nullable field, the retry
@@ -30,7 +31,12 @@ fn replace_once(source: &str, before: &str, after: &str) -> String {
 fn activity_completion_preserves_opaque_task_token() {
     let completion = ActivityCompletion {
         task_token: "AAEC/v8=".to_owned(),
-        result: ActivityCompletionResult::Completed { result: None },
+        result: ActivityCompletionResult::Completed {
+            result: Payload {
+                metadata: BTreeMap::new(),
+                data: Vec::new(),
+            },
+        },
     };
 
     let encoded = encode_completion(&completion).expect("completion should encode");
@@ -71,10 +77,47 @@ fn activity_documents_are_closed_and_tokens_are_canonical() {
 fn activity_completion_result_variants_reject_unknown_fields() {
     assert!(
         decode_completion(
-            r#"{"task_token":"AA==","result":{"kind":"completed","result":null,"injected":true}}"#
+            r#"{"task_token":"AA==","result":{"kind":"completed","result":{"metadata":{},"data":{"encoding":"base64","data":""}},"injected":true}}"#
         )
         .is_err()
     );
+}
+
+/// A successful completion must carry a payload (issue #954).
+///
+/// Core's `validate_activity_completion` rejects `Success { result: None }`
+/// as malformed, so a `null` or absent payload is refused at decode, before
+/// any Core call. A void result is an encoded payload with empty data, and
+/// every decoded success converts to a Core result that has a payload.
+#[test]
+fn activity_completed_result_requires_a_payload() {
+    let null =
+        decode_completion(r#"{"task_token":"AA==","result":{"kind":"completed","result":null}}"#)
+            .expect_err("a null payload must be rejected");
+    assert_eq!(null.code, "invalid_message");
+    assert_eq!(null.path, "$.result.result");
+    assert!(
+        decode_completion(r#"{"task_token":"AA==","result":{"kind":"completed"}}"#).is_err(),
+        "an absent payload must be rejected"
+    );
+
+    let void = decode_completion(
+        r#"{"task_token":"AA==","result":{"kind":"completed","result":{"metadata":{},"data":{"encoding":"base64","data":""}}}}"#,
+    )
+    .expect("an empty payload is a valid void result");
+    let core = completion_to_core(&void).expect("void completion converts");
+    let status = core
+        .result
+        .and_then(|result| result.status)
+        .expect("conversion sets a status");
+    match status {
+        core_activity_result::activity_execution_result::Status::Completed(success) => {
+            let payload = success.result.expect("Core receives a result payload");
+            assert!(payload.data.is_empty());
+            assert!(payload.metadata.is_empty());
+        }
+        other => panic!("void completion converted to {other:?}"),
+    }
 }
 
 /// Heartbeats preserve the opaque token and binary detail payloads while
@@ -133,6 +176,49 @@ fn activity_heartbeat_rejects_unsafe_documents() {
         r#"{"task_token":"AAEC/v8=","details":[{"metadata":{},"data":{"encoding":"raw","data":"AA=="}}]}"#
     )
     .is_err());
+}
+
+/// The async heartbeat document (#1025) round-trips with and without a
+/// heartbeat timeout, and requires the timeout member: it is how the bridge
+/// derives the throttle interval.
+#[test]
+fn async_activity_heartbeat_round_trips_and_requires_its_timeout() {
+    for heartbeat_timeout in [
+        None,
+        Some(Duration {
+            seconds: 2,
+            nanoseconds: 500_000_000,
+        }),
+    ] {
+        let heartbeat = AsyncActivityHeartbeat {
+            task_token: "AAEC/v8=".to_owned(),
+            details: vec![Payload {
+                metadata: BTreeMap::new(),
+                data: vec![0, 255],
+            }],
+            heartbeat_timeout,
+        };
+        let encoded = encode_async_heartbeat(&heartbeat).expect("async heartbeat should encode");
+        assert_eq!(decode_async_heartbeat(&encoded), Ok(heartbeat));
+    }
+    assert!(decode_async_heartbeat(r#"{"task_token":"AAEC/v8=","details":[]}"#).is_err());
+    assert!(
+        decode_async_heartbeat(
+            r#"{"task_token":"AAEC/v8=","details":[],"heartbeat_timeout":{"seconds":-1,"nanoseconds":0}}"#
+        )
+        .is_err()
+    );
+    assert!(
+        decode_async_heartbeat(
+            r#"{"task_token":"AAEC/v8=","details":[],"heartbeat_timeout":{"seconds":1,"nanoseconds":1000000000}}"#
+        )
+        .is_err()
+    );
+    // The synchronous heartbeat decoder does not accept the extra member.
+    assert!(
+        decode_heartbeat(r#"{"task_token":"AAEC/v8=","details":[],"heartbeat_timeout":null}"#)
+            .is_err()
+    );
 }
 
 /// Cancellation tasks retain the stable reason while preserving the single

@@ -96,6 +96,12 @@ if [ "$#" -gt 0 ]; then
 else
   check_opam_file temporal-sdk.opam
   dependencies=$(sed -n 's/^  "\([^"]*\)" {= "\([^"]*\)".*/\1 \2/p' temporal-sdk.opam.locked)
+  # Per-compiler replacements installed by scripts/opam-locked-deps.sh are
+  # part of some release artifact's build closure, so audit them identically.
+  overrides=$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' scripts/opam-lock-overrides.txt |
+    awk '{ print $2, $3 }')
+  [ -z "$overrides" ] || dependencies="$dependencies
+$overrides"
   while read -r package version; do
     [ -n "$package" ] || continue
     value=$(opam show "$package.$version" --field=license 2>/dev/null || true)

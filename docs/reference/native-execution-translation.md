@@ -26,10 +26,11 @@ Temporal Core
     -> Rust Core/protobuf conversion and semantic validation
     -> checked activation JSON
     -> Sdk_supervisor.Native.Protocol_adapter.decode_workflow_activation
-    -> Native_execution.translate_activation
+    -> Native_execution.translate_activation (once per activation)
     -> Execution.activate
     -> Native_execution.completion_of_commands
-    -> Workflow_protocol.encode_completion
+    -> Encoded_workflow_completion.encode (once per completion)
+    -> Sdk_supervisor.Native Complete_workflow (bytes copied, not re-encoded)
     -> Rust protobuf conversion
 ```
 
@@ -38,9 +39,14 @@ native lease. The OCaml supervisor decodes that JSON, and
 `translate_activation` canonical-encodes the typed value again before it
 changes it into runtime jobs. The second pass is intentional: programmatically
 constructed OCaml values receive the same closed-object, bounds, payload, and
-ordering checks as values received from Rust. Outgoing commands follow the
-same rule in reverse: `completion_of_commands` validates the complete command
-batch before the worker submits it.
+ordering checks as values received from Rust. The worker runs it once per
+activation: `translated_activation` is a private record that retains its
+source activation, and `activate_translated` executes it without translating
+again. Outgoing commands follow the same rule in reverse: the complete command
+batch is encoded once before the worker submits it, and those canonical bytes
+(an abstract `Encoded_workflow_completion.t`) are what the supervisor sends to
+Rust, so the supervisor does not encode the completion a second time
+(issue #846).
 
 The adapter does not own a Rust handle, call the supervisor, wait on a lock, or
 perform I/O. Keeping it pure and below the supervisor makes the conversion
@@ -92,9 +98,12 @@ record instead.
 ## Command mapping
 
 `command_to_protocol` converts one runtime command only when the two types have
-an exact, lossless representation. `completion_of_commands` preserves the
+an exact, lossless representation. Completion construction preserves the
 runtime's emission order and runs `Workflow_protocol.encode_completion` over
-the complete result before returning it to the bridge. A poisoned execution
+the complete result exactly once. `activate_translated` returns that output
+with the typed completion so the worker can submit it unchanged;
+`completion_of_commands` and `activate` run the same check and return only the
+typed value. A poisoned execution
 instead returns `task_failure` with an empty command list; it never translates
 its discarded commands into an execution failure. See the
 [workflow failure contract](workflow-failures.md).
@@ -103,14 +112,14 @@ its discarded commands into an execution failure. See the
 | --- | --- | --- |
 | `Request_cancel_activity` | `Request_cancel_activity` | The sequence is range-checked. |
 | `Schedule_activity` | `Schedule_activity` | Activity ID, type, task queue, argument payloads, timeout policies, optional retry policy, validated priority/fairness metadata, cancellation policy, and eager-execution flag are validated and copied. Priority weight bits remain single-precision IEEE-754 data rather than passing through a JSON float. Defaults are applied by the workflow context before this boundary; the translator never invents them. |
-| `Start_child_workflow` | `Start_child_workflow` | The sequence, child workflow ID and type, one copied input payload, explicit child-cancellation policy, and optional retry policy are retained. Retry intervals and coefficient bits are validated before Core conversion. Namespace is worker-scoped rather than repeated in the OCaml command: Rust injects the already validated worker namespace before sending the command to Core. Task queue, workflow timeouts, close/reuse policies, cron, headers, memo, search attributes, versioning, and priority are not represented by the current OCaml command, so Rust sends their Core defaults and its reverse conversion rejects a non-default Core value instead of silently discarding it. |
+| `Start_child_workflow` | `Start_child_workflow` | The sequence, child workflow ID and type, the input argument list (empty for the canonical unit input, otherwise one copied payload), explicit child-cancellation policy, optional retry policy, optional task queue, and optional parent-close policy (`terminate`, `abandon`, or `request_cancel`) are retained. An explicit task queue is validated as an identifier; an omitted queue or parent-close policy keeps the Core/server default (the parent's queue, and terminate). Retry intervals and coefficient bits are validated before Core conversion. Namespace is worker-scoped rather than repeated in the OCaml command: Rust injects the already validated worker namespace before sending the command to Core. Workflow timeouts, the ID reuse policy, cron, headers, memo, search attributes, versioning, and priority are not represented by the current OCaml command, so Rust sends their Core defaults and its reverse conversion rejects a non-default Core value instead of silently discarding it. |
 | `Cancel_child_workflow` | `Cancel_child_workflow` | The sequence and validated reason are copied into Core's `CancelChildWorkflowExecution` command. The policy from the matching start command determines whether Core reports immediately or waits for cancellation progress. |
 | `Start_timer` | `Start_timer` | Non-negative milliseconds are split into exact seconds and nanoseconds; no floating-point conversion is used. |
 | `Cancel_timer` | `Cancel_timer` | The sequence is range-checked. |
 | `Complete_workflow` with the canonical unit/null payload | `Complete_workflow { result = None }` | The nullable protocol result is preserved. |
 | `Complete_workflow` with another payload | `Complete_workflow { result = Some payload }` | Metadata must be valid UTF-8 in the current runtime payload type and body bytes are copied. |
 | `Fail_workflow` | `Fail_workflow` with an OCaml application or cancellation failure | Details are copied and the runtime category/retryability are retained. Recursive Core-only fields are represented in a bounded diagnostic until the runtime has a richer error type. |
-| `Continue_as_new` | `Continue_as_new` with the successor workflow type and one copied input payload | This is terminal direct-style control flow. The scheduler stops the current workflow fiber after buffering the command, and the translator rejects invalid workflow identifiers or payload metadata before a completion is sent. |
+| `Continue_as_new` | `Continue_as_new` with the successor workflow type and the input argument list (empty for the canonical unit input, otherwise one copied payload) | This is terminal direct-style control flow. The scheduler stops the current workflow fiber after buffering the command, and the translator rejects invalid workflow identifiers or payload metadata before a completion is sent. |
 | `Set_patch_marker` | `Set_patch_marker` | The validated durable patch ID and explicit `deprecated` flag are preserved. `patched` emits `false`; `deprecate_patch` emits `true`. Same-mode repetitions are retained in order, while both language validators reject mixed modes for one ID before Core conversion. |
 | `Cancel_workflow_execution` | `Cancel_workflow_execution` | This is already an exact marker. |
 
@@ -135,7 +144,9 @@ recursive failure fields.
 
 `Temporal.Activity.start` keeps its original two-argument form and also accepts
 labelled options for the Core fields. The activity type comes from the
-definition name, and the input is sent as the one-element argument list.
+definition name, and the input codec decides the argument list: `Codec.unit`
+sends an empty list and every other codec sends exactly one payload, so an
+`option` input of `None` still sends one `binary/null` payload.
 Omitting an activity ID creates `ocaml-activity-<sequence>` from the
 workflow-local deterministic sequence. Omitting a task queue uses the queue
 captured in the execution context; native workers populate that value from
@@ -181,10 +192,14 @@ represented without losing meaning. Programmer defects remain exceptions in
 the underlying execution kernel, while expected Temporal outcomes are typed
 results.
 
-Every payload crossing this boundary is copied. Binary protocol metadata cannot
-be represented by the runtime's string metadata map and therefore returns
-`unsupported` instead of being decoded with replacement characters. Runtime
-metadata is validated as UTF-8 before it becomes protocol bytes. Failure causes
+Every payload crossing this boundary is copied. Payload metadata values are
+arbitrary bytes in Temporal's protocol, and the runtime's string metadata map
+holds them losslessly (an OCaml `string` is a byte string), so inbound
+metadata never fails translation (#1048): a rejection would fail every
+workflow task replaying the same history. Outbound runtime metadata keys are
+validated against the bridge protocol's own key rule (non-empty, valid UTF-8,
+at most 65536 bytes; NUL allowed) before they become protocol bytes; values may be any bytes, so a received payload can be returned
+unchanged. Failure causes
 are traversed with a fixed depth limit so malformed recursive values cannot
 consume unbounded stack or memory.
 
@@ -221,29 +236,29 @@ their own adapter coverage in `test/runtime/test_native_activity_execution.ml`.
 The public native worker invokes this adapter through the owner-Domain
 supervisor. The live Compose gate exercises timer and activity success paths
 and includes parent/child result paths against Temporal Server. The complete
-[PR #289 Compose run](https://github.com/mfow/ocaml-temporal/actions/runs/29339077368)
+[PR #289 Compose run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29339077368)
 also live-verifies propagated child failure, child-handle cancellation, child
 retry, and duplicate-ID child-start failure. The [PR #298 Compose
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29346853291) live-verifies
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29346853291) live-verifies
 the current two-generation worker restart/replay path, including the
-replacement-worker retry to attempt two; the earlier [PR #253 run](https://github.com/mfow/ocaml-temporal/actions/runs/29286560471)
+replacement-worker retry to attempt two; the earlier [PR #253 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29286560471)
 remains historical evidence for the original path. Sticky-cache eviction is
-now live-verified by the complete [PR #438 Compose run](https://github.com/mfow/ocaml-temporal/actions/runs/29805397413).
+now live-verified by the complete [PR #438 Compose run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29805397413).
 That repaired gate uses an isolated worker configured with one Core cache slot;
 the one-slot scenario observes a `RemoveFromCache(CacheFull)` activation,
 acknowledges it with an empty completion, and checks the exact workflow runs.
-The earlier [PR #322 run](https://github.com/mfow/ocaml-temporal/actions/runs/29402103748)
+The earlier [PR #322 run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29402103748)
 remains historical evidence for the original gate.
 Other untested child recovery cases remain deferred live acceptance scenarios
 even though several of their local worker paths are already tested. The later
-[PR #306 Build run](https://github.com/mfow/ocaml-temporal/actions/runs/29356904816)
+[PR #306 Build run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29356904816)
 adds a separate forced-crash proof: generation one must exit with code 137 and
 without a graceful-stop marker before generation two is allowed to replay and
 complete. That run verifies worker-process recovery; it does not establish
 broader child-workflow recovery coverage. Exact bilateral parent/child replacement
 recovery is separately live-verified in the complete [PR #351
-run](https://github.com/mfow/ocaml-temporal/actions/runs/29434016013). The
+run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29434016013). The
 [child-failure-after-replay acceptance](child-failure-replay-acceptance.md) is
-also live-verified by the complete [PR #361 CI run](https://github.com/mfow/ocaml-temporal/actions/runs/29475615866),
+also live-verified by the complete [PR #361 CI run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/29475615866),
 which requires replay before the typed child failure and the recovered parent
 result. Additional child-failure and cache-recovery scenarios remain deferred.

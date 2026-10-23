@@ -4,37 +4,36 @@
     shutdown decisions a small, pure surface. They never inspect diagnostic
     text and they do not own a native handle. *)
 
-type drain_failure =
-  | Workflow_drain
-  | Activity_drain of bool
-(** Source of a failed adapter drain. The boolean records the adapter's
-    explicit transient classification, not a guess based on the message. *)
-
 val activity_completion_retryable :
   Temporal_core_bridge.Native_bridge.status -> bool
 (** Returns [true] only for the bilateral retryable-completion status. Generic
     connection, readiness, worker, protocol, and closed states are false. *)
 
-type async_heartbeat_disposition = Retry_exact | Rejected_live | Retired
-(** Whether a failed heartbeat must retry the identical request, can replace a
-    definitively rejected request while retaining its live activity lease, or
-    must retire the handle after token loss or unusable native state. *)
+type async_operation_disposition =
+  | Retry_exact
+  | Rejected_live
+  | Not_admitted
+  | Retired
+(** Ownership outcome of a failed namespace-bound async activity request.
+    [Retry_exact]: the outcome is uncertain and the live lease is retained; a
+    terminal operation may only be retried byte-for-byte, while a heartbeat is
+    dropped. [Rejected_live]: the request was definitively not applied and the
+    handle stays live for a corrected or different operation. [Not_admitted]:
+    the bridge refused to admit the call before any RPC existed because its
+    pending client-call registry was full (#1104); the handle and lease stay
+    live, an earlier uncertain terminal submission is still owed, and the
+    caller receives a retryable error so it can retry once capacity frees.
+    [Retired]: the token is gone or the native graph is unusable. *)
 
-val async_heartbeat_disposition :
-  Temporal_core_bridge.Native_bridge.status -> async_heartbeat_disposition
-(** Classifies typed bridge statuses without reading diagnostic text.
-    [Connection] is uncertain; [Async_heartbeat_rejected] and local preflight
-    failures leave the handle live; [Invalid_state] closes a lost token. *)
-
-val shutdown_retryable : drain_failure -> bool
-(** Returns [true] only when an activity adapter retained a completion after an
-    explicitly transient native failure. Workflow drains and all permanent
-    errors must leave a worker terminal rather than reopening it. *)
-
-val needs_native_cleanup : drain_failure -> bool
-(** Returns [true] when a failed drain must be followed by native graph
-    disposal. Only the explicitly retryable activity case may leave the graph
-    open for another completion attempt. *)
+val async_operation_disposition :
+  Temporal_core_bridge.Native_bridge.status -> async_operation_disposition
+(** Classifies typed bridge statuses for async heartbeats and async
+    complete/fail/cancel alike, without reading diagnostic text.
+    [Connection] is uncertain; [Async_heartbeat_rejected] (which the bridge
+    emits for every definitively rejected async request) and local preflight
+    failures leave the handle live; a full client-call registry
+    ([Resource_exhausted]) is retryable back-pressure that leaves it live;
+    [Invalid_state] closes a lost token. *)
 
 type closed_flag_action =
   | Leave_unchanged
@@ -50,17 +49,14 @@ val reentrant_same_domain_shutdown : closed_flag_action * bool
     the loop). The [bool] is the [shutdown_retryable] value to raise so the
     admission failure can be retried from another Domain after the loop exits. *)
 
-(** Runs a terminal cleanup while preserving the original adapter error. The
-    boolean result is [true] when the cleanup callback returned either [Ok] or
-    [Error]; both outcomes mean the native implementation reached its
-    documented terminal-release path. It is [false] only when the callback
-    raised before returning, in which case callers must retain adapter state
-    and arrange a last-resort retry or finalizer path. A cleanup diagnostic is
-    sent to [on_cleanup_error] rather than replacing the error that explains
-    why the worker became terminal. [on_cleanup_exception] handles an
-    unexpected cleanup exception for the same reason. *)
-val retain_original_error :
-  cleanup:(unit -> ('ok, 'cleanup_error) result) ->
-  on_cleanup_error:('cleanup_error -> unit) ->
-  on_cleanup_exception:(exn -> unit) ->
-  'original -> bool * 'original
+
+val spawn_or_close_admission :
+  spawn:(unit -> bool) -> close_admission:(unit -> unit) -> unit
+(** Runs [spawn], which tries to start an abandoned-worker cleanup thread and
+    returns [false] when no thread exists to finish the cleanup. In that case
+    [close_admission] is called, and any exception it raises is contained.
+    The worker delegates its supervisor's own finalizer (#1044), so every
+    finalizer path that fails to spawn must close supervisor admission itself:
+    otherwise the mailbox owner Domain keeps the native graph reachable, the
+    runtime custom-block finalizer can never run, and a shared-runtime lease
+    stays attached. [close_admission] must not block. *)

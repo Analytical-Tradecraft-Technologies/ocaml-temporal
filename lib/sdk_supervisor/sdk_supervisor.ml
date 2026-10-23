@@ -17,6 +17,7 @@ module Make (Backend : Backend) = struct
     | Backend of Backend.error
     | Closed
     | Supervisor_failed of exn
+    | Owner_unavailable of exn
 
   (** Typed messages accepted by the sole owner Domain. *)
   module Request = struct
@@ -24,6 +25,10 @@ module Make (Backend : Backend) = struct
       | Initialize : Backend.config -> (unit, error) result t
       | Perform : 'result Backend.operation -> ('result, error) result t
       | Shutdown : (unit, error) result t
+      | Spawn_thread : (unit -> unit) -> (unit, exn) result t
+          (** Starts a companion system thread on the owner Domain (#1042).
+              The result is the [Thread.create] outcome, so a thread that
+              cannot be created is reported rather than failing the owner. *)
   end
 
   module Mailbox = Mailbox_processor.Make (Request)
@@ -48,12 +53,16 @@ module Make (Backend : Backend) = struct
       progress transitions; it must never be held across [Mailbox.await] or
       [Mailbox.join], so [initiate_shutdown] cannot block behind full teardown.
       [shutdown_finished] lets the finalizer skip redundant cleanup after
-      explicit closure. All native graph access remains in [mailbox]. *)
+      explicit closure. [cleanup_delegated] is set by an owning wrapper that
+      takes over abandoned-instance cleanup (see {!delegate_abandoned_cleanup});
+      the supervisor's own finalizer then does nothing. All native graph access
+      remains in [mailbox]. *)
   type t = {
     mailbox : Mailbox.t;
     shutdown_mutex : Mutex.t;
     mutable shutdown_progress : shutdown_progress;
     shutdown_finished : bool Atomic.t;
+    cleanup_delegated : bool Atomic.t;
   }
 
   (** Runs an operation with [mutex] held and always releases it. *)
@@ -118,6 +127,12 @@ module Make (Backend : Backend) = struct
                   raise exn)
           | Closed_graph result -> result
           | Not_started -> Ok ())
+      | Spawn_thread body ->
+          (* The new thread never receives [state]; it shares only this
+             Domain and its runtime lock with the owner thread. *)
+          (match Thread.create body () with
+          | _thread -> Ok ()
+          | exception exn -> Error exn)
     in
     { Mailbox.handle }
 
@@ -131,6 +146,17 @@ module Make (Backend : Backend) = struct
   let perform supervisor operation =
     match Mailbox.call supervisor.mailbox (Perform operation) with
     | Ok result -> result
+    | Error failure -> Error (mailbox_failure failure)
+
+  (** Asks the owner to start [body] on a system thread of its own Domain, so
+      a helper that must stay independent of every producer Domain's runtime
+      lock costs no extra Domain (#1042). The thread sees only [body]'s
+      closure, never backend state. The owner Domain cannot be joined until
+      that thread has returned, so [body] must return promptly once the
+      instance begins shutting down. *)
+  let spawn_owner_thread supervisor body =
+    match Mailbox.call supervisor.mailbox (Spawn_thread body) with
+    | Ok spawned -> Ok spawned
     | Error failure -> Error (mailbox_failure failure)
 
   (** Atomically submits the terminal request while the shutdown mutex is held.
@@ -215,9 +241,17 @@ module Make (Backend : Backend) = struct
       via [Mailbox.close], which would contradict the finalizer contract and
       can raise [Sys_error] on an error-checking mutex already held by this
       Domain. The runtime custom-block finalizer remains the last-resort native
-      reclaim path if the owner never drains. *)
+      reclaim path if the owner never drains.
+
+      When an owner has delegated cleanup, this finalizer does nothing: the
+      owner and this supervisor typically become unreachable in the same
+      collection, and [Gc.finalise] then runs both finalizers, so only one of
+      them may start the shutdown (#1044). *)
   let cleanup_abandoned supervisor =
-    if not (Atomic.get supervisor.shutdown_finished) then
+    if
+      (not (Atomic.get supervisor.cleanup_delegated))
+      && not (Atomic.get supervisor.shutdown_finished)
+    then
       match
         Thread.create
           (fun instance -> ignore (shutdown instance))
@@ -227,13 +261,34 @@ module Make (Backend : Backend) = struct
       | exception _ -> (
           try initiate_shutdown supervisor with _ -> ())
 
+  (** Hands abandoned-instance cleanup to the caller. OCaml gives no ordering
+      between the finalizers of values that become unreachable in the same
+      collection, and resurrecting an owner from its own finalizer does not
+      cancel a finalizer already scheduled for this supervisor. An owner that
+      must drain its own state before the graph closes therefore calls this
+      once it holds the supervisor, and its own finalizer becomes the only
+      path that shuts the supervisor down. *)
+  let delegate_abandoned_cleanup supervisor =
+    Atomic.set supervisor.cleanup_delegated true
+
   (** Starts the mailbox first so backend construction itself occurs on the
       owner Domain. Failed initialization stops and joins that Domain before
       returning, ensuring no partially published supervisor remains. A
       non-blocking finalizer schedules the same shutdown path as a last-resort
-      safeguard for callers which abandon a live instance. *)
+      safeguard for callers which abandon a live instance.
+
+      [Domain.spawn] raises when the runtime's Domain limit is reached (each
+      live SDK instance holds one owner Domain) or the Domain cannot be
+      allocated. That is an operational, possibly transient failure (another
+      instance may shut down), so it is returned as [Owner_unavailable] rather
+      than escaping a [result]-typed API or being reported as a defect. No owner
+      exists yet, so nothing needs to be stopped. An invalid capacity remains a
+      programmer error and still raises [Invalid_argument]. *)
   let create ~capacity config =
-    let mailbox = Mailbox.create ~capacity ~handler:(owner_handler ()) in
+    match Mailbox.create ~capacity ~handler:(owner_handler ()) with
+    | exception (Invalid_argument _ as exn) -> raise exn
+    | exception exn -> Error (Owner_unavailable exn)
+    | mailbox -> (
     match Mailbox.call mailbox (Initialize config) with
     | Ok (Ok ()) ->
         let supervisor =
@@ -242,6 +297,7 @@ module Make (Backend : Backend) = struct
             shutdown_mutex = Mutex.create ();
             shutdown_progress = Shutdown_open;
             shutdown_finished = Atomic.make false;
+            cleanup_delegated = Atomic.make false;
           }
         in
         Gc.finalise cleanup_abandoned supervisor;
@@ -251,7 +307,77 @@ module Make (Backend : Backend) = struct
         Error error
     | Error failure ->
         ignore (stop_mailbox mailbox);
-        Error (mailbox_failure failure)
+        Error (mailbox_failure failure))
+end
+
+(** Caller-side completion of submitted client calls (#807).
+
+    The owner Domain answers a client request by submitting it and returning
+    a value of this type at once; the caller then waits for the outcome on
+    its own Domain with {!Client_call.await}. The owner therefore never
+    blocks on the network, and a long wait or query on one caller cannot
+    delay any other request on the same supervisor. The module is generic in
+    the completion handle ([ticket]) so the await loop can be exercised with a
+    fake completion source as well as the native one. *)
+module Client_call = struct
+  module Bridge = Temporal_core_bridge.Native_bridge
+
+  (** A submitted call. [Completed] carries an outcome the owner produced
+      without any RPC, for example a deadline that expired in the mailbox.
+      [In_flight] names a completion handle and the pure decoder that turns
+      its terminal native result into the typed value; decoding runs on the
+      awaiting caller's Domain. *)
+  type ('value, 'ticket) t =
+    | Completed of ('value, Bridge.error) result
+    | In_flight of {
+        ticket : 'ticket;
+        decode : (bytes, Bridge.error) result -> ('value, Bridge.error) result;
+      }
+
+  (** Why an awaited call produced no value. [Closed] means the call can
+      never complete because its supervisor shut down while it was in
+      flight; [Failed] carries any other bridge failure. *)
+  type failure = Closed | Failed of Bridge.error
+
+  (** Length of one bounded completion wait. The wait wakes as soon as the
+      outcome is published or the call is closed, so the slice only bounds
+      how long the calling thread holds no OCaml runtime lock at a time. *)
+  let default_slice_ms = 1_000
+
+  (** Waits for [call] on the calling Domain. [poll ticket ~timeout_ms]
+      performs one bounded wait: [Not_ready] repeats it, [Invalid_state]
+      means the call was closed, and any other result is terminal and is
+      passed to the call's decoder. A terminal poll retires the call in the
+      completion source. If the loop is left any other way (an exception
+      from [poll] or the decoder, or an asynchronous exception between
+      waits), [release ticket] is called exactly once before the exception
+      propagates, so an abandoned call does not keep its capacity slot; its
+      result is ignored because the exception is the primary outcome. Must
+      not run on a workflow scheduler Domain or on the supervisor's owner
+      Domain: it blocks the calling thread until the call completes or is
+      closed. *)
+  let await ~poll ~release ?(slice_ms = default_slice_ms) call =
+    match call with
+    | Completed (Ok value) -> Ok value
+    | Completed (Error error) -> Error (Failed error)
+    | In_flight { ticket; decode } ->
+        let retired = ref false in
+        let rec loop () =
+          match poll ticket ~timeout_ms:slice_ms with
+          | Error { Bridge.status = Not_ready; _ } -> loop ()
+          | Error { Bridge.status = Invalid_state; _ } ->
+              retired := true;
+              Error Closed
+          | outcome -> (
+              retired := true;
+              match decode outcome with
+              | Ok value -> Ok value
+              | Error error -> Error (Failed error))
+        in
+        Fun.protect
+          ~finally:(fun () ->
+            if not !retired then try ignore (release ticket) with _ -> ())
+          loop
 end
 
 (** Converts between OCaml-owned native bytes and the closed semantic protocol
@@ -262,6 +388,15 @@ module Protocol_adapter = struct
   module Client = Temporal_protocol.Client_protocol
   module Workflow = Temporal_protocol.Workflow_protocol
   module Activity = Temporal_protocol.Activity_protocol
+  module Observability = Temporal_base.Observability
+
+  (** Times one protocol codec pass as a [Debug] bridge record when that
+      source is enabled (#528); otherwise it only runs [action]. The
+      measured span includes the copy between native bytes and the OCaml
+      string, matching what the supervisor does for every task. *)
+  let codec_timed operation action =
+    Observability.debug_timed ~src:Observability.Source.bridge ~operation
+      action
 
   (** Converts a workflow protocol failure to the bridge error vocabulary used
       by the native supervisor. Protocol diagnostics contain only stable code,
@@ -313,7 +448,10 @@ module Protocol_adapter = struct
 
   (** Strictly validates one workflow activation copied from Rust. *)
   let decode_workflow_activation input =
-    match Workflow.decode_activation (Bytes.to_string input) with
+    match
+      codec_timed "workflow_activation_decode" (fun () ->
+          Workflow.decode_activation (Bytes.to_string input))
+    with
     | Ok activation -> Ok activation
     | Error error -> workflow_error "workflow activation decoding" error
 
@@ -338,6 +476,7 @@ module Protocol_adapter = struct
       | Already_started -> "already_started"
       | Retryable -> "retryable"
       | Async_heartbeat_rejected -> "async_heartbeat_rejected"
+      | Resource_exhausted -> "resource_exhausted"
       | Unknown code -> Printf.sprintf "unknown(%d)" code
     in
     {
@@ -347,60 +486,59 @@ module Protocol_adapter = struct
           protocol_error.Bridge.message status rejection_error.Bridge.message;
     }
 
-  (** Converts a nonblocking native workflow poll into an optional typed
-      activation. [Not_ready] is the empty-lane state, not a worker failure. *)
-  let workflow_poll_result ~reject = function
+  (** Shared nonblocking poll conversion for both lanes. [decode] strictly
+      validates successful native bytes. When it fails, [reject] must retire
+      their exact native lease first. A successful rejection is reported as
+      [Ok None] when [rejected_is_progress] holds: the task was failed back to
+      Core and is no longer this worker's debt, so a live worker keeps polling
+      instead of ending [Worker.run] for the whole task queue (issue #801).
+      Otherwise the original protocol error stays primary. A failed rejection
+      is always an error, because the native lease state is then uncertain.
+      [Not_ready] is the empty-lane state, not a worker failure. *)
+  let poll_result ~decode ~reject ~rejected_is_progress = function
     | Ok input -> (
-        match decode_workflow_activation input with
-        | Ok activation -> Ok (Some activation)
+        match decode input with
+        | Ok value -> Ok (Some value)
         | Error protocol_error -> (
             match reject input with
+            | Ok () when rejected_is_progress -> Ok None
             | Ok () -> Error protocol_error
             | Error rejection_error ->
                 Error (rejection_failed protocol_error rejection_error)))
     | Error { Bridge.status = Not_ready; _ } -> Ok None
     | Error error -> Error (sanitize_native_worker_error error)
 
-  (** Canonically serializes and reparses one workflow completion before it
-      can be submitted across the C boundary. *)
-  let encode_workflow_completion completion =
-    match Workflow.encode_completion completion with
-    | Ok output -> Ok (Bytes.of_string output)
-    | Error error -> workflow_error "workflow completion encoding" error
+  (** Converts a nonblocking live-worker workflow poll into an optional typed
+      activation. An activation OCaml cannot decode but Rust successfully
+      rejected is local task progress and maps to [Ok None]. *)
+  let workflow_poll_result ~reject result =
+    poll_result ~decode:decode_workflow_activation ~reject
+      ~rejected_is_progress:true result
+
+  (** Converts a nonblocking replay poll into an optional typed activation.
+      Unlike a live worker, a replay must not skip history it cannot decode:
+      that would report a replay as compatible without checking it, so the
+      protocol error remains the result after a successful rejection. *)
+  let replay_workflow_poll_result ~reject result =
+    poll_result ~decode:decode_workflow_activation ~reject
+      ~rejected_is_progress:false result
 
   (** Strictly validates one remote activity task copied from Rust. *)
   let decode_activity_task input =
-    match Activity.decode_task (Bytes.to_string input) with
+    match
+      codec_timed "activity_task_decode" (fun () ->
+          Activity.decode_task (Bytes.to_string input))
+    with
     | Ok task -> Ok task
     | Error error -> activity_error "activity task decoding" error
 
-  (** Converts a nonblocking native activity poll into an optional typed task
-      while preserving every bridge failure other than an empty lane. *)
-  let activity_poll_result ~reject = function
-    | Ok input -> (
-        match decode_activity_task input with
-        | Ok task -> Ok (Some task)
-        | Error protocol_error -> (
-            match reject input with
-            | Ok () -> Error protocol_error
-            | Error rejection_error ->
-                Error (rejection_failed protocol_error rejection_error)))
-    | Error { Bridge.status = Not_ready; _ } -> Ok None
-    | Error error -> Error (sanitize_native_worker_error error)
-
-  (** Canonically serializes and reparses one activity completion before it
-      can be submitted across the C boundary. *)
-  let encode_activity_completion completion =
-    match Activity.encode_completion completion with
-    | Ok output -> Ok (Bytes.of_string output)
-    | Error error -> activity_error "activity completion encoding" error
-
-  (** Canonically serializes one activity heartbeat before it reaches the
-      native bridge. *)
-  let encode_activity_heartbeat heartbeat =
-    match Activity.encode_heartbeat heartbeat with
-    | Ok output -> Ok (Bytes.of_string output)
-    | Error error -> activity_error "activity heartbeat encoding" error
+  (** Converts a nonblocking native activity poll into an optional typed task.
+      A task OCaml cannot decode but Rust successfully failed back to Core
+      maps to [Ok None] (issue #801); every other bridge failure except an
+      empty lane is preserved. *)
+  let activity_poll_result ~reject result =
+    poll_result ~decode:decode_activity_task ~reject ~rejected_is_progress:true
+      result
 
   (** Converts a client codec diagnostic to the same bounded bridge error
       vocabulary used by worker protocol adapters. The source JSON is never
@@ -460,6 +598,31 @@ module Protocol_adapter = struct
     | Ok output -> Ok (Bytes.of_string output)
     | Error error -> client_error "client query request encoding" error
 
+  (** The structured failure Rust reports for an expired RPC budget: the
+      [Connection] status with the closed [rpc] error document. Synthesizing
+      the identical value lets every operation's existing result decoder map
+      a deadline that expired in the mailbox exactly as one that expired on
+      the wire. *)
+  let expired_rpc_deadline_error : Bridge.error =
+    { status = Connection; message = {|{"kind":"rpc","code":"deadline_exceeded"}|} }
+
+  (** Resolves a client request's caller deadline when the owner Domain
+      dispatches it (#499). The deadline's expiry was fixed on the monotonic
+      clock when the public call began, so time spent queued in the
+      supervisor mailbox behind earlier calls on the same client already
+      counts against it. With no deadline, [live None] runs unchanged. With
+      time remaining, [live] receives the deadline lowered to the remaining
+      budget, which is what the request sends. Once expired, [expired ()]
+      runs instead and the request is never encoded or sent, so nothing
+      reaches Temporal. *)
+  let with_rpc_deadline ~now_ns deadline ~expired ~live =
+    match deadline with
+    | None -> live None
+    | Some deadline -> (
+        match Client.remaining_rpc_deadline ~now_ns deadline with
+        | None -> expired ()
+        | Some remaining -> live (Some remaining))
+
   (** Decodes the opaque ticket returned by native asynchronous-start
       admission. The ticket is bound to [request] before it is published to
       the supervisor caller, so later poll operations cannot mix identities. *)
@@ -504,7 +667,10 @@ module Protocol_adapter = struct
       versa. *)
   let client_error_status = function
     | Client.Already_started _ -> Bridge.Already_started
-    | Client.Rpc _ -> Bridge.Connection
+    | Client.Rpc _ | Client.Query_failed _ ->
+        (* A failed query handler arrives as an RPC status, so Rust reports
+           it with the RPC status; the JSON kind carries the distinction. *)
+        Bridge.Connection
     | Client.Protocol _ -> Bridge.Protocol
 
   (** Decodes and status-checks one structured start failure. Statuses outside
@@ -632,6 +798,17 @@ module Protocol_adapter = struct
         | Ok outcome -> Ok (Some outcome)
         | Error error -> client_error "client start outcome decoding" error)
     | Error { Bridge.status = Not_ready; _ } -> Ok None
+    | Error native_error -> Error native_error
+
+  (** Decodes the terminal outcome of a submitted start (#807), correlated
+      with [request]. Unlike a ticket read, a submitted call never reports
+      [Not_ready] here; any native failure is preserved for the caller, which
+      treats it as an uncertain start because the request may have been sent. *)
+  let decode_client_submitted_start_outcome request = function
+    | Ok input -> (
+        match Client.decode_start_outcome ~request (Bytes.to_string input) with
+        | Ok outcome -> Ok outcome
+        | Error error -> client_error "client start outcome decoding" error)
     | Error native_error -> Error native_error
 
   (** Validates a successful native exact-run response and translates it to
@@ -763,7 +940,7 @@ module Protocol_adapter = struct
   let decode_client_update_failure native_error =
     match native_error.Bridge.status with
     | Connection | Protocol -> (
-        match Client.decode_query_error native_error.message with
+        match Client.decode_update_error native_error.message with
         | Error error -> malformed_client_error "client update" error
         | Ok client_error ->
             if native_error.Bridge.status = client_error_status client_error then
@@ -810,9 +987,58 @@ module Native_backend = struct
   module Bridge = Temporal_core_bridge.Native_bridge
   module Client = Temporal_protocol.Client_protocol
 
-  type config = unit
-  type state = Bridge.runtime
+  (* Where the graph's Core runtime comes from (#832): [Owned threads]
+     builds a private Core with an optional Tokio worker bound ([None]
+     selects the bridge default); [Attached lease] runs on a shared Core. *)
+  type config =
+    | Owned of int option
+    | Attached of Sdk_shared_runtime.lease
+
+  (* The owner-confined graph plus, for an attached graph, the lease that
+     this supervisor releases only after the graph has been closed. *)
+  type state = {
+    runtime : Bridge.runtime;
+    lease : Sdk_shared_runtime.lease option;
+  }
   type error = Bridge.error
+
+  (** A client request submitted through the owner (#807), indexed by the
+      typed value its caller eventually receives. A start yields its closed
+      accepted/rejected/unknown outcome; every other request yields the same
+      value as the matching synchronous operation. *)
+  type _ client_rpc =
+    | Rpc_start : Client.start_request -> Client.start_outcome client_rpc
+    | Rpc_wait :
+        Client.wait_request ->
+        (Client.wait_response, Client.client_error) result client_rpc
+    | Rpc_cancel :
+        Client.cancel_request -> (unit, Client.client_error) result client_rpc
+    | Rpc_terminate :
+        Client.terminate_request -> (unit, Client.client_error) result client_rpc
+    | Rpc_reset :
+        Client.reset_request ->
+        (Client.reset_response, Client.client_error) result client_rpc
+    | Rpc_signal :
+        Client.signal_request -> (unit, Client.client_error) result client_rpc
+    | Rpc_query :
+        Client.query_request ->
+        (Client.payload list, Client.client_error) result client_rpc
+    | Rpc_update :
+        Client.update_request ->
+        (Client.update_response, Client.client_error) result client_rpc
+    | Rpc_poll_update :
+        Client.poll_update_request ->
+        (Client.poll_update_response, Client.client_error) result client_rpc
+    | Rpc_visibility : Client.visibility_request -> Client.visibility_page client_rpc
+    | Rpc_async_activity_completion :
+        Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
+    | Rpc_async_activity_heartbeat :
+        Temporal_protocol.Encoded_async_activity_heartbeat.t ->
+        Temporal_protocol.Activity_protocol.async_heartbeat_response client_rpc
+
+  (** A submitted native call awaiting its completion cell. *)
+  type 'value client_call = ('value, Bridge.client_call) Client_call.t
+
   type _ operation =
     | Check_compatibility : unit operation
     | Connect_client : Bridge.client_config -> unit operation
@@ -861,7 +1087,7 @@ module Native_backend = struct
         Temporal_protocol.Workflow_protocol.activation option operation
     | Wait_replay_workflow : unit operation
     | Complete_replay_workflow :
-        Temporal_protocol.Workflow_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_workflow_completion.t -> unit operation
     | Reject_replay_workflow : bytes -> unit operation
     | Finalize_replay : unit operation
     | Dispose_replay : unit operation
@@ -869,44 +1095,206 @@ module Native_backend = struct
         Temporal_protocol.Workflow_protocol.activation option operation
     | Wait_workflow : unit operation
     | Complete_workflow :
-        Temporal_protocol.Workflow_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_workflow_completion.t -> unit operation
     | Try_poll_activity :
         Temporal_protocol.Activity_protocol.task option operation
     | Wait_activity : unit operation
+    | Wait_any : unit operation
     | Wait_activity_completion_retry_backoff : unit operation
     | Complete_activity :
-        Temporal_protocol.Activity_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_activity_completion.t -> unit operation
     | Complete_async_activity :
-        Temporal_protocol.Activity_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_activity_completion.t -> unit operation
     | Record_activity_heartbeat :
-        Temporal_protocol.Activity_protocol.heartbeat -> unit operation
+        Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
     | Record_async_activity_heartbeat :
-        Temporal_protocol.Activity_protocol.heartbeat -> unit operation
+        Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
+    | Initiate_worker_shutdown : unit operation
     | Shutdown_worker : unit operation
     | Disconnect_client : unit operation
+    | Client_submit : 'value client_rpc -> 'value client_call operation
 
-  (** Creates the runtime through the ownership-safe C stubs. *)
-  let create () = Bridge.runtime_create ()
+  (** Creates the graph through the ownership-safe C stubs: either with its
+      own Core, bounding its Tokio pool when a count is supplied, or attached
+      to a shared Core. A failed attach does not release the lease; the
+      supervisor's [create] wrapper owns that release. *)
+  let create = function
+    | Owned worker_threads ->
+        Result.map
+          (fun runtime -> { runtime; lease = None })
+          (Bridge.runtime_create ?worker_threads ())
+    | Attached lease ->
+        Result.map
+          (fun runtime -> { runtime; lease = Some lease })
+          (Sdk_shared_runtime.attach lease)
+
+  (** Resolves a client request's RPC deadline against the monotonic clock at
+      the moment the owner Domain dispatches it; see
+      [Protocol_adapter.with_rpc_deadline]. *)
+  let deadline rpc_deadline ~expired ~live =
+    Protocol_adapter.with_rpc_deadline
+      ~now_ns:(Bridge.monotonic_now_ns ())
+      rpc_deadline ~expired ~live
+
+  (** Hands an encoded request to Rust as one submitted call and pairs the
+      returned identifier with [decode]. An encoding failure is returned
+      before anything reaches Rust. *)
+  let submit_encoded runtime kind ~decode = function
+    | Error error -> Error error
+    | Ok input ->
+        Result.map
+          (fun ticket -> Client_call.In_flight { ticket; decode })
+          (Bridge.client_submit_json runtime kind input)
+
+  (** Submits one bounded request after resolving its RPC deadline. An
+      expired deadline completes the call with [expired] and nothing reaches
+      Rust; otherwise the lowered deadline is encoded and submitted. *)
+  let submit_bounded runtime kind rpc_deadline ~with_deadline ~encode ~decode =
+    deadline rpc_deadline
+      ~expired:(fun () ->
+        Ok (Client_call.Completed (decode (Error Protocol_adapter.expired_rpc_deadline_error))))
+      ~live:(fun rpc_deadline ->
+        submit_encoded runtime kind ~decode (encode (with_deadline rpc_deadline)))
+
+  (** Decodes the outcome of a submitted async activity call (#1025). Rust
+      reports success as a fixed value that [accepted] maps (empty for a
+      terminal request; for a heartbeat, the activity state its latest send
+      reported), and a task token the server no longer knows as the fixed
+      value [not_found], because an awaited [Invalid_state] is reserved for
+      a call closed by its runtime. The latter is mapped back to the
+      [Invalid_state] error the synchronous bridge operation returns, so the
+      activity adapter classifies both paths identically. *)
+  let decode_async_activity_outcome ~operation ~accepted = function
+    | Error _ as error -> error
+    | Ok body when Bytes.equal body (Bytes.of_string "not_found") ->
+        Error
+          {
+            Bridge.status = Bridge.Invalid_state;
+            message =
+              Printf.sprintf "Temporal asynchronous activity %s is no longer active"
+                operation;
+          }
+    | Ok body -> (
+        match accepted (Bytes.to_string body) with
+        | Some value -> Ok value
+        | None ->
+        Error
+          {
+            Bridge.status = Bridge.Protocol;
+            message =
+              Printf.sprintf
+                "unexpected outcome of asynchronous activity %s" operation;
+          })
+
+  (** Submits one client request on the owner Domain (#807). This only
+      validates, encodes, and spawns native work; it never waits for
+      Temporal. A start whose deadline expired in the mailbox is a definite
+      [deadline_exceeded] rejection, since nothing was sent. *)
+  let submit_client_rpc : type value.
+      Bridge.runtime -> value client_rpc -> (value client_call, error) result =
+   fun runtime -> function
+    | Rpc_start request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
+            Ok
+              (Client_call.Completed
+                 (Ok (Client.Rejected (Client.Rpc { code = "deadline_exceeded" })))))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            submit_encoded runtime Bridge.Call_start
+              ~decode:(Protocol_adapter.decode_client_submitted_start_outcome request)
+              (Protocol_adapter.encode_client_start_request request))
+    | Rpc_wait request ->
+        submit_encoded runtime Bridge.Call_wait
+          ~decode:(Protocol_adapter.decode_client_wait_result request)
+          (Protocol_adapter.encode_client_wait_request request)
+    | Rpc_cancel request ->
+        submit_bounded runtime Bridge.Call_cancel request.rpc_deadline
+          ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
+          ~encode:Protocol_adapter.encode_client_cancel_request
+          ~decode:Protocol_adapter.decode_client_cancel_result
+    | Rpc_terminate request ->
+        submit_bounded runtime Bridge.Call_terminate request.rpc_deadline
+          ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
+          ~encode:Protocol_adapter.encode_client_terminate_request
+          ~decode:Protocol_adapter.decode_client_terminate_result
+    | Rpc_reset request ->
+        submit_bounded runtime Bridge.Call_reset request.rpc_deadline
+          ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
+          ~encode:Protocol_adapter.encode_client_reset_request
+          ~decode:(Protocol_adapter.decode_client_reset_result request)
+    | Rpc_signal request ->
+        submit_bounded runtime Bridge.Call_signal request.rpc_deadline
+          ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
+          ~encode:Protocol_adapter.encode_client_signal_request
+          ~decode:Protocol_adapter.decode_client_signal_result
+    | Rpc_query request ->
+        submit_bounded runtime Bridge.Call_query request.rpc_deadline
+          ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
+          ~encode:Protocol_adapter.encode_client_query_request
+          ~decode:Protocol_adapter.decode_client_query_result
+    | Rpc_update request ->
+        submit_bounded runtime Bridge.Call_update request.rpc_deadline
+          ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
+          ~encode:Protocol_adapter.encode_client_update_request
+          ~decode:(Protocol_adapter.decode_client_update_result request)
+    | Rpc_poll_update request ->
+        submit_encoded runtime Bridge.Call_poll_update
+          ~decode:Protocol_adapter.decode_client_poll_update_result
+          (Protocol_adapter.encode_client_poll_update_request request)
+    | Rpc_visibility request ->
+        submit_bounded runtime Bridge.Call_visibility request.rpc_deadline
+          ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
+          ~encode:Protocol_adapter.encode_client_visibility_request
+          ~decode:Protocol_adapter.decode_client_visibility_result
+    | Rpc_async_activity_completion encoded ->
+        (* The activity adapter already encoded the completion exactly once
+           (issue #995); only the C call's owned copy is made here. *)
+        submit_encoded runtime Bridge.Call_async_activity_completion
+          ~decode:
+            (decode_async_activity_outcome ~operation:"completion"
+               ~accepted:(function "" -> Some () | _ -> None))
+          (Ok (Temporal_protocol.Encoded_activity_completion.to_bytes encoded))
+    | Rpc_async_activity_heartbeat encoded ->
+        submit_encoded runtime Bridge.Call_async_activity_heartbeat
+          ~decode:
+            (decode_async_activity_outcome ~operation:"heartbeat"
+               ~accepted:
+                 Temporal_protocol.Activity_protocol
+                 .async_heartbeat_response_of_string)
+          (Ok (Temporal_protocol.Encoded_async_activity_heartbeat.to_bytes encoded))
 
   (** Revalidates the statically linked ABI without exposing the runtime. The
       state argument proves the operation remains ordered with lifecycle use. *)
   let perform : type value. state -> value operation -> (value, error) result =
-   fun runtime -> function
+   fun { runtime; _ } -> function
     | Check_compatibility ->
         Bridge.check_abi_version Bridge.abi_version
     | Connect_client config -> Bridge.client_connect runtime config
-    | Client_start_workflow request -> (
-        match Protocol_adapter.encode_client_start_request request with
-        | Error error -> Error error
-        | Ok input ->
+    | Client_start_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_start_result request
-              (Bridge.client_start_workflow_json runtime input))
-    | Client_begin_start_workflow request -> (
-        match Protocol_adapter.encode_client_start_request request with
-        | Error error -> Error error
-        | Ok input ->
-            Protocol_adapter.decode_client_start_ticket request
-              (Bridge.client_begin_start_workflow_json runtime input))
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_start_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_start_result request
+                  (Bridge.client_start_workflow_json runtime input))
+    | Client_begin_start_workflow request ->
+        (* An expired start was never handed to Rust, so it is a definite
+           [deadline_exceeded] rejection rather than an uncertain outcome. *)
+        deadline request.rpc_deadline
+          ~expired:(fun () -> Ok (Error (Client.Rpc { code = "deadline_exceeded" })))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_start_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_start_ticket request
+                  (Bridge.client_begin_start_workflow_json runtime input))
     | Client_poll_start_workflow ticket -> (
         match Protocol_adapter.encode_client_start_ticket ticket with
         | Error error -> Error error
@@ -925,48 +1313,90 @@ module Native_backend = struct
         | Ok input ->
             Protocol_adapter.decode_client_wait_result request
               (Bridge.client_wait_workflow_json runtime input))
-    | Client_cancel_workflow request -> (
-        match Protocol_adapter.encode_client_cancel_request request with
-        | Error error -> Error error
-        | Ok input ->
+    | Client_cancel_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_cancel_result
-              (Bridge.client_cancel_workflow_json runtime input))
-    | Client_reset_workflow request -> (
-        match Protocol_adapter.encode_client_reset_request request with
-        | Error error -> Error error
-        | Ok input ->
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_cancel_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_cancel_result
+                  (Bridge.client_cancel_workflow_json runtime input))
+    | Client_reset_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_reset_result request
-              (Bridge.client_reset_workflow_json runtime input))
-    | Client_terminate_workflow request -> (
-        match Protocol_adapter.encode_client_terminate_request request with
-        | Error error -> Error error
-        | Ok input ->
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_reset_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_reset_result request
+                  (Bridge.client_reset_workflow_json runtime input))
+    | Client_terminate_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_terminate_result
-              (Bridge.client_terminate_workflow_json runtime input))
-    | Client_signal_workflow request -> (
-        match Protocol_adapter.encode_client_signal_request request with
-        | Error error -> Error error
-        | Ok input ->
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_terminate_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_terminate_result
+                  (Bridge.client_terminate_workflow_json runtime input))
+    | Client_signal_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_signal_result
-              (Bridge.client_signal_workflow_json runtime input))
-    | Client_list_visibility_workflows request -> (
-        match Protocol_adapter.encode_client_visibility_request request with
-        | Error error -> Error error
-        | Ok input ->
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_signal_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_signal_result
+                  (Bridge.client_signal_workflow_json runtime input))
+    | Client_list_visibility_workflows request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_visibility_result
-              (Bridge.client_list_visibility_json runtime input))
-    | Client_query_workflow request -> (
-        match Protocol_adapter.encode_client_query_request request with
-        | Error error -> Error error
-        | Ok input ->
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_visibility_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_visibility_result
+                  (Bridge.client_list_visibility_json runtime input))
+    | Client_query_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_query_result
-              (Bridge.client_query_workflow_json runtime input))
-    | Client_update_workflow request -> (
-        match Protocol_adapter.encode_client_update_request request with
-        | Error error -> Error error
-        | Ok input ->
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_query_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_query_result
+                  (Bridge.client_query_workflow_json runtime input))
+    | Client_update_workflow request ->
+        deadline request.rpc_deadline
+          ~expired:(fun () ->
             Protocol_adapter.decode_client_update_result request
-              (Bridge.client_update_workflow_json runtime input))
+              (Error Protocol_adapter.expired_rpc_deadline_error))
+          ~live:(fun rpc_deadline ->
+            let request = { request with rpc_deadline } in
+            match Protocol_adapter.encode_client_update_request request with
+            | Error error -> Error error
+            | Ok input ->
+                Protocol_adapter.decode_client_update_result request
+                  (Bridge.client_update_workflow_json runtime input))
     | Client_poll_update_workflow request -> (
         match Protocol_adapter.encode_client_poll_update_request request with
         | Error error -> Error error
@@ -979,14 +1409,16 @@ module Native_backend = struct
         Bridge.replay_worker_feed_history runtime input
     | Finish_replay_input -> Bridge.replay_worker_finish_input runtime
     | Try_poll_replay_workflow ->
-        Protocol_adapter.workflow_poll_result
+        Protocol_adapter.replay_workflow_poll_result
           ~reject:(Bridge.replay_worker_reject_workflow_json runtime)
           (Bridge.replay_worker_try_poll_workflow runtime)
     | Wait_replay_workflow -> Bridge.replay_worker_wait_workflow runtime
-    | Complete_replay_workflow completion ->
-        Result.bind
-          (Protocol_adapter.encode_workflow_completion completion)
-          (Bridge.replay_worker_complete_workflow_json runtime)
+    | Complete_replay_workflow encoded ->
+        (* [encoded] already passed the canonical encoder exactly once in the
+           worker adapter (issue #846); only the C call's owned copy is made
+           here. *)
+        Bridge.replay_worker_complete_workflow_json runtime
+          (Temporal_protocol.Encoded_workflow_completion.to_bytes encoded)
     | Reject_replay_workflow input ->
         Bridge.replay_worker_reject_workflow_json runtime input
     | Finalize_replay -> Bridge.replay_worker_finalize runtime
@@ -996,40 +1428,50 @@ module Native_backend = struct
           ~reject:(Bridge.worker_reject_workflow_json runtime)
           (Bridge.worker_try_poll_workflow runtime)
     | Wait_workflow -> Bridge.worker_wait_workflow runtime
-    | Complete_workflow completion ->
-        Result.bind
-          (Protocol_adapter.encode_workflow_completion completion)
-          (Bridge.worker_complete_workflow_json runtime)
+    | Complete_workflow encoded ->
+        (* As for replay: the bytes were validated by their single encoder
+           pass before entering the mailbox and are not encoded again. *)
+        Bridge.worker_complete_workflow_json runtime
+          (Temporal_protocol.Encoded_workflow_completion.to_bytes encoded)
     | Try_poll_activity ->
         Protocol_adapter.activity_poll_result
           ~reject:(Bridge.worker_reject_activity_json runtime)
           (Bridge.worker_try_poll_activity runtime)
     | Wait_activity -> Bridge.worker_wait_activity runtime
+    | Wait_any -> Bridge.worker_wait_any runtime
     | Wait_activity_completion_retry_backoff ->
         Bridge.worker_wait_activity_completion_retry_backoff runtime
-    | Complete_activity completion ->
-        Result.bind
-          (Protocol_adapter.encode_activity_completion completion)
-          (Bridge.worker_complete_activity_json runtime)
-    | Complete_async_activity completion ->
-        Result.bind
-          (Protocol_adapter.encode_activity_completion completion)
-          (Bridge.client_complete_async_activity_json runtime)
-    | Record_activity_heartbeat heartbeat ->
-        Result.bind
-          (Protocol_adapter.encode_activity_heartbeat heartbeat)
-          (Bridge.worker_record_activity_heartbeat_json runtime)
-    | Record_async_activity_heartbeat heartbeat ->
-        Result.bind
-          (Protocol_adapter.encode_activity_heartbeat heartbeat)
-          (Bridge.client_record_async_activity_heartbeat_json runtime)
+    | Complete_activity encoded ->
+        (* [encoded] already passed the canonical encoder exactly once in the
+           activity adapter (issue #995); only the C call's owned copy is made
+           here. *)
+        Bridge.worker_complete_activity_json runtime
+          (Temporal_protocol.Encoded_activity_completion.to_bytes encoded)
+    | Complete_async_activity encoded ->
+        (* The async client path accepts the same completion document and
+           likewise submits the adapter's single-encode bytes unchanged. *)
+        Bridge.client_complete_async_activity_json runtime
+          (Temporal_protocol.Encoded_activity_completion.to_bytes encoded)
+    | Record_activity_heartbeat encoded ->
+        (* [encoded] already passed the canonical encoder exactly once in the
+           activity adapter (issue #1001); only the C call's owned copy is
+           made here. *)
+        Bridge.worker_record_activity_heartbeat_json runtime
+          (Temporal_protocol.Encoded_activity_heartbeat.to_bytes encoded)
+    | Record_async_activity_heartbeat encoded ->
+        (* The async client path accepts the same heartbeat document and
+           likewise submits the adapter's single-encode bytes unchanged. *)
+        Bridge.client_record_async_activity_heartbeat_json runtime
+          (Temporal_protocol.Encoded_activity_heartbeat.to_bytes encoded)
+    | Initiate_worker_shutdown -> Bridge.worker_initiate_shutdown runtime
     | Shutdown_worker -> Bridge.worker_shutdown runtime
     | Disconnect_client -> Bridge.client_disconnect runtime
+    | Client_submit rpc -> submit_client_rpc runtime rpc
 
   (** Requests reverse-order child teardown and always closes the parent graph.
       Runtime close is itself defensive and reclaims any child remaining after
       an earlier error; the first diagnostic is preserved for the caller. *)
-  let shutdown runtime =
+  let shutdown { runtime; lease } =
     let replay_result = Bridge.replay_worker_dispose runtime in
     let worker_result = Bridge.worker_shutdown runtime in
     let client_result =
@@ -1038,6 +1480,9 @@ module Native_backend = struct
       | Error _ as error -> error
     in
     let runtime_result = Bridge.runtime_close runtime in
+    (* [runtime_close] has detached the graph and, on every result, dropped
+       its Core reference, so the shared runtime no longer depends on it. *)
+    Option.iter Sdk_shared_runtime.release lease;
     match (replay_result, worker_result, client_result, runtime_result) with
     | Error _ as error, _, _, _ -> error
     | Ok (), (Error _ as error), _, _ -> error
@@ -1049,11 +1494,61 @@ end
 module Native = struct
   include Make (Native_backend)
 
+  (** Shadows the generic constructor so callers name the optional runtime
+      thread bound or shared-runtime lease instead of passing the backend's
+      raw [config]. The supervisor owns [runtime] from this call on: on
+      success it releases the lease after closing its graph; on any failure
+      (including an owner Domain that never started, so the backend never
+      saw the lease) it is released here before returning. *)
+  let create ?runtime_threads ?runtime ~capacity () =
+    let config =
+      match runtime with
+      | Some lease -> Native_backend.Attached lease
+      | None -> Native_backend.Owned runtime_threads
+    in
+    match create ~capacity config with
+    | Ok _ as created -> created
+    | Error _ as error ->
+        Option.iter Sdk_shared_runtime.release runtime;
+        error
+
   module Protocol_adapter = Protocol_adapter
   module Client = Temporal_protocol.Client_protocol
 
   type client_config = Native_backend.Bridge.client_config
   type worker_config = Native_backend.Bridge.worker_config
+
+  type 'value client_rpc = 'value Native_backend.client_rpc =
+    | Rpc_start : Client.start_request -> Client.start_outcome client_rpc
+    | Rpc_wait :
+        Client.wait_request ->
+        (Client.wait_response, Client.client_error) result client_rpc
+    | Rpc_cancel :
+        Client.cancel_request -> (unit, Client.client_error) result client_rpc
+    | Rpc_terminate :
+        Client.terminate_request -> (unit, Client.client_error) result client_rpc
+    | Rpc_reset :
+        Client.reset_request ->
+        (Client.reset_response, Client.client_error) result client_rpc
+    | Rpc_signal :
+        Client.signal_request -> (unit, Client.client_error) result client_rpc
+    | Rpc_query :
+        Client.query_request ->
+        (Client.payload list, Client.client_error) result client_rpc
+    | Rpc_update :
+        Client.update_request ->
+        (Client.update_response, Client.client_error) result client_rpc
+    | Rpc_poll_update :
+        Client.poll_update_request ->
+        (Client.poll_update_response, Client.client_error) result client_rpc
+    | Rpc_visibility : Client.visibility_request -> Client.visibility_page client_rpc
+    | Rpc_async_activity_completion :
+        Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
+    | Rpc_async_activity_heartbeat :
+        Temporal_protocol.Encoded_async_activity_heartbeat.t ->
+        Temporal_protocol.Activity_protocol.async_heartbeat_response client_rpc
+
+  type 'value client_call = 'value Native_backend.client_call
 
   type 'result operation = 'result Native_backend.operation =
     | Check_compatibility : unit operation
@@ -1103,7 +1598,7 @@ module Native = struct
         Temporal_protocol.Workflow_protocol.activation option operation
     | Wait_replay_workflow : unit operation
     | Complete_replay_workflow :
-        Temporal_protocol.Workflow_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_workflow_completion.t -> unit operation
     | Reject_replay_workflow : bytes -> unit operation
     | Finalize_replay : unit operation
     | Dispose_replay : unit operation
@@ -1111,21 +1606,44 @@ module Native = struct
         Temporal_protocol.Workflow_protocol.activation option operation
     | Wait_workflow : unit operation
     | Complete_workflow :
-        Temporal_protocol.Workflow_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_workflow_completion.t -> unit operation
     | Try_poll_activity :
         Temporal_protocol.Activity_protocol.task option operation
     | Wait_activity : unit operation
+    | Wait_any : unit operation
     | Wait_activity_completion_retry_backoff : unit operation
     | Complete_activity :
-        Temporal_protocol.Activity_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_activity_completion.t -> unit operation
     | Complete_async_activity :
-        Temporal_protocol.Activity_protocol.completion -> unit operation
+        Temporal_protocol.Encoded_activity_completion.t -> unit operation
     | Record_activity_heartbeat :
-        Temporal_protocol.Activity_protocol.heartbeat -> unit operation
+        Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
     | Record_async_activity_heartbeat :
-        Temporal_protocol.Activity_protocol.heartbeat -> unit operation
+        Temporal_protocol.Encoded_activity_heartbeat.t -> unit operation
+    | Initiate_worker_shutdown : unit operation
     | Shutdown_worker : unit operation
     | Disconnect_client : unit operation
+    | Client_submit : 'value client_rpc -> 'value client_call operation
+
+  (** Awaits one submitted call on the calling Domain through the native
+      completion cell; see {!Client_call.await}. A call closed by shutdown is
+      the typed [Closed] error and every other failure is a [Backend]
+      error. *)
+  let await_client_call ?slice_ms call =
+    match
+      Client_call.await ~poll:Native_backend.Bridge.client_await_call
+        ~release:Native_backend.Bridge.client_release_call ?slice_ms call
+    with
+    | Ok value -> Ok value
+    | Error Client_call.Closed -> Error Closed
+    | Error (Client_call.Failed error) -> Error (Backend error)
+
+  (** Submits [rpc] through the owner and awaits it on the calling Domain.
+      Only submission occupies the owner Domain. *)
+  let call supervisor rpc =
+    match perform supervisor (Client_submit rpc) with
+    | Error _ as error -> error
+    | Ok submitted -> await_client_call submitted
 
   let client_config = Native_backend.Bridge.client_config
   let worker_config = Native_backend.Bridge.worker_config

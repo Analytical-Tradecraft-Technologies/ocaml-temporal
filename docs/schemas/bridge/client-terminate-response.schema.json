@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mfow/ocaml-temporal/blob/master/docs/schemas/bridge/client-terminate-response.schema.json",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/master/docs/schemas/bridge/client-terminate-response.schema.json",
   "title": "Exact workflow termination acknowledgement",
   "type": "object",
   "additionalProperties": false,

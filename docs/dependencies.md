@@ -1,15 +1,50 @@
 # Dependency and License Inventory
 
 All project and build dependencies are checked before a milestone commit.
-`make license-check` reads `temporal-sdk.opam.locked`, asks OPAM for each package's
+`make license-check` reads `temporal-sdk.opam.locked` and the per-compiler
+replacements in `scripts/opam-lock-overrides.txt`, asks OPAM for each package's
 exact license metadata, and rejects missing or unapproved values. The
 standalone GitHub Actions license job streams locked metadata emitted by
 `make cargo-metadata` into the repository scanner running in a separate
 official Python container. `make cargo-metadata` only emits the locked Cargo
 metadata; it does not run the scanner. Cargo license scanning deliberately
 does not run in the compiler/architecture matrix or as a Makefile target.
+`make license-check` also audits the CI-only official Python SDK closure of
+the interoperability regression in the pinned Python image; see
+[CI-only interoperability tooling](#ci-only-interoperability-tooling).
 The Makefile's `quality` target is a separate contributor/CI gate for RustSec,
 unused-dependency, and spelling checks.
+
+## Keeping this inventory current
+
+The tables in this document are compared with the files that actually pin each
+dependency by `make check-dependency-inventory`
+(`scripts/check-dependency-inventory.sh`). `make license-check` runs it first,
+so the standalone license job, and `make check` locally, fail when a lock file,
+image digest, action pin, or tool version changes without the matching row
+here. It uses only POSIX tools and needs neither OPAM, Cargo, nor Docker.
+
+| Inventory table | Compared with |
+|---|---|
+| [Locked OCaml closure](#locked-ocaml-closure) | Every package and version in `temporal-sdk.opam.locked`, plus the `temporal-sdk.opam` version |
+| [Per-compiler lock overrides](#per-compiler-lock-overrides) | `scripts/opam-lock-overrides.txt` |
+| [Linking-exception scope](#linking-exception-scope) | The locked versions of `ocaml`, `ocaml-base-compiler`, and `ocamlbuild` in `temporal-sdk.opam.locked`, and of `tyxml`, `re`, and `camlp-streams` in `scripts/docs-tools.locked` |
+| [CI-only documentation tooling](#ci-only-documentation-tooling) | `scripts/docs-tools.locked` |
+| [CI-only interoperability tooling](#ci-only-interoperability-tooling) | Every `name==version` line of `test/integration/sdk_interop/python/requirements.lock` |
+| [Builder image tooling](#builder-image-tooling), [toolchain and CI images](#toolchain-and-ci-images), and [local integration service images](#local-integration-service-images) | Every digest-pinned image reference in `Dockerfile.dev`, `docker/ocaml-*/Dockerfile`, `Dockerfile.rust-ci`, `test/integration/temporal/compose.yaml`, and the GitHub workflows and composite actions |
+| [Locked Cargo closure](#locked-cargo-closure) | The `[[package]]` count in `rust/Cargo.lock` and the Temporal Core revision in `rust/Cargo.toml` |
+| [Direct Rust dependencies](#direct-rust-dependencies) | Every crate in `[workspace.dependencies]` in `rust/Cargo.toml` or declared by the bridge (inherited or directly), every locked version of each crate in `rust/Cargo.lock`, and the bridge's normal and dev dependency sections; any other bridge dependency table fails the check |
+| [CI-only quality tools](#ci-only-quality-tools) | The `taiki-e/install-action` tool list and the Makefile `QUALITY_*_VERSION` defaults |
+| [GitHub Actions](#github-actions) | Every external `uses:` reference, its pinned ref, and its release comment |
+
+The Rust toolchain version stated below is also compared with
+`rust/rust-toolchain.toml`. The checker compares names, versions, and pins; it
+does not re-derive license columns. Those are reviewed from each package's own
+metadata (`opam show <package> -f license`, `cargo metadata`, or the upstream
+repository) when a row is added or changed, and the OPAM and Cargo license
+gates above remain the enforcement for everything the SDK builds or ships.
+`make test-dependency-inventory-contract` proves the checker rejects drift in
+each compared source.
 
 ## Policy
 
@@ -36,24 +71,37 @@ attributes them to the reviewed compiler distribution.
 
 ## Locked OCaml closure
 
-| Package | Exact version | License | Scope | Linked into release | Redistributed | Review note |
+Roles: *runtime* packages are linked into an application that uses the SDK;
+*test-only* packages are declared `with-test` and used only by the SDK's own
+tests; *build* packages run while building the SDK or a dependency and are not
+linked; *system check* packages only verify that an external tool is present;
+*compiler* packages are provided by the pinned image or `setup-ocaml`.
+
+| Package | Exact version | License | Role | Linked into release | Redistributed | Review note |
 |---|---:|---|---|---|---|---|
-| temporal-sdk | ~dev | Apache-2.0 | project | yes | yes | Project source and binary |
-| dune | 3.24.2 | MIT | build | no | no | Build system only |
+| temporal-sdk | 0.1.0~rc.1 | Apache-2.0 | project | yes | yes | Project source and binary |
 | logs | 0.10.0 | ISC | runtime | yes | no | Maintained application-configurable logging infrastructure; the SDK installs no reporter |
-| ocamlbuild | 0.16.1 | LGPL-2.0-or-later WITH OCaml-LGPL-linking-exception | build | no | no | Exact reviewed build-only linking-exception dependency of `logs` |
-| ocamlfind | 1.9.8 | MIT | build | no | no | Build-time library discovery required by `logs` |
-| topkg | 1.1.1 | ISC | build | no | no | Build-time packaging tool required by `logs` |
 | yojson | 3.0.0 | BSD-3-Clause | runtime | yes | no | Implements the optional cross-language `json/plain` codec; Temporal itself does not require JSON |
+| mtime | 2.1.0 | ISC | test-only | no | no | Monotonic clock for the repository benchmark harness (`with-test`); not a library dependency |
+| dune | 3.24.2 | MIT | build | no | no | Build system only |
+| ocamlbuild | 0.16.1 | LGPL-2.0-or-later WITH OCaml-LGPL-linking-exception | build | no | no | Exact reviewed build-only linking-exception dependency of `logs` |
+| ocamlfind | 1.9.8 | MIT | build | no | no | Build-time library discovery required by `topkg` |
+| topkg | 1.1.1 | ISC | build | no | no | Build-time packaging tool required by `logs` and `mtime` |
+| conf-protoc | 4.4.0 | BSD-3-Clause | system check | no | no | Runs `protoc --version`; the Protocol Buffers compiler builds Temporal Core's generated crates |
+| conf-rust-2024 | 1 | MIT | system check | no | no | Checks for a Rust toolchain that supports the 2024 edition used by the bridge |
 | ocaml | 5.2.1 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | compiler/runtime | yes | no | Approved OCaml linking exception |
 | ocaml-base-compiler | 5.2.1 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | compiler | no | no | Approved OCaml linking exception |
-| ocaml-config | 3 | ISC | build | no | no | Compiler configuration package |
-| ocaml-options-vanilla | 1 | CC0-1.0+ | build | no | no | Exact reviewed permissive metadata exception |
+| ocaml-config | 3 | ISC | compiler | no | no | Compiler configuration package |
+| ocaml-options-vanilla | 1 | CC0-1.0+ | compiler | no | no | Exact reviewed permissive metadata exception |
 | base-bigarray | base | compiler virtual package | runtime capability | no | no | No independent source; part of OCaml distribution |
 | base-domains | base | compiler virtual package | runtime capability | no | no | No independent source; part of OCaml distribution |
 | base-nnp | base | compiler virtual package | runtime capability | no | no | No independent source; part of OCaml distribution |
 | base-threads | base | compiler virtual package | runtime capability | no | no | No independent source; part of OCaml distribution |
 | base-unix | base | compiler virtual package | runtime capability | no | no | No independent source; part of OCaml distribution |
+
+The lock is solved for OCaml 5.2.1; the compiler rows show that solve, while
+the other supported series use their own pinned compiler packages (see
+[Installing the locked OPAM closure](#installing-the-locked-opam-closure)).
 
 Protocol conformance tests use a small repository-owned standard-library
 harness. Alcotest itself is ISC, but its complete OPAM test closure includes
@@ -61,38 +109,219 @@ ordinary LGPL packages outside the compiler/runtime exception allowed by this
 project, so it is intentionally neither used nor declared as a package test
 dependency.
 
-## Reviewed OCaml linking exceptions
+## Linking-exception scope
 
-| Package | Exact version | License | Scope | Rationale |
-|---|---:|---|---|---|
-| ocamlbuild | 0.16.1 | LGPL-2.0-or-later WITH OCaml-LGPL-linking-exception | build only | Required to build `logs.0.10.0`; not linked or redistributed |
+The OCaml linking exception is accepted only in the exact places below. Each
+row is either part of the compiler itself, never linked, or confined to a
+disposable CI image; none of them extends to any other package.
 
-Only the exact compiler/runtime names and the exact ocamlbuild version
-hard-coded by the policy are accepted. Adding a row here also requires a
-matching exact-name and version checker change.
+| Package | Exact version | License | Scope | Enforced by | Rationale |
+|---|---:|---|---|---|---|
+| ocaml | 5.2.1 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | compiler/runtime | `scripts/check-licenses.sh` exact package name | The OCaml compiler and runtime every OCaml program links |
+| ocaml-base-compiler | 5.2.1 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | compiler | `scripts/check-licenses.sh` exact package name | The compiler distribution that provides `ocaml` |
+| ocamlbuild | 0.16.1 | LGPL-2.0-or-later WITH OCaml-LGPL-linking-exception | build only | `scripts/check-licenses.sh` exact name and version | Required to build `logs.0.10.0`; not linked or redistributed |
+| tyxml | 4.6.0 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | CI-only documentation tool | `scripts/docs-tools.locked` and the `docs` image stage | Part of the odoc closure; renders HTML in a disposable CI image |
+| re | 1.14.0 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | CI-only documentation tool | `scripts/docs-tools.locked` and the `docs` image stage | Part of the odoc closure; renders HTML in a disposable CI image |
+| camlp-streams | 5.0.1 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | CI-only documentation tool | `scripts/docs-tools.locked` and the `docs` image stage | Part of the odoc closure; renders HTML in a disposable CI image |
+
+`make license-check` accepts only the exact compiler/runtime names and the
+exact ocamlbuild version hard-coded by the policy; adding an SDK row here also
+requires a matching exact-name and version checker change. The three CI-only
+rows are not admitted by `make license-check` at all: they are never SDK
+dependencies, and the reasoning that permits them as documentation tools must
+not be cited to admit them, or any other LGPL package, into the SDK closure.
+
+The compiler rows show the OCaml 5.2.1 solve of the lock; every supported
+series uses its own compiler under the same exception, and
+`scripts/check-licenses.sh` also names `ocaml-compiler-libs` should it enter
+the lock. `make check-dependency-inventory` compares each row's version with
+`temporal-sdk.opam.locked` (compiler and ocamlbuild) or
+`scripts/docs-tools.locked` (the CI-only rows), so upgrading any of these
+packages fails until this table is reviewed.
+
+## CI-only documentation tooling
+
+`make docs` renders the API documentation with odoc in the `docs` stage of
+`Dockerfile.dev`. That stage installs the exact closure in
+`scripts/docs-tools.locked` on top of the locked SDK closure and fails if opam
+installs any package that the manifest does not list. None of these packages
+is an SDK dependency: they are absent from `temporal-sdk.opam` and its lock,
+are not linked into or redistributed with any SDK artifact, and are not
+needed to build or install the SDK. `make license-check` therefore does not
+audit them; changes to the tool lock must update this table instead, which
+`make check-dependency-inventory` enforces. The reasoning, and the limit that
+it must not be generalized to SDK dependencies, is recorded in
+[quality and security gates](reference/quality-gates.md#rendered-api-documentation).
+Packages the docs stage reuses from the SDK lock (`dune`, `ocamlfind`,
+`ocamlbuild`, and `topkg`) are listed only in the locked OCaml closure.
+
+| Package | Exact version | License | Role in the odoc closure |
+|---|---:|---|---|
+| odoc | 3.2.1 | ISC | Documentation compiler and HTML renderer |
+| odoc-parser | 3.2.1 | ISC | Doc-comment parser used by odoc |
+| astring | 0.8.5 | ISC | String utilities used by odoc |
+| cmdliner | 2.1.1 | ISC | Command-line parsing for odoc |
+| cppo | 1.8.0 | BSD-3-Clause | Build-time preprocessor |
+| crunch | 4.0.0 | ISC | Embeds odoc's HTML support files at build time |
+| fmt | 0.11.0 | ISC | Formatting utilities |
+| fpath | 0.7.3 | ISC | File-path utilities |
+| ptime | 1.2.0 | ISC | Time values used by crunch |
+| uutf | 1.0.4 | ISC | UTF-8 handling used by tyxml |
+| seq | base | compiler virtual package | No independent source; part of OCaml distribution |
+| tyxml | 4.6.0 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | HTML generation (see [linking-exception scope](#linking-exception-scope)) |
+| re | 1.14.0 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | Regular expressions used by tyxml (see [linking-exception scope](#linking-exception-scope)) |
+| camlp-streams | 5.0.1 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | Stream compatibility library used by odoc-parser (see [linking-exception scope](#linking-exception-scope)) |
+
+## CI-only interoperability tooling
+
+The [official-SDK interoperability regression](../test/integration/sdk_interop/README.md)
+(#517) drives OCaml workflows from the official Temporal Python SDK. The
+SDK and its runtime dependencies are installed only inside the digest-pinned
+`python:3.15-slim-bookworm` image listed under
+[toolchain and CI images](#toolchain-and-ci-images), into a throwaway virtual
+environment, by `test/integration/sdk_interop/python/run-driver.sh`. That
+script installs `test/integration/sdk_interop/python/requirements.lock` with
+`--require-hashes --no-deps --only-binary :all:`, so every distribution is
+pinned by version and SHA-256 digest, nothing outside the lock is resolved,
+and no package build code runs. None of these packages is an SDK dependency:
+they are absent from `temporal-sdk.opam` and its lock, are never installed in
+the OCaml development image, and are not linked into or redistributed with
+any SDK artifact.
+
+`make license-check` audits the closure itself through
+`make python-license-check`, so the standalone license job covers it. In the
+same pinned Python image, `scripts/check-python-licenses.sh` installs the lock
+with its hashes into a throwaway virtual environment created without pip, and
+`scripts/check-python-licenses.py` reads each installed distribution's own
+metadata with `importlib.metadata`: the PEP 639 `License-Expression`, every
+`License ::` classifier, the free-text `License` field, and each declared
+`License-File`, which must be present. Expressions are evaluated with the SPDX
+parser and permissive allowlist shared with the Cargo scanner
+(`scripts/check-cargo-licenses.py`). A missing, unknown, malformed, copyleft
+or ambiguous license fails, as does a declared license file that is absent, a
+copyleft classifier, or a classifier that contradicts the expression. The
+installed set must equal the lock exactly, so an unlocked or differently
+versioned distribution also fails. `test/smoke/test_python_license_policy.sh`
+runs first and proves these rules on the small fake distributions under
+`test/fixtures/python-licenses`, without the network.
+
+The only overrides are the reviewed entries below, which are keyed by exact
+package and version and also pin the observed metadata value, so an upgrade
+or a metadata change fails until it is reviewed again:
+
+| Package | Version | Observed metadata | Concluded license | Reason |
+|---|---|---|---|---|
+| protobuf | 7.36.2 | `License: 3-Clause BSD License` (free text, no expression or classifier) | BSD-3-Clause | The upstream `protocolbuffers/protobuf` license is BSD-3-Clause |
+| typing-extensions | 4.16.0 | `License-Expression: PSF-2.0` | PSF-2.0 | The Python Software Foundation license is permissive and non-copyleft, the same family as the CPython image itself, but outside the shared allowlist; this package is CI-only and never redistributed |
+
+A lock change must also update the table below, which
+`make check-dependency-inventory` enforces.
+
+| Package | Exact version | License | Role |
+|---|---:|---|---|
+| temporalio | 1.33.0 | MIT | Official Temporal Python SDK (client, worker, default data converter); its wheels embed the official Rust Temporal Core |
+| nexus-rpc | 1.4.0 | MIT | Nexus RPC types imported by the SDK |
+| protobuf | 7.36.2 | BSD-3-Clause | Protocol Buffers runtime for the SDK's API messages |
+| types-protobuf | 7.35.1.20260906 | Apache-2.0 | Typing stubs that the SDK declares as a runtime requirement |
+| typing-extensions | 4.16.0 | PSF-2.0 | Typing backports used by the SDK and nexus-rpc |
 
 ## Builder image tooling
 
-The development image is based on `ocaml/opam:debian-12-ocaml-5.2` and uses
-OPAM to install the locked closure. Operating-system and ambient base-image
-tools are not linked into or redistributed with the future worker artifact.
-Release containers will use a separate minimal runtime stage and will receive
-their own package/SBOM audit before publication.
+The development image starts from one `ocaml/opam:debian-12-ocaml-<series>`
+image per supported compiler series (5.2 through 5.5, matching
+`scripts/ci-matrix.py`). Each series is pinned to the multi-architecture
+manifest index digest below on the single `FROM` line of
+`docker/ocaml-<series>/Dockerfile`; those files are the single source of truth
+and `Dockerfile.dev` names no `ocaml/opam` image itself. The Makefile resolves
+`OCAML_VERSION` (or a series name such as `OCAML_IMAGE=ocaml-5.4`) to the
+pinned reference with `scripts/ocaml-image.sh` and passes it to
+`Dockerfile.dev` as `OCAML_IMAGE`; run directly, the live-test scripts default
+to the 5.2 series. An explicit `OCAML_IMAGE=<image reference>` is still
+accepted for local experiments but is not used by CI or release lanes.
 
-The image copies Rust 1.98.1, Cargo, Clippy, and rustfmt from the official
-multi-architecture `rust:1.98-bookworm` image at manifest digest
-`sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e`.
-That manifest contains native `linux/amd64` and `linux/arm64/v8` images. Rust
-is dual-licensed Apache-2.0 OR MIT. Debian's `protobuf-compiler` and
-`libprotobuf-dev` packages are installed as build-only tools required by
+Dependabot's `docker` ecosystem has one entry per series directory, so each
+job tracks exactly one tag and refreshes its digest in place (#1027). A single
+file holding all four stages was treated as one dependency and could not be
+refreshed. Dependabot compares candidate tags by their trailing number (`5.3`)
+but computes `update-types` ranges from the whole current tag, so a
+`semver-minor` ignore never stopped a retarget to another series. Each entry
+therefore ignores `ocaml/opam` versions from the next series upwards (for
+example `>= 5.3` for the 5.2 directory). The current tag is not ignored, which
+keeps its digest refresh eligible.
+`test/fixtures/install-consumer/test_build_tool_dependencies.sh` checks that
+the pin files, the Dependabot entries and the CI matrix stay in step.
+
+| Image | Pin file | Manifest index digest |
+|---|---|---|
+| `ocaml/opam:debian-12-ocaml-5.2` | `docker/ocaml-5.2/Dockerfile` | `sha256:3f7f5f5adffbb0f69172d69ec34450695257aaf148d4549b3227c6998c5eb2a4` |
+| `ocaml/opam:debian-12-ocaml-5.3` | `docker/ocaml-5.3/Dockerfile` | `sha256:bbaac53e502f6602013d8967c3a54cfcb898b556f453ab72e8e23966c3c681df` |
+| `ocaml/opam:debian-12-ocaml-5.4` | `docker/ocaml-5.4/Dockerfile` | `sha256:56c9ab2e2f9e8fa926efbc36bedf75fbdb0dd7661765440397def7a24d4e3bfa` |
+| `ocaml/opam:debian-12-ocaml-5.5` | `docker/ocaml-5.5/Dockerfile` | `sha256:36803e379c31545ef00dfb64f8bdf3226b5e8c7b76746b636caedda811c625f3` |
+
+Each index contains native `linux/amd64` and `linux/arm64` images. The image
+build recipes are MIT (`ocurrent/docker-base-images`); the OCaml and OPAM
+software they contain is covered by the locked closure above.
+Operating-system and ambient base-image tools are not linked into or
+redistributed with the future worker artifact. Release containers will use a
+separate minimal runtime stage and will receive their own package/SBOM audit
+before publication.
+
+### Installing the locked OPAM closure
+
+Every lane that produces an OCaml artifact (the Docker image used by the Linux
+matrix and the native macOS/Windows jobs) installs dependencies with
+`scripts/opam-locked-deps.sh install`, not by re-solving `temporal-sdk.opam`.
+The script installs each locked package at its exact version and then runs
+`scripts/opam-locked-deps.sh check`, which fails the build with a `MISMATCH`
+line for any package whose installed version differs. The audited versions are
+therefore the versions the published `.cmxa` archives are compiled against.
+
+`temporal-sdk.opam.locked` is solved for OCaml 5.2.1, but the artifact matrix
+also builds OCaml 5.3, 5.4, and 5.5. `opam install --locked` cannot serve that
+matrix: it would pin the compiler too, and the lock's `pin-depends` would
+rebuild 5.2.1 from source. The script therefore leaves compiler-provided
+packages (`ocaml`, `ocaml-base-compiler`, `ocaml-config`,
+`ocaml-options-*`, and `base-*`) to the pinned image or setup-ocaml and only
+reports them; the exact compiler patch level is asserted by the Makefile's
+version checks. Every other package is held to the lock on every compiler.
+
+#### Per-compiler lock overrides
+
+When OPAM metadata makes a locked version uninstallable for one compiler
+series, `scripts/opam-lock-overrides.txt` may name a replacement version for
+that series only. Overrides cannot add packages or replace compiler packages,
+and `make license-check` audits them alongside the lock.
+
+| OCaml series | Package | Replacement version | License | Reason |
+|---|---|---:|---|---|
+| 5.5 | ocamlfind | 1.9.9~preview | MIT | `ocamlfind.1.9.8` declares `ocaml < 5.5.0~`; build-only tool reached through topkg and not linked into the SDK |
+
+## Toolchain and CI images
+
+The development image copies the Rust toolchain `1.99.1`, Cargo, Clippy, and
+rustfmt from the official multi-architecture Rust image below, and
+`Dockerfile.rust-ci` builds the shared Linux Rust producer from the same
+digest. Rust is dual-licensed Apache-2.0 OR MIT. Debian's `protobuf-compiler`
+and `libprotobuf-dev` packages are installed as build-only tools required by
 Temporal Core's generated protobuf crates and standard Google protobuf
 definitions; Protocol Buffers is BSD-3-Clause. Neither tool is intended for
-the eventual minimal runtime image. The Cargo license policy script runs in a
-separate official `python:3.14-slim-bookworm` image pinned at manifest digest
-`sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9`
-in the standalone GitHub Actions audit job. Its scanner container has no
-network access and mounts the source read-only. Python is not installed in the
-development or eventual runtime image.
+the eventual minimal runtime image.
+
+The Cargo license policy script runs in a separate official Python image in
+the standalone GitHub Actions audit job, and the release preflight uses the
+same image to generate and audit the Cargo SBOM. These containers have no
+network access and mount the source read-only. The
+[official-SDK interoperability regression](#ci-only-interoperability-tooling)
+runs the same image as the `sdk-interop-python` Compose service; that test
+container joins the Compose network, downloads only the hash-locked wheels,
+and writes its evidence report under the ignored `_build` tree. Python is not
+installed in the development or eventual runtime image, and nothing from the
+Python image is linked into or redistributed with the SDK.
+
+| Image | Manifest index digest | Used by | Native platforms | License |
+|---|---|---|---|---|
+| `rust:1.99-bookworm` | `sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29` | `Dockerfile.dev` Rust toolchain stage and `Dockerfile.rust-ci` | Linux amd64 and arm64/v8 | Rust is Apache-2.0 OR MIT; image packaging (`rust-lang/docker-rust`) is Apache-2.0 OR MIT |
+| `python:3.15-slim-bookworm` | `sha256:122756f3fe72c4f5d3d71897888204ee85774bc79de952555b8a474e1d0a5d53` | Cargo license audit, release-preflight Cargo SBOM generation and audit, the official-SDK interoperability driver, and its Python license audit (CI-only) | Linux amd64, arm64/v8, and additional official architectures | CPython's PSF license stack (SPDX `Python-2.0`); image packaging (`docker-library/python`) is MIT |
 
 `ocamlformat` is deliberately absent. Version 0.28.1 is MIT licensed, but its
 build closure includes ordinary GPL packages (`menhir` and `fix`), which this
@@ -103,19 +332,22 @@ currently enforce repository-owned whitespace rules instead.
 
 The Compose acceptance substrate uses the following exact OCI manifest
 indexes. These images are development and integration services; they are not
-linked into the SDK or redistributed in its OCaml package.
+linked into the SDK or redistributed in its OCaml package. Dependabot's
+`docker-compose` ecosystem refreshes them, grouping the two Temporal images.
 
 | Image | Manifest digest | Native platforms | Primary software license | Review |
 |---|---|---|---|---|
-| `postgres:16.13-bookworm` | `sha256:472efd9a66f2b2f1a5aeb18b28de74332e6ef88c2b93a1a5d812fb6db67a5f60` | Linux amd64, arm64/v8, and additional official architectures | PostgreSQL License; Docker image packaging is MIT | [PostgreSQL license](https://www.postgresql.org/about/licence/), [official image source](https://github.com/docker-library/postgres) |
-| `temporalio/server:1.31.0` | `sha256:b021b3b58c3f169634cdbb0451fcc0e69e8190b40454323362c7c52bbd4ff7b9` | Linux amd64 and arm64 | MIT | [Temporal source and license](https://github.com/temporalio/temporal), [official Compose sample](https://github.com/temporalio/samples-server/tree/main/compose) |
-| `temporalio/admin-tools:1.31.0` | `sha256:3e68adcd54195a7c1222e99f2dbc32a4fdbf44ad69e3bb48e21e85c4bf417c2e` | Linux amd64 and arm64 | MIT | Schema and CLI tooling from the official Temporal release/sample |
+| `postgres:18.6-bookworm` | `sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c` | Linux amd64, arm64/v8, and additional official architectures | PostgreSQL License; Docker image packaging is MIT | [PostgreSQL license](https://www.postgresql.org/about/licence/), [official image source](https://github.com/docker-library/postgres) |
+| `temporalio/server:1.32.0` | `sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae` | Linux amd64 and arm64 | MIT | [Temporal source and license](https://github.com/temporalio/temporal), [official Compose sample](https://github.com/temporalio/samples-server/tree/main/compose) |
+| `temporalio/admin-tools:1.32.0` | `sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca` | Linux amd64 and arm64 | MIT | Schema and CLI tooling from the official Temporal release/sample |
 
 The pinned manifest indexes were inspected directly before adoption. Both
 Temporal indexes expose native `linux/amd64` and `linux/arm64` manifests; the
 PostgreSQL index includes those architectures and others. Temporal's archived
 Compose repository marks `auto-setup` as deprecated, so this project follows
 the maintained `samples-server` split between Server and admin-tools.
+Committed history fixtures record the image references that produced them as
+provenance; those records are not pins and are not part of this table.
 
 The service containers are not release worker images. The future minimal OCaml
 worker image still requires its own complete SBOM and redistribution audit
@@ -123,29 +355,61 @@ before publication.
 
 ## Locked Cargo closure
 
-`rust/Cargo.lock` locks 319 dependencies rooted at Temporal Core commit
-`95e97686a079dcfe6c42e3254b2f3f5e3d97408f`; metadata contains 320 packages
-including the project bridge itself. The client, common, and SDK-Core
+`rust/Cargo.lock` locks 307 packages: the project bridge and 306 dependencies
+rooted at Temporal Core commit `8fe478ee179ed754614d230f39586f3edb57da71`
+(upstream release tags `v1.1.0` and `core-v0.10.0`).
+Some crates are locked at more than one version because different packages in
+the graph require incompatible releases. The client, common, and SDK-Core
 dependencies disable their default features: `temporalio-client` enables
 `core-based-sdk` and `tls-ring`, `temporalio-sdk-core` enables `tls-ring`, and
-`temporalio-common` uses no additional features. `temporalio-protos` uses its
+`temporalio-common` enables only `prometheus`. That feature backs the opt-in
+Prometheus metrics endpoint of a shared `Temporal.Runtime` (#500). It adds one
+package, `prometheus` 0.14.0 (Apache-2.0, default features off), and activates
+Core's existing `hyper`, `hyper-util`, and `http-body-util` dependencies for
+the scrape server; all three were already locked through Core's gRPC
+transport. Core's `otel` feature (OTLP export) stays disabled. `temporalio-protos` uses its
 default feature set. The project bridge is Apache-2.0 and
 emits `staticlib` and `cdylib` artifacts for the native boundary plus an
 internal `rlib` for Rust integration tests.
 
-The bridge declares `serde` 1.0.228 (MIT OR Apache-2.0), `serde_json` 1.0.150
-(MIT OR Apache-2.0), and `base64` 0.22.1 (MIT OR Apache-2.0) directly for its
-private control protocol. The semantic adapter additionally declares the
-first-party `temporalio-protos` package at the same immutable Core revision and
-`prost-wkt-types` 0.7.1 (Apache-2.0) for exact protobuf timestamps and
-durations. The guarded poll lanes directly declare Tokio 1.52.3 (MIT) for its
-executor, channels, and task handles; their hand-off channels are intentionally
-unbounded because Core's outstanding-task permits provide the bound and a
-bounded send could deadlock shutdown. Temporal Core already selected and used
-that exact locked runtime, so the bridge does not create a second executor.
-Every package was already present at the exact locked version in the
-Temporal Core closure, so these declarations change package ownership metadata
-but add no package to the 319-dependency graph.
+The whole locked graph, not only the direct dependencies below, is audited by
+the standalone Cargo license job (`scripts/check-cargo-licenses.py` over
+`cargo metadata --locked`), by `cargo-deny` for advisories and sources, and by
+the third-party notices generator described below.
+
+### Direct Rust dependencies
+
+The bridge declares these workspace dependencies. "Locked versions" lists every
+version of that crate in `rust/Cargo.lock`; where two appear, the bridge uses
+the newest version that satisfies its requirement and the older one is reached
+only through Temporal Core's graph. Every direct crate is also a dependency of
+the Temporal Core closure at the same locked version, so these declarations
+change package ownership metadata but add no package to the graph. Licenses are
+the `license` field of `cargo metadata` for the locked version.
+
+| Crate | Requirement | Locked versions | Kind | License | Purpose |
+|---|---|---|---|---|---|
+| base64 | 0.23.0 | 0.22.1, 0.23.1 | normal | MIT OR Apache-2.0 | Payload bytes in the private JSON control protocol |
+| flate2 | 1.1.10 | 1.1.10 | dev | MIT OR Apache-2.0 | Decodes gzip-compressed gRPC requests in the test server double |
+| h2 | 0.4.19 | 0.4.20 | dev | MIT | Plaintext HTTP/2 gRPC test server double |
+| http | 1.5.0 | 1.5.0 | dev | MIT OR Apache-2.0 | HTTP types for the test server double |
+| libc | 0.2.190 | 0.2.190 | normal | MIT OR Apache-2.0 | Unix thread signal-mask calls that keep SIGPIPE from terminating the OCaml host (#1041); tests also lower the descriptor limit so the metrics endpoint's `accept()` fails (#1030) |
+| prost | 0.14.4 | 0.14.4 | normal | Apache-2.0 | Protobuf encoding and decoding of Temporal API messages and replay histories |
+| serde | 1.0.228 | 1.0.229 | normal | MIT OR Apache-2.0 | Private control protocol data model |
+| serde_json | 1.0.150 | 1.0.154 | normal | MIT OR Apache-2.0 | Private JSON control protocol |
+| prost-wkt-types | 0.7.1 | 0.7.2 | normal | Apache-2.0 AND BSD-3-Clause | Exact protobuf timestamps and durations in the semantic adapter |
+| temporalio-client | Core revision | 1.1.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core client |
+| temporalio-common | Core revision | 1.1.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core shared types |
+| temporalio-sdk-core | Core revision | 0.10.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal Core worker state machines |
+| temporalio-protos | Core revision | 0.10.0 | normal | MIT (reviewed `LICENSE.txt`) | Temporal API protobuf types |
+| tokio | 1.52.3 | 1.53.3 | normal, dev | MIT | Core's existing executor, channels, and task handles for the guarded poll lanes; `net` and `io-util` for the metrics endpoint's accept loop and relay |
+| tracing | 0.1.44 | 0.1.44 | normal | MIT | Warning and error records from the metrics endpoint, through Core's existing log pipeline |
+| uuid | 1.23.4 | 1.28.0 | normal | Apache-2.0 OR MIT | Random v4 tickets for pending workflow-start operations |
+
+The guarded poll lanes' hand-off channels are intentionally unbounded because
+Core's outstanding-task permits provide the bound and a bounded send could
+deadlock shutdown. Temporal Core already selected and used the locked Tokio
+runtime, so the bridge does not create a second executor.
 
 Dependabot checks the Cargo workspace under `/rust` every calendar day at
 07:00 Australia/Sydney and targets `master`, with a three-day release cooldown
@@ -153,16 +417,68 @@ and a maximum of ten open Cargo version-update PRs. Its explicit
 `allow: dependency-type: all` policy includes direct and transitive Cargo
 dependencies; without that rule, routine version updates cover only direct
 dependencies (security updates can still cover vulnerable lockfile entries).
-Temporal Core packages remain grouped. Cargo resolution continues to enforce
+Temporal Core packages remain grouped, but Dependabot does not move a
+`rev =` pin of a Git dependency, so that group has never proposed a Core
+upgrade; the scheduled freshness check under
+[Temporal Core pin upgrades](#temporal-core-pin-upgrades) does that job. Cargo
+resolution continues to enforce
 upstream version requirements; this policy does not override those constraints.
 Docker, Docker Compose, Rust toolchains, and GitHub Actions have separate daily
 entries. Versions embedded in arbitrary scripts, Makefiles, and action inputs
 still require explicit maintenance. OCaml and OPAM are intentionally absent
 because GitHub Dependabot does not support that ecosystem; the locked OPAM
-closure continues to be reviewed and updated manually.
+closure and its per-compiler overrides continue to be reviewed and updated
+manually. A Dependabot PR that changes any pinned input listed in
+[Keeping this inventory current](#keeping-this-inventory-current) fails the
+license job until the matching table row is updated.
 
 See the [Dependabot allow reference](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#allow)
 for the direct/indirect update behavior.
+
+### Temporal Core pin upgrades
+
+Core is pinned to the commit of an upstream stable release tag rather than an
+untagged commit on its default branch. The `Temporal Core pin freshness`
+workflow (`.github/workflows/core-pin-freshness.yml`) runs every Monday at
+20:00 UTC and on demand: `scripts/check-core-pin-freshness.sh` compares the pin
+with the commit of the latest stable `temporalio/sdk-core` release through the
+GitHub compare API. When that release is not contained in the pin, the
+workflow opens the tracking issue "Temporal Core pin is behind the latest
+sdk-core release" (or comments on the open one once per new release) and
+fails, so the gap stays visible until the pin moves. It never edits the pin.
+The expected cadence is to upgrade within one upstream release, and always
+before an SDK release; a release that is deliberately skipped is recorded on
+the tracking issue together with the upstream fixes left out.
+`test/smoke/test_core_pin_freshness.sh` covers the script's exit-status
+contract offline.
+
+A change to the Temporal Core revision, whether a hand-edited pin bump or a
+grouped Dependabot `temporal-core` PR, and any other Dependabot Cargo PR must
+carry this evidence before merge:
+
+1. Updated license evidence: the standalone Cargo license job passes, and the
+   locked package count, Core revision, and direct-dependency rows above are
+   updated (`make check-dependency-inventory` fails until they are).
+2. ABI evidence: the bridge ABI and Rust integration tests pass
+   (`make verify`, `make native-verify`).
+3. Replay evidence: the [replay history corpus](reference/history-corpus.md)
+   passes `make test-history-corpus-upgrade` without regenerating, editing or
+   deleting any committed history or expected outcome. CI runs the corpus on
+   every leg and uploads the `history-corpus-report-linux-amd64-ocaml-5.5.1`
+   report; the PR description links it and states the candidate
+   `core_revision` and the revisions that produced the corpus. A mismatch lists
+   the failing case IDs and blocks the upgrade until it is fixed or recorded as
+   an approved, intentional compatibility break (see the corpus retention
+   rules). A pass is forward-compatibility evidence only; it does not show
+   that the previous pin can replay histories the new one writes, so it is not
+   rollback evidence.
+4. Compatibility evidence: the Temporal/PostgreSQL live job passes against the
+   new pin.
+
+The most recent upgrade moved the pin from `95e97686` (crate 0.5.0) to
+`8fe478ee` (`v1.1.0`/`core-v0.10.0`) for issue #824; its adaptations and
+evidence are recorded in [progress](progress.md) and the
+[Core bridge reference](reference/core-bridge.md#temporal-core-revision).
 
 The Cargo scanner parses SPDX `AND`, `OR`, `WITH`, and parentheses rather than
 matching substrings. For an `OR`, it prints the exact approved branch selected;
@@ -181,11 +497,116 @@ for those exact package names, the immutable Core git revision, and a file
 named `LICENSE.txt`; the reviewed upstream license is MIT. See
 [ADR 0001](decisions/0001-temporal-core-c-boundary.md).
 
+That conclusion lives once, as `concluded_license` in
+`scripts/check-cargo-licenses.py`, and the SBOM generator and the notices
+generator below import it rather than repeating the package list. Following
+SPDX 2.3, the Cargo SBOM records what each package declares separately from
+what this project concludes: the six Core packages have `licenseDeclared`
+`NOASSERTION` (Cargo metadata names only a file), `licenseConcluded` `MIT`, and
+a `licenseComments` entry naming the reviewed `LICENSE.txt`. Every other
+package's Cargo expression is used for both fields, with the historical
+`MIT/Apache-2.0` slash rewritten as SPDX `OR`. The SBOM audit rejects a package
+whose concluded license is missing or `NOASSERTION`.
+
+## Third-party notices in release archives
+
+Every release archive contains the Rust bridge, which statically links the
+locked Cargo graph, and the MIT, BSD, ISC, Apache-2.0, Unicode-3.0, and similar
+licenses of those packages require their texts and attributions to accompany
+binary redistribution. `scripts/generate-third-party-notices.py` produces
+`THIRD-PARTY-NOTICES.txt` from `cargo metadata --locked` without any new tool
+dependency: it copies each package's top-level `LICENSE*`, `LICENCE*`,
+`COPYING*`, `COPYRIGHT*`, `NOTICE*`, and `UNLICENSE*` files (and one level of a
+`LICENSES` directory) from the package sources Cargo already downloaded, plus
+the metadata `license_file` (the Core workspace `LICENSE.txt`). The document
+contains this project's `LICENSE`, an inventory of every non-workspace package
+grouped by concluded license, and each distinct text once with the packages
+that use it. Output depends only on the Cargo graph: no checkout path,
+timestamp, or environment value is recorded, and CRLF and trailing whitespace
+are normalized.
+
+Some published crates declare a license in Cargo metadata but omit the file
+(currently the OpenTelemetry, `prost-wkt`, `pbjson`, `tonic-prost`, `jni`,
+`objc2-*`, `r-efi`, `valuable`, and `winapi-*-gnu` crates). MIT and BSD
+require the actual copyright notice to accompany binaries, so the generator
+never fills in a licence template for them. Instead each such package must
+have a reviewed entry for its exact version in
+`scripts/license-texts/crates/manifest.json`, which points at upstream texts
+vendored byte for byte under `scripts/license-texts/crates/`. An entry records
+the package names and versions, the concluded license expression it was
+reviewed against (it must still equal the package's concluded license), each
+vendored file's SHA-256 and upstream URL pinned to a full commit hash, and the
+evidence for choosing that commit. Optional `standard_texts` add a text from
+`scripts/license-texts/` (only Apache-2.0 is kept) when upstream merely names a
+license whose terms need no holder line, as for the `objc2` crates; the MIT and
+BSD templates are deliberately absent. An entry without any upstream file is
+accepted only with a `maintainer_exception` explaining the maintainer's
+approval. Generation also rejects any emitted text, including a crate's own
+file, whose copyright line still contains a template placeholder such as
+`<year> <copyright holders>` (the Apache-2.0 appendix's
+`[yyyy] [name of copyright owner]` instruction is part of that licence and is
+allowed), and the `--audit` mode rejects such a line in a finished document.
+
+A package with no licence file and no reviewed entry, an unconcluded license,
+or a missing declared `license_file` fails generation with every affected
+package listed; no partial file is written. The list covers the whole locked
+graph, including platform-specific and build-only packages, so it is a superset
+of what any single platform links.
+
+To add a reviewed notice when a Cargo update introduces a file-less package or
+version:
+
+1. Run the generator against fresh `cargo metadata --locked` output; it names
+   every package that needs review.
+2. Read the crate's `.cargo_vcs_info.json` (in the downloaded registry source)
+   for the commit and path it was published from, or, for an older crate
+   without one, find the commit that set the published version.
+3. Locate the `LICENSE*`, `COPYING*`, `NOTICE*`, or equivalent file at that
+   commit (crate directory first, then repository root) with
+   `gh api repos/<owner>/<repo>/contents/<path>?ref=<commit>`, and save its
+   exact bytes under `scripts/license-texts/crates/<source>/`. Include any
+   upstream `NOTICE` file, and for an `AND` expression the text of every part
+   (for example the protobuf `LICENSE` for `prost-wkt-types`' BSD-3-Clause
+   schemas).
+4. Add or extend the manifest entry with the file's SHA-256, its
+   `https://github.com/<owner>/<repo>/blob/<commit>/<path>` URL, and the
+   evidence. Never write a copyright holder that upstream does not state; if
+   upstream publishes no licence text, record the evidence and ask a
+   maintainer to decide on a `maintainer_exception`.
+5. Re-run the generator and `--audit`, and
+   `python3 -m unittest discover -s test/smoke -p 'test_*artifact*.py'`.
+
+Entries for versions no longer in the lock file are harmless and can be
+removed in the same change that drops the package.
+
+OCaml packages need no entry: the SDK archive contains only the installed
+`temporal-sdk` package, while the OCaml runtime, `logs`, and `yojson` are
+linked by the application from its own OPAM switch and are not redistributed
+(see the locked OCaml closure table above).
+
+The Release workflow generates the file on the publish runner, audits it
+against the same metadata (every package listed exactly once, every referenced
+text present), and passes it to `scripts/package-release-bridges.py`. Packaging
+rejects a notices file that is not generated or does not embed the project
+`LICENSE`, adds `LICENSE` and `THIRD-PARTY-NOTICES.txt` at the root of every
+bridge and SDK archive, re-reads each archive to confirm both files, and
+publishes the notices as a separate checksummed asset recorded in
+`manifest.json`.
+
+The release source archive also redistributes the locked Cargo graph in source
+form: `scripts/create-source-archive.sh` vendors exactly the `Cargo.lock`
+packages (each with its own licence files) so opam can build offline (see
+[Offline opam source builds](reference/package-boundary.md#offline-opam-source-builds)),
+and copies the same audited `THIRD-PARTY-NOTICES.txt` to the archive root,
+which supplies the reviewed texts for crates that publish none. Vendoring adds
+no package and changes no version, so the existing Cargo licence audit covers
+it.
+
 ## CI-only quality tools
 
 The independent quality job installs checksum-verified release artifacts with
-`taiki-e/install-action` 2.83.1, pinned in the workflow by immutable commit.
-The action is MIT OR Apache-2.0 and is configured with no installation
+`taiki-e/install-action`, pinned in the workflow by immutable commit (see
+[GitHub Actions](#github-actions)) and configured with no installation
 fallback. It installs these exact tools without adding them to the SDK's
 runtime or build dependency graph:
 
@@ -202,19 +623,49 @@ pinned Temporal Core workspace and remains the single Cargo licence authority
 in the standalone dependency-audit job.
 
 No additional OCaml semantic analyzer was selected. Dune and the OCaml
-compiler already fail build warnings, while the mature documentation compiler
-`odoc` 3.2.1 currently depends on `tyxml` under
-`LGPL-2.1-only WITH OCaml-LGPL-linking-exception`. This project's policy does
-not extend its narrowly approved compiler and `ocamlbuild` exceptions to
-ordinary tooling packages. `ocamlformat` remains excluded for the separate
-copyleft closure documented above. The language-neutral typo gate still checks
-OCaml identifiers, comments, and interfaces without weakening the policy.
+compiler already fail build warnings, and odoc is used only as the CI-only
+documentation renderer described above; its LGPL closure is confined to the
+`docs` image and does not extend this project's compiler and `ocamlbuild`
+exceptions to SDK tooling or dependencies. `ocamlformat` remains excluded for
+the separate copyleft closure documented above. The language-neutral typo gate
+still checks OCaml identifiers, comments, and interfaces without weakening the
+policy.
+
+## GitHub Actions
+
+Workflows and the composite `rust-bridge` action use these external actions.
+They run only on CI runners and are not linked into or redistributed with the
+SDK. Dependabot's `github-actions` ecosystem refreshes them. "Release" is the
+version comment recorded beside a commit pin.
+
+| Action | Pinned ref | Release | License | Used for |
+|---|---|---|---|---|
+| `actions/checkout` | `v7` | v7 | MIT | Repository checkout |
+| `actions/attest-build-provenance` | `4d101475d8b20a2381f78447822ac1eab6504dd8` | v4.2.2 | MIT | Signing SLSA build provenance for the published release assets |
+| `actions/cache/restore` | `caa296126883cff596d87d8935842f9db880ef25` | v5 | MIT | Restoring verified Rust bridge bundles |
+| `actions/cache/save` | `caa296126883cff596d87d8935842f9db880ef25` | v5 | MIT | Saving verified Rust bridge bundles |
+| `actions/upload-artifact` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | v7 | MIT | Passing bridges, reports, and release inputs between jobs |
+| `actions/upload-artifact` | `cf430e030ddbb5b0abf93d22962f4752f3646cd9` | v7 | MIT | Passing bridges, reports, and release inputs between jobs |
+| `actions/download-artifact` | `9000827ccba6bdab643e8b6fd33ac0654aef8333` | v8 | MIT | Consuming those artifacts |
+| `msys2/setup-msys2` | `ec48f7c5447b3140e2b088413ae3a55687bccb6e` | v2 | MIT | MinGW build tools for the Windows Rust producer |
+| `ocaml/setup-ocaml` | `93303b622b2522e4411e295f9e77411a24912ac7` | v3.9.0 | MIT | Native macOS and Windows OCaml compilers |
+| `taiki-e/install-action` | `1168f6810a3cb30a3514bf5756a3b7f0422c6df8` | v2.87.28 | Apache-2.0 OR MIT | Installing the pinned CI-only quality tools |
+
+`actions/checkout` is referenced by its major-version tag rather than an
+immutable commit; every other action is pinned by commit.
+
+`actions/attest-build-provenance` runs only in the Release workflow's publish
+job. From v4 it is a composite wrapper around `actions/attest`, which it pins
+by commit itself (also GitHub-owned and MIT-licensed); it signs with a
+short-lived Sigstore certificate and stores the attestation through GitHub's
+attestations API. It is a signing step, not a scanner, and adds nothing to the
+SDK or its release archives.
 
 ## Standalone Windows Rust producer
 
-The Rust producer uses `msys2/setup-msys2` (MIT), pinned to
-`66cd2cce69caa17b53920067426061ca1de3a884`, to install GNU/MinGW build tools
-without installing OCaml. It selects MINGW64 to match the existing Windows
+The Rust producer uses `msys2/setup-msys2` (pinned in
+[GitHub Actions](#github-actions)) to install GNU/MinGW build tools without
+installing OCaml. It selects MINGW64 to match the existing Windows
 GNU ABI; the MSYS2 project deprecates this environment in favor of UCRT64,
 so a future CRT migration must update and validate both producers and consumers.
 MSYS2/GCC are build tools, not new SDK library dependencies. The distributed
