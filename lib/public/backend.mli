@@ -342,8 +342,13 @@ val client_create :
 (** Starts one workflow after validating the request in the backend boundary. *)
 val client_start : client -> start_request -> (start_response, Error.t) result
 
-(** Waits for the exact workflow/run pair and returns its terminal outcome. *)
-val client_wait : client -> wait_request -> (terminal_result, Error.t) result
+(** Waits for the exact workflow/run pair and returns its terminal outcome.
+    [deadline_ns], an absolute expiry on the native monotonic clock, bounds
+    the native caller's wait (#1136): on expiry the call is released and the
+    result is the retryable RPC error whose status is [Deadline_exceeded].
+    The mock resolves a wait at once, so it never reaches a deadline. *)
+val client_wait :
+  ?deadline_ns:int64 -> client -> wait_request -> (terminal_result, Error.t) result
 
 (** The [Error.error_type] of a retryable [`Bridge] error returned when the
     native client's bounded pending-start or pending-wait registry is full.
@@ -456,8 +461,10 @@ val client_list_visibility :
 (** Admits one workflow update and returns its durable update handle data. *)
 val client_update : client -> update_request -> (update_response, Error.t) result
 
-(** Polls one admitted workflow update for completion. *)
+(** Polls one admitted workflow update for completion. [deadline_ns] bounds
+    the native caller's wait for this poll exactly as for {!client_wait}. *)
 val client_poll_update :
+  ?deadline_ns:int64 ->
   client -> update_request -> (poll_update_response, Error.t) result
 
 (** Closes a client backend. Native shutdown is serialized and terminal even

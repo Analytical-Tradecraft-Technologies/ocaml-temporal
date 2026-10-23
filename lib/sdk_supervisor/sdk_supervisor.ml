@@ -344,6 +344,21 @@ module Client_call = struct
       how long the calling thread holds no OCaml runtime lock at a time. *)
   let default_slice_ms = 1_000
 
+  (** The structured failure Rust reports for an expired RPC budget. A
+      caller deadline that expires while a call is awaited is decoded from
+      this same value, so every operation reports it as its usual typed
+      [Deadline_exceeded] error. *)
+  let expired_deadline_error : Bridge.error =
+    { status = Connection; message = {|{"kind":"rpc","code":"deadline_exceeded"}|} }
+
+  (** Milliseconds left before [deadline_ns] at [now_ns], rounded up so a
+      deadline that has not expired never yields a zero-length wait, or
+      [None] once it has expired. *)
+  let remaining_ms ~now_ns deadline_ns =
+    let remaining_ns = Int64.sub deadline_ns now_ns in
+    if Int64.compare remaining_ns 0L <= 0 then None
+    else Some (Int64.div (Int64.add remaining_ns 999_999L) 1_000_000L)
+
   (** Waits for [call] on the calling Domain. [poll ticket ~timeout_ms]
       performs one bounded wait: [Not_ready] repeats it, [Invalid_state]
       means the call was closed, and any other result is terminal and is
@@ -355,24 +370,72 @@ module Client_call = struct
       result is ignored because the exception is the primary outcome. Must
       not run on a workflow scheduler Domain or on the supervisor's owner
       Domain: it blocks the calling thread until the call completes or is
-      closed. *)
-  let await ~poll ~release ?(slice_ms = default_slice_ms) call =
+      closed.
+
+      With [deadline_ns], an absolute expiry on the [now_ns] monotonic clock
+      (#1136), no slice outlasts the deadline. Once it passes, the call is
+      released, which frees its capacity slot (including a shared wait slot
+      once no other caller holds it) without affecting the workflow, and
+      the call's decoder receives {!expired_deadline_error}, so the caller
+      gets the operation's ordinary deadline-exceeded result. An outcome
+      published before expiry is still returned: the cell is read once
+      without waiting before the call is abandoned. *)
+  let await ~poll ~release ?(slice_ms = default_slice_ms)
+      ?(now_ns = Bridge.monotonic_now_ns) ?deadline_ns call =
     match call with
     | Completed (Ok value) -> Ok value
     | Completed (Error error) -> Error (Failed error)
     | In_flight { ticket; decode } ->
         let retired = ref false in
+        let decoded outcome =
+          match decode outcome with
+          | Ok value -> Ok value
+          | Error error -> Error (Failed error)
+        in
         let rec loop () =
-          match poll ticket ~timeout_ms:slice_ms with
+          let slice =
+            match deadline_ns with
+            | None -> Some slice_ms
+            | Some deadline_ns -> (
+                match remaining_ms ~now_ns:(now_ns ()) deadline_ns with
+                | None -> None
+                | Some remaining ->
+                    Some
+                      (if Int64.compare remaining (Int64.of_int slice_ms) < 0
+                       then Int64.to_int remaining
+                       else slice_ms))
+          in
+          match slice with
+          | None -> expire ()
+          | Some slice -> poll_slice slice
+        and expire () =
+          (* The outcome may have been published while this thread was not
+             polling (a pause after submission, or between a [Not_ready]
+             slice and the clock check). Release drops a published outcome,
+             so read the cell once without waiting before abandoning it. *)
+          match poll ticket ~timeout_ms:0 with
+          | Error { Bridge.status = Not_ready; _ } ->
+              (* Release before decoding so the slot is free when the
+                 caller sees the timeout; the [finally] below then has
+                 nothing left to do. *)
+              retired := true;
+              (try ignore (release ticket) with _ -> ());
+              decoded (Error expired_deadline_error)
+          | Error { Bridge.status = Invalid_state; _ } ->
+              retired := true;
+              Error Closed
+          | outcome ->
+              retired := true;
+              decoded outcome
+        and poll_slice slice =
+          match poll ticket ~timeout_ms:slice with
           | Error { Bridge.status = Not_ready; _ } -> loop ()
           | Error { Bridge.status = Invalid_state; _ } ->
               retired := true;
               Error Closed
-          | outcome -> (
+          | outcome ->
               retired := true;
-              match decode outcome with
-              | Ok value -> Ok value
-              | Error error -> Error (Failed error))
+              decoded outcome
         in
         Fun.protect
           ~finally:(fun () ->
@@ -604,7 +667,7 @@ module Protocol_adapter = struct
       a deadline that expired in the mailbox exactly as one that expired on
       the wire. *)
   let expired_rpc_deadline_error : Bridge.error =
-    { status = Connection; message = {|{"kind":"rpc","code":"deadline_exceeded"}|} }
+    Client_call.expired_deadline_error
 
   (** Resolves a client request's caller deadline when the owner Domain
       dispatches it (#499). The deadline's expiry was fixed on the monotonic
@@ -1629,10 +1692,11 @@ module Native = struct
       completion cell; see {!Client_call.await}. A call closed by shutdown is
       the typed [Closed] error and every other failure is a [Backend]
       error. *)
-  let await_client_call ?slice_ms call =
+  let await_client_call ?slice_ms ?deadline_ns call =
     match
       Client_call.await ~poll:Native_backend.Bridge.client_await_call
-        ~release:Native_backend.Bridge.client_release_call ?slice_ms call
+        ~release:Native_backend.Bridge.client_release_call ?slice_ms
+        ?deadline_ns call
     with
     | Ok value -> Ok value
     | Error Client_call.Closed -> Error Closed
@@ -1640,10 +1704,10 @@ module Native = struct
 
   (** Submits [rpc] through the owner and awaits it on the calling Domain.
       Only submission occupies the owner Domain. *)
-  let call supervisor rpc =
+  let call ?deadline_ns supervisor rpc =
     match perform supervisor (Client_submit rpc) with
     | Error _ as error -> error
-    | Ok submitted -> await_client_call submitted
+    | Ok submitted -> await_client_call ?deadline_ns submitted
 
   let client_config = Native_backend.Bridge.client_config
   let worker_config = Native_backend.Bridge.worker_config
