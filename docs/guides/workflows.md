@@ -145,7 +145,29 @@ let wait_for_valid_state state =
 ```
 
 Both forms return `(unit, Temporal.Error.t) result`. An exception raised by a
-predicate is contained and returned as a typed non-retryable defect. A
+predicate is contained and returned as a typed non-retryable defect.
+
+To give up after a while, pass `~timeout` (#1134). The bound is a durable
+workflow timer, so it is the one case where a condition records history: a
+`` `Timeout `` error ("workflow condition timed out") is returned if the timer
+fires while the predicate is still false, and a wait that is satisfied first
+cancels its timer (`TimerCanceled`), leaving nothing pending:
+
+```ocaml
+let wait_for_approval_or_give_up approved_by_signal =
+  match
+    Temporal.Condition.wait_until
+      ~timeout:(Temporal.Duration.of_minutes 30L)
+      (fun () -> Option.is_some !approved_by_signal)
+  with
+  | Ok () -> Ok (Some (Option.get !approved_by_signal))
+  | Error error when Temporal.Error.kind error = "timeout" -> Ok None
+  | Error error -> Error error
+```
+
+If the predicate holds when the waiter wakes, the wait succeeds even when the
+timer fired in the same activation. A zero timeout records no timer and
+checks the predicate once. A
 condition is owned by one workflow execution and is removed when that
 execution completes, is evicted, or shuts down; stale callbacks cannot wake a
 finished workflow or retain its state.

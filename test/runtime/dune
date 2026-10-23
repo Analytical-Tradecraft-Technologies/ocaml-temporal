@@ -31,6 +31,7 @@
   test_workflow_time
   test_random_seed_reset
   test_condition
+  test_condition_timeout
   test_external_workflow
   test_settle_scaling
   test_execution_info
