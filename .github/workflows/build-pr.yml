@@ -162,7 +162,7 @@ jobs:
     # always() evidence uploads after it still run before the job is killed
     # (test/smoke/test_temporal_compose_config.sh checks this). A normal run
     # takes about 25 minutes.
-    timeout-minutes: 86
+    timeout-minutes: 93
     env:
       # Keep this as one explicit compatibility lane because it starts the
       # complete PostgreSQL/Temporal stack and two OCaml processes.
@@ -180,7 +180,10 @@ jobs:
           OCAML_RESULT: ${{ needs.verify.result }}
         run: test "$OCAML_RESULT" = success
       - name: Download compiled smoke executables
-        timeout-minutes: 3
+        # The statically linked smoke bundle is about 1.8 GB. Downloads
+        # normally take under three minutes, but slow artifact storage has
+        # stalled them past that, so leave headroom rather than fail the lane.
+        timeout-minutes: 10
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: temporal-smoke-linux-amd64-ocaml-5.5.1
