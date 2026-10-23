@@ -256,7 +256,7 @@ the pin files, the Dependabot entries and the CI matrix stay in step.
 | `ocaml/opam:debian-12-ocaml-5.2` | `docker/ocaml-5.2/Dockerfile` | `sha256:3f7f5f5adffbb0f69172d69ec34450695257aaf148d4549b3227c6998c5eb2a4` |
 | `ocaml/opam:debian-12-ocaml-5.3` | `docker/ocaml-5.3/Dockerfile` | `sha256:bbaac53e502f6602013d8967c3a54cfcb898b556f453ab72e8e23966c3c681df` |
 | `ocaml/opam:debian-12-ocaml-5.4` | `docker/ocaml-5.4/Dockerfile` | `sha256:56c9ab2e2f9e8fa926efbc36bedf75fbdb0dd7661765440397def7a24d4e3bfa` |
-| `ocaml/opam:debian-12-ocaml-5.5` | `docker/ocaml-5.5/Dockerfile` | `sha256:36803e379c31545ef00dfb64f8bdf3226b5e8c7b76746b636caedda811c625f3` |
+| `ocaml/opam:debian-12-ocaml-5.5` | `docker/ocaml-5.5/Dockerfile` | `sha256:002dfe08fb803908effe3426ec2537f1c14ce56e1eb51cf228741c45a402c5f7` |
 
 Each index contains native `linux/amd64` and `linux/arm64` images. The image
 build recipes are MIT (`ocurrent/docker-base-images`); the OCaml and OPAM
