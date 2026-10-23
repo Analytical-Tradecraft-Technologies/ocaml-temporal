@@ -727,23 +727,35 @@ let execute ?scope ?activity_id ?task_queue ?schedule_to_close_timeout
        ?schedule_to_start_timeout ?start_to_close_timeout ?heartbeat_timeout
        ?retry_policy ?priority ?cancellation_type ?do_not_eagerly_execute definition input)
 
-(** Schedules an activity on Temporal Core's local activity lane. Local
-    activities execute in this worker process and are recorded as history
-    markers, so they are useful for short deterministic helper calls that do
-    not need a remote task queue. *)
-let start_local ?activity_id ?schedule_to_close_timeout
+(** Schedules an activity on Temporal Core's local activity lane and keeps a
+    cancellable handle. Local activities execute in this worker process and
+    are recorded as history markers, so they are useful for short
+    deterministic helper calls that do not need a remote task queue. The
+    handle's cancellation emits [Request_cancel_local_activity] once; during a
+    language-owned retry backoff it also cancels the backoff timer and settles
+    the future at once. A [scope] attaches that same cancellation (#1156). *)
+let start_local_handle ?scope ?activity_id ?schedule_to_close_timeout
     ?schedule_to_start_timeout ?start_to_close_timeout ?retry_policy
     ?(cancellation_type = Wait_cancellation_completed) definition input =
-  start_handle_internal ~local:true ?activity_id ?schedule_to_close_timeout
+  start_handle_internal ~local:true ?scope ?activity_id
+    ?schedule_to_close_timeout ?schedule_to_start_timeout
+    ?start_to_close_timeout ?retry_policy ~cancellation_type definition input
+
+(** Schedules a local activity and returns only its future; use
+    [start_local_handle] to cancel it explicitly. *)
+let start_local ?scope ?activity_id ?schedule_to_close_timeout
     ?schedule_to_start_timeout ?start_to_close_timeout ?retry_policy
-    ~cancellation_type definition input
-  |> future
+    ?cancellation_type definition input =
+  future
+    (start_local_handle ?scope ?activity_id ?schedule_to_close_timeout
+       ?schedule_to_start_timeout ?start_to_close_timeout ?retry_policy
+       ?cancellation_type definition input)
 
 (** Executes a local activity and waits for its typed result. *)
-let execute_local ?activity_id ?schedule_to_close_timeout
+let execute_local ?scope ?activity_id ?schedule_to_close_timeout
     ?schedule_to_start_timeout ?start_to_close_timeout ?retry_policy
     ?cancellation_type definition input =
   Future.await
-    (start_local ?activity_id ?schedule_to_close_timeout
+    (start_local ?scope ?activity_id ?schedule_to_close_timeout
        ?schedule_to_start_timeout ?start_to_close_timeout ?retry_policy
        ?cancellation_type definition input)

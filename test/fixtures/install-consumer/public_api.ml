@@ -1049,6 +1049,7 @@ let _activity_priority_fairness_weight :
   T.Activity.Priority.fairness_weight
 
 let _activity_start_local :
+    ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
     ?schedule_to_start_timeout:T.Duration.t ->
@@ -1059,7 +1060,20 @@ let _activity_start_local :
     'input -> ('output, T.Error.t) T.Future.t =
   T.Activity.start_local
 
+let _activity_start_local_handle :
+    ?scope:T.Scope.t ->
+    ?activity_id:string ->
+    ?schedule_to_close_timeout:T.Duration.t ->
+    ?schedule_to_start_timeout:T.Duration.t ->
+    ?start_to_close_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?cancellation_type:T.Activity.cancellation_type ->
+    ('input, 'output) T.Activity.t ->
+    'input -> 'output T.Activity.handle =
+  T.Activity.start_local_handle
+
 let _activity_execute_local :
+    ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
     ?schedule_to_start_timeout:T.Duration.t ->

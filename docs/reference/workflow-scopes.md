@@ -8,7 +8,9 @@ invokes that operation's server-side cancellation hook exactly once. Timers
 and operations started without `~scope` remain observation-only and are
 cleaned up by the normal Temporal/runtime lifecycle.
 
-The local-activity start API does not expose `~scope`.
+Local activities accept the same `~scope` through `Activity.start_local`,
+`start_local_handle` and `execute_local`; cancellation follows the local
+activity's own policy (#1156).
 
 Use a scope when a workflow wants one cancellation decision to cover both its
 local waiters and selected durable operations. Use an operation handle when

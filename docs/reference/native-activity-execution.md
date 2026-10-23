@@ -562,7 +562,17 @@ the OCaml supervisor starts a deterministic workflow timer. When that timer
 fires it re-emits `ScheduleLocalActivity` with the same activity sequence and
 the attempt/schedule metadata supplied by Core. OCaml therefore never chooses
 retry policy or invents attempt numbers, and a local completion is never
-treated as a remote RPC. Local activities remain experimental. The live baseline executes
+treated as a remote RPC.
+
+Workflow code cancels a local activity through `Activity.start_local_handle`
+and `Activity.cancel`, or by passing `~scope` to `start_local`,
+`start_local_handle` or `execute_local` and cancelling that scope (#1156).
+Either path emits Core's `RequestCancelLocalActivity` once; Core then resolves
+the future with a typed cancellation as the recorded policy dictates
+(`Wait_cancellation_completed`, the local default, waits for the running
+attempt to stop). A local activity sitting in a language-owned `DoBackoff`
+timer has no running attempt, so cancellation also cancels that timer and
+settles the future immediately under every policy. Local activities remain experimental. The live baseline executes
 `smoke.local_activity` and requires `LOCAL`; the [audited live evidence](live-acceptance-coverage.md)
 records its successful run. Local backoff/retry, cancellation and replay/restart
 combinations still need dedicated live cases, and interceptors remain absent.
