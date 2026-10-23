@@ -2344,6 +2344,31 @@ pub(crate) fn payload_to_core(value: &Payload) -> Result<api_common::Payload, Co
     })
 }
 
+/// Converts a Core payload list to semantic payloads, preserving order and
+/// failing on the first payload [`payload_from_core`] cannot represent.
+fn payload_vec_from_core(
+    values: &[api_common::Payload],
+) -> Result<Vec<Payload>, CoreConversionError> {
+    values.iter().map(payload_from_core).collect()
+}
+
+/// Converts semantic payloads to a Core payload list, preserving order and
+/// failing on the first payload that exceeds the protocol limits.
+fn payload_vec_to_core(
+    values: &[Payload],
+) -> Result<Vec<api_common::Payload>, CoreConversionError> {
+    values.iter().map(payload_to_core).collect()
+}
+
+/// Converts a failure that Core's protobuf models as optional but whose
+/// enclosing variant requires; `missing` names the variant when it is absent.
+fn required_failure_from_core(
+    value: Option<&api_failure::Failure>,
+    missing: &'static str,
+) -> Result<Failure, CoreConversionError> {
+    failure_from_core(value.ok_or_else(|| invalid_core(missing))?)
+}
+
 /// Converts optional Core payload collections while preserving order.
 fn payloads_from_core(
     value: Option<&api_common::Payloads>,
@@ -2373,10 +2398,7 @@ fn payloads_option_from_core(
 /// Converts semantic payload collections while preserving order.
 fn payloads_to_core(values: &[Payload]) -> Result<api_common::Payloads, CoreConversionError> {
     Ok(api_common::Payloads {
-        payloads: values
-            .iter()
-            .map(payload_to_core)
-            .collect::<Result<_, _>>()?,
+        payloads: payload_vec_to_core(values)?,
     })
 }
 
@@ -2944,19 +2966,15 @@ fn activity_resolution_from_core(
             payload: value.result.as_ref().map(payload_from_core).transpose()?,
         }),
         Status::Failed(value) => Ok(ActivityResolution::Failed {
-            failure: failure_from_core(
-                value
-                    .failure
-                    .as_ref()
-                    .ok_or_else(|| invalid_core("Core failed activity has no failure"))?,
+            failure: required_failure_from_core(
+                value.failure.as_ref(),
+                "Core failed activity has no failure",
             )?,
         }),
         Status::Cancelled(value) => Ok(ActivityResolution::Cancelled {
-            failure: failure_from_core(
-                value
-                    .failure
-                    .as_ref()
-                    .ok_or_else(|| invalid_core("Core cancelled activity has no failure"))?,
+            failure: required_failure_from_core(
+                value.failure.as_ref(),
+                "Core cancelled activity has no failure",
             )?,
         }),
         Status::Backoff(value) => {
@@ -3038,11 +3056,9 @@ fn child_workflow_start_resolution_from_core(
             cause: child_start_failure_cause_from_core(value.cause)?,
         }),
         Status::Cancelled(value) => Ok(ChildWorkflowStartResolution::Cancelled {
-            failure: failure_from_core(
-                value
-                    .failure
-                    .as_ref()
-                    .ok_or_else(|| invalid_core("Core cancelled child start has no failure"))?,
+            failure: required_failure_from_core(
+                value.failure.as_ref(),
+                "Core cancelled child start has no failure",
             )?,
         }),
     }
@@ -3063,20 +3079,17 @@ fn child_workflow_resolution_from_core(
             payload: value.result.as_ref().map(payload_from_core).transpose()?,
         }),
         Status::Failed(value) => Ok(ChildWorkflowResolution::Failed {
-            failure: failure_from_core(
-                value
-                    .failure
-                    .as_ref()
-                    .ok_or_else(|| invalid_core("Core failed child workflow has no failure"))?,
+            failure: required_failure_from_core(
+                value.failure.as_ref(),
+                "Core failed child workflow has no failure",
             )?,
         }),
-        Status::Cancelled(value) => {
-            Ok(ChildWorkflowResolution::Cancelled {
-                failure: failure_from_core(value.failure.as_ref().ok_or_else(|| {
-                    invalid_core("Core cancelled child workflow has no failure")
-                })?)?,
-            })
-        }
+        Status::Cancelled(value) => Ok(ChildWorkflowResolution::Cancelled {
+            failure: required_failure_from_core(
+                value.failure.as_ref(),
+                "Core cancelled child workflow has no failure",
+            )?,
+        }),
     }
 }
 
@@ -3194,11 +3207,7 @@ pub fn activation_from_core(
                     Ok(ActivationJob::InitializeWorkflow {
                         workflow_id: value.workflow_id.clone(),
                         workflow_type: value.workflow_type.clone(),
-                        arguments: value
-                            .arguments
-                            .iter()
-                            .map(payload_from_core)
-                            .collect::<Result<_, _>>()?,
+                        arguments: payload_vec_from_core(&value.arguments)?,
                         randomness_seed: value.randomness_seed.to_string(),
                         attempt: value.attempt,
                         context: Some(Box::new(InitializeContext {
@@ -3330,11 +3339,7 @@ pub fn activation_from_core(
                 }
                 Variant::SignalWorkflow(value) => Ok(ActivationJob::SignalWorkflow {
                     signal_name: value.signal_name.clone(),
-                    input: value
-                        .input
-                        .iter()
-                        .map(payload_from_core)
-                        .collect::<Result<_, _>>()?,
+                    input: payload_vec_from_core(&value.input)?,
                     identity: inbound_identity(&value.identity),
                     headers: inbound_payload_map_from_core(&value.headers)?,
                 }),
@@ -3346,11 +3351,7 @@ pub fn activation_from_core(
                     // route the answer through its legacy response path.
                     query_id: value.query_id.clone(),
                     query_type: value.query_type.clone(),
-                    arguments: value
-                        .arguments
-                        .iter()
-                        .map(payload_from_core)
-                        .collect::<Result<_, _>>()?,
+                    arguments: payload_vec_from_core(&value.arguments)?,
                     headers: inbound_payload_map_from_core(&value.headers)?,
                 }),
                 Variant::DoUpdate(value) => {
@@ -3375,11 +3376,7 @@ pub fn activation_from_core(
                         id: value.id.clone(),
                         protocol_instance_id: value.protocol_instance_id.clone(),
                         name: value.name.clone(),
-                        input: value
-                            .input
-                            .iter()
-                            .map(payload_from_core)
-                            .collect::<Result<_, _>>()?,
+                        input: payload_vec_from_core(&value.input)?,
                         headers: inbound_payload_map_from_core(&value.headers)?,
                         meta: UpdateMeta {
                             identity: inbound_identity(&meta.identity),
@@ -3687,10 +3684,7 @@ fn command_to_core(
             activity_type: activity_type.clone(),
             task_queue: task_queue.clone(),
             headers: Default::default(),
-            arguments: arguments
-                .iter()
-                .map(payload_to_core)
-                .collect::<Result<_, _>>()?,
+            arguments: payload_vec_to_core(arguments)?,
             schedule_to_close_timeout: schedule_to_close_timeout.map(duration_to_core),
             schedule_to_start_timeout: schedule_to_start_timeout.map(duration_to_core),
             start_to_close_timeout: start_to_close_timeout.map(duration_to_core),
@@ -3729,10 +3723,7 @@ fn command_to_core(
                 }
             }),
             headers: Default::default(),
-            arguments: arguments
-                .iter()
-                .map(payload_to_core)
-                .collect::<Result<_, _>>()?,
+            arguments: payload_vec_to_core(arguments)?,
             schedule_to_close_timeout: schedule_to_close_timeout.map(duration_to_core),
             schedule_to_start_timeout: schedule_to_start_timeout.map(duration_to_core),
             start_to_close_timeout: start_to_close_timeout.map(duration_to_core),
@@ -3770,10 +3761,7 @@ fn command_to_core(
             parent_close_policy: parent_close_to_core(*parent_close_policy),
             workflow_id: workflow_id.clone(),
             workflow_type: workflow_type.clone(),
-            input: input
-                .iter()
-                .map(payload_to_core)
-                .collect::<Result<_, _>>()?,
+            input: payload_vec_to_core(input)?,
             retry_policy: retry_policy
                 .as_ref()
                 .map(retry_policy_to_core)
@@ -3821,10 +3809,7 @@ fn command_to_core(
                     seq: *seq,
                     target: Some(target),
                     signal_name: signal_name.clone(),
-                    args: input
-                        .iter()
-                        .map(payload_to_core)
-                        .collect::<Result<_, _>>()?,
+                    args: payload_vec_to_core(input)?,
                     headers: headers
                         .iter()
                         .map(|(key, payload)| Ok((key.clone(), payload_to_core(payload)?)))
@@ -3874,10 +3859,7 @@ fn command_to_core(
         } => {
             Variant::ContinueAsNewWorkflowExecution(core_commands::ContinueAsNewWorkflowExecution {
                 workflow_type: workflow_type.clone(),
-                arguments: input
-                    .iter()
-                    .map(payload_to_core)
-                    .collect::<Result<_, _>>()?,
+                arguments: payload_vec_to_core(input)?,
                 // The semantic protocol intentionally exposes no task queue,
                 // timeout, memo, header, retry, or versioning controls yet.
                 ..Default::default()
@@ -3980,11 +3962,7 @@ fn command_from_core(
                 activity_id: value.activity_id.clone(),
                 activity_type: value.activity_type.clone(),
                 task_queue: value.task_queue.clone(),
-                arguments: value
-                    .arguments
-                    .iter()
-                    .map(payload_from_core)
-                    .collect::<Result<_, _>>()?,
+                arguments: payload_vec_from_core(&value.arguments)?,
                 schedule_to_close_timeout: value
                     .schedule_to_close_timeout
                     .as_ref()
@@ -4041,11 +4019,7 @@ fn command_from_core(
                         nanoseconds: timestamp.nanos,
                     }
                 }),
-                arguments: value
-                    .arguments
-                    .iter()
-                    .map(payload_from_core)
-                    .collect::<Result<_, _>>()?,
+                arguments: payload_vec_from_core(&value.arguments)?,
                 schedule_to_close_timeout: value
                     .schedule_to_close_timeout
                     .as_ref()
@@ -4101,11 +4075,7 @@ fn command_from_core(
                 parent_close_policy: parent_close_from_core(value.parent_close_policy)?,
                 workflow_id: value.workflow_id.clone(),
                 workflow_type: value.workflow_type.clone(),
-                input: value
-                    .input
-                    .iter()
-                    .map(payload_from_core)
-                    .collect::<Result<_, _>>()?,
+                input: payload_vec_from_core(&value.input)?,
                 retry_policy: value
                     .retry_policy
                     .as_ref()
@@ -4147,11 +4117,7 @@ fn command_from_core(
                 workflow_id,
                 run_id,
                 signal_name: value.signal_name.clone(),
-                input: value
-                    .args
-                    .iter()
-                    .map(payload_from_core)
-                    .collect::<Result<_, _>>()?,
+                input: payload_vec_from_core(&value.args)?,
                 child_workflow_only,
                 headers: value
                     .headers
@@ -4192,11 +4158,9 @@ fn command_from_core(
             result: value.result.as_ref().map(payload_from_core).transpose()?,
         }),
         Variant::FailWorkflowExecution(value) => Ok(CompletionCommand::FailWorkflow {
-            failure: failure_from_core(
-                value
-                    .failure
-                    .as_ref()
-                    .ok_or_else(|| invalid_core("Core fail command has no failure"))?,
+            failure: required_failure_from_core(
+                value.failure.as_ref(),
+                "Core fail command has no failure",
             )?,
         }),
         Variant::ContinueAsNewWorkflowExecution(value) => {
@@ -4219,11 +4183,7 @@ fn command_from_core(
                 .map_err(|_| invalid_core("Core continue-as-new workflow type is invalid"))?;
             Ok(CompletionCommand::ContinueAsNew {
                 workflow_type: value.workflow_type.clone(),
-                input: value
-                    .arguments
-                    .iter()
-                    .map(payload_from_core)
-                    .collect::<Result<_, _>>()?,
+                input: payload_vec_from_core(&value.arguments)?,
             })
         }
         Variant::CancelWorkflowExecution(value) => {
