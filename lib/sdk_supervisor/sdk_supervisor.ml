@@ -378,7 +378,8 @@ module Client_call = struct
       once no other caller holds it) without affecting the workflow, and
       the call's decoder receives {!expired_deadline_error}, so the caller
       gets the operation's ordinary deadline-exceeded result. An outcome
-      published before expiry is still returned. *)
+      published before expiry is still returned: the cell is read once
+      without waiting before the call is abandoned. *)
   let await ~poll ~release ?(slice_ms = default_slice_ms)
       ?(now_ns = Bridge.monotonic_now_ns) ?deadline_ns call =
     match call with
@@ -405,14 +406,27 @@ module Client_call = struct
                        else slice_ms))
           in
           match slice with
-          | None ->
+          | None -> expire ()
+          | Some slice -> poll_slice slice
+        and expire () =
+          (* The outcome may have been published while this thread was not
+             polling (a pause after submission, or between a [Not_ready]
+             slice and the clock check). Release drops a published outcome,
+             so read the cell once without waiting before abandoning it. *)
+          match poll ticket ~timeout_ms:0 with
+          | Error { Bridge.status = Not_ready; _ } ->
               (* Release before decoding so the slot is free when the
                  caller sees the timeout; the [finally] below then has
                  nothing left to do. *)
               retired := true;
               (try ignore (release ticket) with _ -> ());
               decoded (Error expired_deadline_error)
-          | Some slice -> poll_slice slice
+          | Error { Bridge.status = Invalid_state; _ } ->
+              retired := true;
+              Error Closed
+          | outcome ->
+              retired := true;
+              decoded outcome
         and poll_slice slice =
           match poll ticket ~timeout_ms:slice with
           | Error { Bridge.status = Not_ready; _ } -> loop ()

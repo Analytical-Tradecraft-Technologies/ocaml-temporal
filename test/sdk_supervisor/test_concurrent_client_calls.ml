@@ -362,7 +362,9 @@ let test_deadline_releases_waiting_call () =
     Client_call.await ~poll:timed ~release ~slice_ms:20
       ~now_ns:(fun () -> !clock) ~deadline_ns:45_000_000L submitted
   in
-  check "slices never outlast the deadline" (List.rev !slices = [ 20; 20; 5 ]);
+  (* The final zero-length read is the check for an outcome published at
+     the last moment before the call is abandoned. *)
+  check "slices never outlast the deadline" (List.rev !slices = [ 20; 20; 5; 0 ]);
   check "expired call released once" (Atomic.get releases = before + 1);
   check "released cell is closed" (with_cell cell (fun () -> cell.state = `Closed));
   (match result with
@@ -380,8 +382,11 @@ let test_deadline_releases_waiting_call () =
   check "shutdown" (Supervisor.shutdown supervisor = Ok ())
 
 (** An outcome published before the deadline is returned unchanged and the
-    call is retired by its read, not released; a deadline that has already
-    passed when the await starts releases without polling at all. *)
+    call is retired by its read, not released. That holds even when the
+    caller only resumes after the deadline has passed (Codex review on
+    #1185): an expired call is read once without waiting, so a published
+    outcome is never dropped by the release. A pending call whose deadline
+    has passed is read once with a zero wait and then released. *)
 let test_deadline_keeps_an_earlier_outcome () =
   let supervisor = Result.get_ok (Supervisor.create ~capacity:4 (ref [])) in
   let before = Atomic.get releases in
@@ -393,24 +398,32 @@ let test_deadline_keeps_an_earlier_outcome () =
     (Client_call.await ~poll ~release ~slice_ms:5 ~now_ns:(fun () -> 0L)
        ~deadline_ns:1_000_000_000L completed
     = Ok "early ok");
+  let late_reader =
+    Result.get_ok
+      (Supervisor.perform supervisor (Backend.Submit_short ("published", None)))
+  in
+  check "outcome published before a late resume"
+    (Client_call.await ~poll ~release ~slice_ms:5 ~now_ns:(fun () -> 10L)
+       ~deadline_ns:10L late_reader
+    = Ok "published ok");
   check "a read call is not released" (Atomic.get releases = before);
   let pending =
     Result.get_ok (Supervisor.perform supervisor (Backend.Submit_long "late"))
   in
-  let polled = ref false in
-  let never cell ~timeout_ms =
-    polled := true;
+  let waits = ref [] in
+  let recording cell ~timeout_ms =
+    waits := timeout_ms :: !waits;
     poll cell ~timeout_ms
   in
   (match
-     Client_call.await ~poll:never ~release ~now_ns:(fun () -> 10L)
+     Client_call.await ~poll:recording ~release ~now_ns:(fun () -> 10L)
        ~deadline_ns:10L pending
    with
   | Error (Client_call.Failed error) ->
       check "expired before polling" (error = Client_call.expired_deadline_error)
   | _ -> failwith "an already expired await did not report the deadline");
-  check "no poll after expiry" (not !polled);
-  check "expired-before-poll call released" (Atomic.get releases = before + 1);
+  check "only a zero-length read after expiry" (!waits = [ 0 ]);
+  check "expired pending call released" (Atomic.get releases = before + 1);
   check "shutdown" (Supervisor.shutdown supervisor = Ok ())
 
 let () =

@@ -434,9 +434,11 @@ val get_handle :
     this caller's share of the run's wait slot, so a stuck run cannot hold
     the slot past the bound. The workflow is unaffected: another [wait] on
     the same handle, with or without a timeout, observes the run as before,
-    and concurrent waits on the same run each keep their own bound. A
-    [timeout] must be positive; zero is a typed defect. Omitted, the wait
-    has no bound. *)
+    and concurrent waits on the same run each keep their own bound. A step
+    of the wait whose bound has already passed is not sent. As with
+    [rpc_timeout], the bound cannot interrupt the client's owner while it
+    admits the request, which never waits on the network. A [timeout] must
+    be positive; zero is a typed defect. Omitted, the wait has no bound. *)
 val wait :
   ?timeout:Duration.t ->
   ('input, 'output) handle ->

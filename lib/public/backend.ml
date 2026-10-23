@@ -1347,6 +1347,18 @@ let client_start client request =
   | Mock_client client -> mock_client_start client request
   | Native_client client -> native_client_start client request
 
+(** Reports whether a caller deadline (#1136) has already passed, so a wait
+    or update poll that could only time out is never submitted: it neither
+    enters the owner's mailbox nor spawns a Rust long poll. The result is the
+    same retryable [Deadline_exceeded] RPC error an expiry during the wait
+    produces. *)
+let expired_before_submit = function
+  | Some deadline_ns
+    when Int64.compare (Temporal_sdk_kernel.Bridge.monotonic_now_ns ()) deadline_ns
+         >= 0 ->
+      Some (rpc_error "deadline_exceeded")
+  | Some _ | None -> None
+
 (** Waits for one exact native run (or the current run for an empty run ID).
     The history long poll runs on a Rust task for as long as the run stays
     open; this caller waits on the call's own completion cell, so the
@@ -1356,6 +1368,9 @@ let native_client_wait ?deadline_ns (client : native_client)
     (request : wait_request) =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else
+    match expired_before_submit deadline_ns with
+    | Some error -> Error error
+    | None ->
     let request : Client_protocol.wait_request =
       {
         namespace = client.namespace;
@@ -2072,6 +2087,9 @@ let native_client_poll_update ?deadline_ns (client : native_client)
     (request : update_request) =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else
+    match expired_before_submit deadline_ns with
+    | Some error -> Error error
+    | None ->
     let protocol_request : Client_protocol.poll_update_request =
       {
         execution =

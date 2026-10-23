@@ -140,7 +140,8 @@ module Client_call : sig
       (default: the native monotonic clock). No bounded wait outlasts it;
       once it passes, the call is released (freeing its capacity slot) and
       its decoder receives {!expired_deadline_error}. An outcome published
-      before expiry is returned as usual. *)
+      before the call is abandoned is returned as usual: an expired call is
+      read once without waiting before it is released. *)
   val await :
     poll:
       ('ticket ->

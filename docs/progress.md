@@ -6062,3 +6062,8 @@ error, that an outcome published first is kept, and that an expired deadline
 releases without polling; `test_client_worker` checks validation and that a
 bounded mock wait is unchanged. A live regression against a stuck run
 (`test/integration/concurrent_client`) remains open.
+Codex review follow-up: an expired call is read once with a zero-length wait
+before it is released, so an outcome published while the caller was paused
+is returned rather than dropped, and a wait or update poll whose deadline has
+already passed is not submitted at all. Like `?rpc_timeout`, the bound does
+not interrupt the owner's network-free admission of a request.
