@@ -73,26 +73,33 @@ let wait_until_result ?timeout predicate =
             | Ok (), (Error _ as error) -> error
             | Ok (), Ok () -> Ok ()
           in
+          (* Waits until the store reports the predicate held or the timer
+             fired, then decides on the state as this fiber resumes. The
+             store may queue several satisfied waiters before any of them
+             runs, so an earlier one can falsify shared state again; such a
+             stale wake neither succeeds nor times out (the timer has not
+             fired), it simply waits again (Codex review on #1186). *)
+          let rec wait () =
+            match
+              wait_without_timeout (fun () ->
+                  match protect_predicate predicate () with
+                  | Ok true -> Ok true
+                  | Ok false -> Ok (fired ())
+                  | Error _ as error -> error)
+            with
+            | Error error -> finish (Error error)
+            | Ok () -> (
+                (* Re-reading the predicate keeps satisfaction ahead of a
+                   timeout delivered in the same activation. *)
+                match protect_predicate predicate () with
+                | Ok true -> finish (Ok ())
+                | Ok false when fired () -> finish (Error (timeout_error ()))
+                | Ok false -> wait ()
+                | Error error -> finish (Error error))
+          in
           match Future.peek timer with
           | Some (Error error) -> finish (Error error)
-          | Some (Ok ()) | None -> (
-              match
-                wait_without_timeout (fun () ->
-                    match protect_predicate predicate () with
-                    | Ok true -> Ok true
-                    | Ok false -> Ok (fired ())
-                    | Error _ as error -> error)
-              with
-              | Error error -> finish (Error error)
-              | Ok () -> (
-                  (* The store returned because the predicate held or the
-                     timer fired; re-reading the predicate keeps
-                     satisfaction ahead of a timeout delivered in the same
-                     activation. *)
-                  match protect_predicate predicate () with
-                  | Ok true -> finish (Ok ())
-                  | Ok false -> finish (Error (timeout_error ()))
-                  | Error error -> finish (Error error)))))
+          | Some (Ok ()) | None -> wait ()))
 
 (** Waits for a boolean predicate by adapting it to the typed predicate form. *)
 let wait_until ?timeout predicate =

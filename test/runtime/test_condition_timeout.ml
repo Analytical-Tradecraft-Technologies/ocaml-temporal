@@ -146,6 +146,42 @@ let test_predicate_error_cancels_timer () =
     (Workflow_context_store.take_commands context);
   Workflow_context_store.shutdown context
 
+(** A stale wake is not a timeout (Codex review on #1186). The condition
+    store queues every satisfied waiter before any of them runs, so an
+    earlier waiter that consumes shared state can falsify the predicate
+    before the bounded waiter resumes. That waiter must keep waiting with its
+    timer pending, and succeed (cancelling the timer) once the state holds
+    again. *)
+let test_stale_wake_keeps_waiting () =
+  let scheduler = Scheduler.create () in
+  let context = Workflow_context_store.create scheduler in
+  let available = ref false in
+  let consumed = ref false in
+  let bounded = ref None in
+  (* Registered first, so it resumes first and takes the item. *)
+  run_in context scheduler (fun () ->
+      match Temporal.Condition.wait_until (fun () -> !available) with
+      | Ok () ->
+          available := false;
+          consumed := true
+      | Error error -> failwith (Temporal.Error.message error));
+  run_in context scheduler (fun () ->
+      bounded :=
+        Some
+          (Temporal.Condition.wait_until ~timeout:ten_seconds (fun () -> !available)));
+  let seq =
+    started_timer "stale wake" (Workflow_context_store.take_commands context)
+  in
+  run_in context scheduler (fun () -> available := true);
+  expect "first waiter consumed the item" true !consumed;
+  expect "stale wake keeps waiting" None !bounded;
+  expect "stale wake emits nothing" [] (Workflow_context_store.take_commands context);
+  run_in context scheduler (fun () -> available := true);
+  expect "satisfied after the stale wake" (Some (Ok ())) !bounded;
+  expect "satisfied wait cancels its timer" [ Activation.Cancel_timer { seq } ]
+    (Workflow_context_store.take_commands context);
+  Workflow_context_store.shutdown context
+
 (** Outside a workflow a bounded wait reports the condition's own defect. *)
 let test_outside_workflow () =
   expect_error "bounded wait outside a workflow" "defect"
@@ -159,4 +195,5 @@ let () =
   test_satisfaction_beats_same_activation_timeout ();
   test_zero_and_unbounded_record_nothing ();
   test_predicate_error_cancels_timer ();
+  test_stale_wake_keeps_waiting ();
   test_outside_workflow ()
