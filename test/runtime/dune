@@ -33,9 +33,9 @@
   test_external_workflow
   test_settle_scaling
   test_execution_info
+  test_child_start_options
   test_thread_context_isolation
-  test_race_matrix
-  test_child_start_options)
+  test_race_matrix)
  (modules
   (:standard \ test_worker_domain_budget))
  (libraries temporal-sdk temporal_runtime temporal_core_bridge unix))
