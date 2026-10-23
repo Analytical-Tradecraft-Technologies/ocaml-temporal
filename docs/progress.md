@@ -6039,19 +6039,3 @@ runner output and report state that a pass is forward-compatibility evidence
 only, not rollback evidence (#508). The
 whole corpus replays in about a second. Every current capture comes from Core
 `95e97686`, so the first Core bump will be the first cross-revision replay.
-
-## 2026-10-24: Release from the tag, not the master tip (#1144)
-
-The Release workflow is now dispatched from the version tag
-(`refs/tags/<tag>`), so `GITHUB_SHA`, every checkout and the signed provenance
-name the tagged commit regardless of what merged to `master` after tagging.
-Validation refuses any other dispatch ref and calls
-`check-release-tag-commit.sh TAG SHA master`, whose new optional branch
-argument fetches enough history (unshallowing a depth-1 checkout) to require
-the tagged commit to be on `origin/master`. The draft and publish checks still
-re-verify that the tag peels to the same commit. The contract test covers a
-tag that stays releasable after `master` advances, the same check from a
-depth-1 clone, an unmerged tagged commit, and an unfetchable branch; a
-mutation that drops the ancestry check fails it. The quality contract pins the
-validate job's ref and ancestry checks. The checklist, preflight guide and
-attestation verification (`--source-ref refs/tags/<tag>`) are updated.
