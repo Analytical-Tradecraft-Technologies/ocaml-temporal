@@ -6039,18 +6039,3 @@ runner output and report state that a pass is forward-compatibility evidence
 only, not rollback evidence (#508). The
 whole corpus replays in about a second. Every current capture comes from Core
 `95e97686`, so the first Core bump will be the first cross-revision replay.
-
-## 2026-10-24: Local activity cancellation from workflow code (#1156)
-
-`Activity.start_local`, `execute_local` and the new `start_local_handle` take
-`?scope`, and `start_local_handle` returns the ordinary activity handle whose
-`Activity.cancel` emits `Request_cancel_local_activity` once. Both paths reuse
-the remote-activity scope attachment (registered until the future settles),
-so the recorded `cancellation_type` (default `Wait_cancellation_completed`)
-now has an effect. A local activity in a language-owned `DoBackoff` timer is
-cancelled with its timer and settles immediately, as the runtime already did.
-`test/runtime/test_local_activity_scope.ml` covers a scope cancelling a
-running local activity once, an explicit handle cancel followed by Core's
-resolution and an idempotent late cancel, cancellation during backoff, and no
-command after completion or for an already-cancelled scope. Live
-qualification of local cancellation remains open.

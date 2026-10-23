@@ -23,6 +23,7 @@
   test_future_retention
   test_activity_retry_policy
   test_local_activity_cancellation
+  test_local_activity_scope
   test_local_activity_backoff_order
   test_scope
   test_scope_retention
@@ -34,8 +35,7 @@
   test_settle_scaling
   test_execution_info
   test_thread_context_isolation
-  test_race_matrix
-  test_local_activity_scope)
+  test_race_matrix)
  (modules
   (:standard \ test_worker_domain_budget))
  (libraries temporal-sdk temporal_runtime temporal_core_bridge unix))
