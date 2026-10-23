@@ -864,13 +864,35 @@ impl ClientOperationError {
     }
 }
 
+/// Strictly parses one client request document.
+///
+/// `parse` selects the strict structural parser: [`protocol::decode_object`]
+/// for ordinary requests, or [`protocol::decode_payload_object`] when base64
+/// payload data may use the larger per-field allowance. It rejects duplicate
+/// members and enforces byte limits before Serde sees the input. Serde's
+/// diagnostic is replaced by `invalid` so input-controlled member names are not
+/// reflected, and `validate` then enforces the request's semantic bounds.
+fn decode_request<T: serde::de::DeserializeOwned>(
+    input: &str,
+    parse: fn(&str) -> Result<protocol::JsonValue, protocol::ProtocolError>,
+    invalid: &'static str,
+    validate: fn(&T) -> Result<(), protocol::ProtocolError>,
+) -> Result<T, protocol::ProtocolError> {
+    parse(input)?;
+    let request =
+        serde_json::from_str(input).map_err(|_| protocol::ProtocolError::invalid("$", invalid))?;
+    validate(&request)?;
+    Ok(request)
+}
+
 /// Strictly parses one start request after duplicate-key and byte-limit checks.
 pub fn decode_start_request(input: &str) -> Result<StartWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_payload_object(input)?;
-    let request = serde_json::from_str(input)
-        .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client start request"))?;
-    validate_start_request(&request)?;
-    Ok(request)
+    decode_request(
+        input,
+        protocol::decode_payload_object,
+        "invalid client start request",
+        validate_start_request,
+    )
 }
 
 /// Compares two validated start requests using every logical field, including
@@ -914,42 +936,46 @@ pub(crate) fn encode_start_ticket(ticket: &str) -> Result<String, protocol::Prot
 
 /// Strictly parses one exact-run wait request.
 pub fn decode_wait_request(input: &str) -> Result<WaitWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
-    let request = serde_json::from_str(input)
-        .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client wait request"))?;
-    validate_wait_request(&request)?;
-    Ok(request)
+    decode_request(
+        input,
+        protocol::decode_object,
+        "invalid client wait request",
+        validate_wait_request,
+    )
 }
 
 /// Strictly parses one exact-run cancellation request.
 pub fn decode_cancel_request(
     input: &str,
 ) -> Result<CancelWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
-    let request = serde_json::from_str(input)
-        .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client cancel request"))?;
-    validate_cancel_request(&request)?;
-    Ok(request)
+    decode_request(
+        input,
+        protocol::decode_object,
+        "invalid client cancel request",
+        validate_cancel_request,
+    )
 }
 
 /// Strictly parses one exact-run termination request.
 pub fn decode_terminate_request(
     input: &str,
 ) -> Result<TerminateWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
-    let request = serde_json::from_str(input)
-        .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client terminate request"))?;
-    validate_terminate_request(&request)?;
-    Ok(request)
+    decode_request(
+        input,
+        protocol::decode_object,
+        "invalid client terminate request",
+        validate_terminate_request,
+    )
 }
 
 /// Strictly parses one exact-run reset request.
 pub fn decode_reset_request(input: &str) -> Result<ResetWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
-    let request = serde_json::from_str(input)
-        .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client reset request"))?;
-    validate_reset_request(&request)?;
-    Ok(request)
+    decode_request(
+        input,
+        protocol::decode_object,
+        "invalid client reset request",
+        validate_reset_request,
+    )
 }
 
 /// Encodes and reparses the new execution identity returned after reset.
@@ -972,11 +998,12 @@ pub fn encode_reset_response(
 pub fn decode_signal_request(
     input: &str,
 ) -> Result<SignalWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_payload_object(input)?;
-    let request = serde_json::from_str(input)
-        .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client signal request"))?;
-    validate_signal_request(&request)?;
-    Ok(request)
+    decode_request(
+        input,
+        protocol::decode_payload_object,
+        "invalid client signal request",
+        validate_signal_request,
+    )
 }
 
 /// Strictly parses one exact-run query request.
@@ -985,11 +1012,12 @@ pub fn decode_signal_request(
 /// per-field and whole-document bounds as start and signal input; the semantic
 /// validator then bounds identifiers and metadata keys as ordinary text.
 pub fn decode_query_request(input: &str) -> Result<QueryWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_payload_object(input)?;
-    let request = serde_json::from_str(input)
-        .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client query request"))?;
-    validate_query_request(&request)?;
-    Ok(request)
+    decode_request(
+        input,
+        protocol::decode_payload_object,
+        "invalid client query request",
+        validate_query_request,
+    )
 }
 
 /// Strictly parses a request that starts one workflow update.
@@ -1000,33 +1028,36 @@ pub fn decode_query_request(input: &str) -> Result<QueryWorkflowRequest, protoco
 pub fn decode_update_request(
     input: &str,
 ) -> Result<UpdateWorkflowRequest, protocol::ProtocolError> {
-    protocol::decode_payload_object(input)?;
-    let request = serde_json::from_str(input)
-        .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client update request"))?;
-    validate_update_request(&request)?;
-    Ok(request)
+    decode_request(
+        input,
+        protocol::decode_payload_object,
+        "invalid client update request",
+        validate_update_request,
+    )
 }
 
 /// Strictly parses a request that polls a previously admitted update.
 pub fn decode_poll_update_request(
     input: &str,
 ) -> Result<PollWorkflowUpdateRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
-    let request = serde_json::from_str(input)
-        .map_err(|_| protocol::ProtocolError::invalid("$", "invalid client update poll request"))?;
-    validate_poll_update_request(&request)?;
-    Ok(request)
+    decode_request(
+        input,
+        protocol::decode_object,
+        "invalid client update poll request",
+        validate_poll_update_request,
+    )
 }
 
 /// Strictly parses one bounded visibility page request.
 pub fn decode_visibility_request(
     input: &str,
 ) -> Result<VisibilityRequest, protocol::ProtocolError> {
-    protocol::decode_object(input)?;
-    let request = serde_json::from_str(input)
-        .map_err(|_| protocol::ProtocolError::invalid("$", "invalid visibility request"))?;
-    validate_visibility_request(&request)?;
-    Ok(request)
+    decode_request(
+        input,
+        protocol::decode_object,
+        "invalid visibility request",
+        validate_visibility_request,
+    )
 }
 
 /// Encodes and reparses a start response before ownership leaves Rust.
@@ -2406,10 +2437,7 @@ fn validate_start_request(value: &StartWorkflowRequest) -> Result<(), protocol::
     validate_identifier(&value.workflow_id, "$.workflow_id")?;
     validate_identifier(&value.workflow_type, "$.workflow_type")?;
     validate_identifier(&value.task_queue, "$.task_queue")?;
-    for payload in &value.input {
-        workflow_protocol::payload_to_core(payload)
-            .map_err(|_| protocol::ProtocolError::invalid("$.input", "invalid Temporal payload"))?;
-    }
+    validate_input_payloads(&value.input)?;
     validate_metadata(&value.memo, "$.memo")?;
     validate_metadata(&value.search_attributes, "$.search_attributes")?;
     validate_start_policies(value)?;
@@ -2510,34 +2538,59 @@ fn validate_metadata(fields: &[MetadataField], path: &str) -> Result<(), protoco
     Ok(())
 }
 
-/// Validates one exact-run wait request.
-fn validate_wait_request(value: &WaitWorkflowRequest) -> Result<(), protocol::ProtocolError> {
-    validate_identifier(&value.namespace, "$.namespace")?;
-    validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_run_selector(&value.run_id, "$.run_id")?;
-    Ok(())
+/// Validates the namespace, workflow ID, and run selector that every
+/// exact-run request uses to address one workflow execution.
+fn validate_run_target(
+    namespace: &str,
+    workflow_id: &str,
+    run_id: &str,
+) -> Result<(), protocol::ProtocolError> {
+    validate_identifier(namespace, "$.namespace")?;
+    validate_identifier(workflow_id, "$.workflow_id")?;
+    validate_run_selector(run_id, "$.run_id")
 }
 
-/// Validates one exact-run cancellation request and keeps its reason bounded.
-fn validate_cancel_request(value: &CancelWorkflowRequest) -> Result<(), protocol::ProtocolError> {
-    validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_identifier(&value.namespace, "$.namespace")?;
-    validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_run_selector(&value.run_id, "$.run_id")?;
-    validate_identifier(&value.request_id, "$.request_id")?;
-    if value.reason.len() > protocol::MAX_STRING_BYTES {
+/// Bounds one free-form operator reason by the protocol string limit and
+/// refuses NUL bytes, which Core's string fields cannot carry.
+fn validate_reason(reason: &str) -> Result<(), protocol::ProtocolError> {
+    if reason.len() > protocol::MAX_STRING_BYTES {
         return Err(protocol::ProtocolError::invalid(
             "$.reason",
             "reason exceeds the protocol string safety limit",
         ));
     }
-    if value.reason.contains('\0') {
+    if reason.contains('\0') {
         return Err(protocol::ProtocolError::invalid(
             "$.reason",
             "reason contains a NUL byte",
         ));
     }
     Ok(())
+}
+
+/// Requires every request argument at `$.input` to convert into a Temporal
+/// payload before the request can reach the service.
+fn validate_input_payloads(
+    input: &[workflow_protocol::Payload],
+) -> Result<(), protocol::ProtocolError> {
+    for payload in input {
+        workflow_protocol::payload_to_core(payload)
+            .map_err(|_| protocol::ProtocolError::invalid("$.input", "invalid Temporal payload"))?;
+    }
+    Ok(())
+}
+
+/// Validates one exact-run wait request.
+fn validate_wait_request(value: &WaitWorkflowRequest) -> Result<(), protocol::ProtocolError> {
+    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)
+}
+
+/// Validates one exact-run cancellation request and keeps its reason bounded.
+fn validate_cancel_request(value: &CancelWorkflowRequest) -> Result<(), protocol::ProtocolError> {
+    validate_rpc_timeout(value.rpc_timeout_ms)?;
+    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
+    validate_identifier(&value.request_id, "$.request_id")?;
+    validate_reason(&value.reason)
 }
 
 /// Validates one exact-run termination request and keeps its reason bounded.
@@ -2545,30 +2598,14 @@ fn validate_terminate_request(
     value: &TerminateWorkflowRequest,
 ) -> Result<(), protocol::ProtocolError> {
     validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_identifier(&value.namespace, "$.namespace")?;
-    validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_run_selector(&value.run_id, "$.run_id")?;
-    if value.reason.len() > protocol::MAX_STRING_BYTES {
-        return Err(protocol::ProtocolError::invalid(
-            "$.reason",
-            "reason exceeds the protocol string safety limit",
-        ));
-    }
-    if value.reason.contains('\0') {
-        return Err(protocol::ProtocolError::invalid(
-            "$.reason",
-            "reason contains a NUL byte",
-        ));
-    }
-    Ok(())
+    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
+    validate_reason(&value.reason)
 }
 
 /// Validates one exact-run reset request and its Temporal event boundary.
 fn validate_reset_request(value: &ResetWorkflowRequest) -> Result<(), protocol::ProtocolError> {
     validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_identifier(&value.namespace, "$.namespace")?;
-    validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_run_selector(&value.run_id, "$.run_id")?;
+    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
     validate_identifier(&value.request_id, "$.request_id")?;
     if value.workflow_task_finish_event_id <= 1 {
         return Err(protocol::ProtocolError::invalid(
@@ -2576,35 +2613,17 @@ fn validate_reset_request(value: &ResetWorkflowRequest) -> Result<(), protocol::
             "event ID must be greater than 1",
         ));
     }
-    if value.reason.len() > protocol::MAX_STRING_BYTES {
-        return Err(protocol::ProtocolError::invalid(
-            "$.reason",
-            "reason exceeds the protocol string safety limit",
-        ));
-    }
-    if value.reason.contains('\0') {
-        return Err(protocol::ProtocolError::invalid(
-            "$.reason",
-            "reason contains a NUL byte",
-        ));
-    }
-    Ok(())
+    validate_reason(&value.reason)
 }
 
 /// Validates one exact-run signal request and every payload conversion before
 /// it can reach the official Temporal service.
 fn validate_signal_request(value: &SignalWorkflowRequest) -> Result<(), protocol::ProtocolError> {
     validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_identifier(&value.namespace, "$.namespace")?;
-    validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_run_selector(&value.run_id, "$.run_id")?;
+    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
     validate_identifier(&value.signal_name, "$.signal_name")?;
     validate_identifier(&value.request_id, "$.request_id")?;
-    for payload in &value.input {
-        workflow_protocol::payload_to_core(payload)
-            .map_err(|_| protocol::ProtocolError::invalid("$.input", "invalid Temporal payload"))?;
-    }
-    Ok(())
+    validate_input_payloads(&value.input)
 }
 
 /// Validates one exact-run query request and every argument payload before it
@@ -2613,15 +2632,9 @@ fn validate_signal_request(value: &SignalWorkflowRequest) -> Result<(), protocol
 /// protocol behavior explicit for the future typed-input extension.
 fn validate_query_request(value: &QueryWorkflowRequest) -> Result<(), protocol::ProtocolError> {
     validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_identifier(&value.namespace, "$.namespace")?;
-    validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_run_selector(&value.run_id, "$.run_id")?;
+    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
     validate_identifier(&value.query_type, "$.query_type")?;
-    for payload in &value.input {
-        workflow_protocol::payload_to_core(payload)
-            .map_err(|_| protocol::ProtocolError::invalid("$.input", "invalid Temporal payload"))?;
-    }
-    Ok(())
+    validate_input_payloads(&value.input)
 }
 
 /// Validates every payload in a successful query response before it leaves the
@@ -2638,25 +2651,17 @@ fn validate_query_response(value: &QueryWorkflowResponse) -> Result<(), protocol
 /// Validates one update admission request and every argument payload.
 fn validate_update_request(value: &UpdateWorkflowRequest) -> Result<(), protocol::ProtocolError> {
     validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_identifier(&value.namespace, "$.namespace")?;
-    validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_run_selector(&value.run_id, "$.run_id")?;
+    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
     validate_identifier(&value.update_id, "$.update_id")?;
     validate_identifier(&value.update_name, "$.update_name")?;
-    for payload in &value.input {
-        workflow_protocol::payload_to_core(payload)
-            .map_err(|_| protocol::ProtocolError::invalid("$.input", "invalid Temporal payload"))?;
-    }
-    Ok(())
+    validate_input_payloads(&value.input)
 }
 
 /// Validates one update poll request.
 fn validate_poll_update_request(
     value: &PollWorkflowUpdateRequest,
 ) -> Result<(), protocol::ProtocolError> {
-    validate_identifier(&value.namespace, "$.namespace")?;
-    validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_run_selector(&value.run_id, "$.run_id")?;
+    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
     validate_identifier(&value.update_id, "$.update_id")?;
     Ok(())
 }
