@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::protocol::{self, JsonValue, MAX_PAYLOAD_BYTES, MAX_STRING_BYTES, ProtocolError};
+use crate::protocol::{self, MAX_PAYLOAD_BYTES, MAX_STRING_BYTES, ProtocolError};
 
 /// Decodes an explicitly present nullable field.
 ///
@@ -926,46 +926,6 @@ pub struct Completion {
     /// Optional task failure; omitted on successful completions for wire compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_failure: Option<Failure>,
-}
-
-/// Converts the duplicate-aware foundation tree to Serde's owned value.
-fn to_serde(value: JsonValue) -> serde_json::Value {
-    match value {
-        JsonValue::Null => serde_json::Value::Null,
-        JsonValue::Bool(value) => serde_json::Value::Bool(value),
-        JsonValue::Signed(value) => value.into(),
-        JsonValue::Unsigned(value) => value.into(),
-        JsonValue::String(value) => value.into(),
-        JsonValue::Array(values) => values.into_iter().map(to_serde).collect(),
-        JsonValue::Object(entries) => entries
-            .into_iter()
-            .map(|(key, value)| (key, to_serde(value)))
-            .collect(),
-    }
-}
-
-/// Converts Serde output back into the restricted integral JSON tree.
-fn from_serde(value: serde_json::Value) -> Result<JsonValue, ProtocolError> {
-    match value {
-        serde_json::Value::Null => Ok(JsonValue::Null),
-        serde_json::Value::Bool(value) => Ok(JsonValue::Bool(value)),
-        serde_json::Value::Number(value) => value
-            .as_i64()
-            .map(JsonValue::Signed)
-            .or_else(|| value.as_u64().map(JsonValue::Unsigned))
-            .ok_or_else(|| ProtocolError::invalid("$", "non-integral number in semantic output")),
-        serde_json::Value::String(value) => Ok(JsonValue::String(value)),
-        serde_json::Value::Array(values) => values
-            .into_iter()
-            .map(from_serde)
-            .collect::<Result<Vec<_>, _>>()
-            .map(JsonValue::Array),
-        serde_json::Value::Object(entries) => entries
-            .into_iter()
-            .map(|(key, value)| Ok((key, from_serde(value)?)))
-            .collect::<Result<Vec<_>, _>>()
-            .map(JsonValue::Object),
-    }
 }
 
 /// Requires a bounded nonempty Temporal identifier that is safe for both
@@ -2138,9 +2098,10 @@ fn validate_inbound_retry_policy(value: &RetryPolicy, path: &str) -> Result<(), 
 
 /// Strictly decodes one workflow activation.
 pub fn decode_activation(input: &str) -> Result<Activation, ProtocolError> {
-    let value = protocol::decode_payload_object(input)?;
-    let activation: Activation = serde_json::from_value(to_serde(value))
-        .map_err(|_| ProtocolError::invalid("$", "invalid workflow activation semantics"))?;
+    let activation: Activation = protocol::semantic_from_value(
+        protocol::decode_payload_object(input)?,
+        "invalid workflow activation semantics",
+    )?;
     validate_activation(&activation)?;
     Ok(activation)
 }
@@ -2148,18 +2109,17 @@ pub fn decode_activation(input: &str) -> Result<Activation, ProtocolError> {
 /// Validates, normalizes, and reparses one outgoing workflow activation.
 pub fn encode_activation(value: &Activation) -> Result<String, ProtocolError> {
     validate_activation(value)?;
-    let json = serde_json::to_value(value)
-        .map_err(|_| ProtocolError::invalid("$", "could not encode workflow activation"))?;
-    let output = protocol::encode_payload_object(&from_serde(json)?)?;
+    let output = protocol::encode_semantic(value, "could not encode workflow activation")?;
     decode_activation(&output)?;
     Ok(output)
 }
 
 /// Strictly decodes one successful workflow completion.
 pub fn decode_completion(input: &str) -> Result<Completion, ProtocolError> {
-    let value = protocol::decode_payload_object(input)?;
-    let completion: Completion = serde_json::from_value(to_serde(value))
-        .map_err(|_| ProtocolError::invalid("$", "invalid workflow completion semantics"))?;
+    let completion: Completion = protocol::semantic_from_value(
+        protocol::decode_payload_object(input)?,
+        "invalid workflow completion semantics",
+    )?;
     validate_completion(&completion)?;
     Ok(completion)
 }
@@ -2167,9 +2127,7 @@ pub fn decode_completion(input: &str) -> Result<Completion, ProtocolError> {
 /// Validates, normalizes, and reparses one outgoing workflow completion.
 pub fn encode_completion(value: &Completion) -> Result<String, ProtocolError> {
     validate_completion(value)?;
-    let json = serde_json::to_value(value)
-        .map_err(|_| ProtocolError::invalid("$", "could not encode workflow completion"))?;
-    let output = protocol::encode_payload_object(&from_serde(json)?)?;
+    let output = protocol::encode_semantic(value, "could not encode workflow completion")?;
     decode_completion(&output)?;
     Ok(output)
 }
