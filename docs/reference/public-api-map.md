@@ -30,7 +30,8 @@ for those rules.
 
 - `Temporal.Workflow` defines local or remote workflows. `start_sleep` creates
   a durable timer and returns a future; `sleep` is its wait-and-return
-  convenience form. `Workflow.now ()` reads the activation timestamp supplied
+  convenience form. Both take `~scope` so cancelling a scope cancels its
+  pending timers. `Workflow.now ()` reads the activation timestamp supplied
   by Temporal and never falls back to host wall-clock time. `random_int ~bound`
   makes a replay-safe pseudo-random choice from the execution-local stream.
   `current_deployment_version ()` reports the deployment and build identity

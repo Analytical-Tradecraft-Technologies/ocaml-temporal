@@ -477,10 +477,12 @@ let _workflow_implementation :
   T.Workflow.implementation
 
 let _workflow_start_sleep :
-    T.Duration.t -> (unit, T.Error.t) T.Future.t =
+    ?scope:T.Scope.t -> T.Duration.t -> (unit, T.Error.t) T.Future.t =
   T.Workflow.start_sleep
 
-let _workflow_sleep : T.Duration.t -> (unit, T.Error.t) result = T.Workflow.sleep
+let _workflow_sleep :
+    ?scope:T.Scope.t -> T.Duration.t -> (unit, T.Error.t) result =
+  T.Workflow.sleep
 let _workflow_now : unit -> (T.Time.t, T.Error.t) result = T.Workflow.now
 let _workflow_patched : id:string -> bool = T.Workflow.patched
 let _workflow_deprecate_patch : id:string -> unit = T.Workflow.deprecate_patch
