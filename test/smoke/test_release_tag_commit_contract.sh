@@ -75,8 +75,11 @@ git -C "$fixture/checkout" push --force origin HEAD:master >/dev/null
 (cd "$fixture/checkout" && sh "$script" v1.0.0-wrong "$second" master)
 # The same check from a depth-1 clone of the tag, as the CI checkout is, must
 # fetch enough history to prove ancestry rather than fail or pass blindly.
-git clone --quiet --depth=1 --branch v1.0.0-annotated \
-  "file://$PWD/$fixture/origin.git" "$fixture/shallow" 2>/dev/null
+# --no-local keeps --depth effective for a plain relative path, which (unlike
+# a file:// URL built from a Cygwin $PWD) Git for Windows also resolves.
+git clone --quiet --no-local --depth=1 --branch v1.0.0-annotated \
+  "$fixture/origin.git" "$fixture/shallow"
+test "$(git -C "$fixture/shallow" rev-parse --is-shallow-repository)" = true
 git -C "$fixture/shallow" config maintenance.auto false
 git -C "$fixture/shallow" config gc.auto 0
 (cd "$fixture/shallow" && sh "$script" v1.0.0-annotated "$first" master)
