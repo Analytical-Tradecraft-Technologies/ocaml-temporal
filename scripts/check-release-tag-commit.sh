@@ -40,13 +40,14 @@ if [ -n "$branch" ]; then
   git check-ref-format "refs/heads/$branch"
   # The ancestry walk needs the history between the tag and the branch tip,
   # which a depth-1 CI checkout (or the depth-1 tag fetch above) lacks.
+  # The arguments were copied above, so the positional parameters carry the
+  # optional flag; "$@" expands it without word splitting or globbing.
   if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
-    fetch_history=--unshallow
+    set -- --unshallow
   else
-    fetch_history=
+    set --
   fi
-  # shellcheck disable=SC2086 # fetch_history is deliberately empty or one flag.
-  if ! git fetch --no-tags $fetch_history origin "refs/heads/$branch"; then
+  if ! git fetch --no-tags "$@" origin "refs/heads/$branch"; then
     echo "Release branch $branch could not be fetched from origin." >&2
     exit 1
   fi
