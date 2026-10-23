@@ -705,6 +705,7 @@ let _client_execution_fields (execution : T.Client.execution) : string * string 
   (execution.namespace, execution.workflow_id, execution.run_id)
 
 let _client_wait :
+    ?timeout:T.Duration.t ->
     ('input, 'output) T.Client.handle ->
     ('output T.Client.terminal_result, T.Error.t) result =
   T.Client.wait
@@ -1120,6 +1121,7 @@ let _client_start_update :
   T.Client.start_update
 
 let _client_wait_update :
+    ?timeout:T.Duration.t ->
     ('input, 'output) T.Client.update_handle -> ('output, T.Error.t) result =
   T.Client.wait_update
 

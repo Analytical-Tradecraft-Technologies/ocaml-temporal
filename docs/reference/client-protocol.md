@@ -359,9 +359,13 @@ bound. A cell is retired by the caller's terminal read, by
 `ocaml_temporal_core_v4_client_release_call(owner, call)`, or by disconnect
 or close. The OCaml await loop calls the release symbol from a
 `Fun.protect` finalizer whenever it is left without a terminal read (an
-exception, including an asynchronous one), so in practice only a caller that
-never awaits at all holds a slot until shutdown; there is no time-based
-reclaim of such cells. Releasing drops any published outcome, frees the
+exception, including an asynchronous one), and when a caller's own
+`Client.wait ?timeout` or `wait_update ?timeout` bound expires (#1136): the
+await loop never sleeps past that deadline, releases the call, and decodes
+the same `{"kind":"rpc","code":"deadline_exceeded"}` failure a mailbox-expired
+RPC uses, so the caller sees a retryable `Deadline_exceeded` error. In
+practice only a caller that never awaits at all holds a slot until
+shutdown; there is no time-based reclaim of such cells. Releasing drops any published outcome, frees the
 slot, and aborts a still-running task through its Tokio abort handle, so an
 abandoned exact-run wait stops long-polling at once instead of running
 until the run closes (#1019). From that moment the call no longer counts

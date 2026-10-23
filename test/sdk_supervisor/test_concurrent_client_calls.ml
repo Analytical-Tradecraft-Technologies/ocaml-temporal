@@ -327,9 +327,97 @@ let test_interrupted_await_releases_its_call () =
   check "a terminal read is not released" (Atomic.get releases = before + 1);
   check "shutdown" (Supervisor.shutdown supervisor = Ok ())
 
+(** A caller deadline on an in-flight call (#1136). The clock is fake and
+    advances by each requested slice, so the test proves that no slice
+    outlasts the remaining budget, that expiry releases the call exactly
+    once (closing its cell, as the native release frees its slot), and that
+    the call's own decoder receives the shared expired-deadline error. A
+    later call on the same supervisor is unaffected. *)
+let test_deadline_releases_waiting_call () =
+  let supervisor = Result.get_ok (Supervisor.create ~capacity:4 (ref [])) in
+  let submitted =
+    Result.get_ok (Supervisor.perform supervisor (Backend.Submit_long "bounded"))
+  in
+  let cell =
+    match submitted with
+    | Client_call.In_flight { ticket; _ } -> ticket
+    | Client_call.Completed _ -> failwith "long call was not in flight"
+  in
+  let clock = ref 0L in
+  let slices = ref [] in
+  (* A pending cell answers [Not_ready] at once; the clock moves by the
+     whole slice, standing in for a wait that used all of it. *)
+  let timed cell ~timeout_ms =
+    slices := timeout_ms :: !slices;
+    clock := Int64.add !clock (Int64.mul (Int64.of_int timeout_ms) 1_000_000L);
+    with_cell cell (fun () ->
+        match cell.state with
+        | `Ready outcome -> outcome
+        | `Closed -> Error { Bridge.status = Invalid_state; message = "closed" }
+        | `Pending -> Error { Bridge.status = Not_ready; message = "pending" })
+  in
+  let before = Atomic.get releases in
+  (* 45 ms of budget with 20 ms slices: 20, 20, then only the 5 left. *)
+  let result =
+    Client_call.await ~poll:timed ~release ~slice_ms:20
+      ~now_ns:(fun () -> !clock) ~deadline_ns:45_000_000L submitted
+  in
+  check "slices never outlast the deadline" (List.rev !slices = [ 20; 20; 5 ]);
+  check "expired call released once" (Atomic.get releases = before + 1);
+  check "released cell is closed" (with_cell cell (fun () -> cell.state = `Closed));
+  (match result with
+  | Error (Client_call.Failed error) ->
+      check "expiry decoded as the shared deadline error"
+        (error = Client_call.expired_deadline_error
+        && error = Protocol_adapter.expired_rpc_deadline_error)
+  | _ -> failwith "an expired await did not report the deadline error");
+  let completed =
+    Result.get_ok
+      (Supervisor.perform supervisor (Backend.Submit_short ("after", None)))
+  in
+  check "later call unaffected"
+    (Client_call.await ~poll ~release ~slice_ms:5 completed = Ok "after ok");
+  check "shutdown" (Supervisor.shutdown supervisor = Ok ())
+
+(** An outcome published before the deadline is returned unchanged and the
+    call is retired by its read, not released; a deadline that has already
+    passed when the await starts releases without polling at all. *)
+let test_deadline_keeps_an_earlier_outcome () =
+  let supervisor = Result.get_ok (Supervisor.create ~capacity:4 (ref [])) in
+  let before = Atomic.get releases in
+  let completed =
+    Result.get_ok
+      (Supervisor.perform supervisor (Backend.Submit_short ("early", None)))
+  in
+  check "outcome before the deadline"
+    (Client_call.await ~poll ~release ~slice_ms:5 ~now_ns:(fun () -> 0L)
+       ~deadline_ns:1_000_000_000L completed
+    = Ok "early ok");
+  check "a read call is not released" (Atomic.get releases = before);
+  let pending =
+    Result.get_ok (Supervisor.perform supervisor (Backend.Submit_long "late"))
+  in
+  let polled = ref false in
+  let never cell ~timeout_ms =
+    polled := true;
+    poll cell ~timeout_ms
+  in
+  (match
+     Client_call.await ~poll:never ~release ~now_ns:(fun () -> 10L)
+       ~deadline_ns:10L pending
+   with
+  | Error (Client_call.Failed error) ->
+      check "expired before polling" (error = Client_call.expired_deadline_error)
+  | _ -> failwith "an already expired await did not report the deadline");
+  check "no poll after expiry" (not !polled);
+  check "expired-before-poll call released" (Atomic.get releases = before + 1);
+  check "shutdown" (Supervisor.shutdown supervisor = Ok ())
+
 let () =
   test_interrupted_await_releases_its_call ();
   test_long_calls_do_not_delay_short_calls ();
   test_completion_reaches_only_its_caller ();
   test_deadline_expires_while_queued ();
+  test_deadline_releases_waiting_call ();
+  test_deadline_keeps_an_earlier_outcome ();
   print_endline "concurrent client call tests passed"

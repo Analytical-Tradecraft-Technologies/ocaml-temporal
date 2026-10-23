@@ -538,8 +538,8 @@ let native_supervisor_error = function
     never delays a call on another. A call that shutdown closed while it was
     in flight, or that reached a supervisor already closing, reports the same
     error as a call made after shutdown. *)
-let native_call (client : native_client) rpc =
-  match Native.call client.supervisor rpc with
+let native_call ?deadline_ns (client : native_client) rpc =
+  match Native.call ?deadline_ns client.supervisor rpc with
   | Ok value -> Ok value
   | Error Native.Closed -> Error (bridge_error "client is shut down")
   | Error error -> Error (native_supervisor_error error)
@@ -1352,7 +1352,8 @@ let client_start client request =
     open; this caller waits on the call's own completion cell, so the
     supervisor owner stays free for every other operation (#807). Shutdown
     closes the call and reports the closed-client error. *)
-let native_client_wait (client : native_client) (request : wait_request) =
+let native_client_wait ?deadline_ns (client : native_client)
+    (request : wait_request) =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else
     let request : Client_protocol.wait_request =
@@ -1362,7 +1363,7 @@ let native_client_wait (client : native_client) (request : wait_request) =
         run_id = request.run_id;
       }
     in
-    match native_call client (Native.Rpc_wait request) with
+    match native_call ?deadline_ns client (Native.Rpc_wait request) with
     | Error error -> Error error
     | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok response) -> native_terminal_result response
@@ -1430,10 +1431,10 @@ let mock_client_wait (client : mock_client) (request : wait_request) =
                 Ok (Timed_out { error; successor })))
 
 (** Waits for a terminal result on the selected private transport. *)
-let client_wait client (request : wait_request) =
+let client_wait ?deadline_ns client (request : wait_request) =
   match client with
   | Mock_client client -> mock_client_wait client request
-  | Native_client client -> native_client_wait client request
+  | Native_client client -> native_client_wait ?deadline_ns client request
 
 (** Scripts one exact mock close event for the public wait/follow regression.
     This private test seam cannot alter a native client or allocate a run. *)
@@ -2067,7 +2068,8 @@ let native_client_update (client : native_client) (request : update_request) =
 (** Polls one admitted native update. The request input is ignored after
     admission but retained in the private value to keep exact handle identity
     and codec ownership in one record. *)
-let native_client_poll_update (client : native_client) (request : update_request) =
+let native_client_poll_update ?deadline_ns (client : native_client)
+    (request : update_request) =
   if Atomic.get client.closed then Error (bridge_error "client is shut down")
   else
     let protocol_request : Client_protocol.poll_update_request =
@@ -2081,7 +2083,9 @@ let native_client_poll_update (client : native_client) (request : update_request
         update_id = request.update_id;
       }
     in
-    match native_call client (Native.Rpc_poll_update protocol_request) with
+    match
+      native_call ?deadline_ns client (Native.Rpc_poll_update protocol_request)
+    with
     | Error error -> Error error
     | Ok (Error error) -> Error (native_client_error ~namespace:client.namespace error)
     | Ok (Ok response) ->
@@ -2110,10 +2114,10 @@ let client_update client request =
   | Native_client client -> native_client_update client request
 
 (** Polls one update through the selected private transport. *)
-let client_poll_update client request =
+let client_poll_update ?deadline_ns client request =
   match client with
   | Mock_client client -> mock_client_poll_update client request
-  | Native_client client -> native_client_poll_update client request
+  | Native_client client -> native_client_poll_update ?deadline_ns client request
 
 (** Marks a client closed while preserving idempotent cleanup. Native shutdown
     runs the supervisor's reverse-order worker/client/runtime release path;

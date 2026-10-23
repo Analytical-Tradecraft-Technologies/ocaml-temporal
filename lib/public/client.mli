@@ -29,7 +29,9 @@
       {!list_visibility}, 3 seconds for {!signal}, {!cancel}, {!terminate},
       and {!reset}, and 30 seconds for queries and for {!start_update}'s
       acceptance wait. {!wait} and {!wait_update} have no RPC deadline: they
-      wait for the workflow or update, with bounded internal polls.
+      wait for the workflow or update, with bounded internal polls. Their
+      optional [timeout] is a caller-side bound on the whole wait instead,
+      described with each function.
 
     An expired RPC deadline is reported as an error with {!val-rpc_status}
     [Some `Deadline_exceeded] (or [`Unavailable] when the last transport
@@ -422,8 +424,21 @@ val get_handle :
     at capacity returns a retryable error recognized by [is_at_capacity]; the
     client stays usable. Terminal results and errors free their slots. A
     pending wait does not delay other calls on the client, and client
-    shutdown ends it with the closed-client error. *)
+    shutdown ends it with the closed-client error.
+
+    [timeout] bounds this caller's wait (#1136), on a monotonic clock, from
+    the moment [wait] is called; on a current-run handle it covers the whole
+    run chain. It is unrelated to the workflow's own timeouts and changes
+    nothing on the server. When it elapses first, [wait] returns a retryable
+    error whose {!val-rpc_status} is [Some `Deadline_exceeded] and releases
+    this caller's share of the run's wait slot, so a stuck run cannot hold
+    the slot past the bound. The workflow is unaffected: another [wait] on
+    the same handle, with or without a timeout, observes the run as before,
+    and concurrent waits on the same run each keep their own bound. A
+    [timeout] must be positive; zero is a typed defect. Omitted, the wait
+    has no bound. *)
 val wait :
+  ?timeout:Duration.t ->
   ('input, 'output) handle ->
   ('output terminal_result, Error.t) result
 
@@ -587,8 +602,17 @@ val start_update :
 (** Waits for an accepted update to complete and decodes its typed result.
     Uses the admission outcome when present, otherwise polls Temporal.
     Application-level update failures and transport defects are returned as
-    [Error.t] values; no expected update failure is raised as an exception. *)
+    [Error.t] values; no expected update failure is raised as an exception.
+
+    [timeout] bounds the wait as for {!wait}: when it elapses before the
+    update completes, a retryable error with {!val-rpc_status}
+    [Some `Deadline_exceeded] is returned and the pending poll is released.
+    The accepted update is unaffected and a later [wait_update] on the same
+    handle still observes its outcome. An outcome already retained in the
+    handle is returned without consulting the timeout's clock. A [timeout]
+    must be positive; zero is a typed defect. *)
 val wait_update :
+  ?timeout:Duration.t ->
   ('input, 'output) update_handle -> ('output, Error.t) result
 
 (** Returns the workflow-scoped update ID retained by a handle. *)

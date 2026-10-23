@@ -134,7 +134,13 @@ module Client_call : sig
       left by an exception instead (including an asynchronous one),
       [release ticket] is called once so the abandoned call frees its
       capacity slot, and the exception propagates. It must not run on a
-      workflow scheduler Domain or on the supervisor owner Domain. *)
+      workflow scheduler Domain or on the supervisor owner Domain.
+
+      [deadline_ns] (#1136) is an absolute expiry on the [now_ns] clock
+      (default: the native monotonic clock). No bounded wait outlasts it;
+      once it passes, the call is released (freeing its capacity slot) and
+      its decoder receives {!expired_deadline_error}. An outcome published
+      before expiry is returned as usual. *)
   val await :
     poll:
       ('ticket ->
@@ -142,8 +148,15 @@ module Client_call : sig
       (bytes, Temporal_core_bridge.Native_bridge.error) result) ->
     release:('ticket -> (unit, Temporal_core_bridge.Native_bridge.error) result) ->
     ?slice_ms:int ->
+    ?now_ns:(unit -> int64) ->
+    ?deadline_ns:int64 ->
     ('value, 'ticket) t ->
     ('value, failure) result
+
+  (** The structured failure Rust reports for an expired RPC budget, which
+      {!await} also hands to a call's decoder when its caller deadline
+      expires, so the caller sees the operation's usual deadline error. *)
+  val expired_deadline_error : Temporal_core_bridge.Native_bridge.error
 end
 
 (** The production supervisor over one native runtime-client-worker graph. *)
@@ -717,12 +730,16 @@ module Native : sig
       workflow scheduler Domain. [slice_ms] defaults to
       {!Client_call.default_slice_ms}. *)
   val await_client_call :
-    ?slice_ms:int -> 'value client_call -> ('value, error) result
+    ?slice_ms:int -> ?deadline_ns:int64 -> 'value client_call ->
+    ('value, error) result
 
   (** [call supervisor rpc] submits [rpc] with [perform] and then awaits it
       with {!await_client_call}. Only submission occupies the owner Domain,
-      so concurrent calls from other Domains proceed independently. *)
-  val call : t -> 'value client_rpc -> ('value, error) result
+      so concurrent calls from other Domains proceed independently.
+      [deadline_ns] bounds only the caller's wait for the outcome, on the
+      native monotonic clock; see {!Client_call.await}. *)
+  val call :
+    ?deadline_ns:int64 -> t -> 'value client_rpc -> ('value, error) result
 
   (** Starts a companion system thread on the owner Domain; see
       {!Make.spawn_owner_thread}. The native worker hosts its activation
