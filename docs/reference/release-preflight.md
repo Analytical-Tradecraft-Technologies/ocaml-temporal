@@ -78,13 +78,17 @@ git tag -a v0.1.0-rc.1 <approved-master-sha> -m 'OCaml Temporal SDK v0.1.0-rc.1'
 git push origin refs/tags/v0.1.0-rc.1
 ```
 
-Open **Actions → Release → Run workflow**, select `master`, and enter the same
-**Version tag**. Dispatch must still resolve to the approved SHA. The workflow:
+Open **Actions → Release → Run workflow**, set **Use workflow from** to the
+tag `v0.1.0-rc.1` (under *Tags*), and enter the same **Version tag**. Running
+from the tag makes the approved SHA the dispatch commit for every job, so
+later merges to `master` cannot spend the tag (#1144). The workflow:
 
-1. Require master, matching version metadata, the committed release notes
-   `docs/releases/<tag>.md` (checked by `scripts/check-release-notes.sh`), a
-   clean source checkout, and a remote tag that peels to the exact dispatch
-   commit. A missing, retargeted, or unreachable tag, or missing or incomplete
+1. Require a dispatch from `refs/tags/<tag>`, matching version metadata, the
+   committed release notes `docs/releases/<tag>.md` (checked by
+   `scripts/check-release-notes.sh`), a clean source checkout, a remote tag
+   that peels to the exact dispatch commit, and that commit's presence on
+   `origin/master`. A dispatch from a branch, a missing, retargeted, or
+   unreachable tag, a tag on an unmerged commit, or missing or incomplete
    notes, fails before the release build.
 2. Build/test all four Rust platforms and all sixteen OCaml combinations, plus
    the single live smoke job, quality/security scans, and dependency audits.

@@ -66,6 +66,49 @@ if (cd "$fixture/checkout" && sh "$script" v1.0.0-wrong "$first" >/dev/null 2>&1
 fi
 (cd "$fixture/checkout" && sh "$script" v1.0.0-wrong "$second")
 
+# Releasing from the tag (#1144): an approved tag stays releasable after
+# unrelated commits land on master, as long as its commit is on master.
+# The earlier depth-1 tag fetches left this checkout shallow, which defeats
+# Git's fast-forward check; the push is a fast-forward of master all the same.
+git -C "$fixture/checkout" push --force origin HEAD:master >/dev/null
+(cd "$fixture/checkout" && sh "$script" v1.0.0-annotated "$first" master)
+(cd "$fixture/checkout" && sh "$script" v1.0.0-wrong "$second" master)
+# The same check from a depth-1 clone of the tag, as the CI checkout is, must
+# fetch enough history to prove ancestry rather than fail or pass blindly.
+# --no-local keeps --depth effective for a plain relative path, which (unlike
+# a file:// URL built from a Cygwin $PWD) Git for Windows also resolves.
+git clone --quiet --no-local --depth=1 --branch v1.0.0-annotated \
+  "$fixture/origin.git" "$fixture/shallow"
+test "$(git -C "$fixture/shallow" rev-parse --is-shallow-repository)" = true
+git -C "$fixture/shallow" config maintenance.auto false
+git -C "$fixture/shallow" config gc.auto 0
+(cd "$fixture/shallow" && sh "$script" v1.0.0-annotated "$first" master)
+# A tag on a commit that never reached master must not be released, even
+# though it peels to the expected commit; nor may an unfetchable branch.
+git -C "$fixture/checkout" checkout --quiet -b unmerged
+printf 'unmerged\n' >> "$fixture/checkout/source.txt"
+git -C "$fixture/checkout" commit -qam unmerged
+unmerged=$(git -C "$fixture/checkout" rev-parse HEAD)
+git -C "$fixture/checkout" tag v1.0.0-unmerged
+git -C "$fixture/checkout" push origin refs/tags/v1.0.0-unmerged >/dev/null
+(cd "$fixture/checkout" && sh "$script" v1.0.0-unmerged "$unmerged")
+if error=$(cd "$fixture/checkout" && sh "$script" v1.0.0-unmerged "$unmerged" master 2>&1); then
+  echo 'release accepted a tag whose commit is not on master' >&2
+  exit 1
+fi
+case "$error" in
+  *"is not on origin/master"*) ;;
+  *)
+    echo "release gave an unclear unmerged-tag rejection: $error" >&2
+    exit 1
+    ;;
+esac
+if (cd "$fixture/checkout" && sh "$script" v1.0.0-annotated "$first" missing-branch >/dev/null 2>&1); then
+  echo 'release accepted a missing release branch' >&2
+  exit 1
+fi
+git -C "$fixture/checkout" checkout --quiet master
+
 # A tag moved after the first check must be rejected even when the checkout
 # still has its old local tag; publication checks the remote a second time.
 git -C "$fixture/origin.git" update-ref refs/tags/v1.0.0-light "$second"
