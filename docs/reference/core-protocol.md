@@ -309,9 +309,14 @@ Core applies that policy while preserving command order for replay. The child
 command carries retry policy and optional `task_queue` and `parent_close_policy`
 fields. Parent-close values are `terminate`, `abandon`, and `request_cancel`;
 omission or null retains the Core/server default. Omitted new fields remain
-omitted on encoding, preserving existing default command bytes. The command
-omits namespace, timeouts, reuse policy, headers, memo, search attributes,
-versioning, and priority because the current OCaml runtime does not expose them. For a live or replay worker, Rust injects
+omitted on encoding, preserving existing default command bytes. Optional
+`execution_timeout`, `run_timeout` and `task_timeout` durations and an
+`id_reuse_policy` (`allow_duplicate`, `allow_duplicate_failed_only`,
+`reject_duplicate`) follow the same rule (#1135); both sides enforce the
+root-start timeout rules, and an absent reuse policy maps to Core's
+`Unspecified`. The command omits namespace, cron, headers, memo, search
+attributes, versioning, and priority because the current OCaml runtime does
+not expose them. For a live or replay worker, Rust injects
 the worker's already-validated namespace into Core's child-start command before
 submission; this is worker configuration, not workflow input. The remaining
 omitted Core fields receive explicit defaults and non-default values are

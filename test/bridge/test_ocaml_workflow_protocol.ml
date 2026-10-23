@@ -576,6 +576,7 @@ let test_start_child_workflow_command () =
               input = [ input ];
               retry_policy = None;
               cancellation_type = Child_try_cancel;
+              execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
             };
         ];
     }
@@ -664,6 +665,7 @@ let test_all_child_cancellation_policies () =
                   input = [ input ];
                   retry_policy = None;
                   cancellation_type;
+                  execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
                 };
             ];
         }
@@ -756,6 +758,7 @@ let test_child_cancellation_validation () =
               input = [];
               retry_policy = None;
               cancellation_type = Child_try_cancel;
+              execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
             };
         ];
     }
@@ -1693,6 +1696,7 @@ let test_child_routing_options () =
       seq = 1L; workflow_id = "child"; workflow_type = "child"; input = [];
       retry_policy = None; cancellation_type = Protocol.Child_try_cancel;
       task_queue = Some "go-llm-worker"; parent_close_policy = policy;
+      execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
     }] } in
     if unwrap (Protocol.decode_completion (unwrap (Protocol.encode_completion completion))) <> completion then
       failwith "child options did not round trip")
@@ -1705,6 +1709,117 @@ let test_child_routing_options () =
     [{|"task_queue":"",|}; {|"task_queue":"bad\u0000queue",|};
      {|"task_queue":23,|}; {|"parent_close_policy":"unknown",|};
      {|"parent_close_policy":1,|}; {|"task_queue":"a","task_queue":"b",|}]
+
+(** Child workflow timeouts and ID reuse policy (#1135). The document is the
+    exact one the Rust test [child_workflow_timeouts_and_reuse_policy_round_trip]
+    pins, so both sides agree on field names and the duration shape; the
+    OCaml encoder's output must decode to the same value, unset options must
+    be omitted, and the root-start timeout rules reject the same documents
+    Rust rejects. *)
+let test_child_timeout_options () =
+  let rust_document =
+    {|{"commands":[{"cancellation_type":"try_cancel","execution_timeout":{"nanoseconds":0,"seconds":3600},"id_reuse_policy":"reject_duplicate","input":[],"kind":"start_child_workflow","retry_policy":null,"run_timeout":{"nanoseconds":0,"seconds":600},"seq":2,"task_timeout":{"nanoseconds":500000000,"seconds":10},"workflow_id":"child/1","workflow_type":"child"}],"run_id":"parent-run"}|}
+  in
+  let seconds seconds : Protocol.duration option = Some { seconds; nanoseconds = 0 } in
+  let child ?execution_timeout ?run_timeout ?task_timeout ?id_reuse_policy () =
+    Protocol.
+      {
+        run_id = "parent-run";
+        task_failure = None;
+        commands =
+          [
+            Start_child_workflow
+              {
+                seq = 2L; workflow_id = "child/1"; workflow_type = "child";
+                input = []; retry_policy = None;
+                cancellation_type = Child_try_cancel; task_queue = None;
+                parent_close_policy = None; execution_timeout; run_timeout;
+                task_timeout; id_reuse_policy;
+              };
+          ];
+      }
+  in
+  let expected =
+    child ?execution_timeout:(seconds 3600L) ?run_timeout:(seconds 600L)
+      ~task_timeout:{ seconds = 10L; nanoseconds = 500_000_000 }
+      ~id_reuse_policy:Protocol.Reuse_reject_duplicate ()
+  in
+  if unwrap (Protocol.decode_completion rust_document) <> expected then
+    failwith "Rust child-option document decoded to a different value";
+  List.iter
+    (fun id_reuse_policy ->
+      let value = child ~id_reuse_policy () in
+      if unwrap (Protocol.decode_completion (unwrap (Protocol.encode_completion value)))
+         <> value
+      then failwith "child reuse policy did not round trip")
+    Protocol.
+      [ Reuse_allow_duplicate; Reuse_allow_duplicate_failed_only; Reuse_reject_duplicate ];
+  if unwrap (Protocol.decode_completion (unwrap (Protocol.encode_completion expected)))
+     <> expected
+  then failwith "child timeouts did not round trip";
+  let unset = unwrap (Protocol.encode_completion (child ())) in
+  List.iter
+    (fun key ->
+      let needle = "\"" ^ key ^ "\"" in
+      let rec contains index =
+        index + String.length needle <= String.length unset
+        && (String.sub unset index (String.length needle) = needle
+           || contains (index + 1))
+      in
+      if contains 0 then failwith ("unset child option was encoded: " ^ key))
+    [ "execution_timeout"; "run_timeout"; "task_timeout"; "id_reuse_policy" ];
+  (* Each invalid combination fails in both directions: the OCaml encoder
+     refuses the value and the decoder refuses the equivalent document. *)
+  List.iter
+    (fun (value, path) ->
+      (match Protocol.encode_completion value with
+      | Ok _ -> failwith ("encoder accepted invalid child timeouts at " ^ path)
+      | Error error ->
+          if (Protocol.error_view error).path <> path then
+            failwith ("encoder reported the wrong path for " ^ path));
+      let document =
+        {|{"run_id":"parent-run","commands":[{"kind":"start_child_workflow","seq":2,"workflow_id":"child/1","workflow_type":"child","input":[],"retry_policy":null,"cancellation_type":"try_cancel",|}
+        ^ (match value.commands with
+          | [ Protocol.Start_child_workflow { execution_timeout; run_timeout; task_timeout; _ } ] ->
+              String.concat ","
+                (List.filter_map
+                   (fun (name, value) ->
+                     Option.map
+                       (fun (value : Protocol.duration) ->
+                         Printf.sprintf {|"%s":{"seconds":%Ld,"nanoseconds":%d}|}
+                           name value.seconds value.nanoseconds)
+                       value)
+                   [ ("execution_timeout", execution_timeout);
+                     ("run_timeout", run_timeout);
+                     ("task_timeout", task_timeout) ])
+          | _ -> assert false)
+        ^ "}]}"
+      in
+      match Protocol.decode_completion document with
+      | Ok _ -> failwith ("decoder accepted invalid child timeouts at " ^ path)
+      | Error _ -> ())
+    [
+      (child ?execution_timeout:(seconds 0L) (), "$.commands.execution_timeout");
+      (child ?run_timeout:(seconds 0L) (), "$.commands.run_timeout");
+      (child ?task_timeout:(seconds 121L) (), "$.commands.task_timeout");
+      (child ?execution_timeout:(seconds 60L) ?run_timeout:(seconds 61L) (),
+       "$.commands.run_timeout");
+      (child ?run_timeout:(seconds 30L) ?task_timeout:(seconds 31L) (),
+       "$.commands.task_timeout");
+      (child ?execution_timeout:(seconds 30L) ?task_timeout:(seconds 31L) (),
+       "$.commands.task_timeout");
+    ];
+  List.iter
+    (fun field ->
+      let malformed =
+        {|{"run_id":"run","commands":[{|} ^ field
+        ^ {|"kind":"start_child_workflow","seq":1,"workflow_id":"child","workflow_type":"child","input":[],"retry_policy":null,"cancellation_type":"try_cancel"}]}|}
+      in
+      match Protocol.decode_completion malformed with
+      | Error _ -> ()
+      | Ok _ -> failwith "invalid child timeout option accepted")
+    [ {|"id_reuse_policy":"terminate_if_running",|}; {|"id_reuse_policy":1,|};
+      {|"run_timeout":5,|}; {|"task_timeout":{"seconds":-1,"nanoseconds":0},|} ]
 
 (** Decodes one activation, re-encodes it, and requires the strict decoder to
     reproduce the same value, proving the input is representable in both
@@ -1836,6 +1951,7 @@ let test_inbound_truncated_eviction_message () =
 
 let () =
   test_child_routing_options ();
+  test_child_timeout_options ();
   run "inbound degraded activation" test_inbound_degraded_activation;
   run "inbound truncated eviction message" test_inbound_truncated_eviction_message;
   run "terminated failure info" test_terminated_failure_info;

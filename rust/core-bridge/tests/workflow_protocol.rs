@@ -502,6 +502,10 @@ fn converts_start_child_workflow_command() {
             input: vec![input.clone()],
             retry_policy: None,
             cancellation_type: workflow_protocol::ChildWorkflowCancellationType::TryCancel,
+            execution_timeout: None,
+            run_timeout: None,
+            task_timeout: None,
+            id_reuse_policy: None,
         }],
     };
     let encoded = workflow_protocol::encode_completion(&completion).unwrap();
@@ -543,13 +547,225 @@ fn converts_start_child_workflow_command() {
     else {
         panic!("child command must map to Core's start-child variant");
     };
-    child.workflow_id_reuse_policy = 1;
+    // Cron schedules are still not represented; reuse policies and
+    // timeouts are, and are covered by the next test.
+    child.cron_schedule = "* * * * *".to_owned();
     assert_eq!(
         workflow_protocol::completion_from_core(&unsupported)
             .unwrap_err()
             .code,
         workflow_protocol::CoreConversionErrorCode::Unsupported
     );
+}
+
+/// Builds a one-command completion that starts `child/1` with the given
+/// workflow timeouts and ID reuse policy, for the child-option tests below.
+fn child_start_with_options(
+    execution_timeout: Option<workflow_protocol::Duration>,
+    run_timeout: Option<workflow_protocol::Duration>,
+    task_timeout: Option<workflow_protocol::Duration>,
+    id_reuse_policy: Option<workflow_protocol::ChildWorkflowIdReusePolicy>,
+) -> workflow_protocol::Completion {
+    workflow_protocol::Completion {
+        task_failure: None,
+        run_id: "parent-run".to_owned(),
+        commands: vec![workflow_protocol::CompletionCommand::StartChildWorkflow {
+            task_queue: None,
+            parent_close_policy: None,
+            seq: 2,
+            workflow_id: "child/1".to_owned(),
+            workflow_type: "child".to_owned(),
+            input: Vec::new(),
+            retry_policy: None,
+            cancellation_type: workflow_protocol::ChildWorkflowCancellationType::TryCancel,
+            execution_timeout,
+            run_timeout,
+            task_timeout,
+            id_reuse_policy,
+        }],
+    }
+}
+
+/// Shorthand for a whole-second protocol duration.
+fn seconds(seconds: i64) -> Option<workflow_protocol::Duration> {
+    Some(workflow_protocol::Duration {
+        seconds,
+        nanoseconds: 0,
+    })
+}
+
+/// Pins the child timeout and ID reuse fields (#1135) through the exact JSON
+/// document, Core's start-child command, and Core's reverse conversion. An
+/// unset option is omitted from the document and left at Core's default, so
+/// existing child starts are unchanged; every reuse policy maps to Core's
+/// enum value.
+#[test]
+fn child_workflow_timeouts_and_reuse_policy_round_trip() {
+    let completion = child_start_with_options(
+        seconds(3_600),
+        seconds(600),
+        Some(workflow_protocol::Duration {
+            seconds: 10,
+            nanoseconds: 500_000_000,
+        }),
+        Some(workflow_protocol::ChildWorkflowIdReusePolicy::RejectDuplicate),
+    );
+    let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+    // The canonical encoder sorts keys, so the whole document is pinned.
+    assert_eq!(
+        encoded,
+        concat!(
+            r#"{"commands":[{"cancellation_type":"try_cancel","#,
+            r#""execution_timeout":{"nanoseconds":0,"seconds":3600},"#,
+            r#""id_reuse_policy":"reject_duplicate","input":[],"#,
+            r#""kind":"start_child_workflow","retry_policy":null,"#,
+            r#""run_timeout":{"nanoseconds":0,"seconds":600},"seq":2,"#,
+            r#""task_timeout":{"nanoseconds":500000000,"seconds":10},"#,
+            r#""workflow_id":"child/1","workflow_type":"child"}],"#,
+            r#""run_id":"parent-run"}"#
+        )
+    );
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        completion
+    );
+    let core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_ref()
+    else {
+        panic!("child completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::StartChildWorkflowExecution(child)) =
+        success.commands[0].variant.as_ref()
+    else {
+        panic!("child command must map to Core's start-child variant");
+    };
+    assert_eq!(
+        child.workflow_execution_timeout.as_ref().unwrap().seconds,
+        3_600
+    );
+    assert_eq!(child.workflow_run_timeout.as_ref().unwrap().seconds, 600);
+    let task = child.workflow_task_timeout.as_ref().unwrap();
+    assert_eq!((task.seconds, task.nanos), (10, 500_000_000));
+    assert_eq!(child.workflow_id_reuse_policy, 3);
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        completion
+    );
+
+    for (policy, core_value, wire_name) in [
+        (
+            workflow_protocol::ChildWorkflowIdReusePolicy::AllowDuplicate,
+            1,
+            "allow_duplicate",
+        ),
+        (
+            workflow_protocol::ChildWorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+            2,
+            "allow_duplicate_failed_only",
+        ),
+        (
+            workflow_protocol::ChildWorkflowIdReusePolicy::RejectDuplicate,
+            3,
+            "reject_duplicate",
+        ),
+    ] {
+        let completion = child_start_with_options(None, None, None, Some(policy));
+        let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+        assert!(encoded.contains(&format!("\"id_reuse_policy\":\"{wire_name}\"")));
+        let core = workflow_protocol::completion_to_core(&completion).unwrap();
+        let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+            core.status.as_ref()
+        else {
+            panic!("child completion must be successful");
+        };
+        let Some(core_commands::workflow_command::Variant::StartChildWorkflowExecution(child)) =
+            success.commands[0].variant.as_ref()
+        else {
+            panic!("child command must map to Core's start-child variant");
+        };
+        assert_eq!(child.workflow_id_reuse_policy, core_value);
+        assert_eq!(
+            workflow_protocol::completion_from_core(&core).unwrap(),
+            completion
+        );
+    }
+
+    let unset = child_start_with_options(None, None, None, None);
+    let encoded = workflow_protocol::encode_completion(&unset).unwrap();
+    for key in [
+        "execution_timeout",
+        "run_timeout",
+        "task_timeout",
+        "id_reuse_policy",
+    ] {
+        assert!(!encoded.contains(key), "unset {key} must be omitted");
+    }
+    let core = workflow_protocol::completion_to_core(&unset).unwrap();
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_ref()
+    else {
+        panic!("child completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::StartChildWorkflowExecution(child)) =
+        success.commands[0].variant.as_ref()
+    else {
+        panic!("child command must map to Core's start-child variant");
+    };
+    assert!(child.workflow_execution_timeout.is_none());
+    assert!(child.workflow_run_timeout.is_none());
+    assert!(child.workflow_task_timeout.is_none());
+    assert_eq!(child.workflow_id_reuse_policy, 0);
+}
+
+/// Rejects child timeout combinations Temporal would not honour with the
+/// same rules as root starts: zero, a task timeout above 120 seconds, a run
+/// timeout above the execution timeout, and a task timeout above the run (or
+/// execution) timeout. Each document is otherwise valid, so only the timeout
+/// rule can reject it.
+#[test]
+fn child_workflow_timeout_rules_are_enforced() {
+    let cases = [
+        (
+            child_start_with_options(seconds(0), None, None, None),
+            "$.commands.execution_timeout",
+        ),
+        (
+            child_start_with_options(None, seconds(0), None, None),
+            "$.commands.run_timeout",
+        ),
+        (
+            child_start_with_options(None, None, seconds(121), None),
+            "$.commands.task_timeout",
+        ),
+        (
+            child_start_with_options(seconds(60), seconds(61), None, None),
+            "$.commands.run_timeout",
+        ),
+        (
+            child_start_with_options(None, seconds(30), seconds(31), None),
+            "$.commands.task_timeout",
+        ),
+        (
+            child_start_with_options(seconds(30), None, seconds(31), None),
+            "$.commands.task_timeout",
+        ),
+    ];
+    for (completion, path) in cases {
+        let error = workflow_protocol::encode_completion(&completion).unwrap_err();
+        assert_eq!(error.path, path);
+    }
+    // Boundary values are accepted: task equal to run and to 120 seconds.
+    for completion in [
+        child_start_with_options(seconds(120), seconds(120), seconds(120), None),
+        child_start_with_options(seconds(60), None, seconds(60), None),
+    ] {
+        let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+        assert_eq!(
+            workflow_protocol::decode_completion(&encoded).unwrap(),
+            completion
+        );
+    }
 }
 
 /// Proves the local-activity command and its distinct cancellation command are
@@ -722,6 +938,10 @@ fn injects_worker_namespace_into_child_workflow_command() {
             input: Vec::new(),
             retry_policy: None,
             cancellation_type: workflow_protocol::ChildWorkflowCancellationType::TryCancel,
+            execution_timeout: None,
+            run_timeout: None,
+            task_timeout: None,
+            id_reuse_policy: None,
         }],
     };
     let core = workflow_protocol::completion_to_core_for_activation_with_namespace(
@@ -800,6 +1020,10 @@ fn converts_all_child_cancellation_policies() {
                 input: vec![input.clone()],
                 retry_policy: None,
                 cancellation_type: policy,
+                execution_timeout: None,
+                run_timeout: None,
+                task_timeout: None,
+                id_reuse_policy: None,
             }],
         };
         let encoded = workflow_protocol::encode_completion(&completion).unwrap();
@@ -926,6 +1150,10 @@ fn rejects_invalid_child_cancellation_commands() {
             input: Vec::new(),
             retry_policy: None,
             cancellation_type: workflow_protocol::ChildWorkflowCancellationType::TryCancel,
+            execution_timeout: None,
+            run_timeout: None,
+            task_timeout: None,
+            id_reuse_policy: None,
         }],
     };
     assert!(workflow_protocol::encode_completion(&outgoing_nul).is_err());
@@ -3931,6 +4159,10 @@ fn child_routing_and_parent_close_round_trip() {
                 input: vec![],
                 retry_policy: None,
                 cancellation_type: workflow_protocol::ChildWorkflowCancellationType::TryCancel,
+                execution_timeout: None,
+                run_timeout: None,
+                task_timeout: None,
+                id_reuse_policy: None,
             }],
         };
         let encoded = workflow_protocol::encode_completion(&completion).unwrap();

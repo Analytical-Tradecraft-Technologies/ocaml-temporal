@@ -6039,3 +6039,25 @@ runner output and report state that a pass is forward-compatibility evidence
 only, not rollback evidence (#508). The
 whole corpus replays in about a second. Every current capture comes from Core
 `95e97686`, so the first Core bump will be the first cross-revision replay.
+
+## 2026-10-24: Child workflow timeouts and ID reuse policy (#1135, first half)
+
+`Child_workflow.start`, `start_handle` and `execute` take
+`?execution_timeout`, `?run_timeout`, `?task_timeout` and `?id_reuse_policy`.
+The timeout rules moved from `Client.start` into the private
+`Workflow_timeouts_private.validate`, so the client and a parent reject the
+same values with the same messages before any command. The runtime command,
+the OCaml workflow protocol (encoder and decoder), the completion JSON schema
+and the Rust `StartChildWorkflow` decoder carry the four fields as optional
+keys omitted when unset, so existing child starts encode byte-identically.
+Rust re-validates the timeout rules, maps them onto Core's
+`StartChildWorkflowExecution` fields (an unset reuse policy stays
+`Unspecified`), and the reverse Core conversion now accepts them, still
+rejecting the deprecated terminate-if-running policy. Evidence: the Rust tests
+`child_workflow_timeouts_and_reuse_policy_round_trip` and
+`child_workflow_timeout_rules_are_enforced` pin the exact document, which the
+OCaml `test_child_timeout_options` decodes, and
+`test/runtime/test_child_start_options.ml` covers the public boundary.
+`Temporal.Testing` records but does not enforce child timeouts. Still open
+under #1135: memo and search attributes (blocked by #512), a live
+run-timeout regression and a corpus history.

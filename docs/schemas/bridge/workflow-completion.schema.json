@@ -181,7 +181,7 @@
         {
           "type": "object", "additionalProperties": false,
           "required": ["kind", "seq", "workflow_id", "workflow_type", "input", "retry_policy", "cancellation_type"],
-          "description": "Starts a child workflow. An optional retry policy is passed to Core. The workflow-level command omits namespace because Rust injects the already validated worker namespace at the Core boundary; Optional task_queue and parent_close_policy preserve explicit routing and lifecycle choices; omission retains Core defaults. Timeouts, reuse policy, cron, headers, memo, search attributes, versioning, and priority remain Core defaults.",
+          "description": "Starts a child workflow. An optional retry policy is passed to Core. The workflow-level command omits namespace because Rust injects the already validated worker namespace at the Core boundary; Optional task_queue and parent_close_policy preserve explicit routing and lifecycle choices; omission retains Core defaults. Optional execution_timeout, run_timeout and task_timeout follow the root-start rules (positive; run no larger than execution; task at most 120 seconds and no larger than run, or execution without run) and optional id_reuse_policy selects closed-run ID reuse; all four are omitted when unset. Cron, headers, memo, search attributes, versioning, and priority remain Core defaults.",
           "properties": {
             "kind": {"const": "start_child_workflow"},
             "task_queue": {"oneOf": [{"$ref": "#/$defs/identifier"}, {"type": "null"}]},
@@ -191,7 +191,11 @@
             "workflow_type": {"$ref": "#/$defs/identifier"},
             "input": {"type": "array", "maxItems": 201326592, "items": {"$ref": "#/$defs/payload"}},
             "retry_policy": {"oneOf": [{"$ref": "#/$defs/retry_policy"}, {"type": "null"}]},
-            "cancellation_type": {"enum": ["try_cancel", "wait_cancellation_completed", "abandon", "wait_cancellation_requested"]}
+            "cancellation_type": {"enum": ["try_cancel", "wait_cancellation_completed", "abandon", "wait_cancellation_requested"]},
+            "execution_timeout": {"oneOf": [{"$ref": "#/$defs/duration"}, {"type": "null"}]},
+            "run_timeout": {"oneOf": [{"$ref": "#/$defs/duration"}, {"type": "null"}]},
+            "task_timeout": {"oneOf": [{"$ref": "#/$defs/duration"}, {"type": "null"}]},
+            "id_reuse_policy": {"enum": ["allow_duplicate", "allow_duplicate_failed_only", "reject_duplicate", null]}
           }
         },
         {

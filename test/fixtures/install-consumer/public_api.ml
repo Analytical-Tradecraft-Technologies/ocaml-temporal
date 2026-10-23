@@ -302,6 +302,10 @@ let _child_start :
     ?retry_policy:T.Retry_policy.t ->
     ?task_queue:string ->
     ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
@@ -314,6 +318,10 @@ let _child_start_handle :
     ?retry_policy:T.Retry_policy.t ->
     ?task_queue:string ->
     ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input -> 'output T.Child_workflow.handle =
@@ -338,6 +346,10 @@ let _child_execute :
     ?retry_policy:T.Retry_policy.t ->
     ?task_queue:string ->
     ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
