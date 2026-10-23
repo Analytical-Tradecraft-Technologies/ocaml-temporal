@@ -64,30 +64,78 @@ let output definition = definition.output
     reference that can only be invoked as a child. *)
 let implementation definition = definition.implementation
 
+(** Verifies an optional structured-cancellation scope before a timer command
+    is emitted. A cancelled scope yields its typed [`Cancelled] error without a
+    command, matching scoped activity and child starts; a query may read the
+    scope but may never schedule a scoped timer. *)
+let check_scope = function
+  | None -> Ok ()
+  | Some scope -> (
+      match Temporal_sdk_kernel.Workflow_context_store.current () with
+      | Some context
+        when Temporal_sdk_kernel.Workflow_context_store.in_owner_turn context ->
+          Scope.check scope
+      | _ ->
+          Error
+            (Error.defect
+               ~message:"scoped workflow sleep used outside a workflow scheduler turn"))
+
 (** Starts a durable timer without waiting for it. The runtime future is
     wrapped before it crosses into the public API, converting native errors to
-    public errors and preserving the workflow scheduler owner. *)
-let start_sleep duration =
+    public errors and preserving the workflow scheduler owner. With [scope],
+    the timer's cancellation is registered until the timer settles, so
+    cancelling the scope emits exactly one [Cancel_timer] for a still-pending
+    timer and none for one that already fired. *)
+let start_sleep ?scope duration =
+  let outside_message = "workflow sleep used outside a workflow execution" in
+  let failed error =
+    Future_private.resolved
+      ~outside_error:(fun () -> Error.defect ~message:outside_message)
+      (Error error)
+  in
   match Temporal_sdk_kernel.Workflow_context_store.current () with
-  | None ->
-      Future_private.resolved
-        ~outside_error:(fun () ->
-          Error.defect ~message:"workflow sleep used outside a workflow execution")
-        (Error
-           (Error.defect ~message:"workflow sleep used outside a workflow execution"))
-  | Some context ->
-      let milliseconds = Duration.to_ms duration in
-      if milliseconds = 0L then
-        (* A zero-duration timer is already ready; omitting the command keeps
-           replay history free of a timer that cannot suspend the workflow. *)
-        Future_private.of_internal
-          (Temporal_sdk_kernel.Workflow_context_store.resolved context (Ok ()))
-      else
-        Future_private.of_internal
-          (Temporal_sdk_kernel.Workflow_context_store.start_timer context milliseconds)
+  | None -> failed (Error.defect ~message:outside_message)
+  | Some context -> (
+      match check_scope scope with
+      | Error error -> failed error
+      | Ok () ->
+          let milliseconds = Duration.to_ms duration in
+          if milliseconds = 0L then
+            (* A zero-duration timer is already ready; omitting the command
+               keeps replay history free of a timer that cannot suspend the
+               workflow, so there is also nothing for a scope to cancel. *)
+            Future_private.of_internal
+              (Temporal_sdk_kernel.Workflow_context_store.resolved context (Ok ()))
+          else
+            let future, cancel =
+              Temporal_sdk_kernel.Workflow_context_store.start_timer context
+                milliseconds
+            in
+            let future = Future_private.of_internal future in
+            Option.iter
+              (fun scope ->
+                (* The scope was checked in this owner turn, so registration
+                   cannot fail on ownership; [until] drops the hook once the
+                   timer fires so long-lived scopes retain no fired timers. *)
+                ignore
+                  (Scope.on_cancel ~until:future scope (fun () ->
+                       Result.map_error Error_private.of_base (cancel ()))))
+              scope;
+            future)
 
-(** Implements direct-style sleep as timer creation followed by a future wait. *)
-let sleep duration = Future.await (start_sleep duration)
+(** Implements direct-style sleep as timer creation followed by a future wait.
+    A scoped sleep is awaited through its scope, so cancelling the scope from
+    another fiber both cancels the durable timer and resumes this caller with
+    the scope's [`Cancelled] error. A start that already failed (outside a
+    workflow, from a query, or on a cancelled scope) returns that error
+    directly, so a detached call reports the sleep defect rather than the
+    scope's ownership defect. *)
+let sleep ?scope duration =
+  let future = start_sleep ?scope duration in
+  match (scope, Future.peek future) with
+  | None, _ -> Future.await future
+  | Some _, Some (Error _ as error) -> error
+  | Some scope, (Some (Ok ()) | None) -> Scope.await scope future
 
 (** Validates a workflow execution target before retaining it in a command.
     [run_id] is [None] to let Temporal resolve the current run; the workflow

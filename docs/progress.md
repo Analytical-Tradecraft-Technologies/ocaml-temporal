@@ -6039,3 +6039,23 @@ runner output and report state that a pass is forward-compatibility evidence
 only, not rollback evidence (#508). The
 whole corpus replays in about a second. Every current capture comes from Core
 `95e97686`, so the first Core bump will be the first cross-revision replay.
+
+## 2026-10-24: Scoped durable-timer cancellation (#1134, first slice)
+
+`Workflow.start_sleep` and `Workflow.sleep` take `?scope`. The runtime timer
+now returns a cancellation operation next to its future: while the timer is
+pending it removes the resolver, emits one `Cancel_timer` and settles the
+future with a `Cancelled` error. After the firing job (same or later
+activation), after a repeated cancellation, or once a terminal command sealed
+the context, it is `Ok ()` with no command; from another execution it is a
+typed defect. Core's timer machine ignores cancels of fired timers and
+delivers no firing job for a cancelled one, so no bridge or protocol change
+was needed, and unscoped sleeps emit the same commands as before.
+`Scope.with_scope` around `Future.race work (start_sleep ~scope timeout)`
+therefore leaves no pending timer when the work wins.
+`test/runtime/test_timer_cancellation.ml` covers cancel before fire,
+direct-style `sleep ~scope`, cancel after fire in the same and a later
+activation, the race cleanup, an already-cancelled scope, zero duration,
+unchanged unscoped commands, and foreign-owner rejection. Still open under
+#1134: `Condition.wait_until ~timeout`, a live scenario and corpus histories
+for cancel-before/after-fire.

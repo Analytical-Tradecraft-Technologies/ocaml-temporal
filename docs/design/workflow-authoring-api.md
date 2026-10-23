@@ -35,8 +35,8 @@ module Child_workflow : sig
 end
 
 module Workflow : sig
-  val start_sleep : Duration.t -> (unit, Error.t) Future.t
-  val sleep : Duration.t -> (unit, Error.t) result
+  val start_sleep : ?scope:Scope.t -> Duration.t -> (unit, Error.t) Future.t
+  val sleep : ?scope:Scope.t -> Duration.t -> (unit, Error.t) result
 end
 
 module Future : sig
@@ -103,8 +103,10 @@ it before resolving, which rejects unknown or duplicate completion jobs without
 double-resolving a future.
 
 `Workflow.start_sleep` records a timer and returns immediately. `Workflow.sleep`
-is exactly `start_sleep` followed by `Future.await`. A zero duration produces an
-already-ready future and no history command.
+is exactly `start_sleep` followed by `Future.await` (or `Scope.await` when
+`~scope` is given). A zero duration produces an already-ready future and no
+history command. A scoped timer is cancelled with one `Cancel_timer` when its
+scope is cancelled before the timer fires.
 
 ## Ordinary helper composition
 

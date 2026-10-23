@@ -39,6 +39,22 @@ timestamp (such as cache eviction), `Temporal.Workflow.now ()` returns a typed
 defect. It never silently falls back to local wall-clock time, because doing so
 would make replay behavior depend on the worker host.
 
+## Durable timers and cancellation
+
+`Temporal.Workflow.start_sleep duration` emits one `Start_timer` command and
+returns a future that resolves when Core delivers the matching firing job;
+`Temporal.Workflow.sleep` starts and awaits it. A zero duration is ready at
+once and records no timer. Both accept `~scope` (#1134): cancelling the scope
+while the timer is pending emits one `Cancel_timer` (history records
+`TimerCanceled`) and settles the timer future with a `Cancelled` error, while a
+timer whose firing job was already applied, in the same or an earlier
+activation, keeps its `Ok ()` and emits nothing. Core folds a cancellation
+buffered in the same activation as the start into no history events at all,
+and it never delivers a firing job for a cancelled timer. Unscoped sleeps emit
+exactly the commands they did before, so histories recorded without timer
+cancellation replay unchanged. See the [scope contract](workflow-scopes.md)
+for the `Scope.with_scope` pattern that cancels the losing timer of a race.
+
 ## Deterministic pseudo-random values
 
 `Temporal.Workflow.random_int ~bound` draws an integer in `[0, bound)` from a

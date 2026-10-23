@@ -372,9 +372,18 @@ val cancel_external_workflow :
   unit ->
   (unit, Temporal_base.Error.t) Future_store.t
 
-(** Emits a durable timer command and returns a future resolved by [fire_timer].
-    The duration is an exact non-negative millisecond count. *)
-val start_timer : t -> int64 -> (unit, Temporal_base.Error.t) Future_store.t
+(** Emits a durable timer command and returns a future resolved by [fire_timer]
+    together with its cancellation operation. The duration is an exact
+    non-negative millisecond count. Cancelling a pending timer emits
+    [Cancel_timer] once and settles the future with a [`Cancelled] error;
+    cancelling after it fired or was already cancelled is [Ok ()] with no
+    command, as is any cancellation after a terminal command sealed the
+    context. Cancellation outside this execution is a typed defect. *)
+val start_timer :
+  t ->
+  int64 ->
+  (unit, Temporal_base.Error.t) Future_store.t
+  * (unit -> (unit, Temporal_base.Error.t) result)
 
 (** Supplies an activity result to the pending future with this sequence number
     and then removes it. An unknown or repeated number returns a non-retryable

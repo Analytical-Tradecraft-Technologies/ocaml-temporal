@@ -19,7 +19,7 @@ let rec timer_loop () =
         (Temporal_base.Error.defect
            ~message:"warm benchmark ran outside a workflow execution")
   | Some context -> (
-      match Future.await (Context.start_timer context 1L) with
+      match Future.await (fst (Context.start_timer context 1L)) with
       | Ok () -> timer_loop ()
       | Error error -> Error error)
 

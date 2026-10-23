@@ -639,7 +639,9 @@ error before a history command is emitted. Omitting `~retry_policy` is
 different from supplying one: the private protocol carries an explicit JSON
 `null`, so Temporal's default policy remains distinguishable from a concrete
 policy during replay. `Temporal.Workflow.start_sleep` creates a durable timer
-without waiting; `Temporal.Workflow.sleep` is the start-and-wait form.
+without waiting; `Temporal.Workflow.sleep` is the start-and-wait form. Both
+accept `~scope`: cancelling that scope while the timer is pending records
+`TimerCanceled` and settles the timer with a `Cancelled` error.
 
 When a workflow must decide later whether to stop an activity, keep the opaque
 handle returned by `Activity.start_handle` instead of discarding it:
@@ -732,11 +734,12 @@ read from racing the queue that owns the scope.
 Scope cancellation is cooperative for local observation and structured for
 selected durable operations. Starting an activity or child workflow with
 `~scope` registers a server-cancellation hook that runs exactly once when the
-scope is cancelled, using that operation's configured cancellation policy.
-Timers and operations started without `~scope` are not implicitly cancelled;
-retain their handles when they must be controlled independently. Losing
-futures in `Future.race` remain ordinary observations unless the caller
-explicitly uses a scope around the later wait.
+scope is cancelled, using that operation's configured cancellation policy; a
+timer started with `Workflow.start_sleep ~scope` is cancelled the same way.
+Operations started without `~scope` are not implicitly cancelled; retain
+their handles when they must be controlled independently. Losing futures in
+`Future.race` remain ordinary observations unless the caller starts them with
+`~scope` inside `Scope.with_scope`, whose cleanup then cancels the losers.
 
 Scopes cancel work the workflow itself started. A cancellation of the
 workflow run (from `Client.cancel` or a parent) is different: the worker
