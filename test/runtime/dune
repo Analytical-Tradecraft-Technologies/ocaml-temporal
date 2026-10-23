@@ -35,7 +35,8 @@
   test_execution_info
   test_thread_context_isolation
   test_race_matrix
-  test_timer_cancellation)
+  test_timer_cancellation
+  test_condition_timeout)
  (modules
   (:standard \ test_worker_domain_budget))
  (libraries temporal-sdk temporal_runtime temporal_core_bridge unix))

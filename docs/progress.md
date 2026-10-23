@@ -6059,3 +6059,20 @@ activation, the race cleanup, an already-cancelled scope, zero duration,
 unchanged unscoped commands, and foreign-owner rejection. Still open under
 #1134: `Condition.wait_until ~timeout`, a live scenario and corpus histories
 for cancel-before/after-fire.
+
+## 2026-10-24: Bounded condition waits (#1134, second slice)
+
+`Condition.wait_until ?timeout` and `wait_until_result ?timeout` bound a
+workflow-local condition with a durable timer built from the scoped timer
+cancellation of the first #1134 slice. The predicate handed to the
+condition store also reports true once the timer has fired, so the
+activation loop's usual idle recheck wakes the waiter; the application
+predicate is then re-read so a satisfied state wins over a timeout delivered
+in the same activation, and the wait's private scope is cancelled, which
+emits `Cancel_timer` for a still-pending timer. A timeout is a typed
+`` `Timeout `` error. No runtime or protocol change; unbounded waits record
+nothing, as before. `test/runtime/test_condition_timeout.ml` covers
+satisfaction cancelling the timer, timeout, satisfaction and firing in one
+activation, zero and unbounded waits, a predicate error, and the detached
+defect. The live scenario and corpus histories for cancel-before/after-fire
+remain open under #1134.

@@ -55,6 +55,14 @@ exactly the commands they did before, so histories recorded without timer
 cancellation replay unchanged. See the [scope contract](workflow-scopes.md)
 for the `Scope.with_scope` pattern that cancels the losing timer of a race.
 
+`Temporal.Condition.wait_until ?timeout` and `wait_until_result ?timeout` use
+the same scoped timer: the condition store's predicate also reports true once
+the timer has fired, so the firing activation wakes the waiter; the
+application predicate is then re-read, satisfaction wins over a timeout in the
+same activation, and the private scope is cancelled so a satisfied wait emits
+`Cancel_timer` for its still-pending timer. A timeout returns a `` `Timeout ``
+error. A zero bound records no timer.
+
 ## Deterministic pseudo-random values
 
 `Temporal.Workflow.random_int ~bound` draws an integer in `[0, bound)` from a

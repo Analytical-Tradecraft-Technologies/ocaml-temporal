@@ -934,11 +934,12 @@ let _worker_shutdown_report_fields
 let _worker_request_shutdown : T.Worker.t -> unit = T.Worker.request_shutdown
 
 (* The remaining small modules still participate in the public contract. *)
-let _condition_wait_until : (unit -> bool) -> (unit, T.Error.t) result =
+let _condition_wait_until :
+    ?timeout:T.Duration.t -> (unit -> bool) -> (unit, T.Error.t) result =
   T.Condition.wait_until
 
 let _condition_wait_until_result :
-    T.Condition.predicate -> (unit, T.Error.t) result =
+    ?timeout:T.Duration.t -> T.Condition.predicate -> (unit, T.Error.t) result =
   T.Condition.wait_until_result
 
 let _runtime_abi_version : unit -> (int32, T.Error.t) result =
