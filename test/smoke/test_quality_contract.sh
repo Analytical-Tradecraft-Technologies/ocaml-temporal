@@ -243,6 +243,12 @@ attest_line=$(printf '%s\n' "$release_publish_job" | grep -n 'uses: actions/atte
 publish_line=$(printf '%s\n' "$release_publish_job" | grep -n 'gh release create' | cut -d: -f1)
 test -n "$attest_line" && test "$attest_line" -lt "$publish_line"
 printf '%s\n' "$release_publish_text" | grep -Fq 'sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"'
+# Release from the tag (#1144): validation requires a dispatch from the tag
+# ref and a tagged commit already on master, never the master tip itself.
+release_validate_job=$(printf '%s\n' "$release_publish_text" | sed -n '/^  validate:/,/^  build:/p')
+printf '%s\n' "$release_validate_job" | grep -Fq 'if [ "$RELEASE_REF" != "refs/tags/$RELEASE_TAG" ]; then'
+printf '%s\n' "$release_validate_job" | grep -Fq 'sh scripts/check-release-tag-commit.sh "$RELEASE_TAG" "$GITHUB_SHA" master'
+if printf '%s\n' "$release_publish_text" | grep -Fq 'refs/heads/master'; then exit 1; fi
 for workflow in "$source_root"/.github/workflows/*.yml "$source_root"/.github/actions/*/action.yml; do
   assert_third_party_actions_pinned "$workflow" "$(cat "$workflow")"
 done

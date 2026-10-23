@@ -1,5 +1,8 @@
 name: Release
 
+# Dispatch from the version tag itself ("Use workflow from" -> Tags), so
+# GITHUB_SHA, every checkout and every attestation name the tagged commit even
+# if other PRs merge to master after the tag was pushed (#1144).
 on:
   workflow_dispatch:
     inputs:
@@ -30,16 +33,22 @@ jobs:
           RELEASE_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          test "$RELEASE_REF" = refs/heads/master
           # The descriptive tag check runs first so a "~" spelling gets its
           # hyphen guidance; Git's ref-format check exits silently.
           sh scripts/check-release-tag.sh . "$RELEASE_TAG"
           git check-ref-format "refs/tags/$RELEASE_TAG"
+          if [ "$RELEASE_REF" != "refs/tags/$RELEASE_TAG" ]; then
+            echo "Dispatch the Release workflow from the tag refs/tags/$RELEASE_TAG, not $RELEASE_REF." >&2
+            exit 1
+          fi
           # The reviewed notes for this tag (docs/releases/<tag>.md) must be
           # committed before anything is built; the publish job uses them.
           sh scripts/check-release-notes.sh . "$RELEASE_TAG"
           make release-preflight
-          sh scripts/check-release-tag-commit.sh "$RELEASE_TAG" "$GITHUB_SHA"
+          # The tag must still peel to the dispatched commit, and that commit
+          # must already be on master: the ruleset limits who may create a
+          # tag, and this keeps an unmerged commit from being released.
+          sh scripts/check-release-tag-commit.sh "$RELEASE_TAG" "$GITHUB_SHA" master
 
   build:
     needs: validate
