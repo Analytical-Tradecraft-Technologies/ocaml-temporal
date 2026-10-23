@@ -6039,31 +6039,3 @@ runner output and report state that a pass is forward-compatibility evidence
 only, not rollback evidence (#508). The
 whole corpus replays in about a second. Every current capture comes from Core
 `95e97686`, so the first Core bump will be the first cross-revision replay.
-
-## 2026-10-24: Bounded Client.wait and wait_update (#1136)
-
-`Client.wait ?timeout` and `Client.wait_update ?timeout` bound the caller's
-wait from the moment of the call; on a current-run handle the one budget
-covers the whole run chain, and on an update every poll. The deadline is
-enforced in `Sdk_supervisor.Client_call.await`, the loop every submitted
-client call is awaited through: no bounded native wait outlasts the
-remaining budget, and on expiry the loop releases the call (freeing its
-share of the `max_pending_waits` slot and aborting the Rust long poll, as
-#1019 already did for abandoned calls) and passes the shared
-expired-deadline failure through the call's own decoder. The caller
-therefore gets the same retryable error with `rpc_status`
-`Some `Deadline_exceeded` that any expired RPC deadline produces, and the
-workflow and the handle are untouched, so a later wait observes the run. No
-Rust or protocol change was needed. A zero timeout is a typed defect; a bound
-too long for the monotonic clock is treated as unbounded. Evidence:
-`test_concurrent_client_calls` checks with a fake clock that slices shrink
-to the remaining budget, that expiry releases once and decodes the deadline
-error, that an outcome published first is kept, and that an expired deadline
-releases without polling; `test_client_worker` checks validation and that a
-bounded mock wait is unchanged. A live regression against a stuck run
-(`test/integration/concurrent_client`) remains open.
-Codex review follow-up: an expired call is read once with a zero-length wait
-before it is released, so an outcome published while the caller was paused
-is returned rather than dropped, and a wait or update poll whose deadline has
-already passed is not submitted at all. Like `?rpc_timeout`, the bound does
-not interrupt the owner's network-free admission of a request.
