@@ -1,4 +1,4 @@
-# Check at 00:00, 08:00 and 16:00 Sydney every calendar day.
+# Check at 06:00 Sydney every calendar day.
 # Expanded ecosystem coverage authorized by the repository owner; OPAM remains unsupported.
 version: 2
 updates:
@@ -8,7 +8,7 @@ updates:
   - dependency-type: all
   schedule:
     interval: cron
-    cronjob: 0 */8 * * *
+    cronjob: 0 6 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
@@ -28,7 +28,7 @@ updates:
   directory: /
   schedule:
     interval: cron
-    cronjob: 0 */8 * * *
+    cronjob: 0 6 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
@@ -47,7 +47,7 @@ updates:
   directory: /docker/ocaml-5.2
   schedule:
     interval: cron
-    cronjob: 0 */8 * * *
+    cronjob: 0 6 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
@@ -59,7 +59,7 @@ updates:
   directory: /docker/ocaml-5.3
   schedule:
     interval: cron
-    cronjob: 0 */8 * * *
+    cronjob: 0 6 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
@@ -71,7 +71,7 @@ updates:
   directory: /docker/ocaml-5.4
   schedule:
     interval: cron
-    cronjob: 0 */8 * * *
+    cronjob: 0 6 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
@@ -83,7 +83,7 @@ updates:
   directory: /docker/ocaml-5.5
   schedule:
     interval: cron
-    cronjob: 0 */8 * * *
+    cronjob: 0 6 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
@@ -95,7 +95,7 @@ updates:
   directory: /test/integration/temporal
   schedule:
     interval: cron
-    cronjob: 0 */8 * * *
+    cronjob: 0 6 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
@@ -108,7 +108,7 @@ updates:
   directory: /rust
   schedule:
     interval: cron
-    cronjob: 0 */8 * * *
+    cronjob: 0 6 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
@@ -116,7 +116,7 @@ updates:
   directory: /
   schedule:
     interval: cron
-    cronjob: 0 */8 * * *
+    cronjob: 0 6 * * *
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
