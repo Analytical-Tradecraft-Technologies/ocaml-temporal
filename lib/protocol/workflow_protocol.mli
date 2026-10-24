@@ -508,15 +508,26 @@ type completion_command =
   | Continue_as_new of { workflow_type : string; input : payload list }
   | Cancel_workflow_execution
 
+(** A workflow type's versioning behavior on a deployment-versioned worker
+    (#1159): [Versioning_pinned] keeps a run on the deployment version it
+    started on; [Versioning_auto_upgrade] lets it move to the current one. *)
+type versioning_behavior = Versioning_pinned | Versioning_auto_upgrade
+
 (** Successful completion of one activation. At most one terminal workflow
     command may appear, and it must be last. Patch commands may repeat one mode
     per ID but may not mix active and deprecated modes for the same ID. *)
+
 type completion = {
   run_id : string;
   commands : completion_command list;
   task_failure : failure option;
   (** [Some] fails the workflow task through Core, never the execution. Failed
       tasks carry no commands. [None] preserves the successful command batch. *)
+  versioning_behavior : versioning_behavior option;
+  (** The workflow type's own behavior, sent as ["versioning_behavior"]
+      (["pinned"] or ["auto_upgrade"]) with a successful completion and
+      omitted when [None], which leaves Core to apply the worker's default.
+      A failed task never carries one. *)
 }
 
 type error

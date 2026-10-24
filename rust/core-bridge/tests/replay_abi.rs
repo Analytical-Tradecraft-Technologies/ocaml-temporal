@@ -590,6 +590,7 @@ fn replay_abi_retains_lease_after_malformed_completion() {
     assert_status(&mut result, STATUS_OUTSTANDING_TASKS);
 
     let completion = workflow_protocol::encode_completion(&workflow_protocol::Completion {
+        versioning_behavior: None,
         run_id: semantic.run_id,
         commands: vec![CompletionCommand::CompleteWorkflow { result: None }],
         task_failure: None,
@@ -753,6 +754,7 @@ fn replay_abi_rejects_only_semantically_matching_lease() {
             if workflow_id == second_workflow_id
     )));
     let completion = workflow_protocol::encode_completion(&workflow_protocol::Completion {
+        versioning_behavior: None,
         run_id: second.run_id,
         commands: vec![CompletionCommand::CompleteWorkflow { result: None }],
         task_failure: None,
@@ -960,6 +962,7 @@ fn replay_live_workflow_task_failure_histories() {
                 });
             }
             let completion = workflow_protocol::Completion {
+                versioning_behavior: None,
                 run_id: run_id.clone(),
                 commands,
                 task_failure: None,

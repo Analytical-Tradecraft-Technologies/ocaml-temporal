@@ -39,7 +39,7 @@ let activation =
 let completion =
   {
     Protocol.run_id = "benchmark-run";
-    task_failure = None;
+    versioning_behavior = None; task_failure = None;
     commands =
       [
         Protocol.Schedule_activity

@@ -66,15 +66,47 @@ deployment, and `Some `Pinned` keeps it on the selected deployment version.
 These choices are passed to Temporal Core's `WorkerDeploymentBased` strategy;
 the SDK does not perform deployment registration or rollout automation.
 
-The default is mandatory because this SDK does not yet offer a per-workflow
-versioning behavior. Every workflow-task completion therefore leaves the
-behavior `UNSPECIFIED`, and the pinned Temporal Core substitutes only a
-configured worker default. Temporal defines `UNSPECIFIED` as "versioning is not
-enabled in the worker" and requires each workflow type on a versioned worker to
-choose between pinned and auto-upgrade, so a versioned worker without a default
-would advertise a deployment while declaring every workflow unversioned.
-`Options.make` rejects that combination with a defect, and the private bridge
-rejects it again as a configuration error.
+The default is mandatory because a workflow type that declares no behavior of
+its own completes its workflow tasks with the behavior `UNSPECIFIED`, and the
+pinned Temporal Core substitutes only a configured worker default. Temporal
+defines `UNSPECIFIED` as "versioning is not enabled in the worker" and requires
+each workflow type on a versioned worker to choose between pinned and
+auto-upgrade, so a versioned worker without a default would advertise a
+deployment while declaring such workflows unversioned. `Options.make` rejects
+that combination with a defect, and the private bridge rejects it again as a
+configuration error.
+
+## Per-workflow versioning behavior
+
+A workflow type can declare its own behavior when it is registered (#1159),
+overriding the worker's default for that type:
+
+```ocaml
+Temporal.Worker.workflow ~versioning_behavior:`Pinned order_workflow
+```
+
+Every successful workflow-task completion for the type then carries that
+behavior to Core as `Success.versioning_behavior`, so Temporal records it on
+the `WorkflowTaskCompleted` event and routes the run accordingly: a
+`` `Pinned `` run stays on the deployment version it started on, and an
+`` `Auto_upgrade `` run moves to the deployment's current version at its next
+workflow task. Eviction acknowledgements and failed workflow tasks never carry
+a behavior. `Worker.create` rejects a registration that declares one with a
+defect unless the worker uses `Deployment_based` versioning with
+`use_worker_versioning`, where it could not be honoured. In the private
+completion document the behavior is the optional `versioning_behavior` member
+(`"pinned"` or `"auto_upgrade"`) of
+[`workflow-completion.schema.json`](../schemas/bridge/workflow-completion.schema.json),
+validated by both OCaml and Rust.
+
+The [worker versioning live regression](../../test/integration/worker_versioning/README.md)
+runs two deployment versions of one worker deployment on one task queue,
+with an `` `Auto_upgrade `` worker default. When the second build becomes the
+deployment's current version, the auto-upgrade run moves to the replacement
+worker, while the `` `Pinned `` run, which only its own declaration pins,
+keeps running on the first build. Both histories record the declared
+behavior. Routing changes reach the task queue asynchronously, so the test
+waits for the move rather than assuming it happens on the next task.
 
 ## Reading the selected deployment in a workflow
 
@@ -134,10 +166,10 @@ boundary.
 ## Scope and evidence
 
 This slice covers legacy and deployment-based worker routing plus their
-bilateral configuration contracts and task-local deployment metadata
+bilateral configuration contracts, per-workflow versioning behavior with a
+live deployment-based routing check, and task-local deployment metadata
 inspection. It does not implement workflow-code history compatibility,
-migration automation, or a live routing
-acceptance test. Those require server-side compatibility-set orchestration and
+migration automation, ramping, or legacy build-ID routing acceptance. Those require server-side compatibility-set orchestration and
 are tracked separately in the [feature coverage](feature-coverage.md) and
 [implementation roadmap](../implementation-roadmap.md).
 

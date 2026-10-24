@@ -940,6 +940,40 @@ pub enum UpdateResponseResult {
     Completed { payload: Payload },
 }
 
+/// A workflow type's own versioning behavior on a deployment-versioned
+/// worker (#1159), declared with a successful completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionVersioningBehavior {
+    /// Keep the run on the deployment version it started on.
+    Pinned,
+    /// Let the run move to the deployment's current version.
+    AutoUpgrade,
+}
+
+impl CompletionVersioningBehavior {
+    /// Temporal's `VersioningBehavior` wire value.
+    fn to_core(self) -> i32 {
+        use temporalio_protos::temporal::api::enums::v1::VersioningBehavior;
+        match self {
+            Self::Pinned => i32::from(VersioningBehavior::Pinned),
+            Self::AutoUpgrade => i32::from(VersioningBehavior::AutoUpgrade),
+        }
+    }
+
+    /// The behavior of a Core wire value: `None` for `UNSPECIFIED`, an
+    /// error for a value this protocol does not name.
+    fn from_core(value: i32) -> Result<Option<Self>, CoreConversionError> {
+        use temporalio_protos::temporal::api::enums::v1::VersioningBehavior;
+        match VersioningBehavior::try_from(value) {
+            Ok(VersioningBehavior::Unspecified) => Ok(None),
+            Ok(VersioningBehavior::Pinned) => Ok(Some(Self::Pinned)),
+            Ok(VersioningBehavior::AutoUpgrade) => Ok(Some(Self::AutoUpgrade)),
+            Err(_) => Err(unsupported("unknown workflow versioning behavior")),
+        }
+    }
+}
+
 /// One activation outcome. A task failure discards every command and preserves
 /// the execution so a corrected worker can reconstruct it from history.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -950,6 +984,11 @@ pub struct Completion {
     /// Optional task failure; omitted on successful completions for wire compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_failure: Option<Failure>,
+    /// The workflow type's own versioning behavior (#1159), only on a
+    /// successful completion; omitted when unspecified, which leaves Core to
+    /// apply the worker's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versioning_behavior: Option<CompletionVersioningBehavior>,
 }
 
 /// Requires a bounded nonempty Temporal identifier that is safe for both
@@ -1656,6 +1695,12 @@ fn validate_activation(value: &Activation) -> Result<(), ProtocolError> {
 /// Applies completion-wide ordering, identity, and cross-command invariants.
 fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
     identifier(&value.run_id, "$.run_id")?;
+    if value.task_failure.is_some() && value.versioning_behavior.is_some() {
+        return Err(ProtocolError::invalid(
+            "$.versioning_behavior",
+            "a failed workflow task cannot carry a versioning behavior",
+        ));
+    }
     if let Some(failure) = &value.task_failure {
         if !value.commands.is_empty() {
             return Err(ProtocolError::invalid(
@@ -4425,13 +4470,16 @@ fn completion_to_core_with_child_namespace(
                         .map(|command| command_to_core(command, child_workflow_namespace))
                         .collect::<Result<_, _>>()?,
                     used_internal_flags: Vec::new(),
-                    // UNSPECIFIED asks Core to apply the worker's
-                    // configured default behavior, if any; unversioned
-                    // workers correctly keep UNSPECIFIED. Worker configuration
-                    // rejects versioned workers without that default, so a
-                    // versioned deployment never reaches the server with
-                    // UNSPECIFIED (issue #817).
-                    versioning_behavior: 0,
+                    // The workflow type's own behavior (#1159) when it
+                    // declares one. Otherwise UNSPECIFIED asks Core to apply
+                    // the worker's configured default behavior, if any;
+                    // unversioned workers correctly keep UNSPECIFIED. Worker
+                    // configuration rejects versioned workers without that
+                    // default, so a versioned deployment never reaches the
+                    // server with UNSPECIFIED (issue #817).
+                    versioning_behavior: value
+                        .versioning_behavior
+                        .map_or(0, CompletionVersioningBehavior::to_core),
                 },
             ),
         ),
@@ -4573,19 +4621,21 @@ pub fn completion_from_core(
                         .as_ref()
                         .ok_or_else(|| invalid_core("workflow task failure is absent"))?,
                 )?),
+                versioning_behavior: None,
             };
             validate_completion(&completion)
                 .map_err(|_| invalid_core("Core task failure violates protocol invariants"))?;
             return Ok(completion);
         }
     };
-    if !success.used_internal_flags.is_empty() || success.versioning_behavior != 0 {
+    if !success.used_internal_flags.is_empty() {
         return Err(unsupported(
             "Core completion metadata is not represented by this protocol slice",
         ));
     }
     let completion = Completion {
         task_failure: None,
+        versioning_behavior: CompletionVersioningBehavior::from_core(success.versioning_behavior)?,
         run_id: value.run_id.clone(),
         commands: success
             .commands

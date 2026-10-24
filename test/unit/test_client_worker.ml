@@ -1466,6 +1466,45 @@ let test_worker_options_versioning () =
   expect_error "defect"
     (Temporal.Worker.Options.make ~max_cached_workflows:(-1) ())
 
+(** A per-workflow versioning behavior (#1159) is accepted only on a worker
+    with deployment-based versioning and [use_worker_versioning]: [create]
+    rejects it, naming the workflow, on an unversioned, legacy-build or
+    opted-out deployment worker, before any backend is created. *)
+let test_worker_workflow_versioning_behavior () =
+  let create versioning =
+    let options =
+      match versioning with
+      | None -> Temporal.Worker.Options.default
+      | Some versioning -> unwrap (Temporal.Worker.Options.make ~versioning ())
+    in
+    Temporal.Worker.create ~options ~target_url:"mock://worker" ~namespace:"unit-test"
+      ~task_queue:"unit-test"
+      ~workflows:[ Temporal.Worker.workflow ~versioning_behavior:`Pinned echo_workflow ]
+      ~activities:[] ()
+  in
+  let deployment use_worker_versioning default_versioning_behavior =
+    Temporal.Worker.Options.Deployment_based
+      {
+        deployment_name = "agents";
+        build_id = "agents-v4";
+        use_worker_versioning;
+        default_versioning_behavior;
+      }
+  in
+  List.iter
+    (fun versioning ->
+      expect_error_message_contains "defect" "unit.echo sets a versioning behavior"
+        (create versioning))
+    [
+      None;
+      Some (Temporal.Worker.Options.Legacy_build_id "agents-v4");
+      Some (deployment false None);
+    ];
+  match create (Some (deployment true (Some `Auto_upgrade))) with
+  | Ok worker -> unwrap (Temporal.Worker.shutdown worker)
+  | Error error ->
+      failwith ("a versioned worker rejected a workflow behavior: " ^ Temporal.Error.message error)
+
 (** Deployment-based routing keeps the deployment identity and default task
     behavior together, while rejecting a default behavior on an opted-out
     worker, or a versioned worker without one, before the native bridge can
@@ -1510,9 +1549,9 @@ let test_worker_options_deployment_versioning () =
               default_versioning_behavior = Some `Pinned;
             })
        ());
-  (* A versioned worker without a default would complete every workflow task
-     with an unspecified behavior because the SDK has no per-workflow
-     behavior API (issue #817). *)
+  (* A versioned worker without a default would complete the tasks of every
+     workflow type that declares no behavior of its own (#1159) with an
+     unspecified behavior (issue #817). *)
   expect_error_message_contains "defect"
     "use_worker_versioning requires default_versioning_behavior"
     (Temporal.Worker.Options.make
@@ -1871,4 +1910,5 @@ let () =
   test_native_worker_configuration_boundary ();
   test_native_worker_requires_a_task_type ();
   test_worker_options_versioning ();
-  test_worker_options_deployment_versioning ()
+  test_worker_options_deployment_versioning ();
+  test_worker_workflow_versioning_behavior ()
