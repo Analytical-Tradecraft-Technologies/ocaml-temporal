@@ -27,6 +27,14 @@ a time and that Domain waited for the network inside each call:
   pending and refuses a wait on a third distinct run at once with an error
   recognized by `Client.is_at_capacity`; shutting it down ends the two
   admitted waits.
+- A fourth client created with `~max_pending_waits:1` checks
+  `Client.wait ?timeout` (#1136): a 1 s bounded wait on an open run returns
+  a retryable error with `Client.rpc_status` `` Some `Deadline_exceeded ``
+  after about a second; the released slot then admits a wait on a second
+  run instead of refusing it as at capacity; after termination a later
+  bounded wait on the first handle reports `Terminated`; and shutting the
+  client down during a 30 s bounded wait ends it promptly with the
+  closed-client error.
 
 The test terminates every workflow it creates, including after an assertion
 failure.

@@ -1,69 +1,80 @@
-(** Live local-retry cancellation and fresh-worker history replay. Explicit
-    local handles are private today, so only scheduling/cancellation uses the
-    runtime adapter; client, worker, signal, and query paths use the public API. *)
+(** Live local-retry cancellation and fresh-worker history replay, through
+    the public local-activity cancellation API (#1156): an explicit
+    [Activity.start_local_handle] cancelled with [Activity.cancel] for each
+    Core cancellation policy, and an [Activity.start_local ~scope] whose scope
+    is cancelled. Client, worker, signal, and query paths use the public API. *)
 open Temporal
-
-module Context = Temporal_runtime.Workflow_context_store
-module Activation = Temporal_runtime.Activation
 
 (** Reports setup and client failures through their public diagnostic. *)
 let get = function Ok value -> value | Error error -> failwith (Error.message error)
-
-(** Preserves the private runtime diagnostic at the fixture adapter boundary. *)
-let get_base = function
-  | Ok value -> value
-  | Error error -> failwith (Temporal_base.Error.message error)
 
 (** Each execution retains its own cancellation operation and query result. *)
 let cancellation = Workflow_context.Local.create ()
 let outcome = Workflow_context.Local.create ()
 
-(** Converts recorded input to the three Core cancellation policies. *)
+(** Converts recorded input to a public cancellation policy. The ["scope"]
+    execution keeps the local default, [Wait_cancellation_completed]. *)
 let policy = function
-  | "try" -> Activation.Try_cancel
-  | "wait" -> Activation.Wait_cancellation_completed
-  | "abandon" -> Activation.Abandon
+  | "try" -> Some Activity.Try_cancel
+  | "wait" -> Some Activity.Wait_cancellation_completed
+  | "abandon" -> Some Activity.Abandon
+  | "scope" -> None
   | _ -> failwith "unknown cancellation policy"
 
 (** A delay longer than Core's local threshold must become a durable timer. *)
-let retry_policy = {
-  Activation.initial_interval = 120_000L;
-  maximum_interval = 120_000L;
-  backoff_coefficient_bits = Int64.to_string (Int64.bits_of_float 1.0);
-  maximum_attempts = 3;
-  non_retryable_error_types = [];
-}
+let retry_policy =
+  get
+    (Retry_policy.make ~initial_interval:(Duration.of_ms 120_000L)
+       ~backoff_coefficient:1.0 ~maximum_interval:(Duration.of_ms 120_000L)
+       ~maximum_attempts:3 ())
 
 (** The signal arrives only after the driver sees a committed backoff timer. *)
 let cancel_signal = Signal.define ~name:"cancel-local" ~input:Codec.unit
 let result_query = Query.define ~name:"cancellation-result" ~output:Codec.string
 
+(** The workflow's view of the worker-registered activity below. *)
+let failing_activity =
+  Activity.remote ~name:"fail-for-local-backoff" ~input:Codec.string ~output:Codec.unit
+
 (** Repeated cancellation must remain harmless before and after resolution. *)
 let cancel () =
   let cancel = Option.get (get (Workflow_context.Local.get cancellation)) in
-  get_base (cancel ());
-  get_base (cancel ());
+  get (cancel ());
+  get (cancel ());
   Ok ()
 
 (** Queries read the terminal state reconstructed by the workflow on replay. *)
 let read () =
   Result.map (Option.value ~default:"pending") (Workflow_context.Local.get outcome)
 
-(** Waits on the original local activity future, not a separate cancel future. *)
+(** Waits on the original local activity future, not a separate cancel
+    future. A policy name schedules through [start_local_handle] and keeps
+    [Activity.cancel] for the signal; ["scope"] starts inside a scope and
+    keeps [Scope.cancel] instead. Both are invoked twice by the signal, and
+    once more after resolution, to prove repeated cancellation is harmless. *)
 let workflow = Workflow.define ~name:"local-backoff-cancellation"
   ~input:Codec.string ~output:Codec.string (fun name ->
-    let context = Option.get (Context.current ()) in
-    let future, cancel_operation = Context.schedule_local_activity context
-      ~name:"fail-for-local-backoff"
-      ~input:[ get_base (Temporal_base.Codec.encode Temporal_base.Codec.string name) ]
-      ~start_to_close_timeout:30_000L ~retry_policy ~cancellation_type:(policy name)
-      ~decode:(Temporal_base.Codec.decode Temporal_base.Codec.unit) () in
+    let start_to_close_timeout = Duration.of_ms 30_000L in
+    let future, cancel_operation =
+      match policy name with
+      | Some cancellation_type ->
+          let handle =
+            Activity.start_local_handle ~start_to_close_timeout ~retry_policy
+              ~cancellation_type failing_activity name
+          in
+          (Activity.future handle, fun () -> Activity.cancel handle)
+      | None ->
+          let scope = get (Scope.create ()) in
+          ( Activity.start_local ~scope ~start_to_close_timeout ~retry_policy
+              failing_activity name,
+            fun () -> Scope.cancel scope )
+    in
     get (Workflow_context.Local.set cancellation cancel_operation);
-    (match Temporal_runtime.Future_store.await future with
-    | Error error when (Temporal_base.Error.view error).category = `Cancelled -> ()
-    | Error error -> failwith (Temporal_base.Error.message error)
+    (match Future.await future with
+    | Error error when Error.kind error = "cancelled" -> ()
+    | Error error -> failwith (Error.message error)
     | Ok () -> failwith "cancelled activity unexpectedly succeeded");
-    get_base (cancel_operation ());
+    get (cancel_operation ());
     get (Workflow_context.Local.set outcome "cancelled");
     Ok "cancelled")
 
@@ -189,7 +200,7 @@ let verify_attempts log =
   let rec lines result = match input_line input with
     | line -> lines (line :: result) | exception End_of_file -> result in
   let actual = Fun.protect ~finally:(fun () -> close_in input) (fun () -> lines []) in
-  if List.sort String.compare actual <> ["abandon"; "try"; "wait"] then
+  if List.sort String.compare actual <> ["abandon"; "scope"; "try"; "wait"] then
     failwith "unexpected local activity attempts"
 
 (** Runs all policies, replaces the worker, and reconstructs terminal query state. *)
@@ -215,7 +226,7 @@ let check address cli =
           get (Client.signal handle ~signal:cancel_signal ~input:());
           (match get (Client.wait handle) with
           | Client.Completed { output = "cancelled"; _ } -> () | _ -> failwith "cancellation did not settle");
-          verify_history cli cli_address handle) ["try"; "wait"; "abandon"];
+          verify_history cli cli_address handle) ["try"; "wait"; "abandon"; "scope"];
         verify_attempts log;
         Option.iter stop !pid;
         pid := None;
@@ -224,7 +235,7 @@ let check address cli =
           if get (Client.query handle ~query:result_query) <> "cancelled" then
             failwith "replayed cancellation result changed") !handles;
         verify_attempts log;
-        print_endline "local activity cancellation: all policies and fresh-worker replay passed")))
+        print_endline "local activity cancellation: all policies, scope, and fresh-worker replay passed")))
 
 (** An overall alarm bounds client waits; protected cleanup reaps the worker. *)
 let () = match Array.to_list Sys.argv with

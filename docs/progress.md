@@ -6158,6 +6158,28 @@ activation, zero and unbounded waits, a predicate error, and the detached
 defect. The live scenario and corpus histories for cancel-before/after-fire
 remain open under #1134.
 
+## 2026-10-24: Local activity cancellation live through the public API (#1156)
+
+`test/integration/local_activity_cancellation` no longer reaches into the
+private runtime adapter: each policy's execution schedules with
+`Activity.start_local_handle` and cancels with `Activity.cancel`, and a new
+fourth execution starts with `Activity.start_local ~scope` (local default
+`Wait_cancellation_completed`) and cancels the scope from the signal
+handler. Every execution cancels a committed 120-second retry timer, records
+exactly one local-activity marker, completes, and replays on a fresh worker
+with the same query result and no new attempt. It passed locally against the
+pinned Compose stack. A corpus history remains open.
+
+## 2026-10-24: Bounded waits live (#1136)
+
+The `concurrent_client` live regression gained a bounded-wait check on a
+client with `max_pending_waits:1`: a 1 s `Client.wait ?timeout` on an open
+run returns a retryable `Deadline_exceeded` error after about a second, the
+released slot admits a wait on another run, a later bounded wait on the same
+handle observes the run's termination, and shutdown during a bounded wait
+ends it promptly with the closed-client error. It passed locally against the
+pinned Compose stack.
+
 ## 2026-10-24: Live child start options regression (#1135)
 
 `test/integration/child_start_options` runs against the Compose
