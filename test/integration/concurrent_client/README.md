@@ -35,6 +35,16 @@ a time and that Domain waited for the network inside each call:
   bounded wait on the first handle reports `Terminated`; and shutting the
   client down during a 30 s bounded wait ends it promptly with the
   closed-client error.
+- A fifth client created with `~max_pending_waits:3` starts waits of 1 s,
+  3 s and 30 s on the same open run at once. The first two expire at their
+  own bounds with `Deadline_exceeded`, the 30 s wait stays pending, a wait
+  started after both expiries is admitted, and terminating the run ends both
+  remaining waits with `Terminated`.
+- A `hold` update that the worker accepts at once but completes only after a
+  `release-hold` signal checks `Client.wait_update ?timeout`: a 1 s bounded
+  wait on the accepted update expires with the same retryable error, and
+  after the signal later bounded waits on the same update handle return its
+  result.
 
 The test terminates every workflow it creates, including after an assertion
 failure.
