@@ -33,7 +33,10 @@ set -eu
 # empty CARGO_HOME inside the writable build directory, as for a user who has
 # never run Cargo: a default home warmed by `cargo vendor` (which created the
 # archive) could otherwise satisfy an offline build for a source the archive's
-# replacement omits. The variables that select a prebuilt bridge, a shared
+# replacement omits. With OCAML_TEMPORAL_OPAM_CHECK_READ_ONLY_CARGO_HOME set,
+# that cold home is instead outside the build directory and read-only inside
+# the sandbox, as the user's default home is under a real `opam install`
+# (#1148). The variables that select a prebuilt bridge, a shared
 # target directory, or offline mode are cleared, so the archive itself must
 # select the vendored build.
 #
@@ -172,17 +175,34 @@ fi
 
 # Clear every input that would bypass or pre-empt the archive's own selection.
 unset TEMPORAL_RUST_BRIDGE_DIR TEMPORAL_RUST_BRIDGE_KEY CARGO_TARGET_DIR CARGO_NET_OFFLINE
-# A cold, writable Cargo home below the build directory (which every sandbox
-# leaves writable). Dune ignores directories whose names start with "_", so
-# it never becomes part of the package build. rustup locates toolchains
-# through RUSTUP_HOME, which is unaffected.
-CARGO_HOME=$(pwd -P)/_opam-check-cargo-home
-if [ -e "$CARGO_HOME" ]; then
-  echo "source archive unexpectedly contains $CARGO_HOME" >&2
-  exit 1
+if [ -n "${OCAML_TEMPORAL_OPAM_CHECK_READ_ONLY_CARGO_HOME:-}" ]; then
+  # A real `opam install` runs the build with the user's default Cargo home,
+  # which the sandbox makes read-only (#1148). Emulate that with a cold home
+  # beside the unpacked source, outside every path the sandbox leaves
+  # writable, and prove it is read-only inside the sandbox before building,
+  # so the vendored build must succeed without writing to it. The home stays
+  # cold so a registry warmed by `cargo vendor` cannot mask a missing source.
+  CARGO_HOME=$work_root/read-only-cargo-home
+  mkdir "$CARGO_HOME"
+  export CARGO_HOME
+  if sandboxed sh -c 'touch "$CARGO_HOME/.write-probe"' 2>/dev/null; then
+    echo "the build sandbox left CARGO_HOME writable; it cannot emulate opam install" >&2
+    exit 1
+  fi
+  echo "sandbox: CARGO_HOME is read-only inside the sandbox, as under opam install"
+else
+  # A cold, writable Cargo home below the build directory (which every
+  # sandbox leaves writable). Dune ignores directories whose names start with
+  # "_", so it never becomes part of the package build.
+  CARGO_HOME=$(pwd -P)/_opam-check-cargo-home
+  if [ -e "$CARGO_HOME" ]; then
+    echo "source archive unexpectedly contains $CARGO_HOME" >&2
+    exit 1
+  fi
+  mkdir "$CARGO_HOME"
+  export CARGO_HOME
 fi
-mkdir "$CARGO_HOME"
-export CARGO_HOME
+# rustup locates toolchains through RUSTUP_HOME, which is unaffected.
 sandboxed dune build -p "$package" -j "$jobs"
 
 install_file=_build/default/$package.install

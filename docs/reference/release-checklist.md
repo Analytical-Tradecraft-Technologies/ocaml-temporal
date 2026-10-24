@@ -26,8 +26,8 @@ replace them:
 | --- | --- | --- |
 | Version metadata, release notes, tag-to-commit match | Yes, before any build and again before the draft and before publishing | Writing the notes and the version PR |
 | Full release build and test graph, licence audit, Cargo SBOM | Yes | No |
-| Source archive builds inside the opam sandbox | Yes, `source-archive-check` | No |
-| Consumer built against the package installed from that archive, outside the checkout | Yes, `source-archive-check` ([#510]) | No |
+| Source archive builds inside the opam sandbox | Yes, `source-archive-check` (macOS) and `source-archive-check-linux` (bubblewrap, read-only Cargo home, #1148) | No |
+| Consumer built against the package installed from that archive, outside the checkout | Yes, `source-archive-check` and `source-archive-check-linux` ([#510]) | No |
 | `SHA256SUMS` over every asset | Yes | No |
 | Signed SLSA build provenance for every asset | Yes, `actions/attest-build-provenance` in `publish` ([#510]) | No |
 | Qualification evidence and sign-off | No | The release owner, in the tracking issue |
@@ -167,10 +167,12 @@ Every item is evidence for the commit that will be tagged, not an older one.
   bundle once with `gh attestation download <asset> --repo "$repo"` and pass
   it with `--bundle`. The repository's **Actions → Attestations** page lists
   the same attestations.
-- [ ] Install the source archive in a fresh environment with
-      [`opam install`](package-boundary.md#offline-opam-source-builds) and
-      build a consumer against it; link one prebuilt SDK archive as described
-      in [prebuilt OCaml](prebuilt-ocaml.md).
+- [ ] The opam sandbox install of the source archive and a consumer build
+      against it are automated on macOS and Linux (`source-archive-check`,
+      `source-archive-check-linux`, #1148). After publication, link one
+      prebuilt SDK archive as described in [prebuilt OCaml](prebuilt-ocaml.md);
+      a fresh-environment [`opam install`](package-boundary.md#offline-opam-source-builds)
+      remains optional extra evidence.
 - [ ] Record the release URL and this verification in the tracking issue.
 
 ## Qualification gates
