@@ -73,7 +73,10 @@ application and cancellation details. The `last_heartbeat_details` that
 Temporal records on a timeout or reset layer are returned separately by
 `Error.last_heartbeat_details`, so an activity's error-details codec never
 decodes a heartbeat payload. The same classification applies to failures a
-client `wait` or `wait_update` decodes. `Temporal.Testing` does not simulate
+client `wait` or `wait_update` decodes, and a `wait` that ends cancelled,
+terminated or timed out reports `` `Cancelled ``, `` `Terminated `` or
+`` `Timeout `Unspecified `` (Temporal does not record which workflow timeout
+expired). `Temporal.Testing` does not simulate
 activity timeouts (#1160); its virtual-deadline errors are created by the
 SDK, so their origin is `None`.
 

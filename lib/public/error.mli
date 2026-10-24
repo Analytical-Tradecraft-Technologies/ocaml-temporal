@@ -56,7 +56,10 @@ type timeout_type =
     - [`Server]: the Temporal server failed the operation itself, for
       example because a result exceeded a namespace limit.
     - [`Cancelled] and [`Terminated]: the operation was cancelled or the
-      run terminated.
+      run terminated, including a [Temporal.Client.wait] that observes a
+      cancelled or terminated run. A [wait] that observes a timed-out run
+      reports [`Timeout `Unspecified], because Temporal does not record
+      which workflow timeout expired.
     - [`Other]: any other layer, such as a workflow reset, a Nexus handler
       error, or a failure kind a newer server introduced.
 

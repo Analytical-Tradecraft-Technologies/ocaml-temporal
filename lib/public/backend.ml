@@ -810,8 +810,8 @@ let workflow_failure_error ?(category = `Workflow)
 
 (** Builds a typed cancellation/termination error from terminal detail
     payloads. Details remain binary-safe and are not interpolated into logs. *)
-let terminal_details_error ~category ~message details =
-  Error.make ~category
+let terminal_details_error ?origin ~category ~message details =
+  Error.make ~category ?origin
     ~details:(List.map public_payload details) ~message ()
 
 (** Canonical [Codec.unit] / [binary/null] payload. The worker maps unit
@@ -864,12 +864,12 @@ let native_terminal_result (response : Client_protocol.wait_response) =
   | Client_protocol.Cancelled { details } ->
       Ok
         (Cancelled
-           (terminal_details_error ~category:`Cancelled
+           (terminal_details_error ~origin:`Cancelled ~category:`Cancelled
               ~message:"workflow execution was cancelled" details))
   | Client_protocol.Terminated { details } ->
       Ok
         (Terminated
-           (Error.make ~non_retryable:true ~category:`Terminated
+           (Error.make ~non_retryable:true ~category:`Terminated ~origin:`Terminated
               ~details:(List.map public_payload details)
               ~message:"workflow execution was terminated" ()))
   | Client_protocol.Timed_out { successor } ->
@@ -877,7 +877,9 @@ let native_terminal_result (response : Client_protocol.wait_response) =
         (Timed_out
            {
              error =
-               Error.make ~category:`Timeout
+               (* Temporal's timed-out close event does not say which
+                  workflow timeout expired. *)
+               Error.make ~category:`Timeout ~origin:(`Timeout `Unspecified)
                  ~message:"workflow execution timed out" ();
              successor = successor_ref successor;
            })
@@ -1412,12 +1414,13 @@ let mock_client_wait (client : mock_client) (request : wait_request) =
             | Mock_cancelled ->
                 Ok
                   (Cancelled
-                     (Error.make ~category:`Cancelled
+                     (Error.make ~category:`Cancelled ~origin:`Cancelled
                         ~message:"workflow execution was cancelled" ()))
             | Mock_terminated ->
                 Ok
                   (Terminated
                      (Error.make ~non_retryable:true ~category:`Terminated
+                        ~origin:`Terminated
                         ~message:"workflow execution was terminated" ()))
             | Mock_failed { error; successor } ->
                 Ok (Failed { error; successor })
