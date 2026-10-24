@@ -63,7 +63,9 @@ before workflow code runs, and is unchanged by later activations, so a
 replaying worker observes the same values. The predecessor's failure and
 completion payloads are retained by the private protocol but are not yet
 public. `Temporal.Testing` reports the predecessor and `` `Continue_as_new ``
-for its continue-as-new successors and records no timeouts or retry policy.
+for its continue-as-new successors. It records no workflow timeouts (all
+three are `None`) and records a retry policy only for a child started with
+one.
 
 Cron schedules and cron-initiated runs remain unsupported. Nonzero root
 start delay also remains unsupported, while absent and explicit-zero backoff

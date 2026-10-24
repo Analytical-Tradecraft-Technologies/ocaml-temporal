@@ -37,7 +37,14 @@ module Handler : sig
       validator may reject with a typed [Error.t] of any category, including
       [Error.defect]; an exception it raises also rejects the update. In both
       cases [run] is not called, no update-side state change can occur, and
-      the workflow task is unaffected. *)
+      the workflow task is unaffected.
+
+      [run] executes after the update is accepted. Its [Error] completes the
+      update as failed for the caller, except a [`Defect] or [`Bridge] error
+      (including an exception [run] raised), which fails the workflow task
+      instead, because the handler may already have changed workflow state
+      or emitted commands. A [`Codec] error encoding the result fails the
+      update, not the task. *)
   val make :
     ?validator:('input -> (unit, Error.t) result) ->
     ('input, 'output) definition ->

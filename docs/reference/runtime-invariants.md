@@ -183,8 +183,15 @@ and bridge, read the [documentation guide](../README.md) first.
   A cache-eviction activation is always acknowledged with an empty completion,
   never one carrying a task failure, because Core rejects it and workflow
   completions are not retried.
-- The implementation uses typed closures and GADTs, not `Obj.magic` or a
-  heterogeneous untyped value store.
+- The implementation uses typed closures and GADTs for futures, handlers and
+  commands. The one untyped store is `Workflow_context.Local`: each run's
+  values live in an `(int, Obj.t) Hashtbl.t` keyed by the integer ID of a
+  `'a Local.t`, written with `Obj.repr` and read with `Obj.obj`. It is sound
+  because the key's type is fixed when it is created: `Local.create ()` is an
+  application, so the value restriction makes the type of a top-level key
+  weak rather than polymorphic, and every read and write of one key uses that
+  one type. The store is private to the runtime, and no other `Obj` use
+  exists in workflow state.
 
 ## Commands and terminal state
 

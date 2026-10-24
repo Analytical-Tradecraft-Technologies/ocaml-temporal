@@ -502,10 +502,12 @@ module Context : sig
       up to the next whole millisecond, as in {!Info.heartbeat_timeout}. *)
   val heartbeat_timeout : t -> Duration.t option
 
-  (** Returns this attempt's task metadata. Contexts created by a native worker
-      always carry it; a context from a backend without a Temporal task, such
-      as the in-process test backend, returns a typed [Defect] error. The value
-      is immutable and remains readable after the attempt completes. *)
+  (** Returns this attempt's task metadata. Contexts created by a native
+      worker or by [Temporal.Testing] always carry it ([Temporal.Testing]
+      reports its virtual clock as the attempt's scheduled and started
+      times); a context from a backend without a Temporal task, such as the
+      [mock://] worker backend, returns a typed [Defect] error. The value is
+      immutable and remains readable after the attempt completes. *)
   val info : t -> (Info.t, Error.t) result
 end
 

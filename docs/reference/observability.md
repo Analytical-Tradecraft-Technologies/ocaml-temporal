@@ -213,10 +213,13 @@ outcome is still returned to the caller as a query response.
 The current update event set is deliberately smaller. A missing update handler
 emits `workflow_update_unhandled` at `Error` level and returns a rejected
 update response. Ordinary validation or input errors reject the update without
-a separate named workflow log operation. A bridge or defect error in a
-validator or implementation can instead fail the workflow task and emit
-`workflow_task_failed`; an accepted update's codec error can reject its update
-response. Absence of `workflow_update_unhandled` must therefore not be read as
+a separate named workflow log operation. Before acceptance, a validator error
+of any category (including a defect or an exception) or an input decoding
+error rejects the update (#790); only an SDK `` `Bridge `` failure fails the
+workflow task. After acceptance, a `` `Defect `` or `` `Bridge `` error from the
+handler (including an exception it raised) fails the workflow task and emits
+`workflow_task_failed`, while any other error, including a codec error,
+rejects the update response. Absence of `workflow_update_unhandled` must therefore not be read as
 proof that an update was accepted. Acceptance and completion remain protocol
 responses rather than separate log operations so callers can correlate them by
 `protocol_instance_id`.
