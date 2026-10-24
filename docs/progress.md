@@ -6222,3 +6222,15 @@ cancelled from a signal handler records `TIMER_CANCELED` and returns
 replacement, so a fresh worker replays the cancel or the firing without a
 nondeterminism error. History-corpus entries for these runs remain open
 under #1134 (#503).
+
+## 2026-10-24: Concurrent bounded waits and bounded update waits live (#1136)
+
+The `concurrent_client` live regression now covers the last #1136 criteria.
+On a client with `max_pending_waits:1`, waits of 1 s, 3 s and 6 s on the
+same open run, started together, each expire at their own bound with a
+retryable `Deadline_exceeded`, and once all three have expired a wait on a
+second run is admitted, so no expired waiter kept a share of the shared
+run's slot. A `hold` update accepted by the worker but released
+only by a later signal makes a 1 s `Client.wait_update ?timeout` expire with
+the same error, and later bounded waits on the same update handle return its
+result. It passed locally against the pinned Compose stack.

@@ -15,8 +15,11 @@
     query ends at its own deadline, that shutting the client down with a
     wait in flight ends that wait with the closed-client error, and that a
     configured [max_pending_waits] (#796) is enforced as a capacity error,
-    and that a bounded [Client.wait ?timeout] (#1136) expires with a
-    retryable deadline error and releases its slot. The parent
+    that a bounded [Client.wait ?timeout] (#1136) expires with a retryable
+    deadline error and releases its slot, that concurrent bounded waits on
+    one run each keep their own bound, and that [Client.wait_update
+    ?timeout] expires the same way without losing the accepted update. The
+    parent
     owns and reaps its worker, uses a unique task queue, and terminates every
     execution it starts. *)
 open Temporal
@@ -38,6 +41,26 @@ let poke = Signal.define ~name:"poke" ~input:Codec.string
 
 (** A query that nobody answers once the workflow's worker is killed. *)
 let state = Query.define ~name:"state" ~output:Codec.string
+
+(** Set by [release_hold]; the [hold] update completes only once it is set. *)
+let hold_released = Workflow_context.Local.create ()
+
+(** Lets every accepted [hold] update of the run complete. *)
+let release_hold = Signal.define ~name:"release-hold" ~input:Codec.unit
+
+(** An update the worker accepts at once and completes only after
+    [release_hold], so its completion wait outlives its acceptance. *)
+let hold = Update.define ~name:"hold" ~input:Codec.string ~output:Codec.string
+
+(** Suspends an accepted [hold] until the run is released, then echoes its
+    input. *)
+let hold_handler input =
+  Result.map
+    (fun () -> input)
+    (Condition.wait_until (fun () ->
+         match Workflow_context.Local.get hold_released with
+         | Ok (Some released) -> released
+         | Ok None | Error _ -> false))
 
 (** Open workflows that the pending waits observe. *)
 let blocked_runs = 8
@@ -63,8 +86,14 @@ let worker address queue =
          ~workflows:
            [
              Worker.workflow blocked
-               ~signals:[ Signal.Handler.make poke (fun _ -> Ok ()) ]
-               ~queries:[ Query.Handler.make state (fun () -> Ok "blocked") ];
+               ~signals:
+                 [
+                   Signal.Handler.make poke (fun _ -> Ok ());
+                   Signal.Handler.make release_hold (fun () ->
+                       Workflow_context.Local.set hold_released true);
+                 ]
+               ~queries:[ Query.Handler.make state (fun () -> Ok "blocked") ]
+               ~updates:[ Update.Handler.make hold hold_handler ];
            ]
          ())
   in
@@ -366,6 +395,87 @@ let check_bounded_wait main cleanups address queue =
       | Error error -> fail ("the bounded wait ended with " ^ Error.message error)
       | Ok _ -> fail "a bounded wait completed after shutdown")
 
+(** Requires [result] to be the retryable [Deadline_exceeded] RPC error of an
+    expired bound, reached between [lower] and [upper] seconds. *)
+let expect_expired label ~lower ~upper (elapsed, result) =
+  match result with
+  | Error error when Client.rpc_status error = Some `Deadline_exceeded ->
+      if (Error.view error).non_retryable then fail (label ^ " was non-retryable");
+      if elapsed < lower || elapsed > upper then
+        fail (Printf.sprintf "%s took %.3f s" label elapsed)
+  | Error error -> fail (label ^ " failed with " ^ Error.message error)
+  | Ok _ -> fail (label ^ " completed on an open run")
+
+(** Concurrent bounded waits on one run (#1136), on a client admitting one
+    pending run. Waits on the same run share that run's slot, so waits of
+    1 s, 3 s and 6 s start together on one open run: each expires at its own
+    bound and not at another wait's (the 6 s wait is still pending after the
+    3 s one expires), and once all three have expired a wait on a second
+    run is admitted, which fails if any expired waiter leaked its share of
+    the first run's slot. Terminating the second run then ends that wait
+    with [Terminated]. *)
+let check_bounded_waits_same_run main cleanups address queue =
+  let first = start_blocked main cleanups queue "bounded-same-run" in
+  let second = start_blocked main cleanups queue "bounded-same-run-next" in
+  let client =
+    get (Client.create ~max_pending_waits:1 ~target_url:address ~namespace:"default" ())
+  in
+  Fun.protect
+    ~finally:(fun () -> ignore (Client.shutdown client))
+    (fun () ->
+      let rebind handle =
+        get
+          (Client.get_handle client ~workflow:blocked ?run_id:(Client.run_id handle)
+             ~id:(Client.workflow_id handle) ())
+      in
+      let handle = rebind first and next_handle = rebind second in
+      let bounded seconds =
+        background (fun () ->
+            timed (fun () -> Client.wait ~timeout:(Duration.of_seconds seconds) handle))
+      in
+      let short = bounded 1L and medium = bounded 3L and long = bounded 6L in
+      await_all ~seconds:10.0 "the 1 s and 3 s waits" [ short; medium ];
+      if finished long then fail "the 6 s wait ended with the shorter bounds";
+      expect_expired "the 1 s wait on a shared run" ~lower:0.9 ~upper:2.5 (join short);
+      expect_expired "the 3 s wait on a shared run" ~lower:2.9 ~upper:5.5 (join medium);
+      await_all ~seconds:10.0 "the 6 s wait" [ long ];
+      expect_expired "the 6 s wait on a shared run" ~lower:5.9 ~upper:8.5 (join long);
+      let admitted = background (fun () -> Client.wait next_handle) in
+      Unix.sleepf 1.0;
+      if finished admitted then (
+        match join admitted with
+        | Error error when Client.is_at_capacity error ->
+            fail "the expired waits on a shared run did not release its slot"
+        | _ -> fail "the wait on the second run finished early");
+      get (Client.terminate second);
+      await_all ~seconds:10.0 "the admitted wait after termination" [ admitted ];
+      match join admitted with
+      | Ok (Client.Terminated _) -> ()
+      | Ok _ -> fail "the admitted wait did not report termination"
+      | Error error -> fail ("the admitted wait failed with " ^ Error.message error))
+
+(** [Client.wait_update ?timeout] (#1136): an update the worker has accepted
+    but not completed makes a 1 s bounded completion wait expire with the
+    retryable [Deadline_exceeded] error; the update is unaffected, so after
+    the run releases it a later bounded wait on the same handle returns its
+    result, and a repeated bounded wait observes the same completed
+    outcome. *)
+let check_bounded_wait_update main cleanups queue =
+  let run = start_blocked main cleanups queue "bounded-update" in
+  let pending =
+    get (Client.start_update ~update_id:"bounded-hold" run ~update:hold ~input:"held" ())
+  in
+  expect_expired "the 1 s update wait" ~lower:0.9 ~upper:5.0
+    (timed (fun () -> Client.wait_update ~timeout:(Duration.of_ms 1_000L) pending));
+  get (Client.signal run ~signal:release_hold ~input:());
+  (match Client.wait_update ~timeout:(Duration.of_seconds 10L) pending with
+  | Ok "held" -> ()
+  | Ok other -> fail ("the released update returned " ^ other)
+  | Error error -> fail ("a later update wait failed with " ^ Error.message error));
+  match Client.wait_update ~timeout:(Duration.of_seconds 10L) pending with
+  | Ok "held" -> ()
+  | Ok _ | Error _ -> fail "a repeated update wait lost the completed outcome"
+
 (** Starts the worker process, runs every check, and terminates every
     fixture execution and the worker even when a check fails. *)
 let check address =
@@ -384,6 +494,8 @@ let check address =
       check_shutdown_in_flight client cleanups address queue;
       check_configured_wait_limit client cleanups address queue;
       check_bounded_wait client cleanups address queue;
+      check_bounded_waits_same_run client cleanups address queue;
+      check_bounded_wait_update client cleanups queue;
       print_endline "concurrent client live regression: ok")
 
 (** The supplied URL must identify a disposable test namespace/server. *)
