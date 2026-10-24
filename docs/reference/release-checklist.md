@@ -51,10 +51,14 @@ that: a version number that has been tagged can never be reused for different
 contents, which is also the [support policy's](v1-support-policy.md#prerelease-compatibility)
 rule.
 
-The Release workflow never creates or moves a tag. It checks, with
-`scripts/check-release-tag-commit.sh`, that the remote tag peels to the
-dispatched commit before the build, before creating the draft, and before
-publishing it.
+The Release workflow never creates or moves a tag. It is dispatched from the
+tag itself, so every job checks out, builds and attests the tagged commit. It
+checks, with `scripts/check-release-tag-commit.sh`, that the remote tag peels
+to the dispatched commit before the build, before creating the draft, and
+before publishing it; the first check also requires that commit to be on
+`master`. Merges that land on `master` after the tag was pushed therefore do
+not invalidate it (#1144), and no merge-queue or Dependabot freeze is needed
+between tagging and dispatch.
 
 ## Roles and sign-off
 
@@ -118,8 +122,11 @@ Every item is evidence for the commit that will be tagged, not an older one.
 - [ ] A maintainer creates and pushes the annotated tag at the approved commit,
       as in [Publish a prerelease](release-preflight.md#publish-a-prerelease).
       Double-check the SHA first: the tag cannot be corrected afterwards.
-- [ ] Dispatch **Actions → Release → Run workflow** on `master` with the same
-      tag. The workflow validates the request, including the release notes,
+- [ ] Dispatch **Actions → Release → Run workflow** with **Use workflow
+      from** set to the tag (under *Tags*, not *Branches*) and the same tag as
+      **Version tag**. A dispatch from `master` or another ref is refused, as
+      is a tag whose commit is not on `master`. Commits merged after the tag
+      do not matter. The workflow validates the request, including the release notes,
       runs the full `release` tier of
       `build-pr.yml` (sixteen OCaml combinations, four Rust producers, the
       live job and the licence audit) and `release-preflight.yml`, builds the
@@ -142,12 +149,12 @@ Every item is evidence for the commit that will be tagged, not an older one.
   gh release download "$tag" --repo "$repo" --dir "ocaml-temporal-$tag"
   cd "ocaml-temporal-$tag"
   sha256sum --check SHA256SUMS
-  # The commit the protected tag peels to; the workflow ran from master at it.
+  # The commit the protected tag peels to; the workflow ran from the tag.
   commit=$(git ls-remote "https://github.com/$repo" "refs/tags/$tag^{}" | cut -f 1)
   for asset in *; do
     gh attestation verify "$asset" --repo "$repo" \
       --signer-workflow "$repo/.github/workflows/release.yml" \
-      --source-ref refs/heads/master --source-digest "$commit" \
+      --source-ref "refs/tags/$tag" --source-digest "$commit" \
       --deny-self-hosted-runners
   done
   ```
@@ -193,8 +200,9 @@ The workflow uploads assets to a draft and publishes only after every check
 passes, so nothing is public yet.
 
 - **Transient failure** (runner loss, a flaky live test) with no draft
-  created: rerun the workflow for the same tag. The tag still points at the
-  approved commit.
+  created: rerun the workflow for the same tag, again dispatched from the tag.
+  The tag still points at the approved commit, and commits merged to `master`
+  in the meantime do not affect the rerun.
 - **A draft exists**: leave it unpublished and inspect it. A rerun will not
   replace an existing draft or release. Once the cause is understood, a
   maintainer may delete the unpublished draft (deleting a draft release does

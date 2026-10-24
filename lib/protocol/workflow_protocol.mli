@@ -368,6 +368,14 @@ type child_workflow_parent_close_policy =
   | Parent_abandon
   | Parent_request_cancel
 
+(** What Temporal does when a child's workflow ID belongs to a closed run.
+    An absent policy keeps the command identical to earlier SDK releases, so
+    the server default (allow duplicates) applies. *)
+type child_workflow_id_reuse_policy =
+  | Reuse_allow_duplicate
+  | Reuse_allow_duplicate_failed_only
+  | Reuse_reject_duplicate
+
 (** Controls how Core reports a child-workflow cancellation request to the
     parent.  The policy is part of the command so replay sees the same
     cancellation semantics on every activation. *)
@@ -427,7 +435,12 @@ type completion_command =
   (** Starts a child workflow. The ordered payload list mirrors Temporal Core's
       repeated input field; the current activation runtime emits one payload.
       [retry_policy] is optional because Core's default policy remains valid
-      when callers do not configure retries. *)
+      when callers do not configure retries. The optional timeouts and ID
+      reuse policy are omitted from the JSON document when absent, keeping
+      commands from earlier releases byte-identical; when present they obey
+      the [Client.start] rules (positive, run no larger than execution, task
+      at most 120 seconds and no larger than the run or execution timeout),
+      checked by both encoder and decoder and again by the Rust bridge. *)
   | Start_child_workflow of {
       task_queue : string option;
       parent_close_policy : child_workflow_parent_close_policy option;
@@ -437,6 +450,10 @@ type completion_command =
       input : payload list;
       retry_policy : retry_policy option;
       cancellation_type : child_workflow_cancellation_type;
+      execution_timeout : duration option;
+      run_timeout : duration option;
+      task_timeout : duration option;
+      id_reuse_policy : child_workflow_id_reuse_policy option;
     }
   (** Requests cancellation of a previously started child workflow.  [reason]
       is retained in history and is therefore part of deterministic replay. *)

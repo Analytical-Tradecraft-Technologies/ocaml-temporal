@@ -302,6 +302,10 @@ let _child_start :
     ?retry_policy:T.Retry_policy.t ->
     ?task_queue:string ->
     ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
@@ -314,6 +318,10 @@ let _child_start_handle :
     ?retry_policy:T.Retry_policy.t ->
     ?task_queue:string ->
     ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input -> 'output T.Child_workflow.handle =
@@ -338,6 +346,10 @@ let _child_execute :
     ?retry_policy:T.Retry_policy.t ->
     ?task_queue:string ->
     ?parent_close_policy:T.Child_workflow.Parent_close_policy.t ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
@@ -477,10 +489,12 @@ let _workflow_implementation :
   T.Workflow.implementation
 
 let _workflow_start_sleep :
-    T.Duration.t -> (unit, T.Error.t) T.Future.t =
+    ?scope:T.Scope.t -> T.Duration.t -> (unit, T.Error.t) T.Future.t =
   T.Workflow.start_sleep
 
-let _workflow_sleep : T.Duration.t -> (unit, T.Error.t) result = T.Workflow.sleep
+let _workflow_sleep :
+    ?scope:T.Scope.t -> T.Duration.t -> (unit, T.Error.t) result =
+  T.Workflow.sleep
 let _workflow_now : unit -> (T.Time.t, T.Error.t) result = T.Workflow.now
 let _workflow_patched : id:string -> bool = T.Workflow.patched
 let _workflow_deprecate_patch : id:string -> unit = T.Workflow.deprecate_patch
@@ -705,6 +719,7 @@ let _client_execution_fields (execution : T.Client.execution) : string * string 
   (execution.namespace, execution.workflow_id, execution.run_id)
 
 let _client_wait :
+    ?timeout:T.Duration.t ->
     ('input, 'output) T.Client.handle ->
     ('output T.Client.terminal_result, T.Error.t) result =
   T.Client.wait
@@ -932,11 +947,12 @@ let _worker_shutdown_report_fields
 let _worker_request_shutdown : T.Worker.t -> unit = T.Worker.request_shutdown
 
 (* The remaining small modules still participate in the public contract. *)
-let _condition_wait_until : (unit -> bool) -> (unit, T.Error.t) result =
+let _condition_wait_until :
+    ?timeout:T.Duration.t -> (unit -> bool) -> (unit, T.Error.t) result =
   T.Condition.wait_until
 
 let _condition_wait_until_result :
-    T.Condition.predicate -> (unit, T.Error.t) result =
+    ?timeout:T.Duration.t -> T.Condition.predicate -> (unit, T.Error.t) result =
   T.Condition.wait_until_result
 
 let _runtime_abi_version : unit -> (int32, T.Error.t) result =
@@ -1049,6 +1065,7 @@ let _activity_priority_fairness_weight :
   T.Activity.Priority.fairness_weight
 
 let _activity_start_local :
+    ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
     ?schedule_to_start_timeout:T.Duration.t ->
@@ -1059,7 +1076,20 @@ let _activity_start_local :
     'input -> ('output, T.Error.t) T.Future.t =
   T.Activity.start_local
 
+let _activity_start_local_handle :
+    ?scope:T.Scope.t ->
+    ?activity_id:string ->
+    ?schedule_to_close_timeout:T.Duration.t ->
+    ?schedule_to_start_timeout:T.Duration.t ->
+    ?start_to_close_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?cancellation_type:T.Activity.cancellation_type ->
+    ('input, 'output) T.Activity.t ->
+    'input -> 'output T.Activity.handle =
+  T.Activity.start_local_handle
+
 let _activity_execute_local :
+    ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
     ?schedule_to_start_timeout:T.Duration.t ->
@@ -1120,6 +1150,7 @@ let _client_start_update :
   T.Client.start_update
 
 let _client_wait_update :
+    ?timeout:T.Duration.t ->
     ('input, 'output) T.Client.update_handle -> ('output, T.Error.t) result =
   T.Client.wait_update
 

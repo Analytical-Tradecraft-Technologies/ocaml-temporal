@@ -48,7 +48,7 @@ let workflow =
                let rec loop fired =
                  if fired = depth then Ok ()
                  else
-                   match W.Future.await (W.Context.start_timer context 1L) with
+                   match W.Future.await (fst (W.Context.start_timer context 1L)) with
                    | Ok () -> loop (fired + 1)
                    | Error error -> Error error
                in

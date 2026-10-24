@@ -6039,3 +6039,158 @@ runner output and report state that a pass is forward-compatibility evidence
 only, not rollback evidence (#508). The
 whole corpus replays in about a second. Every current capture comes from Core
 `95e97686`, so the first Core bump will be the first cross-revision replay.
+
+## 2026-10-24: Scoped durable-timer cancellation (#1134, first slice)
+
+`Workflow.start_sleep` and `Workflow.sleep` take `?scope`. The runtime timer
+now returns a cancellation operation next to its future: while the timer is
+pending it removes the resolver, emits one `Cancel_timer` and settles the
+future with a `Cancelled` error. After the firing job (same or later
+activation), after a repeated cancellation, or once a terminal command sealed
+the context, it is `Ok ()` with no command; from another execution it is a
+typed defect. Core's timer machine ignores cancels of fired timers and
+delivers no firing job for a cancelled one, so no bridge or protocol change
+was needed, and unscoped sleeps emit the same commands as before.
+`Scope.with_scope` around `Future.race work (start_sleep ~scope timeout)`
+therefore leaves no pending timer when the work wins.
+`test/runtime/test_timer_cancellation.ml` covers cancel before fire,
+direct-style `sleep ~scope`, cancel after fire in the same and a later
+activation, the race cleanup, an already-cancelled scope, zero duration,
+unchanged unscoped commands, and foreign-owner rejection. Still open under
+#1134: `Condition.wait_until ~timeout`, a live scenario and corpus histories
+for cancel-before/after-fire.
+
+## 2026-10-24: Child workflow timeouts and ID reuse policy (#1135, first half)
+
+`Child_workflow.start`, `start_handle` and `execute` take
+`?execution_timeout`, `?run_timeout`, `?task_timeout` and `?id_reuse_policy`.
+The timeout rules moved from `Client.start` into the private
+`Workflow_timeouts_private.validate`, so the client and a parent reject the
+same values with the same messages before any command. The runtime command,
+the OCaml workflow protocol (encoder and decoder), the completion JSON schema
+and the Rust `StartChildWorkflow` decoder carry the four fields as optional
+keys omitted when unset, so existing child starts encode byte-identically.
+Rust re-validates the timeout rules, maps them onto Core's
+`StartChildWorkflowExecution` fields (an unset reuse policy stays
+`Unspecified`), and the reverse Core conversion now accepts them, still
+rejecting the deprecated terminate-if-running policy. Evidence: the Rust tests
+`child_workflow_timeouts_and_reuse_policy_round_trip` and
+`child_workflow_timeout_rules_are_enforced` pin the exact document, which the
+OCaml `test_child_timeout_options` decodes, and
+`test/runtime/test_child_start_options.ml` covers the public boundary.
+`Temporal.Testing` records but does not enforce child timeouts. Still open
+under #1135: memo and search attributes (blocked by #512), a live
+run-timeout regression and a corpus history.
+
+## 2026-10-24: Release from the tag, not the master tip (#1144)
+
+The Release workflow is now dispatched from the version tag
+(`refs/tags/<tag>`), so `GITHUB_SHA`, every checkout and the signed provenance
+name the tagged commit regardless of what merged to `master` after tagging.
+Validation refuses any other dispatch ref and calls
+`check-release-tag-commit.sh TAG SHA master`, whose new optional branch
+argument fetches enough history (unshallowing a depth-1 checkout) to require
+the tagged commit to be on `origin/master`. The draft and publish checks still
+re-verify that the tag peels to the same commit. The contract test covers a
+tag that stays releasable after `master` advances, the same check from a
+depth-1 clone, an unmerged tagged commit, and an unfetchable branch; a
+mutation that drops the ancestry check fails it. The quality contract pins the
+validate job's ref and ancestry checks. The checklist, preflight guide and
+attestation verification (`--source-ref refs/tags/<tag>`) are updated.
+
+## 2026-10-24: Local activity cancellation from workflow code (#1156)
+
+`Activity.start_local`, `execute_local` and the new `start_local_handle` take
+`?scope`, and `start_local_handle` returns the ordinary activity handle whose
+`Activity.cancel` emits `Request_cancel_local_activity` once. Both paths reuse
+the remote-activity scope attachment (registered until the future settles),
+so the recorded `cancellation_type` (default `Wait_cancellation_completed`)
+now has an effect. A local activity in a language-owned `DoBackoff` timer is
+cancelled with its timer and settles immediately, as the runtime already did.
+`test/runtime/test_local_activity_scope.ml` covers a scope cancelling a
+running local activity once, an explicit handle cancel followed by Core's
+resolution and an idempotent late cancel, cancellation during backoff, and no
+command after completion or for an already-cancelled scope. Live
+qualification of local cancellation remains open.
+
+## 2026-10-24: Bounded Client.wait and wait_update (#1136)
+
+`Client.wait ?timeout` and `Client.wait_update ?timeout` bound the caller's
+wait from the moment of the call; on a current-run handle the one budget
+covers the whole run chain, and on an update every poll. The deadline is
+enforced in `Sdk_supervisor.Client_call.await`, the loop every submitted
+client call is awaited through: no bounded native wait outlasts the
+remaining budget, and on expiry the loop releases the call (freeing its
+share of the `max_pending_waits` slot and aborting the Rust long poll, as
+#1019 already did for abandoned calls) and passes the shared
+expired-deadline failure through the call's own decoder. The caller
+therefore gets the same retryable error with `rpc_status`
+`Some `Deadline_exceeded` that any expired RPC deadline produces, and the
+workflow and the handle are untouched, so a later wait observes the run. No
+Rust or protocol change was needed. A zero timeout is a typed defect; a bound
+too long for the monotonic clock is treated as unbounded. Evidence:
+`test_concurrent_client_calls` checks with a fake clock that slices shrink
+to the remaining budget, that expiry releases once and decodes the deadline
+error, that an outcome published first is kept, and that an expired deadline
+releases without polling; `test_client_worker` checks validation and that a
+bounded mock wait is unchanged. A live regression against a stuck run
+(`test/integration/concurrent_client`) remains open.
+Codex review follow-up: an expired call is read once with a zero-length wait
+before it is released, so an outcome published while the caller was paused
+is returned rather than dropped, and a wait or update poll whose deadline has
+already passed is not submitted at all. Like `?rpc_timeout`, the bound does
+not interrupt the owner's network-free admission of a request.
+
+## 2026-10-24: Bounded condition waits (#1134, second slice)
+
+`Condition.wait_until ?timeout` and `wait_until_result ?timeout` bound a
+workflow-local condition with a durable timer built from the scoped timer
+cancellation of the first #1134 slice. The predicate handed to the
+condition store also reports true once the timer has fired, so the
+activation loop's usual idle recheck wakes the waiter; the application
+predicate is then re-read so a satisfied state wins over a timeout delivered
+in the same activation, and the wait's private scope is cancelled, which
+emits `Cancel_timer` for a still-pending timer. A timeout is a typed
+`` `Timeout `` error. No runtime or protocol change; unbounded waits record
+nothing, as before. `test/runtime/test_condition_timeout.ml` covers
+satisfaction cancelling the timer, timeout, satisfaction and firing in one
+activation, zero and unbounded waits, a predicate error, and the detached
+defect. The live scenario and corpus histories for cancel-before/after-fire
+remain open under #1134.
+
+## 2026-10-24: Local activity cancellation live through the public API (#1156)
+
+`test/integration/local_activity_cancellation` no longer reaches into the
+private runtime adapter: each policy's execution schedules with
+`Activity.start_local_handle` and cancels with `Activity.cancel`, and a new
+fourth execution starts with `Activity.start_local ~scope` (local default
+`Wait_cancellation_completed`) and cancels the scope from the signal
+handler. Every execution cancels a committed 120-second retry timer, records
+exactly one local-activity marker, completes, and replays on a fresh worker
+with the same query result and no new attempt. It passed locally against the
+pinned Compose stack. A corpus history remains open.
+
+## 2026-10-24: Bounded waits live (#1136)
+
+The `concurrent_client` live regression gained a bounded-wait check on a
+client with `max_pending_waits:1`: a 1 s `Client.wait ?timeout` on an open
+run returns a retryable `Deadline_exceeded` error after about a second, the
+released slot admits a wait on another run, a later bounded wait on the same
+handle observes the run's termination, and shutdown during a bounded wait
+ends it promptly with the closed-client error. It passed locally against the
+pinned Compose stack.
+
+## 2026-10-24: Live child start options regression (#1135)
+
+`test/integration/child_start_options` runs against the Compose
+Temporal/PostgreSQL stack and is part of `make test-temporal-live-regressions`.
+A child started with execution, run and task timeouts reports
+`exec=60000 run=30000 task=7000` through `Workflow.info`, read through the
+parent's query before and after a worker replacement that replays the
+parent's start-child command. A child stalled behind a 3 s run timeout is
+ended by Temporal: the parent sees a `child_workflow` error and an exact-run
+`Client.wait` on the child reports `Timed_out`. After a child completes, the
+same child ID is refused under `` `Reject_duplicate `` and reused under
+`` `Allow_duplicate ``. It passed locally against the pinned Compose stack.
+The parent's error is not yet a typed timeout kind (#1143), and child memo
+and search attributes remain blocked by #512.

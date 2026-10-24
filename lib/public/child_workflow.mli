@@ -24,6 +24,15 @@ module Parent_close_policy : sig
   type t = Terminate | Abandon | Request_cancel
 end
 
+(** What Temporal does when the child's [id] belongs to a closed run; the
+    same choices as {!Client.type-id_reuse_policy}. [`Allow_duplicate]
+    starts a new run, [`Allow_duplicate_failed_only] starts one only if the
+    last run failed, was cancelled, terminated, or timed out, and
+    [`Reject_duplicate] refuses the start, which the child's {!started} and
+    {!future} report as a start failure. *)
+type id_reuse_policy =
+  [ `Allow_duplicate | `Allow_duplicate_failed_only | `Reject_duplicate ]
+
 (** An opaque typed child operation. The handle owns the result future and can
     emit one deterministic cancellation command for that exact child. *)
 type 'output handle
@@ -46,13 +55,31 @@ type 'output handle
     the parent, and await {!started} before the parent returns: Temporal Server
     does not start a child whose parent has already closed, whatever the
     policy, so a child scheduled in the parent's last workflow task is
-    silently never started. *)
+    silently never started.
+
+    [execution_timeout] bounds the whole child execution (across its retries
+    and continue-as-new runs), [run_timeout] one child run, and
+    [task_timeout] one child workflow task (Temporal's default is 10
+    seconds). They follow the same rules as {!Client.start}: each supplied
+    timeout must be positive, [run_timeout] no larger than
+    [execution_timeout], and [task_timeout] at most 120 seconds and no larger
+    than [run_timeout] (or [execution_timeout] without a [run_timeout]).
+    Violations return a ready failed handle with a typed defect before any
+    command is emitted. An expired child timeout ends the child, which the
+    parent observes as a failed {!future}; the child reads the values through
+    {!Workflow.Info.execution_timeout}, {!Workflow.Info.run_timeout} and
+    {!Workflow.Info.task_timeout}. [id_reuse_policy] is sent only when
+    supplied; omitted, Temporal's default ([`Allow_duplicate]) applies. *)
 val start_handle :
   ?scope:Scope.t ->
   ?cancellation_type:cancellation_type ->
   ?retry_policy:Retry_policy.t ->
   ?task_queue:string ->
   ?parent_close_policy:Parent_close_policy.t ->
+  ?execution_timeout:Duration.t ->
+  ?run_timeout:Duration.t ->
+  ?task_timeout:Duration.t ->
+  ?id_reuse_policy:id_reuse_policy ->
   id:string ->
   ('input, 'output) Workflow.t ->
   'input ->
@@ -98,7 +125,8 @@ val cancel :
     Starting several operations before awaiting them lets Temporal run them
     concurrently. The default cancellation policy is [Try_cancel]. A supplied
     [retry_policy] controls retries in Temporal Core. A supplied [scope]
-    attaches server-side child cancellation to the scope. The returned future
+    attaches server-side child cancellation to the scope. The timeouts and
+    [id_reuse_policy] behave as for {!start_handle}. The returned future
     resolves only when the child finishes; use {!start_handle} and {!started}
     to wait for the child to be started instead. *)
 val start :
@@ -107,6 +135,10 @@ val start :
   ?retry_policy:Retry_policy.t ->
   ?task_queue:string ->
   ?parent_close_policy:Parent_close_policy.t ->
+  ?execution_timeout:Duration.t ->
+  ?run_timeout:Duration.t ->
+  ?task_timeout:Duration.t ->
+  ?id_reuse_policy:id_reuse_policy ->
   id:string ->
   ('input, 'output) Workflow.t ->
   'input ->
@@ -123,6 +155,10 @@ val execute :
   ?retry_policy:Retry_policy.t ->
   ?task_queue:string ->
   ?parent_close_policy:Parent_close_policy.t ->
+  ?execution_timeout:Duration.t ->
+  ?run_timeout:Duration.t ->
+  ?task_timeout:Duration.t ->
+  ?id_reuse_policy:id_reuse_policy ->
   id:string ->
   ('input, 'output) Workflow.t ->
   'input ->

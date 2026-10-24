@@ -610,12 +610,17 @@ val execute :
     priority, or eager-execution option.
 
     [cancellation_type] defaults to [Wait_cancellation_completed], unlike the
-    [Try_cancel] default of [start]. The policy is recorded with the schedule
-    command, but this API returns only a future and accepts no [scope], so
-    workflow code currently has no way to request cancellation of a local
-    activity and the option has no observable effect. It is retained so a
-    future local cancellation API can honour it without a signature change. *)
+    [Try_cancel] default of [start]; it governs a cancellation requested
+    through [scope] or {!start_local_handle}. With [scope], cancelling the
+    scope requests cancellation of this local activity: Core records the
+    request and resolves the future with a typed [`Cancelled] error as the
+    policy dictates ([Try_cancel] and [Abandon] at once,
+    [Wait_cancellation_completed] once the running attempt has stopped). A
+    local activity waiting in a language-owned retry backoff is cancelled
+    immediately under every policy, because no attempt is running. A scope
+    that is already cancelled schedules nothing. *)
 val start_local :
+  ?scope:Scope.t ->
   ?activity_id:string ->
   ?schedule_to_close_timeout:Duration.t ->
   ?schedule_to_start_timeout:Duration.t ->
@@ -626,11 +631,28 @@ val start_local :
   'input ->
   ('output, Error.t) Future.t
 
+(** Schedules a local activity and retains a handle for explicit
+    cancellation with {!cancel}, with the same options and cancellation
+    semantics as [start_local]. Repeated cancellation is idempotent, including
+    after the activity has completed; cancellation outside the owning workflow
+    returns a typed lifecycle error and emits no command. *)
+val start_local_handle :
+  ?scope:Scope.t ->
+  ?activity_id:string ->
+  ?schedule_to_close_timeout:Duration.t ->
+  ?schedule_to_start_timeout:Duration.t ->
+  ?start_to_close_timeout:Duration.t ->
+  ?retry_policy:Retry_policy.t ->
+  ?cancellation_type:cancellation_type ->
+  ('input, 'output) t ->
+  'input ->
+  'output handle
+
 (** Schedules a local activity and waits for its result. It has the same
     contract as [start_local], including the [Wait_cancellation_completed]
-    default for [cancellation_type] and the fact that the option currently has
-    no observable effect, because no local activity can be cancelled. *)
+    default for [cancellation_type] and the cancellation a [scope] attaches. *)
 val execute_local :
+  ?scope:Scope.t ->
   ?activity_id:string ->
   ?schedule_to_close_timeout:Duration.t ->
   ?schedule_to_start_timeout:Duration.t ->

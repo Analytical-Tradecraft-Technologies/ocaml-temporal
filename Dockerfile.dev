@@ -14,7 +14,7 @@ ARG OCAML_IMAGE
 FROM ${RUST_IMAGE} AS rust-toolchain
 RUN rustup component add clippy rustfmt
 
-FROM ${OCAML_IMAGE} AS dev
+FROM ${OCAML_IMAGE} AS dev-base
 
 USER root
 # Retry transient package downloads without retrying the build or test suite.
@@ -52,7 +52,7 @@ CMD ["opam", "exec", "--", "dune", "build"]
 # unlisted package (a manifest omission or new upstream metadata) fails the
 # build instead of slipping past the licence review. Nothing in this stage is linked into or
 # shipped with the SDK; see docs/reference/quality-gates.md.
-FROM dev AS docs
+FROM dev-base AS docs
 COPY --chown=opam:opam scripts/docs-tools.locked ./scripts/
 RUN set -eu; \
     tools=$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' scripts/docs-tools.locked); \
@@ -72,6 +72,28 @@ RUN set -eu; \
     rm -f /tmp/docs-before /tmp/docs-after /tmp/docs-added /tmp/docs-expected; \
     sh scripts/opam-locked-deps.sh check
 
+USER root
+# Make supplies a fresh value on every invocation, so cached toolchains and
+# dependencies remain reusable while runtime Cargo/opam HTTPS uses current roots.
+ARG CA_CERTIFICATES_REFRESH
+RUN test -n "${CA_CERTIFICATES_REFRESH}" \
+    && apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install --reinstall --no-install-recommends -y ca-certificates \
+    && update-ca-certificates --fresh \
+    && rm -rf /var/lib/apt/lists/*
+USER opam
+
 # The default (last) stage stays the ordinary development image, so builds
 # that do not request the `docs` target never install the documentation tools.
-FROM dev
+FROM dev-base AS dev
+
+USER root
+# Make supplies a fresh value on every invocation, so cached toolchains and
+# dependencies remain reusable while runtime Cargo/opam HTTPS uses current roots.
+ARG CA_CERTIFICATES_REFRESH
+RUN test -n "${CA_CERTIFICATES_REFRESH}" \
+    && apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install --reinstall --no-install-recommends -y ca-certificates \
+    && update-ca-certificates --fresh \
+    && rm -rf /var/lib/apt/lists/*
+USER opam

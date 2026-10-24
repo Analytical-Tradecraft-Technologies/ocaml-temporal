@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::protocol::{self, JsonValue, MAX_PAYLOAD_BYTES, MAX_STRING_BYTES, ProtocolError};
+use crate::protocol::{self, MAX_PAYLOAD_BYTES, MAX_STRING_BYTES, ProtocolError};
 
 /// Decodes an explicitly present nullable field.
 ///
@@ -724,6 +724,20 @@ pub enum ChildWorkflowParentClosePolicy {
     RequestCancel,
 }
 
+/// What Temporal does when a child's workflow ID belongs to a closed run.
+/// An absent policy keeps the command identical to earlier releases, so the
+/// server default (allow duplicates) applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildWorkflowIdReusePolicy {
+    /// Start a new run whatever the closed run's outcome.
+    AllowDuplicate,
+    /// Start a new run only if the closed run did not complete successfully.
+    AllowDuplicateFailedOnly,
+    /// Refuse the start; the parent observes a start failure.
+    RejectDuplicate,
+}
+
 /// Retry policy supplied with one scheduled activity.
 ///
 /// The coefficient remains an unsigned decimal rendering of its IEEE-754
@@ -799,7 +813,9 @@ pub enum CompletionCommand {
     /// Starts a child workflow and records the policy used for an explicit
     /// later cancellation command.  Core owns retries, so an optional policy
     /// is carried with the command rather than reimplemented in replayed OCaml
-    /// code.
+    /// code. The optional workflow timeouts and ID reuse policy are omitted
+    /// from the document when unset, so commands without them are unchanged;
+    /// [`validate_completion`] applies the same timeout rules as root starts.
     StartChildWorkflow {
         seq: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -812,6 +828,14 @@ pub enum CompletionCommand {
         #[serde(deserialize_with = "required_nullable")]
         retry_policy: Option<RetryPolicy>,
         cancellation_type: ChildWorkflowCancellationType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_timeout: Option<Duration>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_timeout: Option<Duration>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_timeout: Option<Duration>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id_reuse_policy: Option<ChildWorkflowIdReusePolicy>,
     },
     /// Requests cancellation of a previously started child workflow.
     CancelChildWorkflow {
@@ -926,46 +950,6 @@ pub struct Completion {
     /// Optional task failure; omitted on successful completions for wire compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_failure: Option<Failure>,
-}
-
-/// Converts the duplicate-aware foundation tree to Serde's owned value.
-fn to_serde(value: JsonValue) -> serde_json::Value {
-    match value {
-        JsonValue::Null => serde_json::Value::Null,
-        JsonValue::Bool(value) => serde_json::Value::Bool(value),
-        JsonValue::Signed(value) => value.into(),
-        JsonValue::Unsigned(value) => value.into(),
-        JsonValue::String(value) => value.into(),
-        JsonValue::Array(values) => values.into_iter().map(to_serde).collect(),
-        JsonValue::Object(entries) => entries
-            .into_iter()
-            .map(|(key, value)| (key, to_serde(value)))
-            .collect(),
-    }
-}
-
-/// Converts Serde output back into the restricted integral JSON tree.
-fn from_serde(value: serde_json::Value) -> Result<JsonValue, ProtocolError> {
-    match value {
-        serde_json::Value::Null => Ok(JsonValue::Null),
-        serde_json::Value::Bool(value) => Ok(JsonValue::Bool(value)),
-        serde_json::Value::Number(value) => value
-            .as_i64()
-            .map(JsonValue::Signed)
-            .or_else(|| value.as_u64().map(JsonValue::Unsigned))
-            .ok_or_else(|| ProtocolError::invalid("$", "non-integral number in semantic output")),
-        serde_json::Value::String(value) => Ok(JsonValue::String(value)),
-        serde_json::Value::Array(values) => values
-            .into_iter()
-            .map(from_serde)
-            .collect::<Result<Vec<_>, _>>()
-            .map(JsonValue::Array),
-        serde_json::Value::Object(entries) => entries
-            .into_iter()
-            .map(|(key, value)| Ok((key, from_serde(value)?)))
-            .collect::<Result<Vec<_>, _>>()
-            .map(JsonValue::Object),
-    }
 }
 
 /// Requires a bounded nonempty Temporal identifier that is safe for both
@@ -1819,6 +1803,9 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                 workflow_id,
                 workflow_type,
                 retry_policy,
+                execution_timeout,
+                run_timeout,
+                task_timeout,
                 ..
             } => {
                 identifier(workflow_id, "$.commands.workflow_id")?;
@@ -1829,6 +1816,7 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                 if let Some(retry_policy) = retry_policy {
                     validate_retry_policy(retry_policy, "$.commands.retry_policy")?;
                 }
+                validate_child_timeouts(*execution_timeout, *run_timeout, *task_timeout)?;
             }
             CompletionCommand::SignalExternalWorkflow {
                 workflow_id,
@@ -2138,9 +2126,10 @@ fn validate_inbound_retry_policy(value: &RetryPolicy, path: &str) -> Result<(), 
 
 /// Strictly decodes one workflow activation.
 pub fn decode_activation(input: &str) -> Result<Activation, ProtocolError> {
-    let value = protocol::decode_payload_object(input)?;
-    let activation: Activation = serde_json::from_value(to_serde(value))
-        .map_err(|_| ProtocolError::invalid("$", "invalid workflow activation semantics"))?;
+    let activation: Activation = protocol::semantic_from_value(
+        protocol::decode_payload_object(input)?,
+        "invalid workflow activation semantics",
+    )?;
     validate_activation(&activation)?;
     Ok(activation)
 }
@@ -2148,18 +2137,17 @@ pub fn decode_activation(input: &str) -> Result<Activation, ProtocolError> {
 /// Validates, normalizes, and reparses one outgoing workflow activation.
 pub fn encode_activation(value: &Activation) -> Result<String, ProtocolError> {
     validate_activation(value)?;
-    let json = serde_json::to_value(value)
-        .map_err(|_| ProtocolError::invalid("$", "could not encode workflow activation"))?;
-    let output = protocol::encode_payload_object(&from_serde(json)?)?;
+    let output = protocol::encode_semantic(value, "could not encode workflow activation")?;
     decode_activation(&output)?;
     Ok(output)
 }
 
 /// Strictly decodes one successful workflow completion.
 pub fn decode_completion(input: &str) -> Result<Completion, ProtocolError> {
-    let value = protocol::decode_payload_object(input)?;
-    let completion: Completion = serde_json::from_value(to_serde(value))
-        .map_err(|_| ProtocolError::invalid("$", "invalid workflow completion semantics"))?;
+    let completion: Completion = protocol::semantic_from_value(
+        protocol::decode_payload_object(input)?,
+        "invalid workflow completion semantics",
+    )?;
     validate_completion(&completion)?;
     Ok(completion)
 }
@@ -2167,9 +2155,7 @@ pub fn decode_completion(input: &str) -> Result<Completion, ProtocolError> {
 /// Validates, normalizes, and reparses one outgoing workflow completion.
 pub fn encode_completion(value: &Completion) -> Result<String, ProtocolError> {
     validate_completion(value)?;
-    let json = serde_json::to_value(value)
-        .map_err(|_| ProtocolError::invalid("$", "could not encode workflow completion"))?;
-    let output = protocol::encode_payload_object(&from_serde(json)?)?;
+    let output = protocol::encode_semantic(value, "could not encode workflow completion")?;
     decode_completion(&output)?;
     Ok(output)
 }
@@ -2386,6 +2372,31 @@ pub(crate) fn payload_to_core(value: &Payload) -> Result<api_common::Payload, Co
     })
 }
 
+/// Converts a Core payload list to semantic payloads, preserving order and
+/// failing on the first payload [`payload_from_core`] cannot represent.
+fn payload_vec_from_core(
+    values: &[api_common::Payload],
+) -> Result<Vec<Payload>, CoreConversionError> {
+    values.iter().map(payload_from_core).collect()
+}
+
+/// Converts semantic payloads to a Core payload list, preserving order and
+/// failing on the first payload that exceeds the protocol limits.
+fn payload_vec_to_core(
+    values: &[Payload],
+) -> Result<Vec<api_common::Payload>, CoreConversionError> {
+    values.iter().map(payload_to_core).collect()
+}
+
+/// Converts a failure that Core's protobuf models as optional but whose
+/// enclosing variant requires; `missing` names the variant when it is absent.
+fn required_failure_from_core(
+    value: Option<&api_failure::Failure>,
+    missing: &'static str,
+) -> Result<Failure, CoreConversionError> {
+    failure_from_core(value.ok_or_else(|| invalid_core(missing))?)
+}
+
 /// Converts optional Core payload collections while preserving order.
 fn payloads_from_core(
     value: Option<&api_common::Payloads>,
@@ -2415,10 +2426,7 @@ fn payloads_option_from_core(
 /// Converts semantic payload collections while preserving order.
 fn payloads_to_core(values: &[Payload]) -> Result<api_common::Payloads, CoreConversionError> {
     Ok(api_common::Payloads {
-        payloads: values
-            .iter()
-            .map(payload_to_core)
-            .collect::<Result<_, _>>()?,
+        payloads: payload_vec_to_core(values)?,
     })
 }
 
@@ -2986,19 +2994,15 @@ fn activity_resolution_from_core(
             payload: value.result.as_ref().map(payload_from_core).transpose()?,
         }),
         Status::Failed(value) => Ok(ActivityResolution::Failed {
-            failure: failure_from_core(
-                value
-                    .failure
-                    .as_ref()
-                    .ok_or_else(|| invalid_core("Core failed activity has no failure"))?,
+            failure: required_failure_from_core(
+                value.failure.as_ref(),
+                "Core failed activity has no failure",
             )?,
         }),
         Status::Cancelled(value) => Ok(ActivityResolution::Cancelled {
-            failure: failure_from_core(
-                value
-                    .failure
-                    .as_ref()
-                    .ok_or_else(|| invalid_core("Core cancelled activity has no failure"))?,
+            failure: required_failure_from_core(
+                value.failure.as_ref(),
+                "Core cancelled activity has no failure",
             )?,
         }),
         Status::Backoff(value) => {
@@ -3080,11 +3084,9 @@ fn child_workflow_start_resolution_from_core(
             cause: child_start_failure_cause_from_core(value.cause)?,
         }),
         Status::Cancelled(value) => Ok(ChildWorkflowStartResolution::Cancelled {
-            failure: failure_from_core(
-                value
-                    .failure
-                    .as_ref()
-                    .ok_or_else(|| invalid_core("Core cancelled child start has no failure"))?,
+            failure: required_failure_from_core(
+                value.failure.as_ref(),
+                "Core cancelled child start has no failure",
             )?,
         }),
     }
@@ -3105,20 +3107,17 @@ fn child_workflow_resolution_from_core(
             payload: value.result.as_ref().map(payload_from_core).transpose()?,
         }),
         Status::Failed(value) => Ok(ChildWorkflowResolution::Failed {
-            failure: failure_from_core(
-                value
-                    .failure
-                    .as_ref()
-                    .ok_or_else(|| invalid_core("Core failed child workflow has no failure"))?,
+            failure: required_failure_from_core(
+                value.failure.as_ref(),
+                "Core failed child workflow has no failure",
             )?,
         }),
-        Status::Cancelled(value) => {
-            Ok(ChildWorkflowResolution::Cancelled {
-                failure: failure_from_core(value.failure.as_ref().ok_or_else(|| {
-                    invalid_core("Core cancelled child workflow has no failure")
-                })?)?,
-            })
-        }
+        Status::Cancelled(value) => Ok(ChildWorkflowResolution::Cancelled {
+            failure: required_failure_from_core(
+                value.failure.as_ref(),
+                "Core cancelled child workflow has no failure",
+            )?,
+        }),
     }
 }
 
@@ -3236,11 +3235,7 @@ pub fn activation_from_core(
                     Ok(ActivationJob::InitializeWorkflow {
                         workflow_id: value.workflow_id.clone(),
                         workflow_type: value.workflow_type.clone(),
-                        arguments: value
-                            .arguments
-                            .iter()
-                            .map(payload_from_core)
-                            .collect::<Result<_, _>>()?,
+                        arguments: payload_vec_from_core(&value.arguments)?,
                         randomness_seed: value.randomness_seed.to_string(),
                         attempt: value.attempt,
                         context: Some(Box::new(InitializeContext {
@@ -3372,11 +3367,7 @@ pub fn activation_from_core(
                 }
                 Variant::SignalWorkflow(value) => Ok(ActivationJob::SignalWorkflow {
                     signal_name: value.signal_name.clone(),
-                    input: value
-                        .input
-                        .iter()
-                        .map(payload_from_core)
-                        .collect::<Result<_, _>>()?,
+                    input: payload_vec_from_core(&value.input)?,
                     identity: inbound_identity(&value.identity),
                     headers: inbound_payload_map_from_core(&value.headers)?,
                 }),
@@ -3388,11 +3379,7 @@ pub fn activation_from_core(
                     // route the answer through its legacy response path.
                     query_id: value.query_id.clone(),
                     query_type: value.query_type.clone(),
-                    arguments: value
-                        .arguments
-                        .iter()
-                        .map(payload_from_core)
-                        .collect::<Result<_, _>>()?,
+                    arguments: payload_vec_from_core(&value.arguments)?,
                     headers: inbound_payload_map_from_core(&value.headers)?,
                 }),
                 Variant::DoUpdate(value) => {
@@ -3417,11 +3404,7 @@ pub fn activation_from_core(
                         id: value.id.clone(),
                         protocol_instance_id: value.protocol_instance_id.clone(),
                         name: value.name.clone(),
-                        input: value
-                            .input
-                            .iter()
-                            .map(payload_from_core)
-                            .collect::<Result<_, _>>()?,
+                        input: payload_vec_from_core(&value.input)?,
                         headers: inbound_payload_map_from_core(&value.headers)?,
                         meta: UpdateMeta {
                             identity: inbound_identity(&meta.identity),
@@ -3482,6 +3465,56 @@ pub fn activation_from_core(
     validate_activation(&activation)
         .map_err(|_| invalid_core("Core activation violates semantic protocol invariants"))?;
     Ok(activation)
+}
+
+/// Applies the root-start workflow-timeout rules to a child start, mirroring
+/// the OCaml encoder so a hand-built document cannot bypass them: each
+/// supplied timeout is positive (Temporal reads zero as unset), the task
+/// timeout is at most 120 seconds, the run timeout is no larger than the
+/// execution timeout, and the task timeout is no larger than the run timeout,
+/// or the execution timeout when there is no run timeout. Temporal would
+/// otherwise silently lower a value that breaks the ordering rules.
+fn validate_child_timeouts(
+    execution: Option<Duration>,
+    run: Option<Duration>,
+    task: Option<Duration>,
+) -> Result<(), ProtocolError> {
+    let key = |value: Duration| (value.seconds, value.nanoseconds);
+    for (value, path) in [
+        (execution, "$.commands.execution_timeout"),
+        (run, "$.commands.run_timeout"),
+        (task, "$.commands.task_timeout"),
+    ] {
+        if let Some(value) = value {
+            validate_time(value.seconds, value.nanoseconds, true, path)?;
+            if key(value) <= (0, 0) {
+                return Err(ProtocolError::invalid(path, "timeout must be positive"));
+            }
+        }
+    }
+    if task.is_some_and(|task| key(task) > (120, 0)) {
+        return Err(ProtocolError::invalid(
+            "$.commands.task_timeout",
+            "task timeout exceeds 120 seconds",
+        ));
+    }
+    if let (Some(execution), Some(run)) = (execution, run)
+        && key(run) > key(execution)
+    {
+        return Err(ProtocolError::invalid(
+            "$.commands.run_timeout",
+            "run timeout exceeds execution timeout",
+        ));
+    }
+    if let (Some(task), Some(bound)) = (task, run.or(execution))
+        && key(task) > key(bound)
+    {
+        return Err(ProtocolError::invalid(
+            "$.commands.task_timeout",
+            "task timeout exceeds the run (or execution) timeout",
+        ));
+    }
+    Ok(())
 }
 
 /// Converts one semantic duration to the protobuf representation.
@@ -3702,6 +3735,41 @@ fn parent_close_from_core(
     )
 }
 
+/// Maps a child ID reuse policy, keeping an absent policy unspecified so the
+/// command is identical to one built before the option existed.
+fn id_reuse_to_core(value: Option<ChildWorkflowIdReusePolicy>) -> i32 {
+    use temporalio_protos::temporal::api::enums::v1::WorkflowIdReusePolicy as Core;
+    i32::from(match value {
+        None => Core::Unspecified,
+        Some(ChildWorkflowIdReusePolicy::AllowDuplicate) => Core::AllowDuplicate,
+        Some(ChildWorkflowIdReusePolicy::AllowDuplicateFailedOnly) => {
+            Core::AllowDuplicateFailedOnly
+        }
+        Some(ChildWorkflowIdReusePolicy::RejectDuplicate) => Core::RejectDuplicate,
+    })
+}
+
+/// Rejects Core reuse policies this protocol does not offer, including the
+/// deprecated terminate-if-running value, and preserves an unspecified one.
+fn id_reuse_from_core(
+    value: i32,
+) -> Result<Option<ChildWorkflowIdReusePolicy>, CoreConversionError> {
+    use temporalio_protos::temporal::api::enums::v1::WorkflowIdReusePolicy as Core;
+    match Core::try_from(value).map_err(|_| invalid_core("unknown Core ID reuse policy"))? {
+        Core::Unspecified => Ok(None),
+        Core::AllowDuplicate => Ok(Some(ChildWorkflowIdReusePolicy::AllowDuplicate)),
+        Core::AllowDuplicateFailedOnly => {
+            Ok(Some(ChildWorkflowIdReusePolicy::AllowDuplicateFailedOnly))
+        }
+        Core::RejectDuplicate => Ok(Some(ChildWorkflowIdReusePolicy::RejectDuplicate)),
+        // Only the deprecated terminate-if-running value remains; naming it
+        // would trip the deprecation lint.
+        _ => Err(unsupported(
+            "Core child ID reuse policy is not represented by this protocol",
+        )),
+    }
+}
+
 /// Builds one official Core command with unsupported optional fields defaulted explicitly.
 fn command_to_core(
     value: &CompletionCommand,
@@ -3729,10 +3797,7 @@ fn command_to_core(
             activity_type: activity_type.clone(),
             task_queue: task_queue.clone(),
             headers: Default::default(),
-            arguments: arguments
-                .iter()
-                .map(payload_to_core)
-                .collect::<Result<_, _>>()?,
+            arguments: payload_vec_to_core(arguments)?,
             schedule_to_close_timeout: schedule_to_close_timeout.map(duration_to_core),
             schedule_to_start_timeout: schedule_to_start_timeout.map(duration_to_core),
             start_to_close_timeout: start_to_close_timeout.map(duration_to_core),
@@ -3771,10 +3836,7 @@ fn command_to_core(
                 }
             }),
             headers: Default::default(),
-            arguments: arguments
-                .iter()
-                .map(payload_to_core)
-                .collect::<Result<_, _>>()?,
+            arguments: payload_vec_to_core(arguments)?,
             schedule_to_close_timeout: schedule_to_close_timeout.map(duration_to_core),
             schedule_to_start_timeout: schedule_to_start_timeout.map(duration_to_core),
             start_to_close_timeout: start_to_close_timeout.map(duration_to_core),
@@ -3806,16 +3868,17 @@ fn command_to_core(
             input,
             retry_policy,
             cancellation_type,
+            execution_timeout,
+            run_timeout,
+            task_timeout,
+            id_reuse_policy,
         } => Variant::StartChildWorkflowExecution(core_commands::StartChildWorkflowExecution {
             seq: *seq,
             task_queue: task_queue.clone().unwrap_or_default(),
             parent_close_policy: parent_close_to_core(*parent_close_policy),
             workflow_id: workflow_id.clone(),
             workflow_type: workflow_type.clone(),
-            input: input
-                .iter()
-                .map(payload_to_core)
-                .collect::<Result<_, _>>()?,
+            input: payload_vec_to_core(input)?,
             retry_policy: retry_policy
                 .as_ref()
                 .map(retry_policy_to_core)
@@ -3826,8 +3889,13 @@ fn command_to_core(
             // helper intentionally leaves it at Core's default for isolated
             // protocol round-trip tests; it is never submitted to a worker.
             namespace: child_workflow_namespace.unwrap_or_default().to_owned(),
-            // Timeouts and the other child options remain at Core
-            // defaults until they have a stable public representation.
+            workflow_execution_timeout: execution_timeout.map(duration_to_core),
+            workflow_run_timeout: run_timeout.map(duration_to_core),
+            workflow_task_timeout: task_timeout.map(duration_to_core),
+            workflow_id_reuse_policy: id_reuse_to_core(*id_reuse_policy),
+            // Cron, headers, memo, search attributes and the remaining child
+            // options stay at Core defaults until they have a stable public
+            // representation.
             ..Default::default()
         }),
         CompletionCommand::CancelChildWorkflow { seq, reason } => {
@@ -3863,10 +3931,7 @@ fn command_to_core(
                     seq: *seq,
                     target: Some(target),
                     signal_name: signal_name.clone(),
-                    args: input
-                        .iter()
-                        .map(payload_to_core)
-                        .collect::<Result<_, _>>()?,
+                    args: payload_vec_to_core(input)?,
                     headers: headers
                         .iter()
                         .map(|(key, payload)| Ok((key.clone(), payload_to_core(payload)?)))
@@ -3916,10 +3981,7 @@ fn command_to_core(
         } => {
             Variant::ContinueAsNewWorkflowExecution(core_commands::ContinueAsNewWorkflowExecution {
                 workflow_type: workflow_type.clone(),
-                arguments: input
-                    .iter()
-                    .map(payload_to_core)
-                    .collect::<Result<_, _>>()?,
+                arguments: payload_vec_to_core(input)?,
                 // The semantic protocol intentionally exposes no task queue,
                 // timeout, memo, header, retry, or versioning controls yet.
                 ..Default::default()
@@ -4022,11 +4084,7 @@ fn command_from_core(
                 activity_id: value.activity_id.clone(),
                 activity_type: value.activity_type.clone(),
                 task_queue: value.task_queue.clone(),
-                arguments: value
-                    .arguments
-                    .iter()
-                    .map(payload_from_core)
-                    .collect::<Result<_, _>>()?,
+                arguments: payload_vec_from_core(&value.arguments)?,
                 schedule_to_close_timeout: value
                     .schedule_to_close_timeout
                     .as_ref()
@@ -4083,11 +4141,7 @@ fn command_from_core(
                         nanoseconds: timestamp.nanos,
                     }
                 }),
-                arguments: value
-                    .arguments
-                    .iter()
-                    .map(payload_from_core)
-                    .collect::<Result<_, _>>()?,
+                arguments: payload_vec_from_core(&value.arguments)?,
                 schedule_to_close_timeout: value
                     .schedule_to_close_timeout
                     .as_ref()
@@ -4118,10 +4172,6 @@ fn command_from_core(
         }
         Variant::StartChildWorkflowExecution(value) => {
             if !value.namespace.is_empty()
-                || value.workflow_execution_timeout.is_some()
-                || value.workflow_run_timeout.is_some()
-                || value.workflow_task_timeout.is_some()
-                || value.workflow_id_reuse_policy != 0
                 || !value.cron_schedule.is_empty()
                 || !value.headers.is_empty()
                 || !value.memo.is_empty()
@@ -4143,17 +4193,29 @@ fn command_from_core(
                 parent_close_policy: parent_close_from_core(value.parent_close_policy)?,
                 workflow_id: value.workflow_id.clone(),
                 workflow_type: value.workflow_type.clone(),
-                input: value
-                    .input
-                    .iter()
-                    .map(payload_from_core)
-                    .collect::<Result<_, _>>()?,
+                input: payload_vec_from_core(&value.input)?,
                 retry_policy: value
                     .retry_policy
                     .as_ref()
                     .map(retry_policy_from_core)
                     .transpose()?,
                 cancellation_type: child_cancellation_from_core(value.cancellation_type)?,
+                execution_timeout: value
+                    .workflow_execution_timeout
+                    .as_ref()
+                    .map(duration_from_core)
+                    .transpose()?,
+                run_timeout: value
+                    .workflow_run_timeout
+                    .as_ref()
+                    .map(duration_from_core)
+                    .transpose()?,
+                task_timeout: value
+                    .workflow_task_timeout
+                    .as_ref()
+                    .map(duration_from_core)
+                    .transpose()?,
+                id_reuse_policy: id_reuse_from_core(value.workflow_id_reuse_policy)?,
             })
         }
         Variant::CancelChildWorkflowExecution(value) => {
@@ -4189,11 +4251,7 @@ fn command_from_core(
                 workflow_id,
                 run_id,
                 signal_name: value.signal_name.clone(),
-                input: value
-                    .args
-                    .iter()
-                    .map(payload_from_core)
-                    .collect::<Result<_, _>>()?,
+                input: payload_vec_from_core(&value.args)?,
                 child_workflow_only,
                 headers: value
                     .headers
@@ -4234,11 +4292,9 @@ fn command_from_core(
             result: value.result.as_ref().map(payload_from_core).transpose()?,
         }),
         Variant::FailWorkflowExecution(value) => Ok(CompletionCommand::FailWorkflow {
-            failure: failure_from_core(
-                value
-                    .failure
-                    .as_ref()
-                    .ok_or_else(|| invalid_core("Core fail command has no failure"))?,
+            failure: required_failure_from_core(
+                value.failure.as_ref(),
+                "Core fail command has no failure",
             )?,
         }),
         Variant::ContinueAsNewWorkflowExecution(value) => {
@@ -4261,11 +4317,7 @@ fn command_from_core(
                 .map_err(|_| invalid_core("Core continue-as-new workflow type is invalid"))?;
             Ok(CompletionCommand::ContinueAsNew {
                 workflow_type: value.workflow_type.clone(),
-                input: value
-                    .arguments
-                    .iter()
-                    .map(payload_from_core)
-                    .collect::<Result<_, _>>()?,
+                input: payload_vec_from_core(&value.arguments)?,
             })
         }
         Variant::CancelWorkflowExecution(value) => {

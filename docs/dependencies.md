@@ -253,9 +253,9 @@ the pin files, the Dependabot entries and the CI matrix stay in step.
 
 | Image | Pin file | Manifest index digest |
 |---|---|---|
-| `ocaml/opam:debian-12-ocaml-5.2` | `docker/ocaml-5.2/Dockerfile` | `sha256:3f7f5f5adffbb0f69172d69ec34450695257aaf148d4549b3227c6998c5eb2a4` |
+| `ocaml/opam:debian-12-ocaml-5.2` | `docker/ocaml-5.2/Dockerfile` | `sha256:9a6c4e97c6cd133003f89c99fa74093902d88b385494dfcbcd77d22125e82086` |
 | `ocaml/opam:debian-12-ocaml-5.3` | `docker/ocaml-5.3/Dockerfile` | `sha256:bbaac53e502f6602013d8967c3a54cfcb898b556f453ab72e8e23966c3c681df` |
-| `ocaml/opam:debian-12-ocaml-5.4` | `docker/ocaml-5.4/Dockerfile` | `sha256:56c9ab2e2f9e8fa926efbc36bedf75fbdb0dd7661765440397def7a24d4e3bfa` |
+| `ocaml/opam:debian-12-ocaml-5.4` | `docker/ocaml-5.4/Dockerfile` | `sha256:226cbd9f8b39b1059c83c9fc46de7629d28e634ce5be0ca5cc07c83fb0dd98f1` |
 | `ocaml/opam:debian-12-ocaml-5.5` | `docker/ocaml-5.5/Dockerfile` | `sha256:002dfe08fb803908effe3426ec2537f1c14ce56e1eb51cf228741c45a402c5f7` |
 
 Each index contains native `linux/amd64` and `linux/arm64` images. The image
@@ -393,7 +393,7 @@ the `license` field of `cargo metadata` for the locked version.
 | flate2 | 1.1.10 | 1.1.10 | dev | MIT OR Apache-2.0 | Decodes gzip-compressed gRPC requests in the test server double |
 | h2 | 0.4.19 | 0.4.20 | dev | MIT | Plaintext HTTP/2 gRPC test server double |
 | http | 1.5.0 | 1.5.0 | dev | MIT OR Apache-2.0 | HTTP types for the test server double |
-| libc | 0.2.190 | 0.2.190 | normal | MIT OR Apache-2.0 | Unix thread signal-mask calls that keep SIGPIPE from terminating the OCaml host (#1041); tests also lower the descriptor limit so the metrics endpoint's `accept()` fails (#1030) |
+| libc | 0.2.190 | 0.2.191 | normal | MIT OR Apache-2.0 | Unix thread signal-mask calls that keep SIGPIPE from terminating the OCaml host (#1041); tests also lower the descriptor limit so the metrics endpoint's `accept()` fails (#1030) |
 | prost | 0.14.4 | 0.14.4 | normal | Apache-2.0 | Protobuf encoding and decoding of Temporal API messages and replay histories |
 | serde | 1.0.228 | 1.0.229 | normal | MIT OR Apache-2.0 | Private control protocol data model |
 | serde_json | 1.0.150 | 1.0.154 | normal | MIT OR Apache-2.0 | Private JSON control protocol |
@@ -649,7 +649,7 @@ version comment recorded beside a commit pin.
 | `actions/download-artifact` | `9000827ccba6bdab643e8b6fd33ac0654aef8333` | v8 | MIT | Consuming those artifacts |
 | `msys2/setup-msys2` | `ec48f7c5447b3140e2b088413ae3a55687bccb6e` | v2 | MIT | MinGW build tools for the Windows Rust producer |
 | `ocaml/setup-ocaml` | `93303b622b2522e4411e295f9e77411a24912ac7` | v3.9.0 | MIT | Native macOS and Windows OCaml compilers |
-| `taiki-e/install-action` | `1168f6810a3cb30a3514bf5756a3b7f0422c6df8` | v2.87.28 | Apache-2.0 OR MIT | Installing the pinned CI-only quality tools |
+| `taiki-e/install-action` | `8cca0918f8471c33515202b73f56ab27f2bed283` | v2.87.29 | Apache-2.0 OR MIT | Installing the pinned CI-only quality tools |
 
 `actions/checkout` is referenced by its major-version tag rather than an
 immutable commit; every other action is pinned by commit.

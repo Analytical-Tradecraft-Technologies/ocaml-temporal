@@ -291,6 +291,41 @@ let test_typed_start_and_wait_handle () =
     (Temporal.Client.start client ~workflow:echo_workflow
        ~task_queue:"unit-test" ~id:"after-shutdown" ~input:"ignored" ())
 
+(** [Client.wait ?timeout] (#1136): a non-positive bound is a typed defect
+    returned before any backend wait, and a positive bound leaves the result
+    unchanged. The mock resolves a wait at once, so expiry and slot release
+    are covered by the supervisor's [Client_call] deadline tests. *)
+let test_wait_timeout_validation () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let handle =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~request_id:"unit-timeout-1" ~task_queue:"unit-test"
+         ~id:"unit-timeout" ~input:"bounded" ())
+  in
+  (match Temporal.Client.wait ~timeout:(Temporal.Duration.of_ms 0L) handle with
+  | Error error ->
+      assert (Temporal.Error.kind error = "defect");
+      assert (Temporal.Error.message error = "wait timeout must be positive")
+  | Ok _ -> failwith "a zero wait timeout was accepted");
+  (match Temporal.Client.wait ~timeout:(Temporal.Duration.of_seconds 5L) handle with
+  | Ok (Temporal.Client.Completed { output = "bounded"; _ }) -> ()
+  | Ok _ -> failwith "a bounded wait changed the terminal result"
+  | Error error -> failwith (Temporal.Error.message error));
+  (* A bound too long for the monotonic clock is treated as no bound. *)
+  (match
+     Temporal.Client.wait
+       ~timeout:(Temporal.Duration.of_hours 87_000_000L) handle
+   with
+  | Ok (Temporal.Client.Completed { output = "bounded"; _ }) -> ()
+  | Ok _ -> failwith "an unbounded-length wait changed the terminal result"
+  | Error error -> failwith (Temporal.Error.message error));
+  unwrap (Temporal.Client.shutdown client)
+
 (** A custom encoder failure must stop before the backend accepts a start; a
     custom decoder failure leaves the exact mock result available for retry. *)
 let test_client_custom_codec_failures () =
@@ -1770,6 +1805,7 @@ let () =
   test_mock_worker_rejects_async_activity_at_create ();
   test_worker_run_after_shutdown_is_rejected ();
   test_typed_start_and_wait_handle ();
+  test_wait_timeout_validation ();
   test_client_custom_codec_failures ();
   test_mock_start_idempotent_retry ();
   test_mock_start_reuses_closed_workflow_id ();

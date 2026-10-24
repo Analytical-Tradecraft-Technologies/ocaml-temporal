@@ -565,6 +565,42 @@ fn submitted_async_activity_outcome(outcome: std::result::Result<Vec<u8>, Failur
     }
 }
 
+/// The failure for an operation on a runtime graph that no longer holds its
+/// Core reference.
+fn runtime_closed() -> Failure {
+    Failure {
+        status: STATUS_INVALID_STATE,
+        message: "Temporal runtime is already closed".to_owned(),
+    }
+}
+
+/// The failure for a client operation before a client has been connected,
+/// or after it has been released.
+fn client_not_connected() -> Failure {
+    Failure {
+        status: STATUS_INVALID_STATE,
+        message: "Temporal client is not connected".to_owned(),
+    }
+}
+
+/// The failure for a worker operation when no worker is running in this
+/// runtime graph.
+fn worker_not_running() -> Failure {
+    Failure {
+        status: STATUS_INVALID_STATE,
+        message: "Temporal worker is not running".to_owned(),
+    }
+}
+
+/// The failure for attaching to a shared runtime whose Core reference has
+/// already been released.
+fn shared_runtime_released() -> Failure {
+    Failure {
+        status: STATUS_INVALID_STATE,
+        message: "shared Temporal runtime is already released".to_owned(),
+    }
+}
+
 /// The failure for an async activity request on a runtime that has never
 /// started a worker, and so has no namespace to address.
 fn missing_worker_namespace() -> Failure {
@@ -1275,10 +1311,7 @@ impl SharedRuntime {
 
     /// Creates one instance graph holding a new reference to this Core.
     fn attach(&self) -> std::result::Result<Runtime, Failure> {
-        let core = self.core.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "shared Temporal runtime is already released".to_owned(),
-        })?;
+        let core = self.core.as_ref().ok_or_else(shared_runtime_released)?;
         Runtime::new(Arc::clone(core))
     }
 
@@ -1572,10 +1605,7 @@ impl Runtime {
                 message: "Temporal client is already connected".to_owned(),
             });
         }
-        let core = self.core.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal runtime is already closed".to_owned(),
-        })?;
+        let core = self.core.as_ref().ok_or_else(runtime_closed)?;
         let target =
             temporalio_sdk_core::Url::parse(&config.target_url).map_err(|error| Failure {
                 status: STATUS_CONFIGURATION,
@@ -1672,17 +1702,15 @@ impl Runtime {
                         .to_owned(),
             });
         }
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        let connection = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(client_not_connected)?;
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle();
         // Capture validated request identities before the request is moved into
         // the Core start call so an unencodable server response can still report
@@ -1768,17 +1796,15 @@ impl Runtime {
     fn client_and_handle(
         &self,
     ) -> std::result::Result<(Connection, tokio::runtime::Handle), Failure> {
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        let connection = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(client_not_connected)?;
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle();
         Ok((connection, handle))
     }
@@ -2064,17 +2090,15 @@ impl Runtime {
     fn begin_start_workflow_json(&mut self, input: &[u8]) -> Operation {
         let text = decode_semantic_input(input)?;
         let request = client_protocol::decode_start_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        let connection = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(client_not_connected)?;
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle();
 
         // A caller that retries a begin request with the same logical ID must
@@ -2170,10 +2194,7 @@ impl Runtime {
         // admitted by this runtime, but returning the lifecycle error is more
         // useful and consistent with begin/start/wait operations than exposing
         // the implementation detail that the pending-ticket map is empty.
-        self.client.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        self.client.as_ref().ok_or_else(client_not_connected)?;
         let read = {
             let pending = self
                 .pending_starts
@@ -2276,17 +2297,15 @@ impl Runtime {
     fn wait_workflow_json(&mut self, input: &[u8]) -> Operation {
         let text = decode_semantic_input(input)?;
         let request = client_protocol::decode_wait_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        let connection = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(client_not_connected)?;
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle();
         if !self.pending_waits.contains_key(&request) {
             if self.pending_waits.len() >= self.client_limits.pending_waits {
@@ -2340,10 +2359,11 @@ impl Runtime {
                 message: "Temporal replay worker is already running".to_owned(),
             });
         }
-        let client = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        let client = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(client_not_connected)?;
         // Keep the validated worker namespace beside the native graph. Child
         // workflow commands do not expose namespace in the language-level
         // command, but Core needs the worker namespace to populate failure
@@ -2352,10 +2372,7 @@ impl Runtime {
         // The async heartbeat throttle uses the settings handed to Core.
         let heartbeat_intervals = config.tuning.heartbeat_intervals()?;
         let worker_config = config.into_core()?;
-        let core = self.core.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal runtime is already closed".to_owned(),
-        })?;
+        let core = self.core.as_ref().ok_or_else(runtime_closed)?;
         let handle = core.tokio_handle();
         let worker = {
             // Core's synchronous constructor creates poll buffers with
@@ -2414,10 +2431,7 @@ impl Runtime {
         }
         let worker_namespace = config.namespace.clone();
         let worker_config = config.into_core()?;
-        let core = self.core.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal runtime is already closed".to_owned(),
-        })?;
+        let core = self.core.as_ref().ok_or_else(runtime_closed)?;
         let replay = ReplayWorker::start(core, worker_config).map_err(replay_worker_failure)?;
         self.replay_worker = Some(replay);
         self.worker_namespace = Some(worker_namespace);
@@ -2541,16 +2555,10 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
-        let worker = self.worker.as_mut().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_mut().ok_or_else(worker_not_running)?;
         let activation = worker
             .try_take_workflow(&handle)
             .ok_or_else(not_ready)?
@@ -2590,10 +2598,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
         let activation = {
@@ -2642,10 +2647,7 @@ impl Runtime {
     /// A bounded timeout keeps a supervisor mailbox responsive to lifecycle
     /// commands when Core is quiet; callers retry after `STATUS_NOT_READY`.
     fn wait_workflow(&self) -> Operation {
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         match worker.wait_workflow() {
             ReadinessWait::Ready => Ok(Vec::new()),
             ReadinessWait::TimedOut => Err(Failure {
@@ -2684,10 +2686,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
         let worker = self.replay_worker.as_mut().ok_or_else(|| Failure {
@@ -2734,10 +2733,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
         let worker = self.replay_worker.as_ref().ok_or_else(|| Failure {
@@ -2777,10 +2773,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
         let worker = self.replay_worker.as_ref().ok_or_else(|| Failure {
@@ -2797,10 +2790,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
         let worker = self.replay_worker.take().ok_or_else(|| Failure {
@@ -2830,10 +2820,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
         let worker = self
@@ -2875,10 +2862,7 @@ impl Runtime {
             worker_namespace,
         )
         .map_err(core_conversion_failure)?;
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         let handle = self
             .core
             .as_ref()
@@ -2921,16 +2905,10 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
-        let worker = self.worker.as_mut().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_mut().ok_or_else(worker_not_running)?;
         let task = worker
             .try_take_activity(&handle)
             .ok_or_else(not_ready)?
@@ -2985,10 +2963,7 @@ impl Runtime {
     /// As with workflow readiness, this is a blocking native call with a
     /// bounded duration so the owner supervisor can process shutdown messages.
     fn wait_activity(&self) -> Operation {
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         match worker.wait_activity() {
             ReadinessWait::Ready => Ok(Vec::new()),
             ReadinessWait::TimedOut => Err(Failure {
@@ -3011,10 +2986,7 @@ impl Runtime {
     /// waits: `STATUS_NOT_READY` on timeout and `STATUS_INVALID_STATE` once a
     /// lane has closed without queued work.
     fn wait_any(&self) -> Operation {
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         match worker.wait_any() {
             ReadinessWait::Ready => Ok(Vec::new()),
             ReadinessWait::TimedOut => Err(Failure {
@@ -3038,10 +3010,7 @@ impl Runtime {
     /// admission bounded.
     fn wait_activity_completion_retry_backoff(&self) -> Operation {
         let Some(worker) = self.worker.as_ref() else {
-            return Err(Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal worker is not running".to_owned(),
-            });
+            return Err(worker_not_running());
         };
         worker.wait_activity_completion_retry_backoff();
         Ok(Vec::new())
@@ -3054,10 +3023,7 @@ impl Runtime {
         run_id: &str,
         reason: &'static str,
     ) -> std::result::Result<(), Failure> {
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         let handle = self
             .core
             .as_ref()
@@ -3093,10 +3059,7 @@ impl Runtime {
         task_token: &[u8],
         reason: &'static str,
     ) -> std::result::Result<(), Failure> {
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         let handle = self
             .core
             .as_ref()
@@ -3115,10 +3078,7 @@ impl Runtime {
             activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
         let completion =
             activity_protocol::completion_to_core(&semantic).map_err(core_conversion_failure)?;
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         let handle = self
             .core
             .as_ref()
@@ -3148,10 +3108,7 @@ impl Runtime {
             .map(workflow_protocol::payload_to_core)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(core_conversion_failure)?;
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         let heartbeat = CoreActivityHeartbeat {
             task_token,
             details,
@@ -3171,10 +3128,11 @@ impl Runtime {
     /// completion path would make a retained async handle depend on a poll
     /// task that has already been retired.
     fn async_activity_client(&self) -> std::result::Result<Client, Failure> {
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        let connection = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(client_not_connected)?;
         let namespace = self
             .worker_namespace
             .clone()
@@ -3193,10 +3151,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle();
         handle.block_on(request.send_evicting(client, &self.heartbeat_throttle))?;
         Ok(Vec::new())
@@ -4255,6 +4210,67 @@ unsafe fn invoke(output: *mut Result, operation: impl FnOnce() -> Operation) -> 
     status
 }
 
+/// Runs one runtime operation over a bounded strict-document input span.
+///
+/// This is the common shape of the JSON-document entry points: the input span
+/// is checked against [`crate::protocol::MAX_DOCUMENT_BYTES`] before the
+/// runtime handle, preserving the established failure precedence, and the
+/// whole operation runs inside [`invoke`]'s panic and result boundary.
+///
+/// # Safety
+///
+/// `runtime` follows [`runtime_mut`]'s contract, the input span follows
+/// [`input_span`]'s contract, and `output` follows [`invoke`]'s contract.
+unsafe fn invoke_runtime_document(
+    output: *mut Result,
+    runtime: *mut Runtime,
+    input: *const u8,
+    input_len: usize,
+    operation: impl FnOnce(&mut Runtime, &[u8]) -> Operation,
+) -> Status {
+    // SAFETY: The caller supplies the pointer and span contracts documented
+    // above; `invoke` validates `output` before running the closure.
+    unsafe {
+        invoke(output, || {
+            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
+            operation(runtime_mut(runtime)?, input)
+        })
+    }
+}
+
+/// Borrows one opaque runtime handle exclusively, refusing a null pointer.
+///
+/// # Safety
+///
+/// A non-null `runtime` must identify a live handle created by
+/// [`ocaml_temporal_core_v4_runtime_new`] that no other reference aliases for
+/// `'a`.
+unsafe fn runtime_mut<'a>(runtime: *mut Runtime) -> std::result::Result<&'a mut Runtime, Failure> {
+    // SAFETY: Upheld by the caller as documented above.
+    unsafe { runtime.as_mut() }.ok_or_else(null_runtime)
+}
+
+/// Borrows one opaque runtime handle for shared access, refusing a null
+/// pointer. Used by entry points, such as the blocking waits, whose runtime
+/// operation needs only `&Runtime`.
+///
+/// # Safety
+///
+/// A non-null `runtime` must identify a live runtime handle that is not
+/// mutably aliased for `'a`.
+unsafe fn runtime_ref<'a>(runtime: *const Runtime) -> std::result::Result<&'a Runtime, Failure> {
+    // SAFETY: Upheld by the caller as documented above.
+    unsafe { runtime.as_ref() }.ok_or_else(null_runtime)
+}
+
+/// Reports a null runtime handle passed across the native ABI.
+fn null_runtime() -> Failure {
+    Failure {
+        status: STATUS_INVALID_ARGUMENT,
+        message: "runtime pointer is null".to_owned(),
+    }
+}
+
 /// Decodes one bounded strict UTF-8 JSON lifecycle configuration.
 ///
 /// Parser details are deliberately reduced to one stable category. Serde's
@@ -4989,10 +5005,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_metric_meter(
                 status: STATUS_INVALID_ARGUMENT,
                 message: "shared runtime handle is null".to_owned(),
             })?;
-            let core = shared.core.as_ref().ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "shared Temporal runtime is already released".to_owned(),
-            })?;
+            let core = shared.core.as_ref().ok_or_else(shared_runtime_released)?;
             if let Some(temporal_meter) = core.telemetry().get_temporal_metric_meter() {
                 let global_tag_names = core
                     .metrics
@@ -5151,10 +5164,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_connect_json(
     // before dereferencing and forwards the documented input span to decoding.
     unsafe {
         invoke(output, || {
-            let runtime = runtime.as_mut().ok_or_else(|| Failure {
-                status: STATUS_INVALID_ARGUMENT,
-                message: "runtime pointer is null".to_owned(),
-            })?;
+            let runtime = runtime_mut(runtime)?;
             let config = decode_config::<ClientConfig>(input, input_len)?;
             runtime.connect_client(config)
         })
@@ -5180,15 +5190,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_start_workflow_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .start_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.start_workflow_json(input)
         })
     }
 }
@@ -5212,15 +5215,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_cancel_workflow_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .cancel_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.cancel_workflow_json(input)
         })
     }
 }
@@ -5243,15 +5239,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_terminate_workflow_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .terminate_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.terminate_workflow_json(input)
         })
     }
 }
@@ -5275,15 +5264,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_reset_workflow_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .reset_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.reset_workflow_json(input)
         })
     }
 }
@@ -5307,15 +5289,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_signal_workflow_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .signal_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.signal_workflow_json(input)
         })
     }
 }
@@ -5339,15 +5314,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_query_workflow_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .query_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.query_workflow_json(input)
         })
     }
 }
@@ -5367,15 +5335,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_update_workflow_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .update_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.update_workflow_json(input)
         })
     }
 }
@@ -5395,15 +5356,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_poll_update_workflow_json
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .poll_update_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.poll_update_workflow_json(input)
         })
     }
 }
@@ -5426,15 +5380,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_list_visibility_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .list_visibility_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.list_visibility_json(input)
         })
     }
 }
@@ -5459,15 +5406,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_begin_start_workflow_json
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .begin_start_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.begin_start_workflow_json(input)
         })
     }
 }
@@ -5491,15 +5431,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_poll_start_workflow_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .poll_start_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.poll_start_workflow_json(input)
         })
     }
 }
@@ -5523,15 +5456,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_wait_start_workflow_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_start_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.wait_start_workflow_json(input)
         })
     }
 }
@@ -5555,15 +5481,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_wait_workflow_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_workflow_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.wait_workflow_json(input)
         })
     }
 }
@@ -5598,13 +5517,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_submit_json(
     unsafe {
         invoke(output, || {
             let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .submit_client_call(kind, input)
+            runtime_mut(runtime)?.submit_client_call(kind, input)
         })
     }
 }
@@ -5701,10 +5614,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_start_json(
     // preconditions before the runtime graph is mutated.
     unsafe {
         invoke(output, || {
-            let runtime = runtime.as_mut().ok_or_else(|| Failure {
-                status: STATUS_INVALID_ARGUMENT,
-                message: "runtime pointer is null".to_owned(),
-            })?;
+            let runtime = runtime_mut(runtime)?;
             let config = decode_config::<WorkerConfigInput>(input, input_len)?;
             runtime.start_worker(config)
         })
@@ -5728,10 +5638,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_start_json(
 ) -> Status {
     unsafe {
         invoke(output, || {
-            let runtime = runtime.as_mut().ok_or_else(|| Failure {
-                status: STATUS_INVALID_ARGUMENT,
-                message: "runtime pointer is null".to_owned(),
-            })?;
+            let runtime = runtime_mut(runtime)?;
             let config = decode_config::<WorkerConfigInput>(input, input_len)?;
             runtime.start_replay_worker(config)
         })
@@ -5752,15 +5659,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_feed_history_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .feed_replay_history_json(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.feed_replay_history_json(input)
         })
     }
 }
@@ -5776,17 +5676,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_finish_input(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .finish_replay_input()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.finish_replay_input()) }
 }
 
 /// Non-blockingly take one validated replay activation JSON document.
@@ -5800,17 +5690,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_try_poll_workflow(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .try_poll_replay_workflow()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.try_poll_replay_workflow()) }
 }
 
 /// Wait for replay workflow readiness with the same bounded lock-release
@@ -5825,17 +5705,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_wait_workflow(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_replay_workflow()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.wait_replay_workflow()) }
 }
 
 /// Validate and submit one replay workflow completion JSON document.
@@ -5852,15 +5722,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_complete_workflow_
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .complete_replay_workflow(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.complete_replay_workflow(input)
         })
     }
 }
@@ -5879,15 +5742,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_reject_workflow_js
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .reject_replay_workflow(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.reject_replay_workflow(input)
         })
     }
 }
@@ -5904,17 +5760,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_finalize(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .finalize_replay()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.finalize_replay()) }
 }
 
 /// Explicitly abandon replay with Core's shutdown-safe empty completions and
@@ -5931,17 +5777,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_replay_worker_dispose(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .dispose_replay()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.dispose_replay()) }
 }
 
 /// Non-blockingly take one validated workflow activation JSON document.
@@ -5955,17 +5791,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_try_poll_workflow(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .try_poll_workflow()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.try_poll_workflow()) }
 }
 
 /// Wait for workflow-lane readiness without consuming the queued activation.
@@ -5983,17 +5809,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_wait_workflow(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_ref()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_workflow()
-        })
-    }
+    unsafe { invoke(output, || runtime_ref(runtime)?.wait_workflow()) }
 }
 
 /// Validate and submit one workflow completion JSON document.
@@ -6010,15 +5826,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_complete_workflow_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .complete_workflow(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.complete_workflow(input)
         })
     }
 }
@@ -6040,15 +5849,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_reject_workflow_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .reject_polled_workflow(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.reject_polled_workflow(input)
         })
     }
 }
@@ -6064,17 +5866,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_try_poll_activity(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .try_poll_activity()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.try_poll_activity()) }
 }
 
 /// Wait for remote-activity-lane readiness without consuming the queued task.
@@ -6092,17 +5884,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_wait_activity(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_ref()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_activity()
-        })
-    }
+    unsafe { invoke(output, || runtime_ref(runtime)?.wait_activity()) }
 }
 
 /// Wait for readiness on either worker lane without consuming a queued task.
@@ -6120,17 +5902,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_wait_any(
     runtime: *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_ref()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_any()
-        })
-    }
+    unsafe { invoke(output, || runtime_ref(runtime)?.wait_any()) }
 }
 
 /// Apply the bounded native delay used before retrying an explicitly
@@ -6152,13 +5924,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_wait_activity_completion_
 ) -> Status {
     unsafe {
         invoke(output, || {
-            runtime
-                .as_ref()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .wait_activity_completion_retry_backoff()
+            runtime_ref(runtime)?.wait_activity_completion_retry_backoff()
         })
     }
 }
@@ -6177,15 +5943,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_complete_activity_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .complete_activity(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.complete_activity(input)
         })
     }
 }
@@ -6209,15 +5968,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_record_activity_heartbeat
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .record_activity_heartbeat(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.record_activity_heartbeat(input)
         })
     }
 }
@@ -6239,15 +5991,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_complete_async_activity_j
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .complete_async_activity(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.complete_async_activity(input)
         })
     }
 }
@@ -6269,15 +6014,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_record_async_activity_hea
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .record_async_activity_heartbeat(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.record_async_activity_heartbeat(input)
         })
     }
 }
@@ -6300,15 +6038,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_reject_activity_json(
     output: *mut Result,
 ) -> Status {
     unsafe {
-        invoke(output, || {
-            let input = input_span(input, input_len, crate::protocol::MAX_DOCUMENT_BYTES)?;
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .reject_polled_activity(input)
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.reject_polled_activity(input)
         })
     }
 }
@@ -6333,17 +6064,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_initiate_shutdown(
 ) -> Status {
     // SAFETY: `invoke` validates the result before the closure checks and uses
     // the opaque runtime pointer.
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .initiate_worker_shutdown()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.initiate_worker_shutdown()) }
 }
 
 /// Gracefully stop and remove the runtime graph's workflow worker.
@@ -6361,17 +6082,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_shutdown(
 ) -> Status {
     // SAFETY: `invoke` validates the result before the closure checks and uses
     // the opaque runtime pointer.
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .shutdown_worker()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.shutdown_worker()) }
 }
 
 /// Remove the connected client after its worker child has stopped.
@@ -6388,17 +6099,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_disconnect(
 ) -> Status {
     // SAFETY: `invoke` validates output and the opaque handle is checked for
     // null before producing the unique mutable reference required by graph use.
-    unsafe {
-        invoke(output, || {
-            runtime
-                .as_mut()
-                .ok_or_else(|| Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime pointer is null".to_owned(),
-                })?
-                .disconnect_client()
-        })
-    }
+    unsafe { invoke(output, || runtime_mut(runtime)?.disconnect_client()) }
 }
 
 /// Destroy one native runtime and clear the caller's slot.

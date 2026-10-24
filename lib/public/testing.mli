@@ -53,7 +53,9 @@
       immediate cancellation path; child cancellation types are not
       distinguished.
     - Asynchronous activities, Nexus operations, search-attribute visibility,
-      memos, and workflow ID reuse policies are not simulated.
+      memos, and workflow ID reuse policies are not simulated. Child workflow
+      execution, run, and task timeouts are validated and recorded in the
+      start command but not enforced, so a child never times out.
     - Identifiers (workflow IDs, run IDs, update IDs) are deterministic
       counters, so repeated runs of a test observe identical values.
 

@@ -353,6 +353,14 @@ type child_workflow_parent_close_policy =
   | Parent_abandon
   | Parent_request_cancel
 
+(** What Temporal does when a child's workflow ID belongs to a closed run.
+    An absent policy keeps the command identical to earlier SDK releases, so
+    the server default (allow duplicates) applies. *)
+type child_workflow_id_reuse_policy =
+  | Reuse_allow_duplicate
+  | Reuse_allow_duplicate_failed_only
+  | Reuse_reject_duplicate
+
 (** Controls how Core reports a child-workflow cancellation request to the
     parent.  The policy is part of the command so replay sees the same
     cancellation semantics on every activation. *)
@@ -417,6 +425,10 @@ type completion_command =
       input : payload list;
       retry_policy : retry_policy option;
       cancellation_type : child_workflow_cancellation_type;
+      execution_timeout : duration option;
+      run_timeout : duration option;
+      task_timeout : duration option;
+      id_reuse_policy : child_workflow_id_reuse_policy option;
     }
   | Cancel_child_workflow of { seq : int64; reason : string }
   (** Sends a signal to another workflow execution. Core resolves the command
@@ -2617,6 +2629,63 @@ let zero_close_timeout schedule_to_close_timeout start_to_close_timeout =
   in
   is_zero schedule_to_close_timeout || is_zero start_to_close_timeout
 
+(** Maps a child ID reuse policy to its stable JSON spelling. *)
+let child_id_reuse_policy_string = function
+  | Reuse_allow_duplicate -> "allow_duplicate"
+  | Reuse_allow_duplicate_failed_only -> "allow_duplicate_failed_only"
+  | Reuse_reject_duplicate -> "reject_duplicate"
+
+(** Decodes the JSON spelling produced by [child_id_reuse_policy_string]. *)
+let child_id_reuse_policy path = function
+  | `String "allow_duplicate" -> Ok Reuse_allow_duplicate
+  | `String "allow_duplicate_failed_only" -> Ok Reuse_allow_duplicate_failed_only
+  | `String "reject_duplicate" -> Ok Reuse_reject_duplicate
+  | _ -> Error (invalid path "unknown child workflow ID reuse policy")
+
+(** Orders two normalized durations exactly, without float conversion. *)
+let compare_duration (left : duration) (right : duration) =
+  match Int64.compare left.seconds right.seconds with
+  | 0 -> Int.compare left.nanoseconds right.nanoseconds
+  | order -> order
+
+(** Applies the [Client.start] workflow-timeout rules to a child start so a
+    parent and a client agree on what Temporal would honour: each supplied
+    timeout is positive (Temporal reads zero as unset), the task timeout is
+    at most 120 seconds, the run timeout is no larger than the execution
+    timeout, and the task timeout is no larger than the run timeout, or the
+    execution timeout when there is no run timeout. Temporal would silently
+    lower a value that breaks the ordering rules instead of honouring it. *)
+let validate_child_timeouts path ~execution_timeout ~run_timeout ~task_timeout =
+  let zero : duration = { seconds = 0L; nanoseconds = 0 } in
+  let max_task : duration = { seconds = 120L; nanoseconds = 0 } in
+  let positive name = function
+    | Some value when compare_duration value zero <= 0 ->
+        Error (invalid (path ^ "." ^ name) "timeout must be positive")
+    | Some _ | None -> Ok ()
+  in
+  let* () = positive "execution_timeout" execution_timeout in
+  let* () = positive "run_timeout" run_timeout in
+  let* () = positive "task_timeout" task_timeout in
+  let* () =
+    match task_timeout with
+    | Some task when compare_duration task max_task > 0 ->
+        Error (invalid (path ^ ".task_timeout") "task timeout exceeds 120 seconds")
+    | Some _ | None -> Ok ()
+  in
+  let* () =
+    match (execution_timeout, run_timeout) with
+    | Some execution, Some run when compare_duration run execution > 0 ->
+        Error (invalid (path ^ ".run_timeout") "run timeout exceeds execution timeout")
+    | _ -> Ok ()
+  in
+  let run = match run_timeout with Some _ -> run_timeout | None -> execution_timeout in
+  match (task_timeout, run) with
+  | Some task, Some run when compare_duration task run > 0 ->
+      Error
+        (invalid (path ^ ".task_timeout")
+           "task timeout exceeds the run (or execution) timeout")
+  | _ -> Ok ()
+
 (** Encodes a nullable duration. *)
 let optional_duration_json = function
   | None -> `Null
@@ -2786,7 +2855,11 @@ let completion_command path json =
              })
   | "start_child_workflow" ->
       let optional_fields = match json with
-        | `Assoc entries -> List.filter (fun name -> List.mem_assoc name entries) ["task_queue"; "parent_close_policy"]
+        | `Assoc entries ->
+            List.filter
+              (fun name -> List.mem_assoc name entries)
+              [ "task_queue"; "parent_close_policy"; "execution_timeout";
+                "run_timeout"; "task_timeout"; "id_reuse_policy" ]
         | _ -> [] in
       let* entries =
         exact_object path
@@ -2829,10 +2902,27 @@ let completion_command path json =
       let* cancellation_type =
         child_cancellation_type (path ^ ".cancellation_type") cancellation_name
       in
+      (* Absent and explicit-null optional fields both mean "not set"; the
+         encoder never emits null for them. *)
+      let optional name decode =
+        match List.assoc_opt name entries with
+        | None | Some `Null -> Ok None
+        | Some json ->
+            let* value = decode (path ^ "." ^ name) json in
+            Ok (Some value)
+      in
+      let* execution_timeout = optional "execution_timeout" duration in
+      let* run_timeout = optional "run_timeout" duration in
+      let* task_timeout = optional "task_timeout" duration in
+      let* id_reuse_policy = optional "id_reuse_policy" child_id_reuse_policy in
+      let* () =
+        validate_child_timeouts path ~execution_timeout ~run_timeout ~task_timeout
+      in
       Ok
         (Start_child_workflow
            { seq; workflow_id; workflow_type; input; retry_policy;
-             cancellation_type; task_queue; parent_close_policy })
+             cancellation_type; task_queue; parent_close_policy;
+             execution_timeout; run_timeout; task_timeout; id_reuse_policy })
   | "cancel_child_workflow" ->
       let* entries = exact_object path [ "kind"; "seq"; "reason" ] json in
       let* seq_json = field path "seq" entries in
@@ -3041,7 +3131,13 @@ let completion_command_json = function
             ("seq", `Intlit (Int64.to_string seq));
           ])
   | Start_child_workflow
-      { seq; workflow_id; workflow_type; input; retry_policy; cancellation_type; task_queue; parent_close_policy } ->
+      { seq; workflow_id; workflow_type; input; retry_policy; cancellation_type;
+        task_queue; parent_close_policy; execution_timeout; run_timeout;
+        task_timeout; id_reuse_policy } ->
+      let* () =
+        validate_child_timeouts "$.commands" ~execution_timeout
+          ~run_timeout ~task_timeout
+      in
       let* input = payloads_json input in
       let* retry_policy =
         match retry_policy with
@@ -3051,7 +3147,18 @@ let completion_command_json = function
       let options =
         (match task_queue with None -> [] | Some value -> ["task_queue", `String value]) @
         (match parent_close_policy with None -> [] | Some value ->
-          ["parent_close_policy", `String (match value with Parent_terminate -> "terminate" | Parent_abandon -> "abandon" | Parent_request_cancel -> "request_cancel")]) in
+          ["parent_close_policy", `String (match value with Parent_terminate -> "terminate" | Parent_abandon -> "abandon" | Parent_request_cancel -> "request_cancel")]) @
+        (* Unset options are omitted rather than encoded as null so commands
+           without them stay byte-identical to earlier releases. *)
+        List.filter_map
+          (fun (name, value) ->
+            Option.map (fun (value : duration) ->
+                (name, time_json value.seconds value.nanoseconds)) value)
+          [ ("execution_timeout", execution_timeout);
+            ("run_timeout", run_timeout);
+            ("task_timeout", task_timeout) ] @
+        (match id_reuse_policy with None -> [] | Some value ->
+          ["id_reuse_policy", `String (child_id_reuse_policy_string value)]) in
       Ok
         (`Assoc
           (options @ [

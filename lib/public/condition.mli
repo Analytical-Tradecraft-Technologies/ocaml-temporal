@@ -11,9 +11,21 @@
 type predicate = unit -> (bool, Error.t) result
 
 (** Waits until a pure boolean predicate is true.  Exceptions raised by the
-    predicate are caught and returned as non-retryable [`Defect] errors. *)
-val wait_until : (unit -> bool) -> (unit, Error.t) result
+    predicate are caught and returned as non-retryable [`Defect] errors.
 
-(** Result-aware form of [wait_until].  [Error error] is returned unchanged;
-    an exception is converted to a typed non-retryable defect. *)
-val wait_until_result : predicate -> (unit, Error.t) result
+    [timeout] bounds the wait with a durable workflow timer (#1134). If the
+    timer fires while the predicate is still false, the result is a typed
+    [`Timeout] error ("workflow condition timed out"); if the predicate is
+    true when the waiter wakes, the result is [Ok ()] even if the timer fired
+    in the same activation. A wait that is satisfied first cancels its timer,
+    so history records [TimerCanceled] and no timer is left pending. A zero
+    [timeout] records no timer: the predicate is checked once and a false
+    predicate times out at once. Without [timeout] no timer is created and
+    nothing is recorded in history. *)
+val wait_until : ?timeout:Duration.t -> (unit -> bool) -> (unit, Error.t) result
+
+(** Result-aware form of [wait_until], with the same [timeout].  [Error
+    error] from the predicate is returned unchanged; an exception is
+    converted to a typed non-retryable defect. *)
+val wait_until_result :
+  ?timeout:Duration.t -> predicate -> (unit, Error.t) result

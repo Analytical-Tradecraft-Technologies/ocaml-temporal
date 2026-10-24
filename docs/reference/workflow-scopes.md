@@ -3,12 +3,14 @@
 `Temporal.Scope` is an experimental, workflow-local boundary for deciding
 which future a workflow still wants to observe. Cancelling a scope always
 wakes its waiters with a typed cancellation error. When a remote activity or child
-workflow was started with the optional `~scope` argument, cancellation also
-invokes that operation's server-side cancellation hook exactly once. Timers
-and operations started without `~scope` remain observation-only and are
-cleaned up by the normal Temporal/runtime lifecycle.
+workflow, or a durable timer, was started with the optional `~scope`
+argument, cancellation also invokes that operation's server-side cancellation
+hook exactly once. Operations started without `~scope` remain
+observation-only and are cleaned up by the normal Temporal/runtime lifecycle.
 
-The local-activity start API does not expose `~scope`.
+Local activities accept the same `~scope` through `Activity.start_local`,
+`start_local_handle` and `execute_local`; cancellation follows the local
+activity's own policy (#1156).
 
 Use a scope when a workflow wants one cancellation decision to cover both its
 local waiters and selected durable operations. Use an operation handle when
@@ -18,6 +20,7 @@ the Temporal operation must be cancelled independently of a scope:
 | --- | --- | --- |
 | Stop waiting for a workflow-owned future | `Temporal.Scope.cancel` and `Temporal.Scope.await` | Resolves the private signal and wakes scope waiters |
 | Cancel scoped activity or child workflow operations | `Temporal.Scope.cancel` after starting with `~scope` | Runs each registered server-cancellation hook once and emits the corresponding Core command |
+| Cancel a pending durable timer | `Temporal.Scope.cancel` after `Temporal.Workflow.start_sleep ~scope` or `sleep ~scope` | Emits one `Cancel_timer` (history records `TimerCanceled`) and settles the timer future with `Cancelled`; a timer that already fired is left as `Ok ()` with no command |
 | Request cancellation of one scheduled activity | `Temporal.Activity.start_handle` and `Temporal.Activity.cancel` | Emits the activity cancellation command using its configured policy |
 | Request cancellation of one child workflow | `Temporal.Child_workflow.start_handle` and `Temporal.Child_workflow.cancel` | Emits the child cancellation command using its configured policy |
 | Cancel an exact client execution | `Temporal.Client.cancel` | Sends an exact workflow/run cancellation request to Temporal Server |
@@ -44,7 +47,9 @@ cancellation errors.
 The following pattern races a workflow operation against a durable deadline.
 When the deadline wins, the operation is no longer observed by this body. If
 the operation was started with `~scope`, the same cancellation also requests
-server-side cancellation according to that operation's policy:
+server-side cancellation according to that operation's policy. Because the
+deadline timer is started with `~scope`, the cleanup cancellation also cancels
+it when the operation wins, so no timer is left pending in history:
 
 ```ocaml
 let await_until deadline operation =
@@ -52,7 +57,7 @@ let await_until deadline operation =
     match
       Temporal.Scope.await scope
         (Temporal.Future.race operation
-           (Temporal.Workflow.start_sleep deadline))
+           (Temporal.Workflow.start_sleep ~scope deadline))
     with
     | Ok (Temporal.Future.Left value) -> Ok value
     | Ok (Temporal.Future.Right ()) ->
@@ -133,10 +138,12 @@ eviction. This establishes language-layer retention, not live server behavior.
 - `Temporal.Scope.is_cancelled` reports the state without scheduling work.
   Like `check`, it may read through the query marker but cannot mutate or
   resume workflow fibers.
-- Scope cancellation itself is a private deterministic signal. Only activity
-  and child operations started with `~scope` register hooks that enqueue the
-  corresponding server-cancellation command. Timer futures and unscoped
-  operations are not implicitly cancelled. Workflow completion, eviction,
+- Scope cancellation itself is a private deterministic signal. Only activity,
+  child workflow and timer operations started with `~scope` register hooks
+  that enqueue the corresponding cancellation command. Unscoped operations
+  are not implicitly cancelled. A scoped timer whose scope is already
+  cancelled is never started, and a zero-duration sleep records no timer to
+  cancel. Workflow completion, eviction,
   cancellation, and shutdown dispose the scope signal and its waiters.
 
 These rules keep cancellation deterministic and prevent one workflow execution
@@ -144,7 +151,11 @@ from reading or mutating another execution's state. They are part of the
 [runtime invariants](runtime-invariants.md); the focused ownership, cleanup,
 idempotence, and server-cancellation cases live in
 [`test/runtime/test_scope.ml`](../../test/runtime/test_scope.ml) and
-[`test/runtime/test_scope_server_cancel.ml`](../../test/runtime/test_scope_server_cancel.ml).
+[`test/runtime/test_scope_server_cancel.ml`](../../test/runtime/test_scope_server_cancel.ml);
+timer cancellation (cancel before fire, after fire in the same and a later
+activation, repeated cancellation, the race cleanup above, and foreign-owner
+rejection) lives in
+[`test/runtime/test_timer_cancellation.ml`](../../test/runtime/test_timer_cancellation.ml).
 
 For a complete public-module index, see the [public API map](public-api-map.md).
 For server-facing activity and child cancellation behavior, see the

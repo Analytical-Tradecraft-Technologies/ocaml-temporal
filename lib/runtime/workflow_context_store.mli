@@ -333,7 +333,9 @@ val schedule_local_activity :
     no-op, including after Core has delivered a terminal result or start
     failure; a call after context shutdown remains a typed lifecycle defect.
     [input] is the exact argument list sent to Core, as for
-    [schedule_activity]. *)
+    [schedule_activity]. The optional timeouts are exact milliseconds that
+    the caller has already validated; they and [id_reuse_policy] are copied
+    into the command, and omitting them keeps the command unchanged. *)
 val start_child_workflow :
   t ->
   id:string ->
@@ -342,6 +344,10 @@ val start_child_workflow :
   ?retry_policy:Activation.retry_policy ->
   ?task_queue:string ->
   ?parent_close_policy:Activation.child_workflow_parent_close_policy ->
+  ?execution_timeout:int64 ->
+  ?run_timeout:int64 ->
+  ?task_timeout:int64 ->
+  ?id_reuse_policy:Activation.child_workflow_id_reuse_policy ->
   ?cancellation_type:Activation.child_workflow_cancellation_type ->
   decode:(Temporal_base.Codec.payload -> ('output, Temporal_base.Error.t) result) ->
   unit ->
@@ -372,9 +378,18 @@ val cancel_external_workflow :
   unit ->
   (unit, Temporal_base.Error.t) Future_store.t
 
-(** Emits a durable timer command and returns a future resolved by [fire_timer].
-    The duration is an exact non-negative millisecond count. *)
-val start_timer : t -> int64 -> (unit, Temporal_base.Error.t) Future_store.t
+(** Emits a durable timer command and returns a future resolved by [fire_timer]
+    together with its cancellation operation. The duration is an exact
+    non-negative millisecond count. Cancelling a pending timer emits
+    [Cancel_timer] once and settles the future with a [`Cancelled] error;
+    cancelling after it fired or was already cancelled is [Ok ()] with no
+    command, as is any cancellation after a terminal command sealed the
+    context. Cancellation outside this execution is a typed defect. *)
+val start_timer :
+  t ->
+  int64 ->
+  (unit, Temporal_base.Error.t) Future_store.t
+  * (unit -> (unit, Temporal_base.Error.t) result)
 
 (** Supplies an activity result to the pending future with this sequence number
     and then removes it. An unknown or repeated number returns a non-retryable

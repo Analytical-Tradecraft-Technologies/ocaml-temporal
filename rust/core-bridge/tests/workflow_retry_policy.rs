@@ -59,6 +59,10 @@ fn child_completion(policy: Option<RetryPolicy>) -> Completion {
             }],
             retry_policy: policy,
             cancellation_type: ChildWorkflowCancellationType::TryCancel,
+            execution_timeout: None,
+            run_timeout: None,
+            task_timeout: None,
+            id_reuse_policy: None,
         }],
     }
 }

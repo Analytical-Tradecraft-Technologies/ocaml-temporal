@@ -313,56 +313,16 @@ type start_policies = {
 }
 
 (** Validates a start's workflow timeouts and RPC deadline before encoding
-    input, mirroring the protocol encoder and the
-    Rust bridge so the mock rejects the same requests. A zero timeout is
-    rejected because Temporal reads zero as "unset" and would silently apply
-    its default; a task timeout above 120 seconds or above the run timeout
-    (the execution timeout when there is no run timeout) and a run timeout
-    above the execution timeout are rejected because Temporal would silently
-    lower them. Every combination of the reuse and conflict policies is
-    valid. Negative and overflowing values cannot be built as [Duration.t]. *)
+    input, mirroring the protocol encoder and the Rust bridge so the mock
+    rejects the same requests. The timeout rules are shared with child
+    workflow starts through {!Workflow_timeouts_private}. Every combination
+    of the reuse and conflict policies is valid. *)
 let validate_start_policies ~execution_timeout ~run_timeout ~task_timeout
     ~rpc_timeout =
-  let timeout label maximum = function
-    | None -> Ok None
-    | Some duration ->
-        let milliseconds = Duration.to_ms duration in
-        if Int64.compare milliseconds 0L <= 0 then
-          Error (Error.defect ~message:(label ^ " must be positive"))
-        else if Int64.compare milliseconds maximum > 0 then
-          Error (Error.defect ~message:(label ^ " exceeds its maximum"))
-        else Ok (Some milliseconds)
-  in
   let ( let* ) = Result.bind in
-  let* execution_timeout_ms =
-    timeout "execution_timeout" Client_protocol.max_workflow_timeout_ms
-      execution_timeout
-  in
-  let* run_timeout_ms =
-    timeout "run_timeout" Client_protocol.max_workflow_timeout_ms run_timeout
-  in
-  let* task_timeout_ms =
-    timeout "task_timeout (at most 120 seconds)"
-      Client_protocol.max_workflow_task_timeout_ms task_timeout
-  in
-  let* () =
-    match (execution_timeout_ms, run_timeout_ms) with
-    | Some execution, Some run when Int64.compare run execution > 0 ->
-        Error
-          (Error.defect ~message:"run_timeout exceeds execution_timeout")
-    | _ -> Ok ()
-  in
-  let* () =
-    (* A run without its own timeout is bounded by the execution timeout. *)
-    let run =
-      match run_timeout_ms with Some _ -> run_timeout_ms | None -> execution_timeout_ms
-    in
-    match (task_timeout_ms, run) with
-    | Some task, Some run when Int64.compare task run > 0 ->
-        Error
-          (Error.defect
-             ~message:"task_timeout exceeds the run (or execution) timeout")
-    | _ -> Ok ()
+  let* execution_timeout_ms, run_timeout_ms, task_timeout_ms =
+    Workflow_timeouts_private.validate ~execution_timeout ~run_timeout
+      ~task_timeout
   in
   let* start_rpc_deadline = rpc_deadline rpc_timeout in
   Ok
@@ -530,15 +490,36 @@ let chain_successor = function
   | Backend.Cancelled _ | Backend.Terminated _ ->
       None
 
+(** Converts an optional caller bound on [wait] or [wait_update] into an
+    absolute expiry on the native monotonic clock, fixed once at the public
+    entry so every step of a run-chain wait or update poll shares one budget
+    (#1136). The bound must be positive; zero would only ever report a
+    timeout. A bound so long that the expiry would overflow the clock is
+    treated as no bound, since it cannot elapse in practice. *)
+let wait_deadline = function
+  | None -> Ok None
+  | Some timeout ->
+      let milliseconds = Duration.to_ms timeout in
+      if Int64.compare milliseconds 0L <= 0 then
+        Error (Error.defect ~message:"wait timeout must be positive")
+      else
+        let now_ns = Temporal_sdk_kernel.Bridge.monotonic_now_ns () in
+        if
+          Int64.compare milliseconds
+            (Int64.div (Int64.sub Int64.max_int now_ns) 1_000_000L)
+          >= 0
+        then Ok None
+        else Ok (Some (Int64.add now_ns (Int64.mul milliseconds 1_000_000L)))
+
 (** Waits for one backend terminal result. A current-run handle starts from
     the run Temporal resolves for an empty run ID and then waits on each
     successor by its exact run ID until a run closes without one, so the
     result is the last run's outcome and never [Continued_as_new]. Each step is
     a separate bounded backend wait, so client shutdown still interrupts the
-    chain between and during steps. *)
-let wait_backend (handle : ('input, 'output) handle) =
+    chain between and during steps; [deadline_ns] bounds the whole chain. *)
+let wait_backend ?deadline_ns (handle : ('input, 'output) handle) =
   let wait_run run_id =
-    Backend.client_wait handle.client.backend
+    Backend.client_wait ?deadline_ns handle.client.backend
       ({ workflow_id = handle.workflow_id; run_id } : Backend.wait_request)
   in
   match handle.run_id with
@@ -557,11 +538,14 @@ let wait_backend (handle : ('input, 'output) handle) =
 (** Decodes a completed payload and maps terminal failures without exposing the
     private backend constructors. Each successor gains this client's namespace
     only after the protocol has checked it belongs to the waited execution. *)
-let wait (handle : ('input, 'output) handle) =
+let wait ?timeout (handle : ('input, 'output) handle) =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
+    match wait_deadline timeout with
+    | Error _ as error -> error
+    | Ok deadline_ns ->
     (* The backend keeps the validated run pair; the owning client supplies
        the namespace needed by [follow]. *)
     let public_successor =
@@ -572,7 +556,7 @@ let wait (handle : ('input, 'output) handle) =
             run_id = value.run_id;
           })
     in
-    Result.bind (wait_backend handle) (function
+    Result.bind (wait_backend ?deadline_ns handle) (function
       | Backend.Completed { payload; successor } ->
           Result.map
             (fun output ->
@@ -999,14 +983,15 @@ let start_update ?update_id ?rpc_timeout
     supplies a terminal outcome. Each retry occurs on the caller Domain; the
     Rust bridge releases the OCaml runtime lock while its gRPC poll is active.
     Outcomes already supplied at admission are decoded without another RPC. *)
-let wait_update handle =
+let wait_update ?timeout handle =
   if Atomic.get handle.client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
-    match handle.outcome with
-    | Some outcome -> decode_update_output handle.definition outcome
-    | None ->
+    match (wait_deadline timeout, handle.outcome) with
+    | (Error _ as error), _ -> error
+    | Ok _, Some outcome -> decode_update_output handle.definition outcome
+    | Ok deadline_ns, None ->
         let request : Backend.update_request =
           {
             workflow_id = handle.workflow_id;
@@ -1020,7 +1005,10 @@ let wait_update handle =
           }
         in
         let rec poll () =
-          match Backend.client_poll_update handle.client.backend request with
+          match
+            Backend.client_poll_update ?deadline_ns handle.client.backend
+              request
+          with
           | Error error -> Error error
           | Ok { Backend.outcome = None } ->
               Thread.yield ();

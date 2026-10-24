@@ -72,14 +72,27 @@ val implementation :
     timers before awaiting one emits them in call order. A zero duration returns
     a ready future without recording a timer. Outside workflow execution the
     returned future is ready with a typed defect rather than touching global
-    time or creating an unowned timer. *)
-val start_sleep : Duration.t -> (unit, Error.t) Future.t
+    time or creating an unowned timer.
 
-(** Starts a durable Temporal timer and waits until it fires. This is equivalent
-    to [Future.await (start_sleep duration)]. A zero duration returns
-    immediately without recording a timer; outside workflow execution it
-    returns a typed defect. *)
-val sleep : Duration.t -> (unit, Error.t) result
+    With [scope], cancelling the scope while the timer is pending records
+    [TimerCanceled] in history (one [Cancel_timer] command, however often the
+    scope is cancelled) and settles the future with a typed [`Cancelled]
+    error. A timer that already fired keeps its [Ok ()] and emits nothing. If
+    the scope is already cancelled, no timer is started and the future is
+    ready with the scope's [`Cancelled] error; a scoped start from a query or
+    outside a workflow scheduler turn is a typed defect. Wrapping a race in
+    {!Scope.with_scope} therefore cancels the losing timer, for example
+    [Scope.with_scope (fun scope -> ... Future.race work
+    (start_sleep ~scope timeout) ...)]. *)
+val start_sleep : ?scope:Scope.t -> Duration.t -> (unit, Error.t) Future.t
+
+(** Starts a durable Temporal timer and waits until it fires. Without [scope]
+    this is equivalent to [Future.await (start_sleep duration)]; with [scope]
+    the wait is [Scope.await scope (start_sleep ~scope duration)], so a scope
+    cancelled by another fiber cancels the timer and returns [`Cancelled]. A
+    zero duration returns immediately without recording a timer; outside
+    workflow execution it returns a typed defect. *)
+val sleep : ?scope:Scope.t -> Duration.t -> (unit, Error.t) result
 
 (** Sends a typed signal to another workflow execution. The operation is
     represented as a future because Temporal acknowledges delivery in a later
