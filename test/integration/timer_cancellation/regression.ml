@@ -135,6 +135,8 @@ type context = {
   client : Client.t;
   address : string;
   cli : string;
+  cli_address : string;
+      (** [address] without its [http://] scheme: the CLI takes [host:port]. *)
   queue : string;
   mutable worker : int;
   cleanups : (unit -> unit) list ref;
@@ -157,7 +159,7 @@ let await label attempt =
     its event types without the [EVENT_TYPE_] prefix, without a shell. *)
 let history context handle =
   let args =
-    [| context.cli; "--address"; context.address; "--namespace"; "default";
+    [| context.cli; "--address"; context.cli_address; "--namespace"; "default";
        "--command-timeout"; "30s"; "workflow"; "show"; "--workflow-id";
        Client.workflow_id handle; "--run-id"; Option.get (Client.run_id handle);
        "--output"; "json" |]
@@ -251,10 +253,17 @@ let check_scenario context mode ~drive ~expected ~started ~cancelled ~fired =
 (** Starts the worker process, runs every scenario, and terminates all
     fixture executions and the worker even when a check fails. *)
 let check address cli =
+  let cli_address =
+    match String.index_opt address ':' with
+    | Some _ when String.starts_with ~prefix:"http://" address ->
+        String.sub address 7 (String.length address - 7)
+    | _ -> fail "this fixture requires an http:// development server address"
+  in
   let queue = "timer-cancel-" ^ Temporal_base.Client_request_id.create () in
   let client = get (Client.create ~target_url:address ~namespace:"default" ()) in
   let context =
-    { client; address; cli; queue; worker = spawn address queue; cleanups = ref [] }
+    { client; address; cli; cli_address; queue; worker = spawn address queue;
+      cleanups = ref [] }
   in
   Fun.protect
     ~finally:(fun () ->
