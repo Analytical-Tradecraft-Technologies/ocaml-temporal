@@ -1506,7 +1506,26 @@ replay then requires the two to match and reports `Invalid_history` otherwise,
 so one execution's history cannot be replayed under another's ID. A single
 `GetWorkflowExecutionHistory` response is one page: fetch and concatenate
 every page, because a truncated history can still pass while covering only
-its first tasks. `temporal workflow show --output json` produces the
+its first tasks. From an OCaml program connected to the server,
+`Temporal.Client.fetch_history` does all of this: it fetches every page of a
+run's history and returns a `Replay.History.t`, so no export or conversion
+is needed:
+
+```ocaml
+let check_run handle =
+  match Temporal.Client.fetch_history handle with
+  | Error error -> Error (Temporal.Error.message error)
+  | Ok history -> (
+      match
+        Temporal.Replay.replay
+          ~workflows:[ Temporal.Replay.workflow ~signals:[ cancel_handler ] order_workflow ]
+          history
+      with
+      | Ok () -> Ok ()
+      | Error failure -> Error (Temporal.Replay.failure_message failure))
+```
+
+For files exported elsewhere, `temporal workflow show --output json` produces the
 protobuf **JSON** form, so convert it with a protobuf library that has the
 Temporal API descriptors, for example Python's
 `google.protobuf.json_format.Parse` followed by `SerializeToString`; the

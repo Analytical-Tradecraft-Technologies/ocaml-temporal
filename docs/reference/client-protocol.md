@@ -320,8 +320,11 @@ update poll, and visibility) as a submitted call:
    call at once and nothing is sent), encodes the request, and calls
    `ocaml_temporal_core_v4_client_submit_json` with a closed operation
    selector (`1` start, `2` wait, `3` cancel, `4` terminate, `5` reset,
-   `6` signal, `7` query, `8` update, `9` update poll, `10` visibility) and
-   the operation's usual request document.
+   `6` signal, `7` query, `8` update, `9` update poll, `10` visibility,
+   `11` and `12` async activity completion and heartbeat, `13` history) and
+   the operation's usual request document (history, #1137, has no
+   synchronous operation; see
+   [Fetch the complete history of a run](#fetch-the-complete-history-of-a-run-1137)).
 2. Rust validates the document, checks capacity, registers one completion
    cell under a fresh numeric call identifier bound to the runtime graph's
    owner identity, spawns one Tokio task that owns a connection clone and
@@ -1261,6 +1264,45 @@ run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/action
 recorded seventeen-result baseline evidence for those paths.
 The boundary and remaining cases are tracked in the
 [`two-OCaml-binary acceptance design`](two-ocaml-binary-e2e-acceptance.md).
+
+## Fetch the complete history of a run (#1137)
+
+`Temporal.Client.fetch_history` returns a run's recorded history as a
+`Temporal.Replay.History.t`, so a replay gate needs only the SDK:
+
+```ocaml
+Temporal.Client.fetch_history ~page_size:100 handle
+```
+
+It is a submitted call with selector `HISTORY` (13) and has no synchronous
+symbol. The closed request
+([`client-history-request.schema.json`](../schemas/bridge/client-history-request.schema.json))
+carries the connected namespace, the handle's workflow ID, its run ID (empty
+for a current-run handle, which Temporal resolves on the first page and pins
+through the continuation token), an optional `page_size` from 1 through
+1,000, and the optional `rpc_timeout_ms`. Unlike visibility, pagination is
+internal: Rust calls `GetWorkflowExecutionHistory` with every event type,
+without waiting for new events, and follows `next_page_token` until it is
+empty. All pages share one budget, 30 seconds by default, and expiry is the
+usual retryable `deadline_exceeded` RPC error. Each page's `History` is
+re-encoded and appended; because `History` has only the repeated `events`
+field, the concatenation is the same message a single page would have
+carried, whatever the page size.
+
+The success value is the one binary outcome among the submitted calls: the
+serialized `History`, which OCaml passes unchanged to
+`Replay.History.of_protobuf` under the handle's workflow ID. A history over
+the payload safety limit (`Replay.History.max_bytes`) or with no events is a
+protocol error rather than a truncated result, and a gRPC failure (for
+example `not_found` for an unknown run) arrives as the closed `rpc` document
+with the `Connection` status, as for visibility, so `Client.rpc_status`
+classifies it. An open run yields the events recorded so far. The
+deterministic `mock://` backend records no histories and returns a typed
+defect.
+
+The [fetch-history live regression](../../test/integration/fetch_history/README.md)
+replays fetched histories with the default page size and with one and three
+events per page.
 
 ## List workflow executions through visibility
 

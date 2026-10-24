@@ -176,6 +176,19 @@ type visibility_request = {
           it. *)
 }
 
+(** One complete-history fetch (#1137). An empty [run_id] selects the
+    workflow's current run. *)
+type history_request = {
+  workflow_id : string;
+  run_id : string;
+  page_size : int option;
+      (** Events per page, 1 to 1000; [None] keeps the server's default. *)
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline of the whole fetch, every page included, fixed on
+          the monotonic clock when the call began; [None] keeps the
+          30-second default. *)
+}
+
 (** Stable visibility metadata returned for one execution. *)
 type visibility_execution = {
   workflow_id : string;
@@ -457,6 +470,11 @@ val client_query : client -> query_request -> (Payload.t, Error.t) result
 (** Lists one bounded visibility page through Temporal's visibility service. *)
 val client_list_visibility :
   client -> visibility_request -> (visibility_page, Error.t) result
+
+(** Fetches every page of one run's history and returns it as one serialized
+    [temporal.api.history.v1.History] message, for [Temporal.Replay]. The
+    deterministic mock records no histories and returns a typed defect. *)
+val client_fetch_history : client -> history_request -> (string, Error.t) result
 
 (** Admits one workflow update and returns its durable update handle data. *)
 val client_update : client -> update_request -> (update_response, Error.t) result

@@ -93,6 +93,10 @@ module History : sig
       successfully, but it proves compatibility only for the tasks it
       contains; replay cannot tell that later pages are missing.
 
+      An application connected to Temporal can skip exporting altogether:
+      [Temporal.Client.fetch_history] returns the complete history of a run
+      as a {!t}, every page included.
+
       The Temporal CLI's [temporal workflow show --output json] export is
       protobuf JSON, not this binary encoding; convert it with any protobuf
       library that has the Temporal API descriptors (for example Python's

@@ -973,6 +973,7 @@ type client_call_kind =
   | Call_visibility
   | Call_async_activity_completion
   | Call_async_activity_heartbeat
+  | Call_history
 
 (** Handle of one submitted call: the random identity of the runtime graph
     that submitted it and the call identifier, both issued by Rust and
@@ -995,6 +996,7 @@ let client_call_selector = function
   | Call_visibility -> 10
   | Call_async_activity_completion -> 11
   | Call_async_activity_heartbeat -> 12
+  | Call_history -> 13
 
 (** Longest single native wait accepted by Rust for one await. *)
 let max_client_await_ms = 60_000

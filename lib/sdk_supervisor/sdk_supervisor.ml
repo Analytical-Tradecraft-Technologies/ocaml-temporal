@@ -955,6 +955,20 @@ module Protocol_adapter = struct
         | Error error -> client_error "client visibility response decoding" error)
     | Error native_error -> Error native_error
 
+  (** Canonically serializes one history fetch request (#1137). *)
+  let encode_client_history_request request =
+    match Client.encode_history_request request with
+    | Ok output -> Ok (Bytes.of_string output)
+    | Error error -> client_error "client history request encoding" error
+
+  (** Returns the binary [History] protobuf Rust assembled from every page.
+      It is opaque here; [Temporal.Replay] validates it. A failure, including
+      a gRPC status as the closed [rpc] document, is passed through for the
+      public client to classify. *)
+  let decode_client_history_result = function
+    | Ok history -> Ok (Bytes.to_string history)
+    | Error native_error -> Error native_error
+
   (** Decodes a native query payload list or preserves a structured server
       failure as an inner typed client error. The public layer enforces the
       output codec's expected payload cardinality. *)
@@ -1093,6 +1107,7 @@ module Native_backend = struct
         Client.poll_update_request ->
         (Client.poll_update_response, Client.client_error) result client_rpc
     | Rpc_visibility : Client.visibility_request -> Client.visibility_page client_rpc
+    | Rpc_history : Client.history_request -> string client_rpc
     | Rpc_async_activity_completion :
         Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
     | Rpc_async_activity_heartbeat :
@@ -1310,6 +1325,11 @@ module Native_backend = struct
           ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
           ~encode:Protocol_adapter.encode_client_visibility_request
           ~decode:Protocol_adapter.decode_client_visibility_result
+    | Rpc_history request ->
+        submit_bounded runtime Bridge.Call_history request.rpc_deadline
+          ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
+          ~encode:Protocol_adapter.encode_client_history_request
+          ~decode:Protocol_adapter.decode_client_history_result
     | Rpc_async_activity_completion encoded ->
         (* The activity adapter already encoded the completion exactly once
            (issue #995); only the C call's owned copy is made here. *)
@@ -1605,6 +1625,7 @@ module Native = struct
         Client.poll_update_request ->
         (Client.poll_update_response, Client.client_error) result client_rpc
     | Rpc_visibility : Client.visibility_request -> Client.visibility_page client_rpc
+    | Rpc_history : Client.history_request -> string client_rpc
     | Rpc_async_activity_completion :
         Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
     | Rpc_async_activity_heartbeat :

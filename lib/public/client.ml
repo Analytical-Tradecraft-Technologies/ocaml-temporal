@@ -804,6 +804,30 @@ let query ?rpc_timeout (handle : ('workflow_input, 'workflow_output) handle)
 (** Lists one bounded visibility page through the client's backend. The public
     layer validates caller-controlled query metadata before the request enters
     either the deterministic mock or the native supervisor. *)
+let fetch_history ?page_size ?rpc_timeout
+    (handle : ('workflow_input, 'workflow_output) handle) =
+  match rpc_deadline rpc_timeout with
+  | Error error -> Error error
+  | Ok rpc_deadline -> (
+      if Atomic.get handle.client.closed then
+        Error (Error.make ~category:`Bridge ~message:"client is shut down" ())
+      else
+        match page_size with
+        | Some size when size < 1 || size > 1_000 ->
+            Error
+              (Error.defect ~message:"history page_size must be between 1 and 1000")
+        | page_size ->
+            let request : Backend.history_request =
+              {
+                workflow_id = handle.workflow_id;
+                run_id = run_selector handle;
+                page_size;
+                rpc_deadline;
+              }
+            in
+            Result.bind (Backend.client_fetch_history handle.client.backend request)
+              (Replay.History.of_protobuf ~workflow_id:handle.workflow_id))
+
 let list_visibility ?(page_size = 100) ?page_token ?rpc_timeout client ~query
     () =
   (* The deadline is checked before the closed flag, so a malformed deadline

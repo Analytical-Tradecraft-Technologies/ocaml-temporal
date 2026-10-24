@@ -593,6 +593,31 @@ pub struct VisibilityRequest {
     pub rpc_timeout_ms: Option<u64>,
 }
 
+/// Request for the complete recorded history of one run (#1137). Unlike
+/// [`VisibilityRequest`], pagination is internal: the bridge follows every
+/// continuation token and returns one binary `temporal.api.history.v1.History`
+/// message, bounded by [`protocol::MAX_PAYLOAD_BYTES`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryRequest {
+    /// Namespace containing the execution.
+    pub namespace: String,
+    /// Stable workflow identifier.
+    pub workflow_id: String,
+    /// Run identifier, or empty to select the workflow's current run, which
+    /// Temporal resolves on the first page and pins through the token.
+    pub run_id: String,
+    /// Most events per page, between 1 and 1000; absent keeps the server's
+    /// default. Only the number of round trips depends on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    /// Caller-selected total budget of the whole fetch (every page) in
+    /// milliseconds, replacing the thirty-second default. Absent keeps the
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_timeout_ms: Option<u64>,
+}
+
 /// Metadata for a successor run created by continued-as-new.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1060,6 +1085,16 @@ pub fn decode_visibility_request(
     )
 }
 
+/// Strictly parses one complete-history fetch request.
+pub fn decode_history_request(input: &str) -> Result<HistoryRequest, protocol::ProtocolError> {
+    decode_request(
+        input,
+        protocol::decode_object,
+        "invalid history request",
+        validate_history_request,
+    )
+}
+
 /// Encodes and reparses a start response before ownership leaves Rust.
 pub fn encode_start_response(
     response: &StartWorkflowResponse,
@@ -1392,6 +1427,99 @@ pub async fn list_visibility(
             Some(base64::engine::general_purpose::STANDARD.encode(response.next_page_token))
         },
     })
+}
+
+/// Fetches every event of one run's history through Temporal's official
+/// workflow service and returns it as one binary
+/// `temporal.api.history.v1.History` message (#1137).
+///
+/// Each page is re-encoded and appended; protobuf concatenation of the
+/// repeated `events` field yields the complete history, the same form
+/// `Temporal.Replay.History.of_protobuf` accepts. The fetch never waits for
+/// new events, so an open run yields the events recorded so far. The whole
+/// fetch, every page included, shares one budget; expiry is the typed
+/// `deadline_exceeded` RPC error. A history larger than
+/// [`protocol::MAX_PAYLOAD_BYTES`] or one with no events is rejected rather
+/// than returned truncated.
+pub async fn fetch_history(
+    connection: Connection,
+    request: HistoryRequest,
+) -> Result<Vec<u8>, ClientOperationError> {
+    const HISTORY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+    let budget = rpc_budget(request.rpc_timeout_ms, HISTORY_RPC_TIMEOUT);
+    let started = tokio::time::Instant::now();
+    match tokio::time::timeout(
+        budget,
+        fetch_history_pages(connection, request, started, budget),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ClientOperationError::Rpc {
+            code: "deadline_exceeded".to_owned(),
+        }),
+    }
+}
+
+/// Pages through one history for [`fetch_history`], giving each page the
+/// part of `budget` that is left since `started`.
+async fn fetch_history_pages(
+    connection: Connection,
+    request: HistoryRequest,
+    started: tokio::time::Instant,
+    budget: Duration,
+) -> Result<Vec<u8>, ClientOperationError> {
+    use prost::Message;
+
+    let mut encoded = Vec::new();
+    let mut next_page_token = Vec::new();
+    let mut service = connection.clone();
+    loop {
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(ClientOperationError::Rpc {
+                code: "deadline_exceeded".to_owned(),
+            });
+        }
+        let page = GetWorkflowExecutionHistoryRequest {
+            namespace: request.namespace.clone(),
+            execution: Some(WorkflowExecution {
+                workflow_id: request.workflow_id.clone(),
+                run_id: request.run_id.clone(),
+            }),
+            maximum_page_size: request.page_size.map_or(0, |size| size as i32),
+            next_page_token: std::mem::take(&mut next_page_token),
+            wait_new_event: false,
+            history_event_filter_type: i32::from(HistoryEventFilterType::AllEvent),
+            skip_archival: false,
+        };
+        let response = service
+            .get_workflow_execution_history(budgeted_request(page, remaining))
+            .await
+            .map_err(budget_status(started, budget, map_rpc_status))?
+            .into_inner();
+        if let Some(history) = response.history
+            && !history.events.is_empty()
+        {
+            let page = history.encode_to_vec();
+            if encoded.len() + page.len() > protocol::MAX_PAYLOAD_BYTES {
+                return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
+                    "workflow history exceeds the bridge payload limit",
+                )));
+            }
+            encoded.extend_from_slice(&page);
+        }
+        if response.next_page_token.is_empty() {
+            break;
+        }
+        next_page_token = response.next_page_token;
+    }
+    if encoded.is_empty() {
+        return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
+            "Temporal returned a workflow history with no events",
+        )));
+    }
+    Ok(encoded)
 }
 
 /// Requests cancellation of one run (exact, or current for an empty run ID)
@@ -2738,6 +2866,19 @@ fn validate_visibility_request(value: &VisibilityRequest) -> Result<(), protocol
     Ok(())
 }
 
+/// Validates a history fetch request before any RPC occurs.
+fn validate_history_request(value: &HistoryRequest) -> Result<(), protocol::ProtocolError> {
+    validate_rpc_timeout(value.rpc_timeout_ms)?;
+    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
+    match value.page_size {
+        Some(size) if !(1..=1_000).contains(&size) => Err(protocol::ProtocolError::invalid(
+            "$.page_size",
+            "page_size must be between 1 and 1000",
+        )),
+        Some(_) | None => Ok(()),
+    }
+}
+
 /// Validates every reduced visibility row and the opaque continuation token.
 fn validate_visibility_page(value: &VisibilityPage) -> Result<(), protocol::ProtocolError> {
     for (index, execution) in value.executions.iter().enumerate() {
@@ -3298,13 +3439,44 @@ mod tests {
     }
 
     #[test]
+    /// A history fetch request (#1137) names one run, exact or current,
+    /// takes an optional page size between 1 and 1000, and is closed: an
+    /// empty workflow ID, a NUL, an out-of-range page size, or an unknown
+    /// member is rejected before any RPC.
+    fn history_requests_are_validated() {
+        let accepted = [
+            r#"{"namespace":"default","workflow_id":"w","run_id":""}"#,
+            r#"{"namespace":"default","workflow_id":"w","run_id":"r","page_size":1}"#,
+            r#"{"namespace":"default","workflow_id":"w","run_id":"r","page_size":1000,"rpc_timeout_ms":5}"#,
+        ];
+        for document in accepted {
+            assert!(decode_history_request(document).is_ok(), "{document}");
+        }
+        let request = decode_history_request(accepted[1]).expect("history request");
+        assert_eq!(request.page_size, Some(1));
+        assert_eq!(request.rpc_timeout_ms, None);
+        for document in [
+            r#"{"namespace":"default","workflow_id":"","run_id":""}"#,
+            r#"{"namespace":"","workflow_id":"w","run_id":""}"#,
+            "{\"namespace\":\"default\",\"workflow_id\":\"w\\u0000\",\"run_id\":\"\"}",
+            r#"{"namespace":"default","workflow_id":"w","run_id":"","page_size":0}"#,
+            r#"{"namespace":"default","workflow_id":"w","run_id":"","page_size":1001}"#,
+            r#"{"namespace":"default","workflow_id":"w","run_id":"","page_size":"10"}"#,
+            r#"{"namespace":"default","workflow_id":"w"}"#,
+            r#"{"namespace":"default","workflow_id":"w","run_id":"","next_page_token":null}"#,
+        ] {
+            assert!(decode_history_request(document).is_err(), "{document}");
+        }
+    }
+
+    #[test]
     /// Every bounded client request accepts an optional caller RPC timeout
     /// between 1 ms and one minute and rejects anything else; the default
     /// budget applies only when the member is absent.
     fn client_requests_validate_rpc_timeouts() {
         /// Reports whether one request document decodes.
         type Decodes = fn(&str) -> bool;
-        let documents: [(&str, Decodes); 7] = [
+        let documents: [(&str, Decodes); 8] = [
             (
                 r#"{"namespace":"default","workflow_id":"w","run_id":"","request_id":"r","reason":""}"#,
                 |input| decode_cancel_request(input).is_ok(),
@@ -3332,6 +3504,10 @@ mod tests {
             (
                 r#"{"namespace":"default","query":"","page_size":10,"next_page_token":null}"#,
                 |input| decode_visibility_request(input).is_ok(),
+            ),
+            (
+                r#"{"namespace":"default","workflow_id":"w","run_id":""}"#,
+                |input| decode_history_request(input).is_ok(),
             ),
         ];
         for (document, decodes) in documents {

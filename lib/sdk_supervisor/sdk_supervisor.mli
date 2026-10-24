@@ -384,6 +384,17 @@ module Native : sig
        Temporal_core_bridge.Native_bridge.error) result
     (** Strictly decodes one visibility page returned by Rust. *)
 
+    val encode_client_history_request :
+      Temporal_protocol.Client_protocol.history_request ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result
+    (** Canonically serializes one history fetch request (#1137). *)
+
+    val decode_client_history_result :
+      (bytes, Temporal_core_bridge.Native_bridge.error) result ->
+      (string, Temporal_core_bridge.Native_bridge.error) result
+    (** Returns the binary [History] protobuf Rust assembled from every page,
+        or passes the native failure through unchanged. *)
+
     val encode_client_update_request :
       Temporal_protocol.Client_protocol.update_request ->
       (bytes, Temporal_core_bridge.Native_bridge.error) result
@@ -470,6 +481,10 @@ module Native : sig
     | Rpc_visibility :
         Temporal_protocol.Client_protocol.visibility_request ->
         Temporal_protocol.Client_protocol.visibility_page client_rpc
+    | Rpc_history :
+        Temporal_protocol.Client_protocol.history_request -> string client_rpc
+        (** Fetches one run's complete history as one binary
+            [temporal.api.history.v1.History] message (#1137). *)
     | Rpc_async_activity_completion :
         Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
         (** Completes, fails, or cancels an activity handed off with

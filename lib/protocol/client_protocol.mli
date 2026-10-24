@@ -188,6 +188,16 @@ type visibility_request = {
 }
 (** One explicitly bounded visibility page request. The token is opaque base64. *)
 
+type history_request = {
+  execution : execution;
+  page_size : int option;
+  rpc_deadline : rpc_deadline option;
+}
+(** One complete-history fetch (#1137). An empty run ID selects the current
+    run. [page_size] (1 to 1000) only sets the events per round trip; Rust
+    follows every page and returns one binary [History] message.
+    [rpc_deadline] bounds the whole fetch, every page included. *)
+
 type visibility_status =
   [ `Running
   | `Completed
@@ -357,6 +367,10 @@ val encode_visibility_request : visibility_request -> (string, error) result
 
 val decode_visibility_response : string -> (visibility_page, error) result
 (** Strictly decodes one visibility page returned by Rust. *)
+
+val encode_history_request : history_request -> (string, error) result
+(** Validates and serializes one history fetch request; an empty run ID is
+    allowed. *)
 
 val encode_update_request : update_request -> (string, error) result
 (** Validates and serializes one update admission request; an empty run ID

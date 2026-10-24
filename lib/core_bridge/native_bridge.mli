@@ -315,7 +315,10 @@ val client_wait_workflow_json : runtime -> bytes -> (bytes, error) result
     would fail with [Invalid_state], since an awaited [Invalid_state] means
     the call itself was closed. A heartbeat's outcome may instead be
     [cancel_requested], [reset], or [paused], the activity state reported by
-    the token's latest send. *)
+    the token's latest send. [Call_history] (#1137) has no synchronous
+    operation: it takes a history request document, and its successful
+    outcome is binary, one serialized [temporal.api.history.v1.History]
+    message holding every page of the run's history. *)
 type client_call_kind =
   | Call_start
   | Call_wait
@@ -329,6 +332,7 @@ type client_call_kind =
   | Call_visibility
   | Call_async_activity_completion
   | Call_async_activity_heartbeat
+  | Call_history
 
 (** Handle of one submitted client call: the identity of the runtime graph
     that submitted it plus the call identifier. It names a Rust-owned

@@ -278,7 +278,14 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_wait_workflow_json(
  * knows the task token), because an awaited call reports
  * STATUS_INVALID_STATE only when the call itself was closed. A heartbeat's
  * outcome may instead be the fixed value "cancel_requested", "reset", or
- * "paused" (in that precedence) when the latest send reported that state. */
+ * "paused" (in that precedence) when the latest send reported that state.
+ * HISTORY has no synchronous symbol (#1137). Its document is
+ * {"namespace","workflow_id","run_id"} (an empty run ID selects the current
+ * run) with optional "page_size" (1 to 1000) and "rpc_timeout_ms", which
+ * bounds the whole fetch (default 30 s). The bridge follows every page and
+ * its success value is binary, not JSON: one serialized
+ * temporal.api.history.v1.History message of at most the payload safety
+ * limit, the form Temporal.Replay.History.of_protobuf accepts. */
 enum {
   OCAML_TEMPORAL_CORE_CLIENT_CALL_START = 1,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_WAIT = 2,
@@ -291,7 +298,8 @@ enum {
   OCAML_TEMPORAL_CORE_CLIENT_CALL_POLL_UPDATE = 9,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_VISIBILITY = 10,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_COMPLETION = 11,
-  OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_HEARTBEAT = 12
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_HEARTBEAT = 12,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_HISTORY = 13
 };
 
 /* Submit one client RPC without waiting for Temporal (#807). Only the
