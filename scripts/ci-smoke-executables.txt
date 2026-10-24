@@ -32,6 +32,7 @@ test/integration/temporal/worker/cache_eviction_worker.exe
 test/integration/temporal/worker/parent_child_restart_worker.exe
 test/integration/temporal/worker/smoke_worker.exe
 test/integration/test_core_lifecycle.exe
+test/integration/timer_cancellation/regression.exe
 test/integration/transport_interruption/regression.exe
 test/integration/update_outcomes/regression.exe
 test/integration/update_run_close/regression.exe
