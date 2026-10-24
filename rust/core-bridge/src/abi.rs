@@ -565,6 +565,42 @@ fn submitted_async_activity_outcome(outcome: std::result::Result<Vec<u8>, Failur
     }
 }
 
+/// The failure for an operation on a runtime graph that no longer holds its
+/// Core reference.
+fn runtime_closed() -> Failure {
+    Failure {
+        status: STATUS_INVALID_STATE,
+        message: "Temporal runtime is already closed".to_owned(),
+    }
+}
+
+/// The failure for a client operation before a client has been connected,
+/// or after it has been released.
+fn client_not_connected() -> Failure {
+    Failure {
+        status: STATUS_INVALID_STATE,
+        message: "Temporal client is not connected".to_owned(),
+    }
+}
+
+/// The failure for a worker operation when no worker is running in this
+/// runtime graph.
+fn worker_not_running() -> Failure {
+    Failure {
+        status: STATUS_INVALID_STATE,
+        message: "Temporal worker is not running".to_owned(),
+    }
+}
+
+/// The failure for attaching to a shared runtime whose Core reference has
+/// already been released.
+fn shared_runtime_released() -> Failure {
+    Failure {
+        status: STATUS_INVALID_STATE,
+        message: "shared Temporal runtime is already released".to_owned(),
+    }
+}
+
 /// The failure for an async activity request on a runtime that has never
 /// started a worker, and so has no namespace to address.
 fn missing_worker_namespace() -> Failure {
@@ -1275,10 +1311,7 @@ impl SharedRuntime {
 
     /// Creates one instance graph holding a new reference to this Core.
     fn attach(&self) -> std::result::Result<Runtime, Failure> {
-        let core = self.core.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "shared Temporal runtime is already released".to_owned(),
-        })?;
+        let core = self.core.as_ref().ok_or_else(shared_runtime_released)?;
         Runtime::new(Arc::clone(core))
     }
 
@@ -1572,10 +1605,7 @@ impl Runtime {
                 message: "Temporal client is already connected".to_owned(),
             });
         }
-        let core = self.core.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal runtime is already closed".to_owned(),
-        })?;
+        let core = self.core.as_ref().ok_or_else(runtime_closed)?;
         let target =
             temporalio_sdk_core::Url::parse(&config.target_url).map_err(|error| Failure {
                 status: STATUS_CONFIGURATION,
@@ -1672,17 +1702,15 @@ impl Runtime {
                         .to_owned(),
             });
         }
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        let connection = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(client_not_connected)?;
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle();
         // Capture validated request identities before the request is moved into
         // the Core start call so an unencodable server response can still report
@@ -1768,17 +1796,15 @@ impl Runtime {
     fn client_and_handle(
         &self,
     ) -> std::result::Result<(Connection, tokio::runtime::Handle), Failure> {
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        let connection = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(client_not_connected)?;
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle();
         Ok((connection, handle))
     }
@@ -2064,17 +2090,15 @@ impl Runtime {
     fn begin_start_workflow_json(&mut self, input: &[u8]) -> Operation {
         let text = decode_semantic_input(input)?;
         let request = client_protocol::decode_start_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        let connection = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(client_not_connected)?;
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle();
 
         // A caller that retries a begin request with the same logical ID must
@@ -2170,10 +2194,7 @@ impl Runtime {
         // admitted by this runtime, but returning the lifecycle error is more
         // useful and consistent with begin/start/wait operations than exposing
         // the implementation detail that the pending-ticket map is empty.
-        self.client.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        self.client.as_ref().ok_or_else(client_not_connected)?;
         let read = {
             let pending = self
                 .pending_starts
@@ -2276,17 +2297,15 @@ impl Runtime {
     fn wait_workflow_json(&mut self, input: &[u8]) -> Operation {
         let text = decode_semantic_input(input)?;
         let request = client_protocol::decode_wait_request(text).map_err(protocol_failure)?;
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        let connection = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(client_not_connected)?;
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle();
         if !self.pending_waits.contains_key(&request) {
             if self.pending_waits.len() >= self.client_limits.pending_waits {
@@ -2340,10 +2359,11 @@ impl Runtime {
                 message: "Temporal replay worker is already running".to_owned(),
             });
         }
-        let client = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        let client = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(client_not_connected)?;
         // Keep the validated worker namespace beside the native graph. Child
         // workflow commands do not expose namespace in the language-level
         // command, but Core needs the worker namespace to populate failure
@@ -2352,10 +2372,7 @@ impl Runtime {
         // The async heartbeat throttle uses the settings handed to Core.
         let heartbeat_intervals = config.tuning.heartbeat_intervals()?;
         let worker_config = config.into_core()?;
-        let core = self.core.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal runtime is already closed".to_owned(),
-        })?;
+        let core = self.core.as_ref().ok_or_else(runtime_closed)?;
         let handle = core.tokio_handle();
         let worker = {
             // Core's synchronous constructor creates poll buffers with
@@ -2414,10 +2431,7 @@ impl Runtime {
         }
         let worker_namespace = config.namespace.clone();
         let worker_config = config.into_core()?;
-        let core = self.core.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal runtime is already closed".to_owned(),
-        })?;
+        let core = self.core.as_ref().ok_or_else(runtime_closed)?;
         let replay = ReplayWorker::start(core, worker_config).map_err(replay_worker_failure)?;
         self.replay_worker = Some(replay);
         self.worker_namespace = Some(worker_namespace);
@@ -2541,16 +2555,10 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
-        let worker = self.worker.as_mut().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_mut().ok_or_else(worker_not_running)?;
         let activation = worker
             .try_take_workflow(&handle)
             .ok_or_else(not_ready)?
@@ -2590,10 +2598,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
         let activation = {
@@ -2642,10 +2647,7 @@ impl Runtime {
     /// A bounded timeout keeps a supervisor mailbox responsive to lifecycle
     /// commands when Core is quiet; callers retry after `STATUS_NOT_READY`.
     fn wait_workflow(&self) -> Operation {
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         match worker.wait_workflow() {
             ReadinessWait::Ready => Ok(Vec::new()),
             ReadinessWait::TimedOut => Err(Failure {
@@ -2684,10 +2686,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
         let worker = self.replay_worker.as_mut().ok_or_else(|| Failure {
@@ -2734,10 +2733,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
         let worker = self.replay_worker.as_ref().ok_or_else(|| Failure {
@@ -2777,10 +2773,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
         let worker = self.replay_worker.as_ref().ok_or_else(|| Failure {
@@ -2797,10 +2790,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
         let worker = self.replay_worker.take().ok_or_else(|| Failure {
@@ -2830,10 +2820,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
         let worker = self
@@ -2875,10 +2862,7 @@ impl Runtime {
             worker_namespace,
         )
         .map_err(core_conversion_failure)?;
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         let handle = self
             .core
             .as_ref()
@@ -2921,16 +2905,10 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle()
             .clone();
-        let worker = self.worker.as_mut().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_mut().ok_or_else(worker_not_running)?;
         let task = worker
             .try_take_activity(&handle)
             .ok_or_else(not_ready)?
@@ -2985,10 +2963,7 @@ impl Runtime {
     /// As with workflow readiness, this is a blocking native call with a
     /// bounded duration so the owner supervisor can process shutdown messages.
     fn wait_activity(&self) -> Operation {
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         match worker.wait_activity() {
             ReadinessWait::Ready => Ok(Vec::new()),
             ReadinessWait::TimedOut => Err(Failure {
@@ -3011,10 +2986,7 @@ impl Runtime {
     /// waits: `STATUS_NOT_READY` on timeout and `STATUS_INVALID_STATE` once a
     /// lane has closed without queued work.
     fn wait_any(&self) -> Operation {
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         match worker.wait_any() {
             ReadinessWait::Ready => Ok(Vec::new()),
             ReadinessWait::TimedOut => Err(Failure {
@@ -3038,10 +3010,7 @@ impl Runtime {
     /// admission bounded.
     fn wait_activity_completion_retry_backoff(&self) -> Operation {
         let Some(worker) = self.worker.as_ref() else {
-            return Err(Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal worker is not running".to_owned(),
-            });
+            return Err(worker_not_running());
         };
         worker.wait_activity_completion_retry_backoff();
         Ok(Vec::new())
@@ -3054,10 +3023,7 @@ impl Runtime {
         run_id: &str,
         reason: &'static str,
     ) -> std::result::Result<(), Failure> {
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         let handle = self
             .core
             .as_ref()
@@ -3093,10 +3059,7 @@ impl Runtime {
         task_token: &[u8],
         reason: &'static str,
     ) -> std::result::Result<(), Failure> {
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         let handle = self
             .core
             .as_ref()
@@ -3115,10 +3078,7 @@ impl Runtime {
             activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
         let completion =
             activity_protocol::completion_to_core(&semantic).map_err(core_conversion_failure)?;
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         let handle = self
             .core
             .as_ref()
@@ -3148,10 +3108,7 @@ impl Runtime {
             .map(workflow_protocol::payload_to_core)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(core_conversion_failure)?;
-        let worker = self.worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal worker is not running".to_owned(),
-        })?;
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
         let heartbeat = CoreActivityHeartbeat {
             task_token,
             details,
@@ -3171,10 +3128,11 @@ impl Runtime {
     /// completion path would make a retained async handle depend on a poll
     /// task that has already been retired.
     fn async_activity_client(&self) -> std::result::Result<Client, Failure> {
-        let connection = self.client.as_ref().cloned().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal client is not connected".to_owned(),
-        })?;
+        let connection = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(client_not_connected)?;
         let namespace = self
             .worker_namespace
             .clone()
@@ -3193,10 +3151,7 @@ impl Runtime {
         let handle = self
             .core
             .as_ref()
-            .ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal runtime is already closed".to_owned(),
-            })?
+            .ok_or_else(runtime_closed)?
             .tokio_handle();
         handle.block_on(request.send_evicting(client, &self.heartbeat_throttle))?;
         Ok(Vec::new())
@@ -5050,10 +5005,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_metric_meter(
                 status: STATUS_INVALID_ARGUMENT,
                 message: "shared runtime handle is null".to_owned(),
             })?;
-            let core = shared.core.as_ref().ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "shared Temporal runtime is already released".to_owned(),
-            })?;
+            let core = shared.core.as_ref().ok_or_else(shared_runtime_released)?;
             if let Some(temporal_meter) = core.telemetry().get_temporal_metric_meter() {
                 let global_tag_names = core
                     .metrics
