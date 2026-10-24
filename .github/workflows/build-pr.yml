@@ -33,7 +33,7 @@ jobs:
       native: ${{ steps.matrix.outputs.native }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - name: Validate changed paths
@@ -105,7 +105,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Test matrix selection and artifact failure cases
         run: make test-ci-artifacts
       - name: Install pinned quality tools
@@ -124,7 +124,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Audit dependency licenses
         run: make license-check OCAML_VERSION=5.2
       - name: Test dependency inventory drift detection
@@ -173,7 +173,7 @@ jobs:
       # failed and the dependency gate below stops the live test steps.
       - name: Check out repository
         timeout-minutes: 3
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Require successful OCaml builds
         timeout-minutes: 1
         env:
@@ -310,7 +310,7 @@ jobs:
           test "$RUST_AMD64_RESULT" = success
           test "$RUST_ARM64_RESULT" = success
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Download the verified platform bridge
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -417,7 +417,7 @@ jobs:
           RUST_RESULT: ${{ needs.rust-macos.result }}
         run: test "$RUST_RESULT" = success
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set up the exact OCaml compiler
         uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
         with:
@@ -484,7 +484,7 @@ jobs:
           RUST_RESULT: ${{ needs.rust-windows.result }}
         run: test "$RUST_RESULT" = success
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set up the exact OCaml compiler
         uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
         with:
@@ -557,7 +557,7 @@ jobs:
       RUSTUP_TOOLCHAIN: 1.99.1-aarch64-apple-darwin
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set up the exact OCaml compiler
         uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
         with:

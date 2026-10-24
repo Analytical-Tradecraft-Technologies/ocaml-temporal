@@ -18,10 +18,10 @@ pr_workflow_text=$(tr -d '\015' < "$pr_workflow")
 release_workflow_text=$(tr -d '\015' < "$release_workflow")
 makefile_text=$(tr -d '\015' < "$makefile")
 
-# GitHub-owned actions are admitted separately by the effective Actions
-# policy and may use readable major-version references. Every other remote
-# action crosses a third-party supply-chain boundary, so both build workflows
-# must select an immutable full commit. Local actions are repository source and
+# Every remote action, GitHub-owned ones included, must select an immutable
+# full commit in every workflow (#1150): a mutable tag can move under a job,
+# and the release publish job holds write and signing permissions.
+# Dependabot keeps the pins current. Local actions are repository source and
 # therefore do not have an @ reference to validate.
 #
 # This is deliberately a strict source grammar rather than a partial YAML
@@ -105,7 +105,7 @@ assert_third_party_actions_pinned() {
           reject("action reference must be one unquoted token", line)
           next
         }
-        if (ref !~ /^actions\// && ref !~ /^\.\//) print ref
+        if (ref !~ /^\.\//) print ref
         next
       }
 
@@ -126,14 +126,16 @@ assert_third_party_actions_pinned() {
   unpinned_refs=$(printf '%s\n' "$third_party_refs" |
     grep -Ev '@[0-9a-f]{40}$' || true)
   if [ -n "$unpinned_refs" ]; then
-    printf '%s: third-party actions must use full commit SHAs:\n%s\n' \
+    printf '%s: remote actions must use full commit SHAs:\n%s\n' \
       "$workflow_name" "$unpinned_refs" >&2
     return 1
   fi
 }
 
-assert_third_party_actions_pinned build.yml "$master_workflow_text"
-assert_third_party_actions_pinned build-pr.yml "$pr_workflow_text"
+for workflow in "$source_root"/.github/workflows/*.yml; do
+  assert_third_party_actions_pinned "$(basename "$workflow")" \
+    "$(tr -d '\015' < "$workflow")"
+done
 
 # Exercise source spellings that YAML would normalize to the same `uses`
 # mapping key. The workflow policy must either inspect them or reject them;
@@ -186,8 +188,10 @@ assert_action_fixture_rejected compact-folded-block-action \
   '      - uses: >-
           evil/example@v1'
 
-assert_third_party_actions_pinned github-owned-fixture \
+assert_action_fixture_rejected github-owned-mutable-tag \
   '        uses: actions/checkout@v7'
+assert_third_party_actions_pinned github-owned-fixture \
+  '        uses: actions/checkout@0123456789abcdef0123456789abcdef01234567 # v7'
 assert_third_party_actions_pinned local-fixture \
   '        uses: ./.github/actions/example'
 assert_third_party_actions_pinned pinned-third-party-fixture \

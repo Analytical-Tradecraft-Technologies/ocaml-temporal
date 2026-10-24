@@ -6075,6 +6075,25 @@ unchanged unscoped commands, and foreign-owner rejection. Still open under
 #1134: `Condition.wait_until ~timeout`, a live scenario and corpus histories
 for cancel-before/after-fire.
 
+## 2026-10-24: Build and CI hygiene (#1150)
+
+- The OPAM license-policy fixtures (`test/smoke/test_license_policy.sh`) now
+  run in `make test-quality-contract`: in the Compose image on Linux and
+  with the native OCaml toolchain on macOS. Windows skips them, because its
+  opam cannot read the MSYS temporary fixture paths. They take the
+  repository root as an argument, so they no longer depend on the working
+  directory. A mutant allow-list that admits GPL fails them.
+- `rust/dune` excludes `target` and `vendor` from Dune's source tree. With a
+  populated `rust/target`, `dune rules` for the bridge archive lists no
+  `rust/target` path; without the file it lists the probe.
+- `make native-test` runs the sanitized C ABI harness on macOS (verified
+  locally). Windows skips it, as `quality-gates.md` records, because MinGW
+  ships no sanitizer runtimes.
+- Every `actions/checkout` reference is pinned to
+  `3d3c42e5aac5ba805825da76410c181273ba90b1` (v7). The quality contract now
+  requires a full commit SHA for every remote action in every workflow,
+  GitHub-owned ones included, and a mutable `@v7` in `stress.yml` fails it.
+
 ## 2026-10-24: Child workflow timeouts and ID reuse policy (#1135, first half)
 
 `Child_workflow.start`, `start_handle` and `execute` take

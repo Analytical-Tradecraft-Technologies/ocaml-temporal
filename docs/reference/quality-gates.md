@@ -139,8 +139,17 @@ Each OCaml lane still compiles the private C stubs, examples, OCaml libraries,
 and tests and runs the installation/public API checks. Each lane packages its
 compiled SDK and links/runs an independent relocated consumer before uploading
 the SDK. Compatible downstream applications can use these libraries without
-recompilation; see [precompiled OCaml SDKs](prebuilt-ocaml.md). Linux also retains
-the sanitized C ABI harness. One Linux amd64/5.5.1 producer compiles the live
+recompilation; see [precompiled OCaml SDKs](prebuilt-ocaml.md). Linux and
+the native macOS lane also run the sanitized C ABI harness
+(`test/bridge/test_abi.sh`, #1150). The Windows lane skips it because the
+harness builds with AddressSanitizer and UndefinedBehaviorSanitizer, whose
+runtimes the MinGW toolchain does not ship; Windows exercises the bridge
+through the OCaml and Rust suites. `make test-quality-contract` also runs the
+OPAM license-policy fixtures (`test/smoke/test_license_policy.sh`), which
+fail if `scripts/check-licenses.sh` ever accepts a GPL, missing, mixed or
+unreviewed license. They run on Linux and macOS; the Windows lane skips them
+because its opam cannot read the MSYS temporary fixture paths, and the policy
+does not depend on the platform. One Linux amd64/5.5.1 producer compiles the live
 smoke programs; the downstream Temporal/PostgreSQL job runs those verified
 executables without compiling them again. A cold run compiles Rust four times;
 cache hits eliminate those Rust compilations too. Artifact transfer, OCaml/C

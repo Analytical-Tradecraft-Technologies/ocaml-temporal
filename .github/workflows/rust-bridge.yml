@@ -29,7 +29,7 @@ jobs:
       key: ${{ steps.bridge.outputs.key }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Reclaim disposable GitHub-hosted runner disk
         if: inputs.runner == 'ubuntu-24.04' && runner.environment == 'github-hosted'
         shell: bash
