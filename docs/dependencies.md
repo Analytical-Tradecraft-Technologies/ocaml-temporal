@@ -649,7 +649,7 @@ version comment recorded beside a commit pin.
 | `actions/download-artifact` | `9000827ccba6bdab643e8b6fd33ac0654aef8333` | v8 | MIT | Consuming those artifacts |
 | `msys2/setup-msys2` | `ec48f7c5447b3140e2b088413ae3a55687bccb6e` | v2 | MIT | MinGW build tools for the Windows Rust producer |
 | `ocaml/setup-ocaml` | `93303b622b2522e4411e295f9e77411a24912ac7` | v3.9.0 | MIT | Native macOS and Windows OCaml compilers |
-| `taiki-e/install-action` | `8cca0918f8471c33515202b73f56ab27f2bed283` | v2.87.29 | Apache-2.0 OR MIT | Installing the pinned CI-only quality tools |
+| `taiki-e/install-action` | `a4d3f3f761dcd95cce1b72cb61cb6d1963438177` | v2.87.30 | Apache-2.0 OR MIT | Installing the pinned CI-only quality tools |
 
 `actions/checkout` is referenced by its major-version tag rather than an
 immutable commit; every other action is pinned by commit.
