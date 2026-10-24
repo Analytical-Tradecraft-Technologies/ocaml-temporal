@@ -191,7 +191,9 @@ val definition_set_names : string list
       patch lifecycle generations of every [corpus.lifecycle.*] workflow,
       each with both lifecycle child workflow types.
     - ["corpus-v2-cancellation"]: the timer-cancellation, bounded-condition
-      and child start-option workflows of #1134 and #1135. *)
+      and child start-option workflows of #1134 and #1135.
+    - ["negative-timer-cancel-dropped"]: an intentionally incompatible
+      [corpus.timer_cancel_before_fire] that never cancels its long timer. *)
 val definition_set : string -> workflow list option
 
 (** Activities registered by the live capture worker. Every activity used by a

@@ -6040,6 +6040,21 @@ only, not rollback evidence (#508). The
 whole corpus replays in about a second. Every current capture comes from Core
 `95e97686`, so the first Core bump will be the first cross-revision replay.
 
+## 2026-10-24: Corpus histories for timer cancellation and child options (#1134, #1135, #503)
+
+Capture `live-2026-10-24` adds the frozen `corpus-v2-cancellation`
+definition set and six live histories, recorded natively on macOS against
+the pinned Compose server from a clean tree: a scoped 60 s timer cancelled
+while pending (`TimerCanceled`), a scoped timer that fired before its scope
+was cancelled (no cancel command), a bounded condition that timed out
+(`TimerFired`), one satisfied by a signal (`TimerCanceled`), and a parent
+and child where the start-child event records 60 s / 30 s / 7 s timeouts and
+`AllowDuplicateFailedOnly`. The negative control
+`negative-timer-cancel-dropped` replays the cancel-before-fire history
+against code that never cancels and must report nondeterminism. New feature
+rows `timer-cancellation`, `condition-timeout` and `child-start-options` are
+`replayed`; the corpus test passes with 85 cases.
+
 ## 2026-10-24: Scoped durable-timer cancellation (#1134, first slice)
 
 `Workflow.start_sleep` and `Workflow.sleep` take `?scope`. The runtime timer

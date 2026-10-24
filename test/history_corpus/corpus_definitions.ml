@@ -706,6 +706,19 @@ let options_parent_workflow =
             ~task_timeout:(Temporal.Duration.of_seconds 7L)
             ~id_reuse_policy:`Allow_duplicate_failed_only options_child_workflow ())
 
+(** Intentionally incompatible [corpus.timer_cancel_before_fire]: the same
+    two timers, but the long one is unscoped and never cancelled. A recorded
+    history contains [TimerCanceled] with no matching cancel command, so Core
+    must report this definition as nondeterministic, proving the corpus
+    checks the cancellation itself. Never registered by a capture worker. *)
+let timer_cancel_dropped_workflow =
+  Temporal.Workflow.define ~name:timer_cancel_before_fire_workflow_type
+    ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+      let _long = Temporal.Workflow.start_sleep corpus_long_timer in
+      match Temporal.Workflow.sleep corpus_timer with
+      | Error _ as error -> error
+      | Ok () -> Ok "TIMER:CANCELLED-BEFORE-FIRE")
+
 (** Every [corpus-v2-cancellation] registration. *)
 let cancellation_workflows =
   [
@@ -794,6 +807,7 @@ let definition_sets =
     ("corpus-lifecycle-deprecated", lifecycle_workflows Lifecycle_deprecated);
     ("corpus-lifecycle-removed", lifecycle_workflows Lifecycle_removed);
     ("corpus-v2-cancellation", cancellation_workflows);
+    ("negative-timer-cancel-dropped", [ plain timer_cancel_dropped_workflow ]);
   ]
 
 (** Set names in declaration order. *)

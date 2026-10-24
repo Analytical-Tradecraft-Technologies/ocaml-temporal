@@ -196,6 +196,7 @@ Several entries may share one history file; they must agree on its checksum.
 | `live-2026-10-08` | `activity`, `timer`, `activity-retry`, `interaction` (signal, update, condition), `parent`, `child`, `continue-as-new-first`, `continue-as-new-second`, `patch-marker-free`, `patch-active`, `patch-deprecated` | Captured for this corpus with `capture-history-corpus.sh` against Temporal Server 1.32.0 (Compose stack, digest-pinned), Core `95e97686`, OCaml 5.4.1. The worker ran natively on macOS against the Compose server; the Make target runs the same program in the development container. |
 | `task-failure-2026-09-20` | `task-failure-body`, `-encoder`, `-missing`, `-business-retryable`, `-business-permanent` | Copied byte for byte from the [#511 workflow-task failure gate](workflow-failures.md) (`make test-temporal-task-failure-live`), whose own manifest retains run IDs and binary hashes. |
 | `initial-signals-synthetic` | `initial-signals` | The synthetic history from the [#694 regression](../../test/integration/temporal/initial_signals/README.md); not from a server. |
+| `live-2026-10-24` | `timer-cancel-before-fire`, `timer-cancel-after-fire`, `condition-timeout`, `condition-satisfied`, `options-parent`, `options-child` | Captured for [#1134](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/1134) and [#1135](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/1135) with only the `corpus-v2-cancellation` generation, against Temporal Server 1.32.0 (Compose stack, digest-pinned), Core `8fe478ee`, OCaml 5.4.1, from a clean tree at the recorded `sdk_commit`. The worker ran natively on macOS. Scoped timers cancelled before and after firing, a bounded condition that times out and one satisfied by a signal, and a child started with execution/run/task timeouts and an ID reuse policy. |
 | `live-2026-10-11` | `lifecycle-{multi,loop,handlers}-{legacy,patched,deprecated,removed}`, `lifecycle-handover` | Captured for [#531](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/531) with only the four `corpus-lifecycle-*` generations, against Temporal Server 1.32.0 (Compose stack, digest-pinned), Core `95e97686`, OCaml 5.4.1, from a clean tree at the recorded `sdk_commit`. The worker ran natively on macOS. The handover run was started by the legacy process and finished by a fresh patched process. |
 
 Derived cases reuse those histories against other definition sets:
@@ -205,7 +206,11 @@ patched generation, where `Workflow.patched` reports `false`),
 `Workflow.deprecate_patch`), and two negative controls:
 `negative-timer-removed` (the timer workflow without its timer) and
 `negative-patch-active-on-legacy` (a patched history on the pre-patch
-generation). Core reports both as `[TMPRL1100]` nondeterminism.
+generation). Core reports both as `[TMPRL1100]` nondeterminism. A third,
+`negative-timer-cancel-dropped`, replays the `live-2026-10-24` cancel-before-fire
+history against a definition whose long timer is unscoped and never cancelled:
+history records `TimerCanceled` with no matching command, so Core must report
+nondeterminism, which shows the corpus checks the cancellation itself.
 
 The `live-2026-10-11` histories are each replayed against every other
 lifecycle generation: `compat-lifecycle-<workflow>-<history stage>-on-<code
@@ -357,6 +362,9 @@ with a `not yet captured` feature and requires exactly those two problems.
 | `child-side` | replayed | `live-2026-10-08-child` |
 | `continue-as-new` | replayed | `live-2026-10-08-continue-as-new-first`, `-second` |
 | `continue-as-new-successor` | replayed | `live-2026-10-08-continue-as-new-second` |
+| `timer-cancellation` | replayed | `live-2026-10-24-timer-cancel-before-fire`, `-timer-cancel-after-fire`, `-condition-satisfied` |
+| `condition-timeout` | replayed | `live-2026-10-24-condition-timeout`, `-condition-satisfied` |
+| `child-start-options` | replayed | `live-2026-10-24-options-parent`, `-options-child` |
 | `activity` | replayed | `live-2026-10-08-activity` and others |
 | `activity-retry` | replayed | `live-2026-10-08-activity-retry` |
 | `signal` | replayed | `live-2026-10-08-interaction`, lifecycle handler cases |
