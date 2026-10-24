@@ -21,11 +21,14 @@ type activity_registration
     handlers to the same workflow execution; handlers run on the deterministic
     workflow scheduler when native SignalWorkflow activations arrive. [updates]
     attaches typed update handlers for native DoUpdate jobs; a handler is
-    acknowledged after validation and may then suspend on workflow futures. *)
+    acknowledged after validation and may then suspend on workflow futures.
+    [versioning_behavior] is declared on the type's successful completions
+    (#1159). *)
 val register_workflow :
   ?signals:Signal.Handler.t list ->
   ?queries:Query.Handler.t list ->
   ?updates:Update.Handler.t list ->
+  ?versioning_behavior:[ `Pinned | `Auto_upgrade ] ->
   ('input, 'output,
    'input -> ('output, Temporal_base.Error.t) result)
   Temporal_base.Definition.t ->

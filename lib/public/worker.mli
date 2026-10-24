@@ -309,11 +309,22 @@ end
     attach synchronous read-only handlers for matching query requests; [updates]
     attach typed update handlers for matching update activations. An update
     handler runs on the workflow scheduler once validation, if any, accepts
-    the request and may suspend on workflow futures; see [Temporal.Update]. *)
+    the request and may suspend on workflow futures; see [Temporal.Update].
+
+    [versioning_behavior] (#1159) sets this workflow type's own behavior on
+    a deployment-versioned worker, overriding the worker's
+    [default_versioning_behavior] (see {!Options.type-versioning}): [`Pinned]
+    keeps each run on the deployment version it started on, and
+    [`Auto_upgrade] lets a run move to the deployment's current version at
+    its next workflow task. It is recorded with every workflow task the
+    worker completes for the type. {!create} rejects it with a defect on a
+    worker without deployment-based versioning and [use_worker_versioning],
+    where it could not be honoured. *)
 val workflow :
   ?signals:Signal.Handler.t list ->
   ?queries:Query.Handler.t list ->
   ?updates:Update.Handler.t list ->
+  ?versioning_behavior:[ `Pinned | `Auto_upgrade ] ->
   ('input, 'output) Workflow.t -> registered_workflow
 
 (** A heterogeneous activity registration item. *)

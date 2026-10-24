@@ -373,6 +373,7 @@ impl Graph {
             vec![CompletionCommand::CompleteWorkflow { result: None }]
         };
         let document = workflow_protocol::encode_completion(&Completion {
+            versioning_behavior: None,
             run_id: activation.run_id,
             commands,
             task_failure: None,

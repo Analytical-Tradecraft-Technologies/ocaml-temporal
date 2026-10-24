@@ -11,6 +11,7 @@ use temporalio_protos::coresdk::workflow_completion;
 /// workflow completion.
 fn completion(policy: Option<RetryPolicy>) -> Completion {
     Completion {
+        versioning_behavior: None,
         task_failure: None,
         run_id: "run-1".to_owned(),
         commands: vec![CompletionCommand::ScheduleActivity {
@@ -45,6 +46,7 @@ fn completion(policy: Option<RetryPolicy>) -> Completion {
 /// proves the two command paths share the exact Core policy conversion.
 fn child_completion(policy: Option<RetryPolicy>) -> Completion {
     Completion {
+        versioning_behavior: None,
         task_failure: None,
         run_id: "run-child".to_owned(),
         commands: vec![CompletionCommand::StartChildWorkflow {

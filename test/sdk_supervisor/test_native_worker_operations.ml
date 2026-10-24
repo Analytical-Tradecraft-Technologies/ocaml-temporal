@@ -162,7 +162,7 @@ let test_protocol_serialization () =
   if not (Bytes.equal task.task_token (Bytes.of_string "\000\001\002")) then
     failwith "activity token changed while decoding";
   let workflow_completion : Workflow.completion =
-    { run_id = "run-1"; task_failure = None; commands = [] }
+    { run_id = "run-1"; versioning_behavior = None; task_failure = None; commands = [] }
   in
   (* Workflow completions are encoded once, before they enter the supervisor
      mailbox; the supervisor copies exactly these bytes into the C call. *)
@@ -214,7 +214,7 @@ let test_protocol_failures_are_typed () =
       then failwith "workflow protocol error exposed source JSON"
   | _ -> failwith "invalid workflow activation was not a protocol error");
   let invalid_completion : Workflow.completion =
-    { run_id = ""; task_failure = None; commands = [] }
+    { run_id = ""; versioning_behavior = None; task_failure = None; commands = [] }
   in
   (* An invalid outgoing completion is rejected by the single encoder pass, so
      no value exists that could be handed to [Complete_workflow]. *)
@@ -539,7 +539,7 @@ let test_native_lifecycle_guards () =
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
   | _ -> failwith "combined readiness wait without worker was accepted");
   let invalid_completion : Workflow.completion =
-    { run_id = ""; task_failure = None; commands = [] }
+    { run_id = ""; versioning_behavior = None; task_failure = None; commands = [] }
   in
   (* The encoder is the only constructor of a submittable completion, so an
      invalid one cannot reach the native worker at all. *)
@@ -549,7 +549,7 @@ let test_native_lifecycle_guards () =
   let workflow_completion =
     match
       Encoded_completion.encode
-        ({ run_id = "run-1"; task_failure = None; commands = [] }
+        ({ run_id = "run-1"; versioning_behavior = None; task_failure = None; commands = [] }
           : Workflow.completion)
     with
     | Ok encoded -> encoded

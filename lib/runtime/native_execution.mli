@@ -115,6 +115,7 @@ val validate_completion_for_activation :
     activation before a completion reaches the native supervisor. *)
 
 val activate_translated :
+  ?versioning_behavior:Temporal_protocol.Workflow_protocol.versioning_behavior ->
   ('input, 'output) Execution.t ->
   translated_activation ->
   (encoded_completion, error) result
@@ -124,7 +125,10 @@ val activate_translated :
     submit them without a second encode. Query-answer and cache-eviction
     checks run against [translated.source] after encoding, and an error from
     any check means no completion was produced. The activation is not
-    translated or validated again. *)
+    translated or validated again. [versioning_behavior] is the workflow
+    type's own behavior on a deployment-versioned worker (#1159); it is
+    attached only to a successful completion, never to an eviction
+    acknowledgement or a failed task. *)
 
 val activate :
   ('input, 'output) Execution.t ->

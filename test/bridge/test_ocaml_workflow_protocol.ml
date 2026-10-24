@@ -200,6 +200,46 @@ let test_valid_completion () =
   check_string "completion" expected (unwrap (Protocol.encode_completion value));
   ignore (unwrap (Protocol.decode_completion expected))
 
+(** A completion's versioning behavior (#1159) is encoded as ["pinned"] or
+    ["auto_upgrade"] in the canonical (key-sorted) document, omitted when
+    [None], decoded back
+    unchanged, read as absent from [null], and rejected when unknown or on
+    a failed task, as Rust does. *)
+let test_completion_versioning_behavior () =
+  let completion behavior : Protocol.completion =
+    { run_id = "versioned"; commands = []; task_failure = None; versioning_behavior = behavior }
+  in
+  List.iter
+    (fun (behavior, expected) ->
+      let encoded = unwrap (Protocol.encode_completion (completion behavior)) in
+      if not (String.equal expected encoded) then
+        failwith ("versioned completion encoded as " ^ encoded);
+      if unwrap (Protocol.decode_completion encoded) <> completion behavior then
+        failwith "versioning behavior did not round-trip")
+    [
+      (None, {|{"commands":[],"run_id":"versioned"}|});
+      ( Some Protocol.Versioning_pinned,
+        {|{"commands":[],"run_id":"versioned","versioning_behavior":"pinned"}|} );
+      ( Some Protocol.Versioning_auto_upgrade,
+        {|{"commands":[],"run_id":"versioned","versioning_behavior":"auto_upgrade"}|} );
+    ];
+  if
+    (unwrap
+       (Protocol.decode_completion
+          {|{"run_id":"versioned","commands":[],"versioning_behavior":null}|}))
+      .versioning_behavior
+    <> None
+  then failwith "a null versioning behavior was not read as absent";
+  require_error
+    (Protocol.decode_completion
+       {|{"run_id":"versioned","commands":[],"versioning_behavior":"sticky"}|});
+  let failed =
+    unwrap (Protocol.decode_completion (fixture [ "valid"; "task-failure.input.json" ]))
+  in
+  require_error
+    (Protocol.encode_completion
+       { failed with versioning_behavior = Some Protocol.Versioning_pinned })
+
 (** A failed task crosses the same owned JSON buffer as successful commands,
     but cannot carry even one command from the abandoned activation. *)
 let test_task_failure_completion () =
@@ -239,7 +279,7 @@ let test_local_activity_protocol_slice () =
   let completion =
     {
       Protocol.run_id = "local-run";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands = [ command; Protocol.Request_cancel_local_activity { seq = 4L } ];
     }
   in
@@ -311,7 +351,7 @@ let test_patch_marker_protocol_slice () =
   let repeated : Protocol.completion =
     {
       run_id = "patch-run";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands =
         [ Protocol.Set_patch_marker
             { patch_id = "orders.v2"; deprecated = false };
@@ -390,7 +430,7 @@ let test_query_protocol_slice () =
   let successful : Protocol.completion =
     {
       run_id = "query-run";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands =
         [
           Protocol.Query_result
@@ -491,7 +531,7 @@ let test_update_protocol_slice () =
   let completion : Protocol.completion =
     {
       run_id = "update-run";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands =
         [
           Protocol.Update_response
@@ -510,7 +550,7 @@ let test_update_protocol_slice () =
   let later_completion =
     {
       Protocol.run_id = "update-run";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands =
         [
           Protocol.Update_response
@@ -565,7 +605,7 @@ let test_start_child_workflow_command () =
   let completion : Protocol.completion =
     {
       run_id = "parent-run";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands =
         [
           Start_child_workflow
@@ -602,7 +642,7 @@ let test_external_workflow_commands () =
   let completion : Protocol.completion =
     {
       run_id = "parent-run";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands =
         [ Protocol.Signal_external_workflow
             {
@@ -654,7 +694,7 @@ let test_all_child_cancellation_policies () =
       let completion : Protocol.completion =
         {
           run_id = "parent-run";
-          task_failure = None;
+          versioning_behavior = None; task_failure = None;
           commands =
             [
               Start_child_workflow
@@ -747,7 +787,7 @@ let test_child_cancellation_validation () =
   let completion : Protocol.completion =
     {
       run_id = "parent-run";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands =
         [
           Start_child_workflow
@@ -780,7 +820,7 @@ let test_continue_as_new_command () =
   let completion : Protocol.completion =
     {
       run_id = "current-run";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands =
         [
           Continue_as_new
@@ -886,7 +926,7 @@ let test_large_nested_payload () =
   let completion : Protocol.completion =
     {
       run_id = "run-large";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands = [ Complete_workflow { result = Some payload } ];
     }
   in
@@ -924,7 +964,7 @@ let test_metadata_key_canonicalization () =
   let completion : Protocol.completion =
     {
       run_id = "run-map";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands = [ Complete_workflow { result = Some payload } ];
     }
   in
@@ -959,7 +999,7 @@ let test_duplicate_metadata_rejected () =
   let completion : Protocol.completion =
     {
       run_id = "run-duplicate-metadata";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands = [ Complete_workflow { result = Some payload } ];
     }
   in
@@ -970,13 +1010,13 @@ let test_duplicate_metadata_rejected () =
     enforced. *)
 let test_identifier_safety_limit () =
   let long_id = String.make 300 'i' in
-  let completion : Protocol.completion = { run_id = long_id; task_failure = None; commands = [] } in
+  let completion : Protocol.completion = { run_id = long_id; versioning_behavior = None; task_failure = None; commands = [] } in
   let encoded = unwrap (Protocol.encode_completion completion) in
   let decoded = unwrap (Protocol.decode_completion encoded) in
   check_string "long identifier" long_id decoded.run_id;
   require_error
     (Protocol.encode_completion
-       { run_id = String.make 65_537 'i'; task_failure = None; commands = [] })
+       { run_id = String.make 65_537 'i'; versioning_behavior = None; task_failure = None; commands = [] })
 
 (** Proves Core initialization ordering and nullable eviction timestamps are
     checked independently of structural JSON validation. *)
@@ -1067,7 +1107,7 @@ let test_recursive_failure_depth () =
   let completion cause_count : Protocol.completion =
     {
       run_id = "run-nested-failure";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands =
         [ Fail_workflow { failure = nested_application_failure cause_count } ];
     }
@@ -1079,7 +1119,7 @@ let test_recursive_failure_depth () =
     private JSON contract. The default case keeps existing fixture spelling. *)
 let test_application_failure_options () =
   let completion category next_retry_delay : Protocol.completion =
-    { run_id = "options-run"; task_failure = None;
+    { run_id = "options-run"; versioning_behavior = None; task_failure = None;
       commands = [ Fail_workflow { failure = failure_with_info
         (Application { type_name = "ExpectedError"; non_retryable = false;
                        details = []; category; next_retry_delay }) } ] }
@@ -1129,7 +1169,7 @@ let test_failure_field_semantics () =
   let application : Protocol.completion =
     {
       run_id = "run-failure";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands =
         [
           Fail_workflow
@@ -1147,7 +1187,7 @@ let test_failure_field_semantics () =
   let invalid_activity scheduled_event_id started_event_id identity =
     ({
        run_id = "run-failure";
-       task_failure = None;
+       versioning_behavior = None; task_failure = None;
        commands =
          [
            Fail_workflow
@@ -1188,7 +1228,7 @@ let test_timeout_failure_info () =
   let completion : Protocol.completion =
     {
       run_id = "run-timeout";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands =
         [
           Fail_workflow
@@ -1384,7 +1424,7 @@ let test_batched_default_temporal_payloads () =
   let completion : Protocol.completion =
     {
       run_id = "run-batched-payloads";
-      task_failure = None;
+      versioning_behavior = None; task_failure = None;
       commands = [ Complete_workflow { result = Some payload } ];
     }
   in
@@ -1453,7 +1493,7 @@ let test_activity_retry_policy () =
       }
   in
   let command = schedule (Some policy) in
-  let completion = { Protocol.run_id = "run-retry"; task_failure = None; commands = [ command ] } in
+  let completion = { Protocol.run_id = "run-retry"; versioning_behavior = None; task_failure = None; commands = [ command ] } in
   let encoded = unwrap (Protocol.encode_completion completion) in
   if not (String.contains encoded '"') then failwith "policy JSON was empty";
   let retry_policy_json =
@@ -1494,7 +1534,7 @@ let test_activity_retry_policy () =
     failwith "retry policy did not round-trip"
   else
     let no_policy =
-      { Protocol.run_id = "run-default"; task_failure = None; commands = [ schedule None ] }
+      { Protocol.run_id = "run-default"; versioning_behavior = None; task_failure = None; commands = [ schedule None ] }
     in
     let no_policy_json = unwrap (Protocol.encode_completion no_policy) in
     let no_retry_policy_json =
@@ -1553,7 +1593,7 @@ let test_terminated_failure_info () =
   List.iter (fun identity ->
     let failure = failure_with_info (Protocol.Terminated { identity }) in
     let completion : Protocol.completion =
-      { run_id = "terminated-run"; task_failure = None;
+      { run_id = "terminated-run"; versioning_behavior = None; task_failure = None;
         commands = [ Protocol.Fail_workflow { failure } ] } in
     let encoded = unwrap (Protocol.encode_completion completion) in
     assert (unwrap (Protocol.decode_completion encoded) = completion);
@@ -1599,7 +1639,7 @@ let test_extended_failure_info_kinds () =
       let completion : Protocol.completion =
         {
           run_id = "run-extended";
-          task_failure = None;
+          versioning_behavior = None; task_failure = None;
           commands = [ Fail_workflow { failure = failure_with_info info } ];
         }
       in
@@ -1725,7 +1765,7 @@ let test_child_timeout_options () =
     Protocol.
       {
         run_id = "parent-run";
-        task_failure = None;
+        versioning_behavior = None; task_failure = None;
         commands =
           [
             Start_child_workflow
@@ -1950,6 +1990,7 @@ let test_inbound_truncated_eviction_message () =
   require_error (Protocol.decode_activation (eviction ("x" ^ truncated)))
 
 let () =
+  test_completion_versioning_behavior ();
   test_child_routing_options ();
   test_child_timeout_options ();
   run "inbound degraded activation" test_inbound_degraded_activation;

@@ -302,13 +302,20 @@ let runtime_update_handler (handler : Update.Handler.t) =
 (** Packs a workflow definition and its handlers for the private runtime
     adapter. The public [Worker] module validates names and duplicates before
     native resources are allocated. *)
-let register_workflow ?(signals = []) ?(queries = []) ?(updates = []) definition
-    =
+let register_workflow ?(signals = []) ?(queries = []) ?(updates = [])
+    ?versioning_behavior definition =
   let signal_handlers = List.map runtime_signal_handler signals in
   let query_handlers = List.map runtime_query_handler queries in
   let update_handlers = List.map runtime_update_handler updates in
+  let versioning_behavior =
+    Option.map
+      (function
+        | `Pinned -> Temporal_sdk_kernel.Workflow_protocol.Versioning_pinned
+        | `Auto_upgrade -> Temporal_sdk_kernel.Workflow_protocol.Versioning_auto_upgrade)
+      versioning_behavior
+  in
   Workflow_adapter.register ~signal_handlers ~query_handlers ~update_handlers
-    definition
+    ?versioning_behavior definition
 
 (** Packs an activity definition for [Activity.create]. *)
 let register_activity definition = Activity_adapter.register definition

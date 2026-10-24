@@ -1667,6 +1667,7 @@ impl Case {
             vec![CompletionCommand::CompleteWorkflow { result: None }]
         };
         let document = workflow_protocol::encode_completion(&Completion {
+            versioning_behavior: None,
             run_id: run_id.clone(),
             commands,
             task_failure: None,
@@ -1723,6 +1724,7 @@ impl Case {
         let document = match reusable.filter(|_| stale) {
             Some(document) => document,
             None => workflow_protocol::encode_completion(&Completion {
+                versioning_behavior: None,
                 run_id: "lifecycle-stress-never-leased".to_owned(),
                 commands: Vec::new(),
                 task_failure: None,

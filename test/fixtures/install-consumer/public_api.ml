@@ -842,6 +842,7 @@ let _worker_workflow :
     ?signals:T.Signal.Handler.t list ->
     ?queries:T.Query.Handler.t list ->
     ?updates:T.Update.Handler.t list ->
+    ?versioning_behavior:[ `Pinned | `Auto_upgrade ] ->
     ('input, 'output) T.Workflow.t -> T.Worker.registered_workflow =
   T.Worker.workflow
 
