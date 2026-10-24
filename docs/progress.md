@@ -6055,6 +6055,22 @@ against code that never cancels and must report nondeterminism. New feature
 rows `timer-cancellation`, `condition-timeout` and `child-start-options` are
 `replayed`; the corpus test passes with 85 cases.
 
+## 2026-10-24: Linux bubblewrap install of the source archive in CI (#1148)
+
+`opam-source-sandbox-linux` in `build-pr.yml`, on every tier, and
+`source-archive-check-linux` in `release.yml`, which `publish` now needs,
+build the source archive under opam's bubblewrap sandbox on Ubuntu 24.04.
+Each job then builds the installed-package consumer against the result.
+They lift Ubuntu's AppArmor restriction on unprivileged user namespaces that
+bubblewrap needs, and fail if opam has no sandbox hook. They set the new
+`OCAML_TEMPORAL_OPAM_CHECK_READ_ONLY_CARGO_HOME` mode of
+`check-opam-source-archive.sh`: Cargo's home is a cold directory outside
+every writable path, and a write probe proves it is read-only inside the
+sandbox before the build, as a user's default home is under `opam install`.
+Locally, the mode refused a work directory under `/tmp`, which the macOS
+wrapper leaves writable. The release checklist now lists the Linux job and no
+longer makes the opam install a manual post-publication step.
+
 ## 2026-10-24: Scoped durable-timer cancellation (#1134, first slice)
 
 `Workflow.start_sleep` and `Workflow.sleep` take `?scope`. The runtime timer

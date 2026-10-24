@@ -253,12 +253,17 @@ which could otherwise satisfy the consumer instead of the archive.
 The Release workflow gates publication on the exact published file: its
 `source-archive` job creates the archive and audited notices once and uploads
 them as the `release-source` artifact with the archive's SHA-256; the
-`source-archive-check` job (macOS ARM64, OCaml 5.5) downloads that artifact,
-confirms the digest, and runs both checks; and `publish`, which needs both,
-confirms the digest again before adding the same file to the release. Master
-builds also run the `opam-source-offline` job in `build-pr.yml`, which checks
-an archive it creates itself, as an early warning; pull requests skip both
-because of the full optimized Rust build. Run the checks locally with
+`source-archive-check` job (macOS ARM64, OCaml 5.5) and the
+`source-archive-check-linux` job (Linux amd64) download that artifact,
+confirm the digest, and run both checks; and `publish`, which needs them all,
+confirms the digest again before adding the same file to the release. The
+Linux job runs under opam's bubblewrap sandbox with
+`OCAML_TEMPORAL_OPAM_CHECK_READ_ONLY_CARGO_HOME` set, so Cargo's home is
+read-only during the build, as a user's default home is under `opam install`
+(#1148). `build-pr.yml` runs the same Linux check as
+`opam-source-sandbox-linux` on every tier, pull requests included, because
+Linux is the live-qualified platform; the macOS `opam-source-offline` job
+runs on master builds only, because of the full optimized Rust build. Run the checks locally with
 `opam exec -- sh scripts/check-opam-source-archive.sh <archive> <work-dir>`
 followed by `opam exec -- sh scripts/check-source-archive-consumer.sh
 <work-dir>`; they need the
