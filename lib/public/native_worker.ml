@@ -310,8 +310,8 @@ let register_workflow ?(signals = []) ?(queries = []) ?(updates = [])
   let versioning_behavior =
     Option.map
       (function
-        | `Pinned -> Temporal_protocol.Workflow_protocol.Versioning_pinned
-        | `Auto_upgrade -> Temporal_protocol.Workflow_protocol.Versioning_auto_upgrade)
+        | `Pinned -> Temporal_sdk_kernel.Workflow_protocol.Versioning_pinned
+        | `Auto_upgrade -> Temporal_sdk_kernel.Workflow_protocol.Versioning_auto_upgrade)
       versioning_behavior
   in
   Workflow_adapter.register ~signal_handlers ~query_handlers ~update_handlers
