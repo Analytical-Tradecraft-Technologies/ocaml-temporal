@@ -1487,7 +1487,12 @@ async fn fetch_history_pages(
                 workflow_id: request.workflow_id.clone(),
                 run_id: request.run_id.clone(),
             }),
-            maximum_page_size: request.page_size.map_or(0, |size| size as i32),
+            // Validation bounds the size to 1..=1000, so it always fits; zero
+            // asks for the server's default.
+            maximum_page_size: request
+                .page_size
+                .and_then(|size| i32::try_from(size).ok())
+                .unwrap_or(0),
             next_page_token: std::mem::take(&mut next_page_token),
             wait_new_event: false,
             history_event_filter_type: i32::from(HistoryEventFilterType::AllEvent),
