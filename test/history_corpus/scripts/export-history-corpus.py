@@ -76,6 +76,37 @@ CASES = {
         ["patch", "patch-deprecated"],
         "Deprecated generation records a deprecated patch marker.",
     ),
+    # corpus-v2-cancellation (#1134, #1135).
+    "timer-cancel-before-fire": (
+        ["timer", "timer-cancellation"],
+        "A scoped 60 s timer is cancelled while pending (TimerCanceled) after "
+        "a short unscoped timer fires.",
+    ),
+    "timer-cancel-after-fire": (
+        ["timer", "timer-cancellation"],
+        "A scoped short timer fires before its scope is cancelled, so no "
+        "cancel command is recorded.",
+    ),
+    "condition-timeout": (
+        ["timer", "condition", "condition-timeout"],
+        "A bounded Condition.wait_until whose timer fires while the predicate "
+        "is false, so the wait times out.",
+    ),
+    "condition-satisfied": (
+        ["timer", "condition", "condition-timeout", "timer-cancellation", "signal"],
+        "A signal satisfies a 60 s bounded Condition.wait_until, which "
+        "cancels the bound's timer (TimerCanceled).",
+    ),
+    "options-parent": (
+        ["child-workflow", "child-start-options"],
+        "Parent starts a child with execution, run and task timeouts and the "
+        "AllowDuplicateFailedOnly ID reuse policy.",
+    ),
+    "options-child": (
+        ["child-workflow", "child-side", "child-start-options"],
+        "Child run started with those options; it reads them through "
+        "Workflow.info.",
+    ),
 }
 
 # Patch lifecycle cases (issue #531). Each stage of the lifecycle captures the

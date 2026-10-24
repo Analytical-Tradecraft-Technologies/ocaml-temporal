@@ -86,6 +86,11 @@ let table =
     replayed "child-side";
     replayed "continue-as-new";
     replayed "continue-as-new-successor";
+    (* Timer cancellation, bounded conditions and child start options
+       (#1134, #1135), captured by corpus-v2-cancellation. *)
+    replayed "timer-cancellation";
+    replayed "condition-timeout";
+    replayed "child-start-options";
     (* Remote activities. *)
     replayed "activity";
     replayed "activity-retry";

@@ -68,6 +68,24 @@
         "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
       },
       "notes": "Captured for #531 with only the four corpus-lifecycle generations (HISTORY_CORPUS_GENERATIONS). The worker and client ran natively on macOS arm64 against a Compose Temporal stack under its own project name and frontend port. The working tree was clean at sdk_commit, which contains the frozen lifecycle definitions. The capture script ran with capture ID live-2026-10-11-lifecycle; the same recorded runs were then re-exported unchanged by export-history-corpus.py with capture ID live-2026-10-11 so entry IDs do not repeat the word lifecycle. The handover run was started by the corpus-lifecycle-legacy process, parked, and finished by a fresh corpus-lifecycle-patched process."
+    },
+    "live-2026-10-24": {
+      "kind": "live",
+      "captured_on": "2026-10-24",
+      "sdk_commit": "5eb14fea9af4392bb43e280ea32ecc4d420be96a",
+      "sdk_tree_dirty": false,
+      "core_revision": "8fe478ee179ed754614d230f39586f3edb57da71",
+      "temporal_server_image": "temporalio/server:1.32.0@sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae",
+      "temporal_cli_image": "temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca",
+      "worker_toolchains": [
+        "OCaml 5.4.1 (Unix)"
+      ],
+      "capture_command": "make history-corpus-capture HISTORY_CORPUS_CAPTURE_ID=live-2026-10-24 HISTORY_CORPUS_GENERATIONS=corpus-v2-cancellation (worker run natively on macOS against the Compose server)",
+      "protobuf_export": {
+        "tool": "Python protobuf 6.33.6 json_format",
+        "descriptor_sha256": "8c92175f70af3c521cb8fedd9713fe928b64b386953345b87867768233b5947c",
+        "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
+      }
     }
   },
   "entries": [
@@ -1801,6 +1819,159 @@
       "expected": "invalid_history",
       "negative_control_of": "live-2026-10-08-patch-active",
       "expected_message": "records a different workflow ID than the one supplied"
+    },
+    {
+      "id": "live-2026-10-24-timer-cancel-before-fire",
+      "purpose": "A scoped 60 s timer is cancelled while pending (TimerCanceled) after a short unscoped timer fires.",
+      "features": [
+        "timer",
+        "timer-cancellation"
+      ],
+      "workflow_type": "corpus.timer_cancel_before_fire",
+      "workflow_id": "history-corpus-timer-cancel-before-fire",
+      "run_id": "01a16c72-2b7d-720d-8f86-ac641046e9fa",
+      "capture": "live-2026-10-24",
+      "generation": "corpus-v2-cancellation",
+      "history": {
+        "protobuf": "histories/live-2026-10-24-timer-cancel-before-fire.pb",
+        "protobuf_sha256": "eed85ddaf77a2f576cfef5947bf98da7afe9c3516da3d06d39a72f2712a0d18d",
+        "json": "histories/live-2026-10-24-timer-cancel-before-fire.json",
+        "json_sha256": "d2105e313398b1cc57893db3aa4c78137126001df3c1c8a58b223b125b66e7e0"
+      },
+      "replay_definitions": "corpus-v2-cancellation",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-24-timer-cancel-after-fire",
+      "purpose": "A scoped short timer fires before its scope is cancelled, so no cancel command is recorded.",
+      "features": [
+        "timer",
+        "timer-cancellation"
+      ],
+      "workflow_type": "corpus.timer_cancel_after_fire",
+      "workflow_id": "history-corpus-timer-cancel-after-fire",
+      "run_id": "01a16c72-2f7d-7058-bbeb-7e7fe27d3adb",
+      "capture": "live-2026-10-24",
+      "generation": "corpus-v2-cancellation",
+      "history": {
+        "protobuf": "histories/live-2026-10-24-timer-cancel-after-fire.pb",
+        "protobuf_sha256": "b4bc3d466146a6bc2fc985a5866adec057563c005b3fe7bb7a3c2c1a5fed5871",
+        "json": "histories/live-2026-10-24-timer-cancel-after-fire.json",
+        "json_sha256": "1660cf93a1f2b41ea02e11436b845281171e1351af49440de3a5563f5dff0a57"
+      },
+      "replay_definitions": "corpus-v2-cancellation",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-24-condition-timeout",
+      "purpose": "A bounded Condition.wait_until whose timer fires while the predicate is false, so the wait times out.",
+      "features": [
+        "timer",
+        "condition",
+        "condition-timeout"
+      ],
+      "workflow_type": "corpus.condition_timeout",
+      "workflow_id": "history-corpus-condition-timeout",
+      "run_id": "01a16c72-3377-7868-92b6-7789f1e830c1",
+      "capture": "live-2026-10-24",
+      "generation": "corpus-v2-cancellation",
+      "history": {
+        "protobuf": "histories/live-2026-10-24-condition-timeout.pb",
+        "protobuf_sha256": "c5ee2c02b509bc61fa4d5fdf53d041049347e2bf7ebb6b18a087f2445fe7fdc3",
+        "json": "histories/live-2026-10-24-condition-timeout.json",
+        "json_sha256": "233cd9fa3e08c2bd1150abfd9359e0c5abf6652c909171984fe7452e3e44235d"
+      },
+      "replay_definitions": "corpus-v2-cancellation",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-24-condition-satisfied",
+      "purpose": "A signal satisfies a 60 s bounded Condition.wait_until, which cancels the bound's timer (TimerCanceled).",
+      "features": [
+        "timer",
+        "condition",
+        "condition-timeout",
+        "timer-cancellation",
+        "signal"
+      ],
+      "workflow_type": "corpus.condition_satisfied",
+      "workflow_id": "history-corpus-condition-satisfied",
+      "run_id": "01a16c72-376e-7576-8457-bf84c3b397c2",
+      "capture": "live-2026-10-24",
+      "generation": "corpus-v2-cancellation",
+      "history": {
+        "protobuf": "histories/live-2026-10-24-condition-satisfied.pb",
+        "protobuf_sha256": "09532d9b7f607d1f2c498c59a462dcffce4cb4d5f1c0d3e6e4913d084f37af07",
+        "json": "histories/live-2026-10-24-condition-satisfied.json",
+        "json_sha256": "754ae9863cf7032a815fe75b73c3ee1a6558847e40a17fefc72be0389c69d5ee"
+      },
+      "replay_definitions": "corpus-v2-cancellation",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-24-options-parent",
+      "purpose": "Parent starts a child with execution, run and task timeouts and the AllowDuplicateFailedOnly ID reuse policy.",
+      "features": [
+        "child-workflow",
+        "child-start-options"
+      ],
+      "workflow_type": "corpus.options_parent",
+      "workflow_id": "history-corpus-options-parent",
+      "run_id": "01a16c72-3785-739b-927f-64cf4cc71fff",
+      "capture": "live-2026-10-24",
+      "generation": "corpus-v2-cancellation",
+      "history": {
+        "protobuf": "histories/live-2026-10-24-options-parent.pb",
+        "protobuf_sha256": "eb69cc690d7797cef8f560c311f5198a9e4707cae80b69fc93f6d62f95079b6f",
+        "json": "histories/live-2026-10-24-options-parent.json",
+        "json_sha256": "0f7e271e2ebd9c7e07cd4ed6b17c4f68a5fd990fb14896735fd49d8483750e6f"
+      },
+      "replay_definitions": "corpus-v2-cancellation",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-24-options-child",
+      "purpose": "Child run started with those options; it reads them through Workflow.info.",
+      "features": [
+        "child-workflow",
+        "child-side",
+        "child-start-options"
+      ],
+      "workflow_type": "corpus.options_child",
+      "workflow_id": "history-corpus-options-parent-child",
+      "run_id": "01a16c72-3790-7467-98d5-3e262469873a",
+      "capture": "live-2026-10-24",
+      "generation": "corpus-v2-cancellation",
+      "history": {
+        "protobuf": "histories/live-2026-10-24-options-child.pb",
+        "protobuf_sha256": "5ad48b7dc9571531e3797b3f6dd06fdb9b10c0492958119292d8d171490b7d55",
+        "json": "histories/live-2026-10-24-options-child.json",
+        "json_sha256": "b11cd8d9699a0b53c7565c6b8113cfd50c1d672234cd9a41a6daa3b65dc118e2"
+      },
+      "replay_definitions": "corpus-v2-cancellation",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-timer-cancel-dropped",
+      "purpose": "Negative control: the before-fire timer workflow without its scope cancellation must be reported as nondeterministic.",
+      "features": [
+        "timer",
+        "timer-cancellation",
+        "negative-control"
+      ],
+      "workflow_type": "corpus.timer_cancel_before_fire",
+      "workflow_id": "history-corpus-timer-cancel-before-fire",
+      "run_id": "01a16c72-2b7d-720d-8f86-ac641046e9fa",
+      "capture": "live-2026-10-24",
+      "history": {
+        "protobuf": "histories/live-2026-10-24-timer-cancel-before-fire.pb",
+        "protobuf_sha256": "eed85ddaf77a2f576cfef5947bf98da7afe9c3516da3d06d39a72f2712a0d18d",
+        "json": "histories/live-2026-10-24-timer-cancel-before-fire.json",
+        "json_sha256": "d2105e313398b1cc57893db3aa4c78137126001df3c1c8a58b223b125b66e7e0"
+      },
+      "replay_definitions": "negative-timer-cancel-dropped",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-24-timer-cancel-before-fire"
     }
   ]
 }

@@ -1,0 +1,166 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-10-24T05:46:26.039551552Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048976",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "corpus.condition_timeout"
+        },
+        "taskQueue": {
+          "name": "ocaml-temporal-history-corpus",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {},
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "01a16c72-3377-7868-92b6-7789f1e830c1",
+        "identity": "history-corpus-client",
+        "firstExecutionRunId": "01a16c72-3377-7868-92b6-7789f1e830c1",
+        "attempt": 1,
+        "firstWorkflowTaskBackoff": "0s",
+        "workflowId": "history-corpus-condition-timeout"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-10-24T05:46:26.039587177Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048977",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "ocaml-temporal-history-corpus",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-10-24T05:46:26.044058802Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048982",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "history-corpus-corpus-v2-cancellation",
+        "requestId": "4d64bf49-8314-4e59-adfa-43e8fe648f15",
+        "historySizeBytes": "303",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-10-24T05:46:26.050470385Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048986",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "history-corpus-corpus-v2-cancellation",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            2,
+            3,
+            1
+          ],
+          "sdkName": "temporal-ocaml",
+          "sdkVersion": "0.1.0-rc.1"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-10-24T05:46:26.050493219Z",
+      "eventType": "EVENT_TYPE_TIMER_STARTED",
+      "taskId": "1048987",
+      "timerStartedEventAttributes": {
+        "timerId": "1",
+        "startToFireTimeout": "0.100s",
+        "workflowTaskCompletedEventId": "4"
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "2026-10-24T05:46:27.043496344Z",
+      "eventType": "EVENT_TYPE_TIMER_FIRED",
+      "taskId": "1048991",
+      "timerFiredEventAttributes": {
+        "timerId": "1",
+        "startedEventId": "5"
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "2026-10-24T05:46:27.043506719Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048992",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "history-corpus-corpus-v2-cancellation-f1b8c05a865948b3a0432888cba9d63b",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "ocaml-temporal-history-corpus"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "8",
+      "eventTime": "2026-10-24T05:46:27.045884677Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048996",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "7",
+        "identity": "history-corpus-corpus-v2-cancellation",
+        "requestId": "bf422f77-275b-4213-9d56-add8053f0cdf",
+        "historySizeBytes": "759",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "9",
+      "eventTime": "2026-10-24T05:46:27.050501011Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1049000",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "7",
+        "startedEventId": "8",
+        "identity": "history-corpus-corpus-v2-cancellation",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "10",
+      "eventTime": "2026-10-24T05:46:27.050517927Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1049001",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "IkNPTkRJVElPTjpUSU1FRC1PVVQi"
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "9"
+      }
+    }
+  ]
+}

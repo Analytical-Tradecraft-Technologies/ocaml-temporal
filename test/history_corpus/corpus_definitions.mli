@@ -112,6 +112,42 @@ val lifecycle_handover_release : unit Temporal.Signal.t
     learn that the first workflow task completed. *)
 val lifecycle_handover_status : string Temporal.Query.definition
 
+(** {1 Cancellation and start-option workflow types (#1134, #1135)}
+
+    Captured by the [corpus-v2-cancellation] generation. *)
+
+(** [corpus.timer_cancel_before_fire]: starts a 60 s timer in a scope, waits
+    on a short unscoped timer, then cancels the scope while the long timer is
+    pending ([TimerCanceled]). *)
+val timer_cancel_before_fire_workflow_type : string
+
+(** [corpus.timer_cancel_after_fire]: starts a short timer in a scope, waits
+    on a longer unscoped timer, then cancels the scope after the scoped timer
+    has fired, so no cancel command is recorded. *)
+val timer_cancel_after_fire_workflow_type : string
+
+(** [corpus.condition_timeout]: a [Condition.wait_until ~timeout] that is
+    never satisfied, so its timer fires and the wait times out. *)
+val condition_timeout_workflow_type : string
+
+(** [corpus.condition_satisfied]: a [Condition.wait_until ~timeout] (60 s)
+    satisfied by {!condition_release}, so its timer is cancelled. *)
+val condition_satisfied_workflow_type : string
+
+(** [corpus.options_parent]: runs [corpus.options_child] with execution, run
+    and task timeouts and an ID reuse policy, returning the child's report. *)
+val options_parent_workflow_type : string
+
+(** [corpus.options_child]: reports the timeouts Temporal recorded for it. *)
+val options_child_workflow_type : string
+
+(** Satisfies a waiting [corpus.condition_satisfied] run. *)
+val condition_release : unit Temporal.Signal.t
+
+(** Returns ["waiting"] once [corpus.condition_satisfied] has reached its
+    bounded wait, and ["-"] before. *)
+val condition_state : string Temporal.Query.definition
+
 (** {1 Interaction handler names}
 
     Used by the capture driver to send the interactions recorded in history. *)
@@ -153,7 +189,11 @@ val definition_set_names : string list
     - ["corpus-lifecycle-legacy"], ["corpus-lifecycle-patched"],
       ["corpus-lifecycle-deprecated"], ["corpus-lifecycle-removed"]: the four
       patch lifecycle generations of every [corpus.lifecycle.*] workflow,
-      each with both lifecycle child workflow types. *)
+      each with both lifecycle child workflow types.
+    - ["corpus-v2-cancellation"]: the timer-cancellation, bounded-condition
+      and child start-option workflows of #1134 and #1135.
+    - ["negative-timer-cancel-dropped"]: an intentionally incompatible
+      [corpus.timer_cancel_before_fire] that never cancels its long timer. *)
 val definition_set : string -> workflow list option
 
 (** Activities registered by the live capture worker. Every activity used by a
