@@ -91,6 +91,9 @@ let table =
     replayed "timer-cancellation";
     replayed "condition-timeout";
     replayed "child-start-options";
+    (* Deterministic uuid4, random_bytes and random_float draws (#1155),
+       captured by corpus-v3-random. *)
+    replayed "deterministic-randomness";
     (* Remote activities. *)
     replayed "activity";
     replayed "activity-retry";

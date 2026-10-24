@@ -86,6 +86,24 @@
         "descriptor_sha256": "8c92175f70af3c521cb8fedd9713fe928b64b386953345b87867768233b5947c",
         "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
       }
+    },
+    "live-2026-10-24-random": {
+      "kind": "live",
+      "captured_on": "2026-10-24",
+      "sdk_commit": "967f83b0aaa7bd528e44a64300e13e3bb9b8e8ed",
+      "sdk_tree_dirty": false,
+      "core_revision": "8fe478ee179ed754614d230f39586f3edb57da71",
+      "temporal_server_image": "temporalio/server:1.32.0@sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae",
+      "temporal_cli_image": "temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca",
+      "worker_toolchains": [
+        "OCaml 5.4.1 (Unix)"
+      ],
+      "capture_command": "make history-corpus-capture HISTORY_CORPUS_CAPTURE_ID=live-2026-10-24-random HISTORY_CORPUS_GENERATIONS=corpus-v3-random",
+      "protobuf_export": {
+        "tool": "Python protobuf 6.33.6 json_format",
+        "descriptor_sha256": "8c92175f70af3c521cb8fedd9713fe928b64b386953345b87867768233b5947c",
+        "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
+      }
     }
   },
   "entries": [
@@ -1972,6 +1990,71 @@
       "replay_definitions": "negative-timer-cancel-dropped",
       "expected": "nondeterminism",
       "negative_control_of": "live-2026-10-24-timer-cancel-before-fire"
+    },
+    {
+      "id": "live-2026-10-24-random-random-parent",
+      "purpose": "Parent draws uuid4, random_bytes and random_float, then uuid4 again after a timer, and starts a child under an ID built from the draws.",
+      "features": [
+        "timer",
+        "child-workflow",
+        "deterministic-randomness"
+      ],
+      "workflow_type": "corpus.random_parent",
+      "workflow_id": "history-corpus-random-parent",
+      "run_id": "01a16dd1-0cb5-70d5-a818-0802acbdb081",
+      "capture": "live-2026-10-24-random",
+      "generation": "corpus-v3-random",
+      "history": {
+        "protobuf": "histories/live-2026-10-24-random-random-parent.pb",
+        "protobuf_sha256": "ee6a0799d1b8aaa7aae590be2e19db96c1f5d92745ae719010b31fe012e168b2",
+        "json": "histories/live-2026-10-24-random-random-parent.json",
+        "json_sha256": "83840dd07558885818d9841158ca0bd4499954fa1d69041e88c66ff13fed031d"
+      },
+      "replay_definitions": "corpus-v3-random",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-10-24-random-random-child",
+      "purpose": "Child run started under the drawn ID.",
+      "features": [
+        "child-workflow",
+        "child-side"
+      ],
+      "workflow_type": "corpus.random_child",
+      "workflow_id": "random-f9daf7aa-bbd2-4577-b4f0-7849f30c562c-ccb3074a410a-792026-64ffb3fd-46fc-476f-9924-ae0773f6a5c8",
+      "run_id": "01a16dd1-10b1-7886-991a-2c3521c93ac1",
+      "capture": "live-2026-10-24-random",
+      "generation": "corpus-v3-random",
+      "history": {
+        "protobuf": "histories/live-2026-10-24-random-random-child.pb",
+        "protobuf_sha256": "62f1d7b873eae50ca1de070555de270a151f5d0a642d09624e7bfc818b7c0258",
+        "json": "histories/live-2026-10-24-random-random-child.json",
+        "json_sha256": "8f94d1cf8faab5ac96f09bb6ddb228b5bf2820511cca68cc8de73c62e5ab541d"
+      },
+      "replay_definitions": "corpus-v3-random",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-random-reordered",
+      "purpose": "Negative control: the random parent drawing its float first must start its child under another ID and be reported as nondeterministic.",
+      "features": [
+        "child-workflow",
+        "deterministic-randomness",
+        "negative-control"
+      ],
+      "workflow_type": "corpus.random_parent",
+      "workflow_id": "history-corpus-random-parent",
+      "run_id": "01a16dd1-0cb5-70d5-a818-0802acbdb081",
+      "capture": "live-2026-10-24-random",
+      "history": {
+        "protobuf": "histories/live-2026-10-24-random-random-parent.pb",
+        "protobuf_sha256": "ee6a0799d1b8aaa7aae590be2e19db96c1f5d92745ae719010b31fe012e168b2",
+        "json": "histories/live-2026-10-24-random-random-parent.json",
+        "json_sha256": "83840dd07558885818d9841158ca0bd4499954fa1d69041e88c66ff13fed031d"
+      },
+      "replay_definitions": "negative-random-reordered",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-10-24-random-random-parent"
     }
   ]
 }

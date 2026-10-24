@@ -500,6 +500,14 @@ let _workflow_patched : id:string -> bool = T.Workflow.patched
 let _workflow_deprecate_patch : id:string -> unit = T.Workflow.deprecate_patch
 let _workflow_random_int : bound:int -> (int, T.Error.t) result =
   T.Workflow.random_int
+
+let _workflow_random_float : unit -> (float, T.Error.t) result =
+  T.Workflow.random_float
+
+let _workflow_random_bytes : length:int -> (string, T.Error.t) result =
+  T.Workflow.random_bytes
+
+let _workflow_uuid4 : unit -> (string, T.Error.t) result = T.Workflow.uuid4
 let _workflow_continue_as_new :
     ('input, 'output) T.Workflow.t -> 'input -> 'value =
   T.Workflow.continue_as_new
