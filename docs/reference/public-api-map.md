@@ -112,7 +112,10 @@ for those rules.
   JSON; `Temporal.Payload` remains opaque bytes plus encoding metadata.
 - `Temporal.Error.t` is the typed failure channel for expected operational
   failures. Use `Error.view`, `Error.kind`, and `Error.message` for stable
-  inspection. Exceptions are for programmer defects or violated internal
+  inspection, and `Error.origin` (with `Error.timeout_type` and
+  `Error.last_heartbeat_details`) to tell a received timeout, application,
+  or server failure apart ([workflow failures](workflow-failures.md)).
+  Exceptions are for programmer defects or violated internal
   invariants, not normal Temporal outcomes.
 - `Temporal.Result_syntax` supplies ordinary `result` composition. It does
   not introduce workflow effects or change error ownership.

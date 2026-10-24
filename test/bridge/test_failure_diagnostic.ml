@@ -293,6 +293,119 @@ let test_inbound_failure_type_is_sanitized () =
   let sanitized = accepted controls in
   assert (String.length sanitized = ((limit - 3) / 7 * 6) + 3)
 
+(** One payload whose bytes name it, for order and membership checks. *)
+let payload name : Protocol.payload = { metadata = []; data = Bytes.of_string name }
+
+(** Names of [payloads] in order. *)
+let names payloads =
+  List.map (fun (value : Protocol.payload) -> Bytes.to_string value.data) payloads
+
+(** An application failure layer carrying [details]. *)
+let application ?(details = []) cause =
+  layer ~message:"business" ~source:"worker"
+    ~info:(Protocol.Application
+             {
+               type_name = "Business";
+               non_retryable = false;
+               details;
+               category = Protocol.Application_category_unspecified;
+               next_retry_delay = None;
+             })
+    ~cause
+
+(** A timeout layer of [timeout_type] carrying [heartbeat] details. *)
+let timeout ?(heartbeat = []) timeout_type cause =
+  layer ~message:"timed out" ~source:"server"
+    ~info:(Protocol.Timeout_failure { timeout_type; last_heartbeat_details = heartbeat })
+    ~cause
+
+(** An activity wrapper around [cause]. *)
+let activity cause =
+  layer ~message:"activity failed" ~source:"core"
+    ~info:(Protocol.Activity
+             {
+               scheduled_event_id = 5L;
+               started_event_id = 6L;
+               identity = "worker";
+               activity_type = "charge";
+               activity_id = "1";
+               retry_state = Protocol.Timeout;
+             })
+    ~cause
+
+(** A child-workflow wrapper around [cause]. *)
+let child cause =
+  layer ~message:"child failed" ~source:"core"
+    ~info:(Protocol.Child_workflow
+             {
+               namespace = "default";
+               workflow_id = "child";
+               run_id = "run";
+               workflow_type = "child";
+               initiated_event_id = 5L;
+               started_event_id = 6L;
+               retry_state = Protocol.Timeout;
+             })
+    ~cause
+
+(** [failure_origin] (#1143) skips the activity, child and Nexus operation
+    wrappers and an info-less layer that has a cause, and classifies the
+    first other layer: a timeout of each type, including one that wraps the
+    last attempt's application failure, an application failure, a server
+    failure, cancellation and termination. A chain of wrappers only, a reset
+    and a Nexus handler error are [`Other]. *)
+let test_failure_origin () =
+  let origin = Diagnostic.failure_origin in
+  let bare info = layer ~message:"m" ~source:"s" ~info ~cause:None in
+  List.iter
+    (fun (timeout_type, expected) ->
+      assert (origin (activity (Some (timeout timeout_type (Some (application None)))))
+              = `Timeout expected))
+    [
+      (Protocol.Timeout_start_to_close, `Start_to_close);
+      (Protocol.Timeout_schedule_to_start, `Schedule_to_start);
+      (Protocol.Timeout_schedule_to_close, `Schedule_to_close);
+      (Protocol.Timeout_heartbeat, `Heartbeat);
+      (Protocol.Timeout_unspecified, `Unspecified);
+    ];
+  assert (origin (child (Some (timeout Protocol.Timeout_start_to_close None)))
+          = `Timeout `Start_to_close);
+  assert (origin (activity (Some (application None))) = `Application);
+  assert (origin (child (Some (activity (Some (application None))))) = `Application);
+  assert (origin (activity (Some (bare (Protocol.Server { non_retryable = true }))))
+          = `Server);
+  assert (origin (activity (Some (bare (Protocol.Canceled { details = []; identity = "" }))))
+          = `Cancelled);
+  assert (origin (child (Some (bare (Protocol.Terminated { identity = "" })))) = `Terminated);
+  assert (origin
+            (layer ~message:"m" ~source:"s" ~info:Protocol.Absent
+               ~cause:(Some (application None)))
+          = `Application);
+  assert (origin (activity None) = `Other);
+  assert (origin (bare Protocol.Absent) = `Other);
+  assert (origin (bare (Protocol.Reset_workflow { last_heartbeat_details = [] })) = `Other)
+
+(** Heartbeat payloads are a timeout's or reset's own record (#1143):
+    [failure_details] keeps only application and cancellation details, and
+    [last_heartbeat_details] returns the heartbeat payloads, both outer to
+    inner. *)
+let test_heartbeat_details_are_separate () =
+  let failure =
+    activity
+      (Some
+         (timeout ~heartbeat:[ payload "progress-42" ] Protocol.Timeout_heartbeat
+            (Some (application ~details:[ payload "business" ] None))))
+  in
+  assert (names (Diagnostic.failure_details failure) = [ "business" ]);
+  assert (names (Diagnostic.last_heartbeat_details failure) = [ "progress-42" ]);
+  let reset =
+    layer ~message:"reset" ~source:"server"
+      ~info:(Protocol.Reset_workflow { last_heartbeat_details = [ payload "outer" ] })
+      ~cause:(Some (timeout ~heartbeat:[ payload "inner" ] Protocol.Timeout_heartbeat None))
+  in
+  assert (names (Diagnostic.last_heartbeat_details reset) = [ "outer"; "inner" ]);
+  assert (Diagnostic.failure_details reset = [])
+
 (** Runs the pure diagnostic regression cases. *)
 let () =
   test_inbound_failure_type_is_sanitized ();
@@ -301,4 +414,6 @@ let () =
   test_depth_is_bounded ();
   test_application_options_survive_cause_diagnostic ();
   test_truncation_keeps_utf_8 ();
-  test_extended_kinds_are_visible ()
+  test_extended_kinds_are_visible ();
+  test_failure_origin ();
+  test_heartbeat_details_are_separate ()

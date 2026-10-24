@@ -27,6 +27,15 @@ type view = {
   error_type : string option;
 }
 
+(** Which Temporal timeout expired; mirrors the public [Error.timeout_type]. *)
+type timeout_type =
+  [ `Start_to_close | `Schedule_to_start | `Schedule_to_close | `Heartbeat | `Unspecified ]
+
+(** Where a failure received from Temporal originated; mirrors the public
+    [Error.origin]. *)
+type origin =
+  [ `Application | `Timeout of timeout_type | `Server | `Cancelled | `Terminated | `Other ]
+
 (** An abstract structured error. Expected Temporal failures travel as this
     type inside [result], never as control-flow exceptions. *)
 type t
@@ -42,6 +51,8 @@ val make :
   ?non_retryable:bool ->
   ?error_type:string ->
   ?details:Payload.t list ->
+  ?origin:origin ->
+  ?last_heartbeat_details:Payload.t list ->
   category:category ->
   message:string ->
   unit ->
@@ -57,6 +68,17 @@ val kind : t -> string
 
 (** Returns the explicit application error type, if any. *)
 val error_type : t -> string option
+
+(** Returns where a failure received from Temporal originated, or [None] for
+    an error the SDK or application created (#1143). *)
+val origin : t -> origin option
+
+(** Returns the timeout of a [`Timeout] origin, or [None]. *)
+val timeout_type : t -> timeout_type option
+
+(** Returns the heartbeat details recorded with a timeout or reset, kept
+    apart from [details]; copied as for [view]. *)
+val last_heartbeat_details : t -> Payload.t list
 
 (** Returns the Temporal [ApplicationFailureInfo.type] emitted for this error:
     the explicit [error_type] when present, otherwise {!kind}. Keeping the
