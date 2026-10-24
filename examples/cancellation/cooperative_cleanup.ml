@@ -283,7 +283,11 @@ let step_details index =
     is the result of {!Temporal.Activity.Async_handle.heartbeat}:
     - a non-retryable [`Cancelled] error is a requested cancellation: release
       the reservation, then acknowledge with [Async_handle.cancel];
-    - a retryable [`Cancelled] error is a pause or reset: release the
+    - a retryable [`Cancelled] error of type ["WorkerShutdown"] means this
+      worker is stopping (#1157): release the reservation, then fail the
+      handle with that error, so Temporal retries the attempt on another
+      worker before the graceful shutdown period ends;
+    - any other retryable [`Cancelled] error is a pause or reset: release the
       reservation, then fail the handle with that error, because Temporal
       accepts a cancelled completion only after a cancellation request;
     - another retryable error means the handoff is not accepted yet or a
@@ -292,14 +296,12 @@ let step_details index =
       the activity no longer exists), so the reservation is released and
       nothing more can be reported.
 
-    The handle is not notified when its worker stops, so this thread cannot
-    clean up on shutdown the way {!hold_reservation} does. A worker shutdown
-    waits for the handle for the graceful shutdown period and then closes it
-    as a lost completion, and an unfinished handle expires once Temporal must
-    have timed its attempt out; the next heartbeat then returns a
-    non-retryable error and the last case above releases the reservation.
-    Temporal retries the attempt after its heartbeat or start-to-close
-    timeout. *)
+    The shutdown case lets this thread clean up on shutdown the way
+    {!hold_reservation} does. A handle that is still unfinished when the
+    graceful shutdown period ends is closed as a lost completion, and one
+    that is never finished expires once Temporal must have timed its attempt
+    out; the next heartbeat then returns a non-retryable error and the last
+    case above releases the reservation. *)
 let drive_async handle ~key ~attempt ~steps =
   let module Handle = Temporal.Activity.Async_handle in
   let rec step index =
@@ -322,6 +324,9 @@ let drive_async handle ~key ~attempt ~steps =
           | `Cancelled, true ->
               Ledger.release key ~attempt Cancellation_requested;
               deliver (fun () -> Handle.cancel handle [])
+          | `Cancelled, false when view.error_type = Some "WorkerShutdown" ->
+              Ledger.release key ~attempt Worker_stopping;
+              deliver (fun () -> Handle.fail handle error)
           | `Cancelled, false ->
               Ledger.release key ~attempt Operator_interrupted;
               deliver (fun () -> Handle.fail handle error)

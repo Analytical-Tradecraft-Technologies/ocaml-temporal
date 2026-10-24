@@ -255,8 +255,30 @@ module Async_handle : sig
       handle with {!cancel}, or with {!fail} and that error. A failed send
       ends the throttle interval, so the next call is sent at once and
       returns the server's answer, for example a non-retryable error once
-      the activity no longer exists. *)
+      the activity no longer exists.
+
+      Once the worker that ran the attempt has begun to stop (see
+      {!is_worker_shutting_down}), a heartbeat that would otherwise return
+      [Ok] returns a retryable [`Cancelled] error of type
+      ["WorkerShutdown"] instead (#1157). The heartbeat was still recorded,
+      so the attempt stays alive while the completer winds down. Finishing
+      the handle with {!fail} and that error before the worker's graceful
+      shutdown period ends hands the attempt back to Temporal as a
+      retryable failure, so it is retried, normally on another worker,
+      without waiting for the attempt's timeouts. *)
   val heartbeat : 'output t -> Payload.t list -> (unit, Error.t) result
+
+  (** Returns [true] once the worker that ran this attempt has begun to stop,
+      because [Temporal.Worker.shutdown] or [Temporal.Worker.request_shutdown]
+      was called (#1157). The worker then waits for the handle only until its
+      graceful shutdown period ends; a handle still unfinished at that point
+      is closed as a lost completion. An external completer that checks this
+      flag, or sees {!heartbeat}'s shutdown error, can finish early, for
+      example with {!fail} and a retryable error so that Temporal retries the
+      attempt elsewhere. It never contacts the server, may be called from
+      any Domain, and is always [false] for a handle outside a native
+      worker. *)
+  val is_worker_shutting_down : 'output t -> bool
 end
 
 (** Read-only identity and scheduling facts for one activity attempt, copied
@@ -339,6 +361,11 @@ module Async_context : sig
   (** Returns the opaque handle that can be retained after the callback. *)
   val handle : 'output t -> 'output Async_handle.t
 
+  (** Returns {!Async_handle.is_worker_shutting_down} of this attempt's
+      handle, as [Context.is_worker_shutting_down] does for a synchronous
+      activity (#1157). *)
+  val is_worker_shutting_down : 'output t -> bool
+
   (** Returns this attempt's task metadata, as {!Context.info} does for a
       synchronous activity. Contexts created by a native worker always carry
       it; any other context returns a typed [Defect] error. The value is
@@ -378,11 +405,14 @@ end
     An asynchronous activity has no context to read. Its completer learns of
     the same requests from the result of {!Async_handle.heartbeat} and
     reports the outcome itself, with {!Async_handle.cancel} or
-    {!Async_handle.fail}. It is not notified when its worker stops: shutdown
-    waits for the handle for the graceful shutdown period and then closes it
-    as a lost completion, after which its calls return a non-retryable error,
-    and a handle that is never finished expires once Temporal must have timed
-    its attempt out. Temporal then retries the attempt according to its
+    {!Async_handle.fail}. It learns that its worker is stopping the same way,
+    from {!Async_handle.is_worker_shutting_down} or the retryable
+    ["WorkerShutdown"] error of {!Async_handle.heartbeat} (#1157), and can
+    then fail the handle retryably so Temporal retries the attempt
+    elsewhere. Shutdown waits for the handle for the graceful shutdown
+    period and then closes it as a lost completion, after which its calls
+    return a non-retryable error, and a handle that is never finished
+    expires once Temporal must have timed its attempt out. Temporal then retries the attempt according to its
     heartbeat, start-to-close and schedule-to-close timeouts. The
     repository's [examples/cancellation] shows both forms releasing an
     external reservation idempotently on cancellation, and the synchronous

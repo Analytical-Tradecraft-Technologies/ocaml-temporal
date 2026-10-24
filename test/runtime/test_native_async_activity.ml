@@ -1773,13 +1773,82 @@ let test_stale_handle_rejected () =
     | Ok () -> failwith "stale dormant handle became usable after rejection"
   end
 
+(** Once the owning worker is stopping (#1157), an accepted heartbeat is
+    still submitted but returns the retryable ["WorkerShutdown"] error, a
+    heartbeat whose submission reports an activity state keeps that error,
+    the flag is readable through the handle, and the completer can still
+    fail the handle with the shutdown error so Temporal retries the attempt.
+    A handle created without a reader never reports shutdown. *)
+let test_worker_shutdown_reaches_async_handle () =
+  let stopping = ref false in
+  let submitted = ref [] in
+  let paused = ref false in
+  let payload = Temporal_base.Payload.{ metadata = []; data = Bytes.empty } in
+  let handle =
+    Base_async.create ()
+      ~worker_shutting_down:(fun () -> !stopping)
+      ~submit:(fun operation ->
+        submitted := operation :: !submitted;
+        if !paused then
+          Error
+            (Base_async.Activity_state
+               (Temporal_base.Error.make ~category:`Cancelled ~error_type:"ActivityPause"
+                  ~message:"paused" ()))
+        else Ok ())
+      ~encode_output:(fun _ -> Ok payload)
+  in
+  (match Base_async.prepare_handoff ~expected:handle handle with
+  | Ok () -> ()
+  | Error _ -> failwith "shutdown fixture could not reserve its handoff");
+  (match Base_async.activate handle with
+  | Ok () -> ()
+  | Error _ -> failwith "shutdown fixture could not activate");
+  if Base_async.worker_shutting_down handle then
+    failwith "a running worker was reported as shutting down";
+  (match Base_async.heartbeat handle [] with
+  | Ok () -> ()
+  | Error _ -> failwith "a heartbeat before shutdown failed");
+  stopping := true;
+  if not (Base_async.worker_shutting_down handle) then
+    failwith "a stopping worker was not reported through the handle";
+  let shutdown_error =
+    match Base_async.heartbeat handle [] with
+    | Error error ->
+        let view = Temporal_base.Error.view error in
+        if view.non_retryable || view.category <> `Cancelled
+           || view.error_type <> Some Base_async.worker_shutdown_error_type
+        then failwith "the shutdown heartbeat error has the wrong shape";
+        error
+    | Ok () -> failwith "a heartbeat during shutdown returned Ok"
+  in
+  if List.length !submitted <> 2 then
+    failwith "the heartbeat during shutdown was not submitted";
+  paused := true;
+  (match Base_async.heartbeat handle [] with
+  | Error error when Temporal_base.Error.error_type error = Some "ActivityPause" -> ()
+  | Error _ | Ok () -> failwith "an activity-state error did not take precedence");
+  paused := false;
+  (match Base_async.fail handle shutdown_error with
+  | Ok () -> ()
+  | Error _ -> failwith "the completer could not fail with the shutdown error");
+  (match !submitted with
+  | Base_async.Fail error :: _
+    when Temporal_base.Error.error_type error = Some Base_async.worker_shutdown_error_type ->
+      ()
+  | _ -> failwith "the shutdown failure was not submitted");
+  let unowned =
+    Base_async.create () ~submit:(fun _ -> Ok ()) ~encode_output:(fun _ -> Ok payload)
+  in
+  if Base_async.worker_shutting_down unowned then
+    failwith "a handle without a worker reported shutdown"
+
 (** The base state machine rejects use before activation and keeps its terminal
     state after one accepted completion without requiring a native supervisor. *)
 let test_base_state_machine () =
   let submitted = ref 0 in
   let payload = Temporal_base.Payload.{ metadata = []; data = Bytes.empty } in
   let handle =
-    Base_async.create
+    Base_async.create ()
       ~submit:(fun _operation -> incr submitted; Ok ())
       ~encode_output:(fun _ -> Ok payload)
   in
@@ -1805,7 +1874,7 @@ let test_base_state_machine () =
     | Ok () -> failwith "handoff-pending base handle submitted an operation"
   end;
   let abandoned =
-    Base_async.create
+    Base_async.create ()
       ~submit:(fun _operation -> incr submitted; Ok ())
       ~encode_output:(fun _ -> Ok payload)
   in
@@ -1844,7 +1913,7 @@ let test_operation_key_boundaries () =
     Temporal_base.Error.make ~category:`Bridge ~message:"transport unavailable" ()
   in
   let handle =
-    Base_async.create
+    Base_async.create ()
       ~submit:(fun _operation ->
         incr submitted;
         Error (Base_async.Retryable_submission failure))
@@ -1872,7 +1941,7 @@ let test_operation_key_boundaries () =
 let test_local_rejection_preserves_earlier_uncertainty () =
   let attempts = ref 0 in
   let error = Temporal_base.Error.make ~category:`Bridge ~message:"unavailable" () in
-  let handle = Base_async.create
+  let handle = Base_async.create ()
       ~encode_output:(fun text -> Ok Temporal_base.Payload.
         { metadata = []; data = Bytes.of_string text })
       ~submit:(fun _ ->
@@ -1903,7 +1972,7 @@ let test_local_rejection_preserves_earlier_uncertainty () =
 let test_native_rejection_releases_earlier_uncertainty () =
   let attempts = ref 0 in
   let error = Temporal_base.Error.make ~category:`Bridge ~message:"completion failed" () in
-  let handle = Base_async.create
+  let handle = Base_async.create ()
       ~encode_output:(fun text -> Ok Temporal_base.Payload.
         { metadata = []; data = Bytes.of_string text })
       ~submit:(fun _ ->
@@ -1936,7 +2005,7 @@ let test_native_rejection_releases_earlier_uncertainty () =
 let test_uncertain_heartbeat_is_not_retained () =
   let submitted = ref [] in
   let error = Temporal_base.Error.make ~category:`Bridge ~message:"unavailable" () in
-  let handle = Base_async.create
+  let handle = Base_async.create ()
       ~encode_output:(fun text -> Ok Temporal_base.Payload.
         { metadata = []; data = Bytes.of_string text })
       ~submit:(fun operation ->
@@ -1971,7 +2040,7 @@ let test_uncertain_heartbeat_is_not_retained () =
 let test_in_flight_conflict_is_retryable () =
   let handle_ref = ref None in
   let inner = ref None in
-  let handle = Base_async.create
+  let handle = Base_async.create ()
       ~encode_output:(fun text -> Ok Temporal_base.Payload.
         { metadata = []; data = Bytes.of_string text })
       ~submit:(fun operation ->
@@ -2521,6 +2590,7 @@ let test_async_full_registry_lease_still_expires () =
 (** Runs the isolated async lifecycle assertions. *)
 let () =
   test_base_state_machine ();
+  test_worker_shutdown_reaches_async_handle ();
   test_operation_key_boundaries ();
   test_local_rejection_preserves_earlier_uncertainty ();
   test_native_rejection_releases_earlier_uncertainty ();

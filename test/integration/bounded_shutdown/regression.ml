@@ -21,6 +21,15 @@
     its late result must be discarded without disturbing anything, and B and
     the workflow worker must shut down cleanly.
 
+    A second scenario covers asynchronous handles (#1157). Worker C hands
+    attempt 1 of [bounded-shutdown.async] to an external completer thread,
+    which heartbeats the handle until a heartbeat returns the retryable
+    ["WorkerShutdown"] error, confirms [Async_handle.is_worker_shutting_down],
+    and fails the handle with that error. C's shutdown, with a long grace
+    period, must then return well before the period ends with a clean
+    report (no lost completion), and Temporal must retry the attempt at once
+    on worker D, which completes attempt 2.
+
     Run against a disposable Temporal Server only:
     [dune exec test/integration/bounded_shutdown/regression.exe -- check
     http://127.0.0.1:7233]. [TEMPORAL_NAMESPACE] defaults to
@@ -127,10 +136,166 @@ let describe_report (report : Worker.Shutdown_report.t) =
     | `Completed -> "completed"
     | `Detached -> "detached")
 
+(** Activity type of the asynchronous scenario (#1157). *)
+let async_activity_name = "bounded-shutdown.async"
+
+(** Grace period given to worker C. The completer hands the attempt back
+    long before it ends, so shutdown must not wait for it. *)
+let async_grace_ms = 30_000L
+
+(** Set by C's completer once a heartbeat was accepted on the active handle. *)
+let async_heartbeating = Atomic.make false
+
+(** Set by C's completer once it saw the shutdown error, observed the
+    handle's flag, and failed the handle with that error. *)
+let async_handed_back = Atomic.make false
+
+(** C's completer: heartbeats every 50 ms, retrying the handoff's
+    retryable "not active yet" error, until a heartbeat reports the worker's
+    shutdown; then fails the handle with that error. Gives up after two
+    minutes as a fixture safety net. *)
+let drive_async handle =
+  let deadline = Unix.gettimeofday () +. 120. in
+  let rec loop () =
+    if Unix.gettimeofday () < deadline then
+      match Activity.Async_handle.heartbeat handle [] with
+      | Ok () ->
+          Atomic.set async_heartbeating true;
+          Thread.delay 0.05;
+          loop ()
+      | Error error when Error.error_type error = Some "WorkerShutdown" ->
+          if
+            Activity.Async_handle.is_worker_shutting_down handle
+            && Activity.Async_handle.fail handle error = Ok ()
+          then Atomic.set async_handed_back true
+      | Error _ ->
+          Thread.delay 0.05;
+          loop ()
+  in
+  loop ()
+
+(** Worker C's implementation: hands every attempt to {!drive_async}. *)
+let async_handed_off =
+  Activity.define_async ~name:async_activity_name ~input:Codec.string
+    ~output:Codec.string (fun context _label ->
+      let handle = Activity.Async_context.handle context in
+      ignore (Thread.create drive_async handle);
+      Activity.Will_complete_async handle)
+
+(** Worker D's implementation of the same type: completes at once. *)
+let async_quick =
+  Activity.define_with_context ~name:async_activity_name ~input:Codec.string
+    ~output:Codec.string (fun context _label ->
+      Ok (Printf.sprintf "completed-by-d:attempt=%d" (attempt context)))
+
+(** Runs the asynchronous activity like {!workflow} runs the synchronous one. *)
+let async_workflow =
+  Workflow.define ~name:"bounded-shutdown.async-workflow" ~input:Codec.string
+    ~output:Codec.string (fun activity_queue ->
+      let retry_policy =
+        get
+          (Retry_policy.make ~initial_interval:(Duration.of_ms 1_000L)
+             ~backoff_coefficient:1.0 ~maximum_interval:(Duration.of_ms 1_000L)
+             ~maximum_attempts:5 ())
+      in
+      Activity.execute ~task_queue:activity_queue
+        ~start_to_close_timeout:(Duration.of_ms 600_000L) ~retry_policy async_quick
+        "bounded-shutdown-async")
+
+(** Runs the asynchronous scenario described in the module docs; [client]
+    and the workflow worker on [workflow_queue] are shared with {!check}. *)
+let check_async address client workflow_queue suffix =
+  let activity_queue = "bounded-shutdown-async-activities-" ^ suffix in
+  let c_options =
+    get
+      (Worker.Options.make
+         ~graceful_shutdown_period:(Duration.of_ms async_grace_ms)
+         ~shutdown_teardown_timeout:(Duration.of_ms teardown_ms) ())
+  in
+  let worker_c =
+    get
+      (Worker.create ~options:c_options ~target_url:address ~namespace
+         ~task_queue:activity_queue ~identity:"bounded-shutdown-c"
+         ~workflows:[] ~activities:[ Worker.activity async_handed_off ] ())
+  in
+  let c_domain = start_worker worker_c in
+  let c_shut_down = ref false in
+  let worker_d = ref None in
+  let body =
+    try
+      let handle =
+        get
+          (Client.start client ~workflow:async_workflow ~task_queue:workflow_queue
+             ~id:("bounded-shutdown-async-" ^ suffix) ~input:activity_queue ())
+      in
+      require
+        (wait_until ~seconds:60. (fun () -> Atomic.get async_heartbeating))
+        "attempt 1 was never handed off on worker C";
+      let started = Unix.gettimeofday () in
+      let report = Worker.shutdown_with_report worker_c in
+      let elapsed = Unix.gettimeofday () -. started in
+      c_shut_down := true;
+      let report =
+        match report with
+        | Ok report -> report
+        | Error error ->
+            failwith ("worker C lost the handed-back completion: " ^ Error.message error)
+      in
+      Printf.printf "worker C shutdown: %s\n%!" (describe_report report);
+      require (Atomic.get async_handed_back)
+        "the completer did not observe the shutdown and fail the handle";
+      require
+        (elapsed < Int64.to_float async_grace_ms /. 1_000. /. 2.)
+        (Printf.sprintf "shutdown waited %.1fs for a handle already handed back"
+           elapsed);
+      require (Worker.Shutdown_report.is_clean report)
+        "a handed-back handle left an unclean shutdown";
+      require (get (Domain.join c_domain) = ()) "worker C run failed";
+      let d =
+        get
+          (Worker.create ~target_url:address ~namespace
+             ~task_queue:activity_queue ~identity:"bounded-shutdown-d"
+             ~workflows:[] ~activities:[ Worker.activity async_quick ] ())
+      in
+      worker_d := Some (d, start_worker d);
+      let output =
+        match get (Client.wait ~timeout:(Duration.of_seconds 30L) handle) with
+        | Client.Completed { output; _ } -> output
+        | _ -> failwith "the asynchronous workflow did not complete"
+      in
+      require
+        (output = "completed-by-d:attempt=2")
+        ("the handed-back activity completed as " ^ output);
+      Ok output
+    with exception_ -> Error exception_
+  in
+  if not !c_shut_down then begin
+    ignore (Worker.shutdown worker_c);
+    ignore (Domain.join c_domain)
+  end;
+  let d_clean =
+    match !worker_d with
+    | None -> true
+    | Some (d, domain) ->
+        let report = Worker.shutdown_with_report d in
+        ignore (Domain.join domain);
+        (match report with
+        | Ok report -> Worker.Shutdown_report.is_clean report
+        | Error _ -> false)
+  in
+  match body with
+  | Ok output ->
+      require d_clean "worker D did not shut down cleanly";
+      Printf.printf
+        "bounded shutdown live regression: worker C's completer handed attempt \
+         1 back on shutdown and Temporal retried it on worker D (%s)\n%!"
+        output
+  | Error exception_ -> raise exception_
+
 (** Runs the scenario and always shuts every worker down. A process-wide
     alarm bounds a hung server or worker. *)
 let check address =
-  ignore (Unix.alarm 170);
+  ignore (Unix.alarm 240);
   let suffix =
     Printf.sprintf "%d-%d" (Unix.getpid ())
       (Random.State.bits (Random.State.make_self_init ()))
@@ -141,7 +306,8 @@ let check address =
     get
       (Worker.create ~target_url:address ~namespace ~task_queue:workflow_queue
          ~identity:"bounded-shutdown-workflows"
-         ~workflows:[ Worker.workflow workflow ] ~activities:[] ())
+         ~workflows:[ Worker.workflow workflow; Worker.workflow async_workflow ]
+         ~activities:[] ())
   in
   let a_options =
     get
@@ -228,6 +394,7 @@ let check address =
         (wait_until ~seconds:10. (fun () -> Atomic.get stuck_returned))
         "the released callback did not return";
       Unix.sleepf 0.5;
+      check_async address client workflow_queue suffix;
       Ok output
     with exception_ -> Error exception_
   in

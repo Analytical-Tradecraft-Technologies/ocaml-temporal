@@ -425,8 +425,11 @@ val options : t -> Options.t
 val health : t -> Health.t
 
 (** Shuts the worker down within a bound and reports what it abandoned
-    (#495). Admission closes at once: both lanes stop polling and activity
-    contexts report {!Activity.Context.is_worker_shutting_down}. Then:
+    (#495). Admission closes at once: both lanes stop polling, activity
+    contexts report {!Activity.Context.is_worker_shutting_down}, and
+    asynchronous activity handles report
+    {!Activity.Async_handle.is_worker_shutting_down}, with their heartbeats
+    returning a retryable ["WorkerShutdown"] error (#1157). Then:
 
     + Work already running may finish until the grace period
       ({!Options.make}) elapses. Retained completions are delivered.
@@ -452,7 +455,9 @@ val health : t -> Health.t
     teardown reported a failure; native resources are still released. An
     asynchronous activity handle that external code had not completed by
     the end of the grace period counts as a lost completion: its handle is
-    closed with the worker.
+    closed with the worker. A completer that fails the handle retryably
+    when it sees the shutdown hands the attempt back instead, so nothing is
+    lost and Temporal retries the attempt at once.
     Abandoned work that Temporal retries is not an error.
 
     Repeated calls are safe and return the same cached terminal result.

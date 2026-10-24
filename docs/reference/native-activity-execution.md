@@ -659,8 +659,18 @@ heartbeats to the server, so a cancellation is typically delivered one or two
 heartbeats after the request. Core's local heartbeat timer and the server's
 `NotFound` response surface as `Timed_out` and `Not_found`; Core suppresses the
 completion for those, so the callback's result is discarded. Asynchronous
-callbacks have no synchronous context and are not notified; an asynchronous
-handle's heartbeat does not report cancellation.
+callbacks have no synchronous context; an asynchronous handle learns of a
+cancellation, pause or reset from its heartbeat result instead.
+
+An asynchronous handle reads the same shutdown flag through
+`Async_handle.is_worker_shutting_down` (and `Async_context`'s), and once it is
+set every heartbeat that would otherwise return `Ok` returns a retryable
+`` `Cancelled `` error of type `"WorkerShutdown"` (#1157). The heartbeat is
+still recorded, and an activity-state or delivery error from the same call
+takes precedence. A completer that fails the handle with that error
+finishes it before the grace period ends, so shutdown does not wait for it or
+report a lost completion, and Temporal retries the attempt at once, normally
+on another worker. The bounded-shutdown live regression verifies this.
 
 `Context.is_worker_shutting_down` reads the public worker's `closed` and
 `stop_requested` flags; it is the shutdown signal. Core's polling stops as

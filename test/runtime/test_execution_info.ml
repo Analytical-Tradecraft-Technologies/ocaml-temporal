@@ -629,6 +629,7 @@ let test_async_context_info () =
     Temporal_base.Async_activity.create
       ~submit:(fun _ -> Ok ())
       ~encode_output:(fun () -> Ok (Temporal_base.Payload.unit_null ()))
+      ()
   in
   let info : Temporal_base.Activity_context.info =
     {
