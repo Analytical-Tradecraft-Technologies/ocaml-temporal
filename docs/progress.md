@@ -6172,3 +6172,16 @@ same child ID is refused under `` `Reject_duplicate `` and reused under
 `` `Allow_duplicate ``. It passed locally against the pinned Compose stack.
 The parent's error is not yet a typed timeout kind (#1143), and child memo
 and search attributes remain blocked by #512.
+
+## 2026-10-24: Live timer cancellation regression (#1134)
+
+`test/integration/timer_cancellation` runs in
+`make test-temporal-live-regressions` and passed locally against the pinned
+Compose stack. A bounded `Condition.wait_until` satisfied by a signal records
+`TIMER_STARTED` and `TIMER_CANCELED`; one left to expire records
+`TIMER_FIRED` and returns `` `Timeout ``; a `Workflow.sleep ~scope`
+cancelled from a signal handler records `TIMER_CANCELED` and returns
+`` `Cancelled ``. Each outcome is read before and after a worker
+replacement, so a fresh worker replays the cancel or the firing without a
+nondeterminism error. History-corpus entries for these runs remain open
+under #1134 (#503).

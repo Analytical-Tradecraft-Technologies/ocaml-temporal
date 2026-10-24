@@ -61,7 +61,10 @@ the timer has fired, so the firing activation wakes the waiter; the
 application predicate is then re-read, satisfaction wins over a timeout in the
 same activation, and the private scope is cancelled so a satisfied wait emits
 `Cancel_timer` for its still-pending timer. A timeout returns a `` `Timeout ``
-error. A zero bound records no timer.
+error. A zero bound records no timer. The
+[timer cancellation regression](../../test/integration/timer_cancellation/README.md)
+checks both cancellation paths and a fired bound against a live server,
+including replay after a worker replacement.
 
 ## Deterministic pseudo-random values
 
