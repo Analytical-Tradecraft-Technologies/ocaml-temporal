@@ -130,6 +130,7 @@ for executable in "$@"; do
   case "$executable" in
     test/integration/activity_cancellation/regression.exe|\
     test/integration/bounded_shutdown/regression.exe|\
+    test/integration/child_start_options/regression.exe|\
     test/integration/client_request_ids/regression.exe|\
     test/integration/completed_queries/regression.exe|\
     test/integration/concurrent_client/regression.exe|\
