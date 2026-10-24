@@ -148,6 +148,18 @@ val condition_release : unit Temporal.Signal.t
     bounded wait, and ["-"] before. *)
 val condition_state : string Temporal.Query.definition
 
+(** {1 Deterministic randomness workflow types (#1155)}
+
+    Captured by the [corpus-v3-random] generation. *)
+
+(** [corpus.random_parent]: builds a child workflow ID from [uuid4],
+    [random_bytes], [random_float] and, after a timer, [uuid4] again, runs
+    [corpus.random_child] under it, and returns the ID. *)
+val random_parent_workflow_type : string
+
+(** [corpus.random_child]: completes at once. *)
+val random_child_workflow_type : string
+
 (** {1 Interaction handler names}
 
     Used by the capture driver to send the interactions recorded in history. *)
@@ -193,7 +205,11 @@ val definition_set_names : string list
     - ["corpus-v2-cancellation"]: the timer-cancellation, bounded-condition
       and child start-option workflows of #1134 and #1135.
     - ["negative-timer-cancel-dropped"]: an intentionally incompatible
-      [corpus.timer_cancel_before_fire] that never cancels its long timer. *)
+      [corpus.timer_cancel_before_fire] that never cancels its long timer.
+    - ["corpus-v3-random"]: the deterministic randomness workflows of #1155.
+    - ["negative-random-reordered"]: [corpus.random_parent] drawing its
+      float first; replaying a [corpus-v3-random] parent history against it
+      must report nondeterminism. *)
 val definition_set : string -> workflow list option
 
 (** Activities registered by the live capture worker. Every activity used by a

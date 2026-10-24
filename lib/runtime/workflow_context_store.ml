@@ -546,10 +546,10 @@ let next_random_word context =
   context.random_state <- value;
   value
 
-(** Returns one unbiased integer below [bound] from the deterministic stream.
-    Rejection sampling avoids the modulo bias that would otherwise make the
-    same workflow produce a skewed distribution for non-power-of-two bounds. *)
-let random_int context ~bound =
+(** Rejects a draw after shutdown or inside a read-only update validator,
+    where advancing the stream would change later draws on the live path
+    only. *)
+let check_randomness context =
   if context.sealed then
     Error
       (Temporal_base.Error.defect
@@ -558,11 +558,19 @@ let random_int context ~bound =
     Error
       (Temporal_base.Error.defect
          ~message:"workflow randomness is unavailable in a read-only update validator")
-  else if bound <= 0 then
+  else Ok ()
+
+(** Returns one unbiased integer below [bound] from the deterministic stream.
+    Rejection sampling avoids the modulo bias that would otherwise make the
+    same workflow produce a skewed distribution for non-power-of-two bounds. *)
+let random_int context ~bound =
+  match check_randomness context with
+  | Error error -> Error error
+  | Ok () when bound <= 0 ->
     Error
       (Temporal_base.Error.defect
          ~message:"workflow random_int bound must be positive")
-  else
+  | Ok () ->
     let bound64 = Int64.of_int bound in
     let remainder = Int64.rem Int64.max_int bound64 in
     let limit = Int64.sub Int64.max_int remainder in
@@ -572,6 +580,78 @@ let random_int context ~bound =
       else Ok (Int64.to_int (Int64.rem sample bound64))
     in
     draw ()
+
+(** The SplitMix64 output finalizer. The float, bytes and UUID draws pass
+    each stream word through it, so every output bit depends on every state
+    bit even right after a small seed. It changes only the new draws' view
+    of the stream: [random_int] keeps the raw words, so histories recorded
+    before #1155 replay unchanged. *)
+let mix word =
+  let word = Int64.logxor word (Int64.shift_right_logical word 30) in
+  let word = Int64.mul word 0xbf58476d1ce4e5b9L in
+  let word = Int64.logxor word (Int64.shift_right_logical word 27) in
+  let word = Int64.mul word 0x94d049bb133111ebL in
+  Int64.logxor word (Int64.shift_right_logical word 31)
+
+(** Returns a float in \[0, 1) built from the top 53 bits of one word, so
+    every value is an exact multiple of 2{^-53} and the result never
+    reaches 1. *)
+let random_float context =
+  Result.map
+    (fun () ->
+      let bits = Int64.shift_right_logical (mix (next_random_word context)) 11 in
+      Int64.to_float bits *. 0x1p-53)
+    (check_randomness context)
+
+(** Largest [random_bytes] length, matching the protocol string bound so a
+    drawn value can always be passed to an activity or child as text. *)
+let max_random_bytes = 65_536
+
+(** Fills [length] bytes from consecutive words, little-endian, discarding
+    the unused tail of the last word. *)
+let random_bytes context ~length =
+  match check_randomness context with
+  | Error _ as error -> error
+  | Ok () when length < 0 || length > max_random_bytes ->
+      Error
+        (Temporal_base.Error.defect
+           ~message:"workflow random_bytes length must be between 0 and 65536")
+  | Ok () ->
+      let output = Bytes.create length in
+      let rec fill offset =
+        if offset < length then (
+          let word = mix (next_random_word context) in
+          for index = 0 to min 8 (length - offset) - 1 do
+            Bytes.set output (offset + index)
+              (Char.chr
+                 (Int64.to_int
+                    (Int64.logand (Int64.shift_right_logical word (8 * index)) 0xffL)))
+          done;
+          fill (offset + 8))
+      in
+      fill 0;
+      Ok (Bytes.unsafe_to_string output)
+
+(** Formats 16 drawn bytes as an RFC 9562 version-4 UUID: the version nibble
+    is 4 and the variant bits are 10, the other 122 bits come from the
+    deterministic stream. *)
+let uuid4 context =
+  Result.map
+    (fun raw ->
+      let byte index = Char.code raw.[index] in
+      let byte index =
+        match index with
+        | 6 -> (byte 6 land 0x0f) lor 0x40
+        | 8 -> (byte 8 land 0x3f) lor 0x80
+        | _ -> byte index
+      in
+      let hex = Buffer.create 36 in
+      for index = 0 to 15 do
+        if index = 4 || index = 6 || index = 8 || index = 10 then Buffer.add_char hex '-';
+        Buffer.add_string hex (Printf.sprintf "%02x" (byte index))
+      done;
+      Buffer.contents hex)
+    (random_bytes context ~length:16)
 
 (** Runs a read-only callback with workflow randomness disabled.  Update
     validators are evaluated only on live requests and are deliberately not

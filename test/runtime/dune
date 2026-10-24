@@ -30,6 +30,7 @@
   test_scope_server_cancel
   test_workflow_time
   test_random_seed_reset
+  test_workflow_random
   test_condition
   test_condition_timeout
   test_external_workflow

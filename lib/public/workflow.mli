@@ -133,6 +133,31 @@ val now : unit -> (Time.t, Error.t) result
     outside a workflow return a typed defect. *)
 val random_int : bound:int -> (int, Error.t) result
 
+(** Returns a deterministic pseudo-random float [x] with [0. <= x < 1.],
+    from the same per-run stream as {!random_int} (#1155), so it is stable
+    across replay and follows a reset's new seed. Calls outside a workflow,
+    or in a read-only update validator, return a typed defect. *)
+val random_float : unit -> (float, Error.t) result
+
+(** Returns [length] deterministic pseudo-random bytes from the same stream
+    as {!random_int} (#1155). [length] must be between 0 and 65,536;
+    otherwise, and outside a workflow, the result is a typed defect. *)
+val random_bytes : length:int -> (string, Error.t) result
+
+(** Returns a deterministic version-4 UUID, such as
+    ["1b4e28ba-2fa1-4d2a-883f-0016d3cca427"], from the same stream as
+    {!random_int} (#1155): 36 lowercase hexadecimal characters with
+    hyphens, with the RFC 9562 version and variant bits set. Use it for
+    child workflow IDs and idempotency keys that must differ between runs
+    yet be identical on replay. It is not a security token: the stream is
+    recorded in history and predictable from the run's seed. Calls outside
+    a workflow return a typed defect.
+
+    Generic side effects that read the outside world have no
+    deterministic equivalent here; run them in a local activity, whose
+    result is recorded in history. *)
+val uuid4 : unit -> (string, Error.t) result
+
 (** Returns the deployment/build identity attached to the current workflow
     task. [None] means that the worker is unversioned, the activation is
     synthetic, or the call is outside workflow execution. The value is

@@ -233,6 +233,26 @@ let corpus_v2_cancellation client =
   in
   [ before; after; timeout; satisfied; parent; child ]
 
+(** Scenarios captured by the [corpus-v3-random] generation (#1155). The
+    parent returns the child ID it drew, which locates the child's run. *)
+let corpus_v3_random client =
+  let workflow_type = Defs.random_parent_workflow_type in
+  let handle =
+    start client
+      ~workflow:(remote workflow_type Temporal.Codec.unit Temporal.Codec.string)
+      ~id:"history-corpus-random-parent" ~input:()
+  in
+  let child_id = expect_completed "random-parent" handle in
+  [
+    record ~case:"random-parent" ~workflow_type handle;
+    {
+      case = "random-child";
+      workflow_id = child_id;
+      run_id = None;
+      workflow_type = Defs.random_child_workflow_type;
+    };
+  ]
+
 (** Captures one [corpus.patch] run under the current generation. *)
 let patch client ~case =
   let workflow_type = Defs.patch_workflow_type in
@@ -360,6 +380,7 @@ let scenarios generation client =
   | "corpus-lifecycle-deprecated" -> lifecycle_matrix client ~stage:"deprecated"
   | "corpus-lifecycle-removed" -> lifecycle_matrix client ~stage:"removed"
   | "corpus-v2-cancellation" -> corpus_v2_cancellation client
+  | "corpus-v3-random" -> corpus_v3_random client
   | other -> failwith ("generation has no capture scenarios: " ^ other)
 
 (** Converts a definition-set entry to a live worker registration. *)
