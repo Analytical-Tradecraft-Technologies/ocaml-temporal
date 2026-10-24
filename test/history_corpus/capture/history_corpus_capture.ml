@@ -172,6 +172,67 @@ let corpus_v1 client =
   [ activity; timer; activity_retry; interaction; parent; child ]
   @ continue_as_new
 
+(** Scenarios captured by the [corpus-v2-cancellation] generation (#1134,
+    #1135). Every run but the bounded-condition release completes on its
+    own; that one is signalled only after its query reports it waiting, so
+    its timer is always in history before the signal. The options child's
+    run ID is resolved by the export script from its derived workflow ID. *)
+let corpus_v2_cancellation client =
+  let unit_workflow name = remote name Temporal.Codec.unit Temporal.Codec.string in
+  let simple ~case ~workflow_type =
+    let handle =
+      start client ~workflow:(unit_workflow workflow_type)
+        ~id:("history-corpus-" ^ case) ~input:()
+    in
+    ignore (expect_completed case handle : string);
+    record ~case ~workflow_type handle
+  in
+  let before =
+    simple ~case:"timer-cancel-before-fire"
+      ~workflow_type:Defs.timer_cancel_before_fire_workflow_type
+  in
+  let after =
+    simple ~case:"timer-cancel-after-fire"
+      ~workflow_type:Defs.timer_cancel_after_fire_workflow_type
+  in
+  let timeout =
+    simple ~case:"condition-timeout" ~workflow_type:Defs.condition_timeout_workflow_type
+  in
+  let satisfied =
+    let workflow_type = Defs.condition_satisfied_workflow_type in
+    let handle =
+      start client ~workflow:(unit_workflow workflow_type)
+        ~id:"history-corpus-condition-satisfied" ~input:()
+    in
+    let deadline = Unix.gettimeofday () +. 30. in
+    let rec await_waiting () =
+      match Temporal.Client.query handle ~query:Defs.condition_state with
+      | Ok "waiting" -> ()
+      | _ when Unix.gettimeofday () < deadline ->
+          Unix.sleepf 0.2;
+          await_waiting ()
+      | Ok state -> failwith ("condition state query returned " ^ state)
+      | Error error -> require "condition state query" (Error error)
+    in
+    await_waiting ();
+    require "condition release"
+      (Temporal.Client.signal handle ~signal:Defs.condition_release ~input:());
+    ignore (expect_completed "condition-satisfied" handle : string);
+    record ~case:"condition-satisfied" ~workflow_type handle
+  in
+  let parent =
+    simple ~case:"options-parent" ~workflow_type:Defs.options_parent_workflow_type
+  in
+  let child =
+    {
+      case = "options-child";
+      workflow_id = "history-corpus-options-parent-child";
+      run_id = None;
+      workflow_type = Defs.options_child_workflow_type;
+    }
+  in
+  [ before; after; timeout; satisfied; parent; child ]
+
 (** Captures one [corpus.patch] run under the current generation. *)
 let patch client ~case =
   let workflow_type = Defs.patch_workflow_type in
@@ -298,6 +359,7 @@ let scenarios generation client =
       lifecycle_matrix client ~stage:"patched" @ [ handover ]
   | "corpus-lifecycle-deprecated" -> lifecycle_matrix client ~stage:"deprecated"
   | "corpus-lifecycle-removed" -> lifecycle_matrix client ~stage:"removed"
+  | "corpus-v2-cancellation" -> corpus_v2_cancellation client
   | other -> failwith ("generation has no capture scenarios: " ^ other)
 
 (** Converts a definition-set entry to a live worker registration. *)

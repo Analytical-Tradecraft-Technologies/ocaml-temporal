@@ -559,6 +559,170 @@ let lifecycle_workflows stage =
     plain lifecycle_child_new;
   ]
 
+(** {1 Cancellation and start-option workflows (#1134, #1135)}
+
+    Frozen with the [corpus-v2-cancellation] capture. Each completes on its
+    own except [corpus.condition_satisfied], which the capture driver
+    releases with one signal after the query reports it waiting. *)
+
+let timer_cancel_before_fire_workflow_type = "corpus.timer_cancel_before_fire"
+let timer_cancel_after_fire_workflow_type = "corpus.timer_cancel_after_fire"
+let condition_timeout_workflow_type = "corpus.condition_timeout"
+let condition_satisfied_workflow_type = "corpus.condition_satisfied"
+let options_parent_workflow_type = "corpus.options_parent"
+let options_child_workflow_type = "corpus.options_child"
+
+(** A bound long enough never to elapse during a capture. *)
+let corpus_long_timer = Temporal.Duration.of_seconds 60L
+
+(** Distinguishes a cancelled timer future from every other outcome. *)
+let is_cancelled = function
+  | Some (Error error) -> Temporal.Error.kind error = "cancelled"
+  | Some (Ok ()) | None -> false
+
+(** Builds the defect a frozen workflow returns when Temporal did not behave
+    as the capture expects, so a wrong history cannot replay as a pass. *)
+let unexpected message = Error (Temporal.Error.defect ~message)
+
+(** [corpus.timer_cancel_before_fire]: the scoped 60 s timer is still pending
+    when the scope is cancelled after the short unscoped timer fires. *)
+let timer_cancel_before_fire_workflow =
+  Temporal.Workflow.define ~name:timer_cancel_before_fire_workflow_type
+    ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+      Temporal.Scope.with_scope (fun scope ->
+          let long = Temporal.Workflow.start_sleep ~scope corpus_long_timer in
+          match Temporal.Workflow.sleep corpus_timer with
+          | Error _ as error -> error
+          | Ok () -> (
+              match Temporal.Scope.cancel scope with
+              | Error _ as error -> error
+              | Ok () ->
+                  if is_cancelled (Temporal.Future.peek long) then
+                    Ok "TIMER:CANCELLED-BEFORE-FIRE"
+                  else unexpected "scoped timer was not cancelled")))
+
+(** [corpus.timer_cancel_after_fire]: the scoped short timer has fired before
+    the longer unscoped timer, so cancelling the scope records nothing. *)
+let timer_cancel_after_fire_workflow =
+  Temporal.Workflow.define ~name:timer_cancel_after_fire_workflow_type
+    ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+      Temporal.Scope.with_scope (fun scope ->
+          let short = Temporal.Workflow.start_sleep ~scope corpus_timer in
+          match Temporal.Workflow.sleep (Temporal.Duration.of_ms 300L) with
+          | Error _ as error -> error
+          | Ok () -> (
+              match Temporal.Scope.cancel scope with
+              | Error _ as error -> error
+              | Ok () -> (
+                  match Temporal.Future.peek short with
+                  | Some (Ok ()) -> Ok "TIMER:FIRED-BEFORE-CANCEL"
+                  | _ -> unexpected "scoped timer had not fired"))))
+
+(** [corpus.condition_timeout]: the bound's timer fires while the predicate
+    is false, so the wait reports a timeout. *)
+let condition_timeout_workflow =
+  Temporal.Workflow.define ~name:condition_timeout_workflow_type
+    ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+      match Temporal.Condition.wait_until ~timeout:corpus_timer (fun () -> false) with
+      | Error error when Temporal.Error.kind error = "timeout" ->
+          Ok "CONDITION:TIMED-OUT"
+      | Error _ as error -> error
+      | Ok () -> unexpected "an unsatisfiable condition succeeded")
+
+(** Set by {!condition_release_handler}; an unset flag is false. *)
+let condition_released = Temporal.Workflow_context.Local.create ()
+
+(** Set once [corpus.condition_satisfied] reaches its bounded wait. *)
+let condition_waiting = Temporal.Workflow_context.Local.create ()
+
+(** Reads a workflow-local boolean flag. *)
+let local_flag key =
+  match Temporal.Workflow_context.Local.get key with
+  | Ok (Some true) -> true
+  | Ok _ | Error _ -> false
+
+let condition_release =
+  Temporal.Signal.define ~name:"corpus.condition.release" ~input:Temporal.Codec.unit
+
+let condition_state =
+  Temporal.Query.define ~name:"corpus.condition.state" ~output:Temporal.Codec.string
+
+(** Releases the bounded wait. *)
+let condition_release_handler =
+  Temporal.Signal.Handler.make condition_release (fun () ->
+      Temporal.Workflow_context.Local.set condition_released true)
+
+(** Lets the capture driver signal only once the timer has been started. *)
+let condition_state_handler =
+  Temporal.Query.Handler.make condition_state (fun () ->
+      Ok (if local_flag condition_waiting then "waiting" else "-"))
+
+(** [corpus.condition_satisfied]: the signal satisfies the 60 s bounded wait,
+    which cancels its timer. *)
+let condition_satisfied_workflow =
+  Temporal.Workflow.define ~name:condition_satisfied_workflow_type
+    ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+      match Temporal.Workflow_context.Local.set condition_waiting true with
+      | Error _ as error -> error
+      | Ok () -> (
+          match
+            Temporal.Condition.wait_until ~timeout:corpus_long_timer (fun () ->
+                local_flag condition_released)
+          with
+          | Ok () -> Ok "CONDITION:SATISFIED"
+          | Error _ as error -> error))
+
+(** Formats an optional duration as milliseconds, or [-] when absent. *)
+let show_duration =
+  Option.fold ~none:"-" ~some:(fun value ->
+      Int64.to_string (Temporal.Duration.to_ms value))
+
+(** [corpus.options_child]: reports its recorded timeouts. *)
+let options_child_workflow =
+  Temporal.Workflow.define ~name:options_child_workflow_type
+    ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+      match Temporal.Workflow.info () with
+      | Error _ as error -> error
+      | Ok info ->
+          let module Info = Temporal.Workflow.Info in
+          Ok
+            (Printf.sprintf "exec=%s run=%s task=%s"
+               (show_duration (Info.execution_timeout info))
+               (show_duration (Info.run_timeout info))
+               (show_duration (Info.task_timeout info))))
+
+(** [corpus.options_parent]: starts the child with every #1135 option, under
+    a child ID derived from the parent's own workflow ID. *)
+let options_parent_workflow =
+  Temporal.Workflow.define ~name:options_parent_workflow_type
+    ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+      match Temporal.Workflow.info () with
+      | Error _ as error -> error
+      | Ok info ->
+          Temporal.Child_workflow.execute
+            ~id:(Temporal.Workflow.Info.workflow_id info ^ "-child")
+            ~execution_timeout:(Temporal.Duration.of_seconds 60L)
+            ~run_timeout:(Temporal.Duration.of_seconds 30L)
+            ~task_timeout:(Temporal.Duration.of_seconds 7L)
+            ~id_reuse_policy:`Allow_duplicate_failed_only options_child_workflow ())
+
+(** Every [corpus-v2-cancellation] registration. *)
+let cancellation_workflows =
+  [
+    plain timer_cancel_before_fire_workflow;
+    plain timer_cancel_after_fire_workflow;
+    plain condition_timeout_workflow;
+    Workflow
+      {
+        definition = condition_satisfied_workflow;
+        signals = [ condition_release_handler ];
+        queries = [ condition_state_handler ];
+        updates = [];
+      };
+    plain options_parent_workflow;
+    plain options_child_workflow;
+  ]
+
 (** {1 Reused fixture definitions} *)
 
 (** The corrected generation of [test/integration/temporal/task_failure]. The
@@ -629,6 +793,7 @@ let definition_sets =
     ("corpus-lifecycle-patched", lifecycle_workflows Lifecycle_patched);
     ("corpus-lifecycle-deprecated", lifecycle_workflows Lifecycle_deprecated);
     ("corpus-lifecycle-removed", lifecycle_workflows Lifecycle_removed);
+    ("corpus-v2-cancellation", cancellation_workflows);
   ]
 
 (** Set names in declaration order. *)
