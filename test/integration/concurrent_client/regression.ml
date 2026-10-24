@@ -14,7 +14,9 @@
     terminating the workflows releases the waits promptly, that the stuck
     query ends at its own deadline, that shutting the client down with a
     wait in flight ends that wait with the closed-client error, and that a
-    configured [max_pending_waits] (#796) is enforced as a capacity error. The parent
+    configured [max_pending_waits] (#796) is enforced as a capacity error,
+    and that a bounded [Client.wait ?timeout] (#1136) expires with a
+    retryable deadline error and releases its slot. The parent
     owns and reaps its worker, uses a unique task queue, and terminates every
     execution it starts. *)
 open Temporal
@@ -294,6 +296,76 @@ let check_configured_wait_limit main cleanups address queue =
           | Ok _ -> fail "a limited wait completed after shutdown")
         admitted)
 
+(** [Client.wait ?timeout] on a live server (#1136), on a client admitting
+    only one pending wait:
+    - a bounded wait on an open run gives up after its bound with the
+      retryable [Deadline_exceeded] RPC error, and the workflow is untouched;
+    - the expired wait released its slot, so a wait on a second run is then
+      admitted (not refused as at capacity) and stays pending;
+    - once the first run is terminated, a later bounded wait on the same
+      handle observes its terminal result;
+    - shutting the client down during a bounded wait ends it promptly with
+      the closed-client error rather than at its bound. *)
+let check_bounded_wait main cleanups address queue =
+  let first = start_blocked main cleanups queue "bounded-first" in
+  let second = start_blocked main cleanups queue "bounded-second" in
+  let client =
+    get (Client.create ~max_pending_waits:1 ~target_url:address ~namespace:"default" ())
+  in
+  let shut_down = ref false in
+  Fun.protect
+    ~finally:(fun () -> if not !shut_down then ignore (Client.shutdown client))
+    (fun () ->
+      let rebind handle =
+        get
+          (Client.get_handle client ~workflow:blocked ?run_id:(Client.run_id handle)
+             ~id:(Client.workflow_id handle) ())
+      in
+      let first_handle = rebind first and second_handle = rebind second in
+      (match timed (fun () -> Client.wait ~timeout:(Duration.of_ms 1_000L) first_handle) with
+      | elapsed, Error error when Client.rpc_status error = Some `Deadline_exceeded ->
+          if (Error.view error).non_retryable then fail "the wait timeout was non-retryable";
+          if elapsed < 0.9 || elapsed > 5.0 then
+            fail (Printf.sprintf "the 1 s wait bound took %.3f s" elapsed)
+      | _, Error error -> fail ("the bounded wait failed with " ^ Error.message error)
+      | _, Ok _ -> fail "a bounded wait on an open run completed");
+      let admitted = background (fun () -> Client.wait second_handle) in
+      Unix.sleepf 1.0;
+      if finished admitted then (
+        match join admitted with
+        | Error error when Client.is_at_capacity error ->
+            fail "the expired wait did not release its slot"
+        | _ -> fail "the wait on the second run finished early");
+      get (Client.terminate second_handle);
+      await_all ~seconds:10.0 "admitted wait after termination" [ admitted ];
+      (match join admitted with
+      | Ok (Client.Terminated _) -> ()
+      | Ok _ -> fail "the admitted wait did not report termination"
+      | Error error -> fail ("the admitted wait failed with " ^ Error.message error));
+      get (Client.terminate first_handle);
+      (match Client.wait ~timeout:(Duration.of_seconds 10L) first_handle with
+      | Ok (Client.Terminated _) -> ()
+      | Ok _ -> fail "a later wait on the timed-out handle did not see termination"
+      | Error error -> fail ("a later bounded wait failed with " ^ Error.message error));
+      let third = start_blocked main cleanups queue "bounded-shutdown" in
+      let third_handle = rebind third in
+      let waiting =
+        background (fun () -> Client.wait ~timeout:(Duration.of_seconds 30L) third_handle)
+      in
+      Unix.sleepf 1.0;
+      if finished waiting then fail "the bounded wait finished before shutdown";
+      let elapsed, shutdown = timed (fun () -> Client.shutdown client) in
+      shut_down := true;
+      (match shutdown with
+      | Ok () -> ()
+      | Error error -> fail ("shutdown failed: " ^ Error.message error));
+      await_all ~seconds:10.0 "bounded wait after shutdown" [ waiting ];
+      if elapsed > 10.0 then fail "shutdown waited for the bounded wait";
+      match join waiting with
+      | Error error when Error.message error = "client is shut down" -> ()
+      | Error error -> fail ("the bounded wait ended with " ^ Error.message error)
+      | Ok _ -> fail "a bounded wait completed after shutdown")
+
 (** Starts the worker process, runs every check, and terminates every
     fixture execution and the worker even when a check fails. *)
 let check address =
@@ -311,6 +383,7 @@ let check address =
       check_concurrency client cleanups address queue;
       check_shutdown_in_flight client cleanups address queue;
       check_configured_wait_limit client cleanups address queue;
+      check_bounded_wait client cleanups address queue;
       print_endline "concurrent client live regression: ok")
 
 (** The supplied URL must identify a disposable test namespace/server. *)
