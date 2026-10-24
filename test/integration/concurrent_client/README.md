@@ -35,11 +35,13 @@ a time and that Domain waited for the network inside each call:
   bounded wait on the first handle reports `Terminated`; and shutting the
   client down during a 30 s bounded wait ends it promptly with the
   closed-client error.
-- A fifth client created with `~max_pending_waits:3` starts waits of 1 s,
-  3 s and 30 s on the same open run at once. The first two expire at their
-  own bounds with `Deadline_exceeded`, the 30 s wait stays pending, a wait
-  started after both expiries is admitted, and terminating the run ends both
-  remaining waits with `Terminated`.
+- A fifth client created with `~max_pending_waits:1` starts waits of 1 s,
+  3 s and 6 s on the same open run at once; they share that run's slot. Each
+  expires at its own bound with `Deadline_exceeded` (the 6 s wait is still
+  pending after the 3 s one expires). Once all three have expired, a wait on
+  a second run is admitted rather than refused as at capacity, which shows no
+  expired waiter kept a share of the first run's slot. Terminating the second
+  run ends that wait with `Terminated`.
 - A `hold` update that the worker accepts at once but completes only after a
   `release-hold` signal checks `Client.wait_update ?timeout`: a 1 s bounded
   wait on the accepted update expires with the same retryable error, and

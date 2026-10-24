@@ -406,50 +406,53 @@ let expect_expired label ~lower ~upper (elapsed, result) =
   | Error error -> fail (label ^ " failed with " ^ Error.message error)
   | Ok _ -> fail (label ^ " completed on an open run")
 
-(** Concurrent bounded waits on one run (#1136), on a client admitting three
-    pending waits: waits of 1 s, 3 s and 30 s start together on the same
-    open run, the first two expire at their own bounds and not at another
-    wait's, the 30 s wait stays pending until the run is terminated and then
-    reports [Terminated], and a wait started after both expiries is admitted
-    because their slots were released. *)
+(** Concurrent bounded waits on one run (#1136), on a client admitting one
+    pending run. Waits on the same run share that run's slot, so waits of
+    1 s, 3 s and 6 s start together on one open run: each expires at its own
+    bound and not at another wait's (the 6 s wait is still pending after the
+    3 s one expires), and once all three have expired a wait on a second
+    run is admitted, which fails if any expired waiter leaked its share of
+    the first run's slot. Terminating the second run then ends that wait
+    with [Terminated]. *)
 let check_bounded_waits_same_run main cleanups address queue =
-  let run = start_blocked main cleanups queue "bounded-same-run" in
+  let first = start_blocked main cleanups queue "bounded-same-run" in
+  let second = start_blocked main cleanups queue "bounded-same-run-next" in
   let client =
-    get (Client.create ~max_pending_waits:3 ~target_url:address ~namespace:"default" ())
+    get (Client.create ~max_pending_waits:1 ~target_url:address ~namespace:"default" ())
   in
   Fun.protect
     ~finally:(fun () -> ignore (Client.shutdown client))
     (fun () ->
-      let handle =
+      let rebind handle =
         get
-          (Client.get_handle client ~workflow:blocked ?run_id:(Client.run_id run)
-             ~id:(Client.workflow_id run) ())
+          (Client.get_handle client ~workflow:blocked ?run_id:(Client.run_id handle)
+             ~id:(Client.workflow_id handle) ())
       in
+      let handle = rebind first and next_handle = rebind second in
       let bounded seconds =
         background (fun () ->
             timed (fun () -> Client.wait ~timeout:(Duration.of_seconds seconds) handle))
       in
-      let short = bounded 1L and medium = bounded 3L and long = bounded 30L in
+      let short = bounded 1L and medium = bounded 3L and long = bounded 6L in
       await_all ~seconds:10.0 "the 1 s and 3 s waits" [ short; medium ];
+      if finished long then fail "the 6 s wait ended with the shorter bounds";
       expect_expired "the 1 s wait on a shared run" ~lower:0.9 ~upper:2.5 (join short);
       expect_expired "the 3 s wait on a shared run" ~lower:2.9 ~upper:5.5 (join medium);
-      if finished long then fail "the 30 s wait ended with the shorter bounds";
-      let unbounded = background (fun () -> timed (fun () -> Client.wait handle)) in
+      await_all ~seconds:10.0 "the 6 s wait" [ long ];
+      expect_expired "the 6 s wait on a shared run" ~lower:5.9 ~upper:8.5 (join long);
+      let admitted = background (fun () -> Client.wait next_handle) in
       Unix.sleepf 1.0;
-      if finished unbounded then (
-        match snd (join unbounded) with
+      if finished admitted then (
+        match join admitted with
         | Error error when Client.is_at_capacity error ->
-            fail "the expired waits on a shared run did not release their slots"
-        | _ -> fail "the wait started after the expiries finished early");
-      get (Client.terminate run);
-      await_all ~seconds:10.0 "waits after termination" [ long; unbounded ];
-      List.iter
-        (fun (label, result) ->
-          match result with
-          | Ok (Client.Terminated _) -> ()
-          | Ok _ -> fail (label ^ " did not report termination")
-          | Error error -> fail (label ^ " failed with " ^ Error.message error))
-        [ ("the 30 s wait", snd (join long)); ("the later wait", snd (join unbounded)) ])
+            fail "the expired waits on a shared run did not release its slot"
+        | _ -> fail "the wait on the second run finished early");
+      get (Client.terminate second);
+      await_all ~seconds:10.0 "the admitted wait after termination" [ admitted ];
+      match join admitted with
+      | Ok (Client.Terminated _) -> ()
+      | Ok _ -> fail "the admitted wait did not report termination"
+      | Error error -> fail ("the admitted wait failed with " ^ Error.message error))
 
 (** [Client.wait_update ?timeout] (#1136): an update the worker has accepted
     but not completed makes a 1 s bounded completion wait expire with the
