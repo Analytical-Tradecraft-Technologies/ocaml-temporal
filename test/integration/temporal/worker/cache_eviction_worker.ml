@@ -62,7 +62,13 @@ let run () =
           Worker.create ~target_url ~namespace
             ~identity:"ocaml-temporal-cache-eviction-worker"
             ~options ~task_queue:Definitions.task_queue
-            ~workflows:[ Worker.workflow Definitions.cache_eviction ]
+            ~workflows:
+              [
+                Worker.workflow
+                  ~signals:[ Definitions.signal_value_handler ]
+                  Definitions.cache_eviction_resumable;
+                Worker.workflow Definitions.cache_eviction;
+              ]
             ~activities:[] ())
       in
       publish_marker ready_file "worker-ready\n";

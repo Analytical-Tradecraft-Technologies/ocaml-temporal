@@ -87,7 +87,7 @@ Temporal/PostgreSQL job through `make test-temporal-live-ci`.
 | Worker removal during a running activity callback | `activity_worker_crash` (#519) | `SIGKILL` to the worker process (hosting the workflow and the activity) after the callback's marker file and `workflow describe` both show attempt 1 started and heartbeating on it; the process must die of that signal | With no worker polling, the server alone fails attempt 1 on its three-second heartbeat timeout and schedules attempt 2. A replacement process completes attempt 2 (`Activity.Info.attempt`), reads attempt 1's last heartbeat detail, and the run returns the exact expected result; history has one scheduled, started (attempt 2, replacement identity, heartbeat-timeout last failure) and completed activity event and no activity failure or timeout |
 | Worker removal during pending work | `interaction_recovery` (#530) | `SIGTERM` to the worker process that accepted a suspended update | The replacement answers queries from replayed state; history has one acceptance and one completion of the original update ID, attributed to the original and replacement workers |
 | Shutdown with outstanding work | `bounded_shutdown` (#495) | `Worker.shutdown_with_report` with a two-second grace period while an activity callback ignores cancellation and the shutdown flag | Shutdown returns within its bound and reports one abandoned callback; Temporal retries the attempt and a second worker completes attempt 2 |
-| Eviction followed by continued progress | `test-temporal-worker-cache-eviction` | One-slot cache; a second parked run forces Core `RemoveFromCache` (`cache_full`) of the first | Empty eviction acknowledgement, continued progress, and typed terminal outcomes after cancelling both exact runs |
+| Eviction followed by continued progress | `test-temporal-worker-cache-eviction` | One-slot cache; a second parked run forces Core `RemoveFromCache` (`cache_full`) of the first | Empty eviction acknowledgement; evicted run A resumes on its signal and completes, then B is cancelled with a typed terminal outcome (see the [#519 matrix](#issue-519-worker-recovery-regression-matrix)) |
 | Eviction followed by continued progress | `interaction_recovery` (#530) | One-entry sticky cache; a filler run evicts the target while an update handler is suspended | A query answers from replayed state, the release signal resumes the handler from history, and the run's durable events equal the control run's |
 
 Reproduce each against the pinned Compose stack (Docker required). The first
@@ -135,6 +135,48 @@ controller kills its worker while the run is parked on a timer, and
 `bounded_shutdown` abandons a running callback through the graceful path in a
 process that stays alive. Here recovery rests on Temporal's heartbeat timeout
 and retry policy alone, the documented at-least-once contract.
+
+## Issue #519 worker recovery regression matrix
+
+For [issue #519](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/519),
+this matrix separates the existing live-tested restart and crash cases from
+the stronger cache-eviction assertion. The cache change is
+source and contract coverage until its revised controller passes a live run;
+the September baseline job above does not verify that new behavior. The
+[Makefile](../../Makefile), [restart driver](../../test/integration/temporal/driver/restart_driver.ml),
+[cache driver](../../test/integration/temporal/driver/cache_eviction_driver.ml),
+and [workflow definitions](../../test/integration/temporal/common/smoke_definitions.ml)
+are the current source for these assertions.
+
+| Case and command | Fault barrier and required durable outcome | Evidence and limit |
+| --- | --- | --- |
+| Graceful shutdown with pending work: `make test-temporal-worker-restart` | The controller records the exact run's initial server history with `TimerStarted` and no `TimerFired` before stopping generation one. `temporal-stop-worker` gives Compose 30 seconds and requires the worker's post-shutdown marker. A fresh generation-two container must replay that same run and complete with `SMOKE:AFTER-REPLAY:ATTEMPT:2`; process exit alone does not pass. | Exact initial/terminal histories, replay diagnostics, controller phases, and worker logs. This covers a parked timer, not a long-running OCaml activity callback or an orchestrator termination deadline. |
+| Forced removal with pending work: `make test-temporal-worker-crash-recovery` | The same pending-timer history precedes `SIGKILL`; generation one must exit 137 without a graceful-stop marker and be removed. A new container must replay the exact run and reach the same successful terminal result. | The same exact-run evidence plus crash mode and exit code in the controller. One kill/replacement cycle does not cover repeated churn or every in-flight command. |
+| Cache eviction followed by normal progress: `make test-temporal-worker-cache-eviction` | A parks on a replay-safe signal condition. Its initial activation completion is acknowledged before timer-backed B starts; the observer publishes A's exact `RemoveFromCache(CacheFull)` marker only after Core acknowledges removal. The driver then waits for B's initial activation acknowledgement, signals exact run A while B is outstanding, requires `SMOKE:CACHE:FIRST:RESUME` and terminal `WorkflowExecutionCompleted`, and cancels B only afterward. B's exact history must contain `TimerStarted`, `WorkflowExecutionCancelRequested`, and terminal `WorkflowExecutionCanceled`. | The [cache history validator](../../test/integration/temporal/scripts/validate-cache-eviction-progress.sh) checks the marker and payload-free histories for both run IDs; the driver log and worker logs retain fault phases. This is a one-slot, two-run case and remains **live-unverified for #519** until the revised command succeeds. A has no timer; B supplies the pending timer boundary. |
+
+For a reproducible run that retains filtered worker logs, available normalized
+exact-run histories, and failure phases under `_build/live-diagnostics/`, use the same
+[diagnostic wrapper](../../test/integration/temporal/scripts/run-with-live-diagnostics.sh)
+as CI:
+
+```sh
+bash test/integration/temporal/scripts/run-with-live-diagnostics.sh restart make test-temporal-worker-restart
+bash test/integration/temporal/scripts/run-with-live-diagnostics.sh crash make test-temporal-worker-crash-recovery
+bash test/integration/temporal/scripts/run-with-live-diagnostics.sh cache-eviction make test-temporal-worker-cache-eviction
+```
+
+Each command owns a disposable Temporal/PostgreSQL Compose stack. The cache
+driver has a 900-second process watchdog; its marker waits share the same
+deadline, and each CLI identity/history query has a 60-second bound. The
+controller checks each `workflow describe` run identity before accepting its
+normalized history. Failure output identifies the exact run IDs and last
+completed phases. The [diagnostic collector](../../test/integration/temporal/scripts/collect-live-diagnostics.sh)
+retains bounded, filtered artifacts rather than raw history payloads. A failed
+or timed-out run is evidence of an unresolved boundary, not passing qualification.
+The cache controller fetches both histories on success and makes a best-effort
+exact-run query during failure cleanup once a run ID is known. A pre-start
+failure, unavailable Temporal service, or failed history query can still leave
+a normalized history absent; the collector records the available phases and logs.
 
 ## Baseline scenario assertions
 
