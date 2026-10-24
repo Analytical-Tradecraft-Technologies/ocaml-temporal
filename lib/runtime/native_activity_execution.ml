@@ -1977,8 +1977,9 @@ module Make (Supervisor : SUPERVISOR) = struct
               in
               let handle =
                 Async_activity.create
+                  ~worker_shutting_down:adapter.worker_shutting_down
                   ~submit:(submit_async_operation adapter ~token)
-                  ~encode_output
+                  ~encode_output ()
               in
               let context =
                 Async_activity.context ~info:(task_info start) handle

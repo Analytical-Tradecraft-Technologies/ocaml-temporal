@@ -111,6 +111,14 @@ let _activity_async_handle_heartbeat :
     'output T.Activity.async_handle -> T.Payload.t list -> (unit, T.Error.t) result =
   T.Activity.Async_handle.heartbeat
 
+let _activity_async_handle_is_worker_shutting_down :
+    'output T.Activity.async_handle -> bool =
+  T.Activity.Async_handle.is_worker_shutting_down
+
+let _activity_async_context_is_worker_shutting_down :
+    'output T.Activity.async_context -> bool =
+  T.Activity.Async_context.is_worker_shutting_down
+
 let _activity_async_context_handle :
     'output T.Activity.async_context -> 'output T.Activity.async_handle =
   T.Activity.Async_context.handle

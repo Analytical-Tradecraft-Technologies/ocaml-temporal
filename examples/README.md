@@ -158,13 +158,14 @@ reservation already committed reports success without doing the work again.
   error, because Temporal accepts a cancelled completion only after a
   cancellation request.
 
-  Only the synchronous form can clean up when its worker stops. An
-  asynchronous handle is not notified: a worker shutdown waits for it for the
-  graceful shutdown period and then closes it as a lost completion, and a
-  handle that is never finished expires once Temporal must have timed its
-  attempt out (#1043). Its later calls return a non-retryable error, at which
-  point this example's completer releases the reservation, and Temporal
-  retries the attempt after its heartbeat or start-to-close timeout.
+  A retryable `` `Cancelled `` error of type `"WorkerShutdown"` means the
+  worker is stopping (#1157): the thread releases the reservation and fails
+  the handle with that error, so Temporal retries the attempt elsewhere
+  before the worker's graceful shutdown period ends. A handle still
+  unfinished when that period ends is closed as a lost completion, and one
+  that is never finished expires once Temporal must have timed its attempt
+  out (#1043). Its later calls return a non-retryable error, at which point
+  this example's completer releases the reservation.
 
 The `reserve-then-cancel` workflow starts one of these activities with
 `Activity.start_handle ~cancellation_type:Wait_cancellation_completed`,

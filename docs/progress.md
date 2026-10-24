@@ -6185,6 +6185,22 @@ exactly one local-activity marker, completes, and replays on a fresh worker
 with the same query result and no new attempt. It passed locally against the
 pinned Compose stack. A corpus history remains open.
 
+## 2026-10-24: Asynchronous handles observe worker shutdown (#1157)
+
+`Activity.Async_handle.is_worker_shutting_down` and
+`Activity.Async_context.is_worker_shutting_down` read the worker's shutdown
+flag, and once it is set `Async_handle.heartbeat` returns a retryable
+`` `Cancelled `` error of type `"WorkerShutdown"` instead of `Ok`. The
+heartbeat is still recorded, and an activity-state error from the same call
+takes precedence. A completer that fails the handle with that error hands
+the attempt back. The `bounded_shutdown` live regression gained an
+asynchronous scenario: worker C's completer hands attempt 1 back, C's
+shutdown with a 30 s grace period returns in about 0.1 s with a clean
+report, and worker D completes attempt 2. A mutant without the heartbeat
+error fails it with a lost completion. It passed locally against the pinned
+Compose stack. The cooperative-cleanup example's asynchronous completer
+releases its reservation and fails retryably on shutdown.
+
 ## 2026-10-24: Bounded waits live (#1136)
 
 The `concurrent_client` live regression gained a bounded-wait check on a

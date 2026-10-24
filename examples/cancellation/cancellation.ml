@@ -12,8 +12,9 @@
     + The worker is shut down while an activity runs. The activity must
       release its reservation and fail retryably; a replacement worker then
       runs the retry, which reacquires the same reservation key and commits
-      it. The synchronous activity is used because only it can observe its
-      worker stopping; an asynchronous handle is not notified.
+      it. The synchronous activity is used here; the asynchronous form
+      observes the same shutdown through its heartbeat result (#1157), which
+      the bounded-shutdown live regression verifies.
     + A new run reuses the closed run's workflow ID. Its activity must make
       and commit its own reservation, because the key includes the run ID.
 

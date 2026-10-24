@@ -75,6 +75,9 @@ type 'output handle = {
   mutable pending : pending option;
   submit : operation -> (unit, submission_error) result;
   encode_output : 'output -> (Payload.t, Error.t) result;
+  worker_shutting_down : unit -> bool;
+      (** Reads the owning worker's shutdown flag (#1157); it never blocks
+          and is safe from any Domain. *)
 }
 
 (** The short-lived callback context from which an activity obtains its
@@ -114,14 +117,31 @@ let with_mutex mutex operation =
 (** Creates a handle before the worker has accepted its asynchronous handoff.
     Keeping it dormant prevents a callback from completing an activity through
     a task token that the native worker has not yet made durable. *)
-let create ~submit ~encode_output =
+let create ?(worker_shutting_down = fun () -> false) ~submit ~encode_output () =
   {
     mutex = Mutex.create ();
     lifecycle = Dormant;
     pending = None;
     submit;
     encode_output;
+    worker_shutting_down;
   }
+
+(** Reads the flag without taking the handle's lock: it belongs to the
+    worker, not to the handle's lifecycle. *)
+let worker_shutting_down handle = handle.worker_shutting_down ()
+
+(** Error type of {!worker_shutdown_error}, as Temporal records it when a
+    completer fails the handle with that error. *)
+let worker_shutdown_error_type = "WorkerShutdown"
+
+(** The retryable error a heartbeat reports once the worker is stopping. Its
+    category matches the pause and reset errors, so a completer that fails
+    the handle with it hands the attempt back to Temporal as a retryable
+    failure of type {!worker_shutdown_error_type}. *)
+let worker_shutdown_error () =
+  Error.make ~category:`Cancelled ~error_type:worker_shutdown_error_type
+    ~message:"the worker running this asynchronous activity is shutting down" ()
 
 (** Builds the callback context for a newly created attempt-scoped handle. *)
 let context ?info handle = { handle; info }
@@ -359,7 +379,13 @@ let cancel handle details =
     leaves the handle active with no retained heartbeat, so a failed heartbeat
     never blocks a newer heartbeat or a terminal operation. *)
 let heartbeat handle details =
-  submit_operation handle ~terminal:false (Heartbeat details)
+  match submit_operation handle ~terminal:false (Heartbeat details) with
+  | Ok () when handle.worker_shutting_down () ->
+      (* The heartbeat was still recorded, keeping the attempt alive while
+         the completer winds down; an activity-state or delivery error from
+         the same call takes precedence below. *)
+      Error (worker_shutdown_error ())
+  | result -> result
 
 (** Invalidates the capability during worker teardown. An in-flight supervisor
     call is allowed to finish first; otherwise closing would hide whether its

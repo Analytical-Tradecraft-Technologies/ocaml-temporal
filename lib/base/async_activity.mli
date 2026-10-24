@@ -77,9 +77,23 @@ type ('input, 'output) implementation =
     retained by the handle so callers can complete it with the activity's
     typed output rather than constructing a wire payload themselves. *)
 val create :
+  ?worker_shutting_down:(unit -> bool) ->
   submit:(operation -> (unit, submission_error) result) ->
   encode_output:('output -> (Payload.t, Error.t) result) ->
+  unit ->
   'output handle
+
+(** Reports whether the worker that owns [handle] has begun to stop
+    (#1157), from the [worker_shutting_down] reader passed to {!create}
+    (always [false] without one). It takes no lock and never blocks. *)
+val worker_shutting_down : 'output handle -> bool
+
+(** The error type of {!worker_shutdown_error}. *)
+val worker_shutdown_error_type : string
+
+(** The retryable [`Cancelled] error of type {!worker_shutdown_error_type}
+    that {!heartbeat} returns once the owning worker is stopping. *)
+val worker_shutdown_error : unit -> Error.t
 
 (** Builds the callback context associated with a handle. The native adapter
     passes the start task's [info]; contexts built without it report no task
@@ -125,7 +139,10 @@ val cancel : 'output handle -> Payload.t list -> submit_result
 
 (** Sends one heartbeat without changing the terminal lifecycle. A failed
     heartbeat is reported and forgotten unless the token is gone; it never
-    blocks a later heartbeat or terminal operation. *)
+    blocks a later heartbeat or terminal operation. Once the owning worker is
+    stopping, a heartbeat that was otherwise accepted returns
+    {!worker_shutdown_error} instead of [Ok] (#1157); the heartbeat itself
+    was still recorded. *)
 val heartbeat : 'output handle -> Payload.t list -> submit_result
 
 (** Closes a handle after the owning SDK has stopped. Closing while an

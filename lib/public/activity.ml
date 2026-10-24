@@ -279,6 +279,10 @@ module Async_handle = struct
     Temporal_base.Async_activity.heartbeat handle
       (List.map payload_to_base details)
     |> Result.map_error Error_private.of_base
+
+  (** Reads the owning worker's shutdown flag. *)
+  let is_worker_shutting_down handle =
+    Temporal_base.Async_activity.worker_shutting_down handle
 end
 
 (** Public projection of the private activity task metadata. The private
@@ -369,6 +373,11 @@ module Async_context = struct
 
   (** Returns the retained completion capability. *)
   let handle context = Temporal_base.Async_activity.handle context
+
+  (** Reads the shutdown flag of the worker running this attempt. *)
+  let is_worker_shutting_down context =
+    Temporal_base.Async_activity.worker_shutting_down
+      (Temporal_base.Async_activity.handle context)
 
   (** Returns the start task's metadata, or a defect for a context built
       without a Temporal task. *)
