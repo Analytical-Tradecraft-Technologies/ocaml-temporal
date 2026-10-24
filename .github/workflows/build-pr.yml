@@ -591,3 +591,57 @@ jobs:
       - name: Build a consumer against the package installed from the archive
         shell: bash
         run: opam exec -- sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"
+
+  # The install path Linux users take (#1148): opam's bubblewrap build sandbox,
+  # with a read-only Cargo home as `opam install` presents the user's default
+  # one. Runs on every tier because Linux is the live-qualified platform.
+  opam-source-sandbox-linux:
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    needs: changes
+    name: Sandboxed opam build from the source archive / Linux amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.1-x86_64-unknown-linux-gnu
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor,
+      # which bubblewrap needs for opam's build sandbox.
+      - name: Allow the bubblewrap sandbox
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install --no-install-recommends -y bubblewrap protobuf-compiler libprotobuf-dev
+      - name: Set up the exact OCaml compiler
+        uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
+        with:
+          ocaml-compiler: "5.5.1"
+      - name: Set up pinned Rust toolchain
+        shell: bash
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Install and verify locked OCaml dependencies
+        shell: bash
+        run: sh scripts/opam-locked-deps.sh install --assume-depexts
+      - name: Create the release source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version: "\(.*\)"$/\1/p' temporal-sdk.opam)
+          test -n "$version"
+          sh scripts/create-source-archive.sh . "v${version//\~/-}" \
+            "$RUNNER_TEMP/ocaml-temporal-source.tar.gz"
+      - name: Build the archive inside the opam bubblewrap sandbox
+        shell: bash
+        env:
+          OCAML_TEMPORAL_OPAM_CHECK_READ_ONLY_CARGO_HOME: "1"
+        run: |
+          set -euo pipefail
+          # Fail rather than fall back if opam was initialised without its
+          # sandbox: the check would then prove nothing about bubblewrap.
+          test -f "$(opam var root)/opam-init/hooks/sandbox.sh"
+          opam exec -- sh scripts/check-opam-source-archive.sh \
+            "$RUNNER_TEMP/ocaml-temporal-source.tar.gz" "$RUNNER_TEMP/opam-source-check"
+      - name: Build a consumer against the package installed from the archive
+        shell: bash
+        run: opam exec -- sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"

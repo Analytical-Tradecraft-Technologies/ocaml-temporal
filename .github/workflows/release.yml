@@ -165,9 +165,59 @@ jobs:
         shell: bash
         run: opam exec -- sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"
 
+  # The same check on Linux under opam's bubblewrap sandbox, with a read-only
+  # Cargo home as `opam install` presents the user's default one (#1148).
+  source-archive-check-linux:
+    name: Sandboxed opam build of the release source archive / Linux amd64
+    needs: source-archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RUSTUP_TOOLCHAIN: 1.99.1-x86_64-unknown-linux-gnu
+      ARCHIVE_SHA256: ${{ needs.source-archive.outputs.sha256 }}
+    steps:
+      - name: Check out the exact requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor,
+      # which bubblewrap needs for opam's build sandbox.
+      - name: Allow the bubblewrap sandbox
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install --no-install-recommends -y bubblewrap protobuf-compiler libprotobuf-dev
+      - name: Set up the exact OCaml compiler
+        uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
+        with:
+          ocaml-compiler: "5.5.1"
+      - name: Set up pinned Rust toolchain
+        shell: bash
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Install and verify locked OCaml dependencies
+        shell: bash
+        run: sh scripts/opam-locked-deps.sh install --assume-depexts
+      - name: Download the release source archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-source
+          path: _build/release-source
+      - name: Build the published archive inside the opam bubblewrap sandbox
+        shell: bash
+        env:
+          OCAML_TEMPORAL_OPAM_CHECK_READ_ONLY_CARGO_HOME: "1"
+        run: |
+          set -euo pipefail
+          archive="_build/release-source/ocaml-temporal-$RELEASE_TAG-source.tar.gz"
+          test "$(sha256sum "$archive" | cut -d ' ' -f 1)" = "$ARCHIVE_SHA256"
+          test -f "$(opam var root)/opam-init/hooks/sandbox.sh"
+          opam exec -- sh scripts/check-opam-source-archive.sh "$archive" "$RUNNER_TEMP/opam-source-check"
+      - name: Build a consumer against the package installed from the archive
+        shell: bash
+        run: opam exec -- sh scripts/check-source-archive-consumer.sh "$RUNNER_TEMP/opam-source-check"
+
   publish:
     name: Publish the tested release
-    needs: [build, metadata, source-archive, source-archive-check]
+    needs: [build, metadata, source-archive, source-archive-check, source-archive-check-linux]
     runs-on: ubuntu-24.04
     # The contents permission creates the release. The id-token permission
     # lets the attestation step mint the OIDC token that Sigstore exchanges for
