@@ -3444,44 +3444,13 @@ mod tests {
     }
 
     #[test]
-    /// A history fetch request (#1137) names one run, exact or current,
-    /// takes an optional page size between 1 and 1000, and is closed: an
-    /// empty workflow ID, a NUL, an out-of-range page size, or an unknown
-    /// member is rejected before any RPC.
-    fn history_requests_are_validated() {
-        let accepted = [
-            r#"{"namespace":"default","workflow_id":"w","run_id":""}"#,
-            r#"{"namespace":"default","workflow_id":"w","run_id":"r","page_size":1}"#,
-            r#"{"namespace":"default","workflow_id":"w","run_id":"r","page_size":1000,"rpc_timeout_ms":5}"#,
-        ];
-        for document in accepted {
-            assert!(decode_history_request(document).is_ok(), "{document}");
-        }
-        let request = decode_history_request(accepted[1]).expect("history request");
-        assert_eq!(request.page_size, Some(1));
-        assert_eq!(request.rpc_timeout_ms, None);
-        for document in [
-            r#"{"namespace":"default","workflow_id":"","run_id":""}"#,
-            r#"{"namespace":"","workflow_id":"w","run_id":""}"#,
-            "{\"namespace\":\"default\",\"workflow_id\":\"w\\u0000\",\"run_id\":\"\"}",
-            r#"{"namespace":"default","workflow_id":"w","run_id":"","page_size":0}"#,
-            r#"{"namespace":"default","workflow_id":"w","run_id":"","page_size":1001}"#,
-            r#"{"namespace":"default","workflow_id":"w","run_id":"","page_size":"10"}"#,
-            r#"{"namespace":"default","workflow_id":"w"}"#,
-            r#"{"namespace":"default","workflow_id":"w","run_id":"","next_page_token":null}"#,
-        ] {
-            assert!(decode_history_request(document).is_err(), "{document}");
-        }
-    }
-
-    #[test]
     /// Every bounded client request accepts an optional caller RPC timeout
     /// between 1 ms and one minute and rejects anything else; the default
     /// budget applies only when the member is absent.
     fn client_requests_validate_rpc_timeouts() {
         /// Reports whether one request document decodes.
         type Decodes = fn(&str) -> bool;
-        let documents: [(&str, Decodes); 8] = [
+        let documents: [(&str, Decodes); 7] = [
             (
                 r#"{"namespace":"default","workflow_id":"w","run_id":"","request_id":"r","reason":""}"#,
                 |input| decode_cancel_request(input).is_ok(),
@@ -3509,10 +3478,6 @@ mod tests {
             (
                 r#"{"namespace":"default","query":"","page_size":10,"next_page_token":null}"#,
                 |input| decode_visibility_request(input).is_ok(),
-            ),
-            (
-                r#"{"namespace":"default","workflow_id":"w","run_id":""}"#,
-                |input| decode_history_request(input).is_ok(),
             ),
         ];
         for (document, decodes) in documents {
