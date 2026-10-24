@@ -164,7 +164,10 @@ rules. `~id_reuse_policy` takes the `Client.id_reuse_policy` choices
 (`Allow_duplicate`, `Allow_duplicate_failed_only`, `Reject_duplicate`); a
 refused start settles `started` and the result future with the start failure.
 Omitted options are left out of the command entirely, so existing child starts
-and their recorded histories are unchanged. The child reads its timeouts
+and their recorded histories are unchanged. The
+[child start options regression](../../test/integration/child_start_options/README.md)
+checks the timeouts, a run timeout ending a child as `Timed_out`, and both
+reuse outcomes against a live server. The child reads its timeouts
 through `Workflow.Info`. `Temporal.Testing` records but does not enforce child
 timeouts or reuse policies. Memo and search attributes for children remain
 open under #1135 (blocked by #512).

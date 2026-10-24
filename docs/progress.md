@@ -6157,3 +6157,18 @@ satisfaction cancelling the timer, timeout, satisfaction and firing in one
 activation, zero and unbounded waits, a predicate error, and the detached
 defect. The live scenario and corpus histories for cancel-before/after-fire
 remain open under #1134.
+
+## 2026-10-24: Live child start options regression (#1135)
+
+`test/integration/child_start_options` runs against the Compose
+Temporal/PostgreSQL stack and is part of `make test-temporal-live-regressions`.
+A child started with execution, run and task timeouts reports
+`exec=60000 run=30000 task=7000` through `Workflow.info`, read through the
+parent's query before and after a worker replacement that replays the
+parent's start-child command. A child stalled behind a 3 s run timeout is
+ended by Temporal: the parent sees a `child_workflow` error and an exact-run
+`Client.wait` on the child reports `Timed_out`. After a child completes, the
+same child ID is refused under `` `Reject_duplicate `` and reused under
+`` `Allow_duplicate ``. It passed locally against the pinned Compose stack.
+The parent's error is not yet a typed timeout kind (#1143), and child memo
+and search attributes remain blocked by #512.
