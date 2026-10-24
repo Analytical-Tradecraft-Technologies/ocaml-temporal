@@ -724,6 +724,20 @@ pub enum ChildWorkflowParentClosePolicy {
     RequestCancel,
 }
 
+/// What Temporal does when a child's workflow ID belongs to a closed run.
+/// An absent policy keeps the command identical to earlier releases, so the
+/// server default (allow duplicates) applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildWorkflowIdReusePolicy {
+    /// Start a new run whatever the closed run's outcome.
+    AllowDuplicate,
+    /// Start a new run only if the closed run did not complete successfully.
+    AllowDuplicateFailedOnly,
+    /// Refuse the start; the parent observes a start failure.
+    RejectDuplicate,
+}
+
 /// Retry policy supplied with one scheduled activity.
 ///
 /// The coefficient remains an unsigned decimal rendering of its IEEE-754
@@ -799,7 +813,9 @@ pub enum CompletionCommand {
     /// Starts a child workflow and records the policy used for an explicit
     /// later cancellation command.  Core owns retries, so an optional policy
     /// is carried with the command rather than reimplemented in replayed OCaml
-    /// code.
+    /// code. The optional workflow timeouts and ID reuse policy are omitted
+    /// from the document when unset, so commands without them are unchanged;
+    /// [`validate_completion`] applies the same timeout rules as root starts.
     StartChildWorkflow {
         seq: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -812,6 +828,14 @@ pub enum CompletionCommand {
         #[serde(deserialize_with = "required_nullable")]
         retry_policy: Option<RetryPolicy>,
         cancellation_type: ChildWorkflowCancellationType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_timeout: Option<Duration>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_timeout: Option<Duration>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_timeout: Option<Duration>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id_reuse_policy: Option<ChildWorkflowIdReusePolicy>,
     },
     /// Requests cancellation of a previously started child workflow.
     CancelChildWorkflow {
@@ -1779,6 +1803,9 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                 workflow_id,
                 workflow_type,
                 retry_policy,
+                execution_timeout,
+                run_timeout,
+                task_timeout,
                 ..
             } => {
                 identifier(workflow_id, "$.commands.workflow_id")?;
@@ -1789,6 +1816,7 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                 if let Some(retry_policy) = retry_policy {
                     validate_retry_policy(retry_policy, "$.commands.retry_policy")?;
                 }
+                validate_child_timeouts(*execution_timeout, *run_timeout, *task_timeout)?;
             }
             CompletionCommand::SignalExternalWorkflow {
                 workflow_id,
@@ -3439,6 +3467,56 @@ pub fn activation_from_core(
     Ok(activation)
 }
 
+/// Applies the root-start workflow-timeout rules to a child start, mirroring
+/// the OCaml encoder so a hand-built document cannot bypass them: each
+/// supplied timeout is positive (Temporal reads zero as unset), the task
+/// timeout is at most 120 seconds, the run timeout is no larger than the
+/// execution timeout, and the task timeout is no larger than the run timeout,
+/// or the execution timeout when there is no run timeout. Temporal would
+/// otherwise silently lower a value that breaks the ordering rules.
+fn validate_child_timeouts(
+    execution: Option<Duration>,
+    run: Option<Duration>,
+    task: Option<Duration>,
+) -> Result<(), ProtocolError> {
+    let key = |value: Duration| (value.seconds, value.nanoseconds);
+    for (value, path) in [
+        (execution, "$.commands.execution_timeout"),
+        (run, "$.commands.run_timeout"),
+        (task, "$.commands.task_timeout"),
+    ] {
+        if let Some(value) = value {
+            validate_time(value.seconds, value.nanoseconds, true, path)?;
+            if key(value) <= (0, 0) {
+                return Err(ProtocolError::invalid(path, "timeout must be positive"));
+            }
+        }
+    }
+    if task.is_some_and(|task| key(task) > (120, 0)) {
+        return Err(ProtocolError::invalid(
+            "$.commands.task_timeout",
+            "task timeout exceeds 120 seconds",
+        ));
+    }
+    if let (Some(execution), Some(run)) = (execution, run)
+        && key(run) > key(execution)
+    {
+        return Err(ProtocolError::invalid(
+            "$.commands.run_timeout",
+            "run timeout exceeds execution timeout",
+        ));
+    }
+    if let (Some(task), Some(bound)) = (task, run.or(execution))
+        && key(task) > key(bound)
+    {
+        return Err(ProtocolError::invalid(
+            "$.commands.task_timeout",
+            "task timeout exceeds the run (or execution) timeout",
+        ));
+    }
+    Ok(())
+}
+
 /// Converts one semantic duration to the protobuf representation.
 pub(crate) fn duration_to_core(value: Duration) -> prost_wkt_types::Duration {
     prost_wkt_types::Duration {
@@ -3657,6 +3735,41 @@ fn parent_close_from_core(
     )
 }
 
+/// Maps a child ID reuse policy, keeping an absent policy unspecified so the
+/// command is identical to one built before the option existed.
+fn id_reuse_to_core(value: Option<ChildWorkflowIdReusePolicy>) -> i32 {
+    use temporalio_protos::temporal::api::enums::v1::WorkflowIdReusePolicy as Core;
+    i32::from(match value {
+        None => Core::Unspecified,
+        Some(ChildWorkflowIdReusePolicy::AllowDuplicate) => Core::AllowDuplicate,
+        Some(ChildWorkflowIdReusePolicy::AllowDuplicateFailedOnly) => {
+            Core::AllowDuplicateFailedOnly
+        }
+        Some(ChildWorkflowIdReusePolicy::RejectDuplicate) => Core::RejectDuplicate,
+    })
+}
+
+/// Rejects Core reuse policies this protocol does not offer, including the
+/// deprecated terminate-if-running value, and preserves an unspecified one.
+fn id_reuse_from_core(
+    value: i32,
+) -> Result<Option<ChildWorkflowIdReusePolicy>, CoreConversionError> {
+    use temporalio_protos::temporal::api::enums::v1::WorkflowIdReusePolicy as Core;
+    match Core::try_from(value).map_err(|_| invalid_core("unknown Core ID reuse policy"))? {
+        Core::Unspecified => Ok(None),
+        Core::AllowDuplicate => Ok(Some(ChildWorkflowIdReusePolicy::AllowDuplicate)),
+        Core::AllowDuplicateFailedOnly => {
+            Ok(Some(ChildWorkflowIdReusePolicy::AllowDuplicateFailedOnly))
+        }
+        Core::RejectDuplicate => Ok(Some(ChildWorkflowIdReusePolicy::RejectDuplicate)),
+        // Only the deprecated terminate-if-running value remains; naming it
+        // would trip the deprecation lint.
+        _ => Err(unsupported(
+            "Core child ID reuse policy is not represented by this protocol",
+        )),
+    }
+}
+
 /// Builds one official Core command with unsupported optional fields defaulted explicitly.
 fn command_to_core(
     value: &CompletionCommand,
@@ -3755,6 +3868,10 @@ fn command_to_core(
             input,
             retry_policy,
             cancellation_type,
+            execution_timeout,
+            run_timeout,
+            task_timeout,
+            id_reuse_policy,
         } => Variant::StartChildWorkflowExecution(core_commands::StartChildWorkflowExecution {
             seq: *seq,
             task_queue: task_queue.clone().unwrap_or_default(),
@@ -3772,8 +3889,13 @@ fn command_to_core(
             // helper intentionally leaves it at Core's default for isolated
             // protocol round-trip tests; it is never submitted to a worker.
             namespace: child_workflow_namespace.unwrap_or_default().to_owned(),
-            // Timeouts and the other child options remain at Core
-            // defaults until they have a stable public representation.
+            workflow_execution_timeout: execution_timeout.map(duration_to_core),
+            workflow_run_timeout: run_timeout.map(duration_to_core),
+            workflow_task_timeout: task_timeout.map(duration_to_core),
+            workflow_id_reuse_policy: id_reuse_to_core(*id_reuse_policy),
+            // Cron, headers, memo, search attributes and the remaining child
+            // options stay at Core defaults until they have a stable public
+            // representation.
             ..Default::default()
         }),
         CompletionCommand::CancelChildWorkflow { seq, reason } => {
@@ -4050,10 +4172,6 @@ fn command_from_core(
         }
         Variant::StartChildWorkflowExecution(value) => {
             if !value.namespace.is_empty()
-                || value.workflow_execution_timeout.is_some()
-                || value.workflow_run_timeout.is_some()
-                || value.workflow_task_timeout.is_some()
-                || value.workflow_id_reuse_policy != 0
                 || !value.cron_schedule.is_empty()
                 || !value.headers.is_empty()
                 || !value.memo.is_empty()
@@ -4082,6 +4200,22 @@ fn command_from_core(
                     .map(retry_policy_from_core)
                     .transpose()?,
                 cancellation_type: child_cancellation_from_core(value.cancellation_type)?,
+                execution_timeout: value
+                    .workflow_execution_timeout
+                    .as_ref()
+                    .map(duration_from_core)
+                    .transpose()?,
+                run_timeout: value
+                    .workflow_run_timeout
+                    .as_ref()
+                    .map(duration_from_core)
+                    .transpose()?,
+                task_timeout: value
+                    .workflow_task_timeout
+                    .as_ref()
+                    .map(duration_from_core)
+                    .transpose()?,
+                id_reuse_policy: id_reuse_from_core(value.workflow_id_reuse_policy)?,
             })
         }
         Variant::CancelChildWorkflowExecution(value) => {

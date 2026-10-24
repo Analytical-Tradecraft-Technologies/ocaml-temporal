@@ -224,6 +224,7 @@ let test_child_workflow_cancellation () =
           input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_wait_cancellation_requested;
+          execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
         };
       Activation.Cancel_child_workflow { seq = 1L; reason = "no longer needed" };
     ]
@@ -316,6 +317,7 @@ let test_default_child_workflow_cancellation_policy () =
           input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
+          execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
         };
       Activation.Cancel_child_workflow
         { seq = 1L; reason = "cancelled by workflow" };
@@ -703,6 +705,7 @@ let test_child_workflow_completion () =
           input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
+          execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
         };
     ]
     (Execution.activate execution [ Activation.Start_workflow ]);
@@ -738,6 +741,7 @@ let test_child_workflow_retry_policy () =
                 non_retryable_error_types = [ "InvalidInput" ];
               };
           cancellation_type = Activation.Child_try_cancel;
+          execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
         };
     ]
     (Execution.activate execution [ Activation.Start_workflow ])
@@ -769,6 +773,7 @@ let test_child_workflow_concurrency_and_decoding () =
           input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
+          execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
         };
       Activation.Schedule_activity
         {
@@ -931,6 +936,7 @@ let test_child_workflow_id_boundary () =
           input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
+          execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
         };
     ]
     (Execution.activate execution [ Activation.Start_workflow ]);
@@ -1041,6 +1047,7 @@ let test_child_cancelled_before_start_acknowledgment () =
         input = [ payload "Ada" ];
         retry_policy = None;
         cancellation_type = Activation.Child_try_cancel;
+        execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
       }
   in
   let cancel_command =
@@ -1364,6 +1371,7 @@ let test_child_cancel_after_natural_completion_is_noop () =
           input = [ payload "Ada" ];
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
+          execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
         };
     ]
     (Workflow_context_store.take_commands context);

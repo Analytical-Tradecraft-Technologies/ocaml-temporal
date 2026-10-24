@@ -150,6 +150,25 @@ server default. Parent-close policy is independent of `~cancellation_type`,
 which controls an explicit cancellation request made through a child handle or
 scope.
 
+### Child timeouts and ID reuse
+
+`Child_workflow.start`, `start_handle`, and `execute` also accept
+`~execution_timeout`, `~run_timeout`, `~task_timeout` and `~id_reuse_policy`
+(#1135). The timeouts obey exactly the `Client.start` rules, through one
+shared validator: each must be positive, `run_timeout` no larger than
+`execution_timeout`, and `task_timeout` at most 120 seconds and no larger than
+`run_timeout` (or `execution_timeout` without a run timeout). A violation is a
+typed defect returned as a ready failed handle before input encoding or any
+command, and the OCaml protocol encoder and the Rust bridge re-check the same
+rules. `~id_reuse_policy` takes the `Client.id_reuse_policy` choices
+(`Allow_duplicate`, `Allow_duplicate_failed_only`, `Reject_duplicate`); a
+refused start settles `started` and the result future with the start failure.
+Omitted options are left out of the command entirely, so existing child starts
+and their recorded histories are unchanged. The child reads its timeouts
+through `Workflow.Info`. `Temporal.Testing` records but does not enforce child
+timeouts or reuse policies. Memo and search attributes for children remain
+open under #1135 (blocked by #512).
+
 Temporal Server does not start a child whose parent has already closed, even
 under `Abandon`: the start-child transfer task finds the parent closed and
 drops the child. A parent that schedules a child and completes in the same

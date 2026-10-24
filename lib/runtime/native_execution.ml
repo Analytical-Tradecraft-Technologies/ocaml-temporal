@@ -1087,7 +1087,9 @@ let command_to_protocol command =
                cancellation_type = protocol_cancellation_type cancellation_type;
              })
   | Activation.Start_child_workflow
-      { seq; id; name; input; retry_policy; cancellation_type; task_queue; parent_close_policy } ->
+      { seq; id; name; input; retry_policy; cancellation_type; task_queue;
+        parent_close_policy; execution_timeout; run_timeout; task_timeout;
+        id_reuse_policy } ->
       let* () = validate_sequence "$.command.seq" seq in
       let* () = validate_identifier "$.command.id" id in
       let* () = validate_identifier "$.command.name" name in
@@ -1128,6 +1130,25 @@ let command_to_protocol command =
             in
             Ok (Some policy)
       in
+      let* execution_timeout =
+        optional_duration_of_milliseconds "$.command.execution_timeout"
+          execution_timeout
+      in
+      let* run_timeout =
+        optional_duration_of_milliseconds "$.command.run_timeout" run_timeout
+      in
+      let* task_timeout =
+        optional_duration_of_milliseconds "$.command.task_timeout" task_timeout
+      in
+      let id_reuse_policy =
+        Option.map
+          (function
+            | Activation.Reuse_allow_duplicate -> Protocol.Reuse_allow_duplicate
+            | Activation.Reuse_allow_duplicate_failed_only ->
+                Protocol.Reuse_allow_duplicate_failed_only
+            | Activation.Reuse_reject_duplicate -> Protocol.Reuse_reject_duplicate)
+          id_reuse_policy
+      in
       Ok
         (Protocol.Start_child_workflow
            {
@@ -1138,6 +1159,10 @@ let command_to_protocol command =
              input;
              retry_policy;
              cancellation_type = protocol_child_cancellation_type cancellation_type;
+             execution_timeout;
+             run_timeout;
+             task_timeout;
+             id_reuse_policy;
            })
   | Activation.Cancel_child_workflow { seq; reason } ->
       let* () = validate_sequence "$.command.seq" seq in

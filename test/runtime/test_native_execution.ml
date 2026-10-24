@@ -1997,6 +1997,7 @@ let test_activity_command_translation_and_validation () =
               input = [];
               retry_policy = None;
               cancellation_type = Activation.Child_abandon;
+              execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
             }))
   with
   | Protocol.Start_child_workflow
@@ -2008,6 +2009,7 @@ let test_activity_command_translation_and_validation () =
         input = [];
         retry_policy = None;
         cancellation_type = Protocol.Child_abandon;
+        execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
       } ->
       ()
   | _ -> failwith "child command fields were not preserved"
@@ -2023,6 +2025,7 @@ let test_activity_command_translation_and_validation () =
               input = [ runtime_payload "argument" ];
               retry_policy = None;
               cancellation_type = Activation.Child_abandon;
+              execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
             }))
   with
   | Protocol.Start_child_workflow { input = [ child_input ]; _ }

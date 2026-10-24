@@ -92,6 +92,13 @@ type child_workflow_parent_close_policy =
   | Parent_abandon
   | Parent_request_cancel
 
+(** What Temporal does when the child's workflow ID belongs to a closed run.
+    An absent policy keeps Temporal's default (allow duplicates). *)
+type child_workflow_id_reuse_policy =
+  | Reuse_allow_duplicate
+  | Reuse_allow_duplicate_failed_only
+  | Reuse_reject_duplicate
+
 (** Controls when Core resolves a parent future after a child cancellation
     request.  [Abandon] reports cancellation without asking the child worker;
     [Try_cancel] requests cancellation and resolves immediately; the two wait
@@ -165,6 +172,14 @@ type command =
               input, otherwise one payload. *)
       retry_policy : retry_policy option;
       cancellation_type : child_workflow_cancellation_type;
+      execution_timeout : int64 option;
+          (** Child execution timeout in milliseconds, or [None] for none. *)
+      run_timeout : int64 option;
+          (** Child run timeout in milliseconds, or [None] for none. *)
+      task_timeout : int64 option;
+          (** Child workflow-task timeout in milliseconds, or [None] for
+              Temporal's 10-second default. *)
+      id_reuse_policy : child_workflow_id_reuse_policy option;
     }
   (** Requests cancellation of the child identified by the start command's
       sequence.  Core owns the race between this command and the start

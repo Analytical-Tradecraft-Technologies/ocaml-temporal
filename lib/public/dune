@@ -10,7 +10,8 @@
   native_worker
   payload_private
   retry_policy_private
-  workflow_private)
+  workflow_private
+  workflow_timeouts_private)
  (libraries
   temporal_base
   temporal_sdk_kernel

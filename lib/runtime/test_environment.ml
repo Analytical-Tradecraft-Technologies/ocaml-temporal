@@ -1082,6 +1082,9 @@ let rec apply_command environment run command =
   | Start_child_workflow
       { seq; id; name; input; parent_close_policy; retry_policy; task_queue; _ }
     ->
+      (* Child timeouts and the ID reuse policy are deliberately ignored: the
+         simulator neither enforces workflow timeouts nor keeps closed runs
+         to reuse, as [Temporal.Testing] documents. *)
       start_child environment run ~seq ~id ~name ~input ~parent_close_policy
         ~retry_policy ~task_queue
   | Cancel_child_workflow { seq; _ } -> (

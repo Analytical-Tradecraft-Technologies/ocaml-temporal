@@ -35,6 +35,7 @@
   test_external_workflow
   test_settle_scaling
   test_execution_info
+  test_child_start_options
   test_thread_context_isolation
   test_race_matrix
   test_timer_cancellation)
