@@ -6275,6 +6275,23 @@ handle observes the run's termination, and shutdown during a bounded wait
 ends it promptly with the closed-client error. It passed locally against the
 pinned Compose stack.
 
+## 2026-10-24: Client.fetch_history (#1137)
+
+`Temporal.Client.fetch_history ?page_size ?rpc_timeout handle` returns the
+complete recorded history of a run as a `Replay.History.t`, so a replay gate
+needs only `Temporal.Client` and `Temporal.Replay`. It is the submitted call
+selector `HISTORY` (13), additive within ABI version 4. Rust follows every
+`GetWorkflowExecutionHistory` page within one budget (30 s by default) and
+returns one binary `History` message, the concatenation of the re-encoded
+pages, bounded by the payload safety limit. The
+`test/integration/fetch_history` live regression replays an open run's
+partial history and the complete history fetched with the default page size
+and with one and three events per page. A variant that changes only the code
+after the run's last signal must fail each complete fetch, so a fetch that
+dropped later pages would be caught (verified with a mutant that stops after
+the first page). It passed locally against the pinned Compose stack.
+`Replay.History.of_json` for CLI exports remains open.
+
 ## 2026-10-24: Live child start options regression (#1135)
 
 `test/integration/child_start_options` runs against the Compose

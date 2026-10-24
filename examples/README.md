@@ -309,6 +309,11 @@ the workflow reads them.
 
 ### Export a history
 
+An OCaml program connected to the server does not need this section:
+`Temporal.Client.fetch_history` returns a run's complete history ready for
+`Temporal.Replay.replay`, or for writing out as a file this command reads
+(#1137).
+
 The command reads the binary encoding of Temporal's
 `temporal.api.history.v1.History` message. The Temporal CLI exports the
 protobuf **JSON** encoding, so convert it once after exporting:

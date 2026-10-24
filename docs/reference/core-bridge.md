@@ -114,6 +114,16 @@ with the other aborted tasks). Throttle state is bounded by the
 connection's `max_in_flight_calls`; see
 [native activity execution](native-activity-execution.md#async-heartbeat-throttling).
 
+The history selector (`HISTORY`, #1137) is additive within version 4 in the
+same way: an older OCaml object never submits it and an older archive rejects
+it as an unknown kind before any RPC. It has no synchronous symbol. Its
+document
+([schema](../schemas/bridge/client-history-request.schema.json)) names one
+run, and the bridge follows every `GetWorkflowExecutionHistory` page within
+one budget. It is the one selector whose success value is binary rather than
+JSON: a single serialized `temporal.api.history.v1.History` message, at most
+the payload safety limit, built by appending each page's re-encoded history.
+
 The canonical header is
 `rust/core-bridge/include/ocaml_temporal_core.h`. Both Rust and C compile-time
 assertions protect the status width, every numeric status value, and field

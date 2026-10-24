@@ -237,6 +237,11 @@ enum ClientCallKind {
     /// accepts: it adds the attempt's heartbeat timeout; see
     /// [`activity_protocol::AsyncActivityHeartbeat`].
     AsyncActivityHeartbeat,
+    /// Fetch one run's complete history (#1137). It has no synchronous
+    /// symbol, and its successful outcome is the binary protobuf of one
+    /// `History` message rather than a JSON document; see
+    /// [`client_protocol::fetch_history`].
+    History,
 }
 
 impl TryFrom<u32> for ClientCallKind {
@@ -257,6 +262,7 @@ impl TryFrom<u32> for ClientCallKind {
             10 => Self::Visibility,
             11 => Self::AsyncActivityCompletion,
             12 => Self::AsyncActivityHeartbeat,
+            13 => Self::History,
             _ => {
                 return Err(Failure {
                     status: STATUS_INVALID_ARGUMENT,
@@ -280,6 +286,7 @@ enum ClientRpc {
     Update(client_protocol::UpdateWorkflowRequest),
     PollUpdate(client_protocol::PollWorkflowUpdateRequest),
     Visibility(client_protocol::VisibilityRequest),
+    History(client_protocol::HistoryRequest),
     /// A namespace-bound async activity completion, failure, or
     /// cancellation (#1025). `binding` is `None` straight after
     /// [`ClientRpc::decode`], which has no runtime;
@@ -392,6 +399,9 @@ impl ClientRpc {
             ClientCallKind::Visibility => Self::Visibility(
                 client_protocol::decode_visibility_request(text).map_err(protocol_failure)?,
             ),
+            ClientCallKind::History => Self::History(
+                client_protocol::decode_history_request(text).map_err(protocol_failure)?,
+            ),
             ClientCallKind::AsyncActivityCompletion => Self::AsyncActivity {
                 request: AsyncActivityRequest::decode_completion(text)?,
                 binding: None,
@@ -490,6 +500,11 @@ impl ClientRpc {
                     .await
                     .map_err(client_operation_failure)?;
                 encode_bytes(client_protocol::encode_visibility_response(&response))
+            }),
+            Self::History(request) => Box::pin(async move {
+                client_protocol::fetch_history(connection, request)
+                    .await
+                    .map_err(client_operation_failure)
             }),
             Self::AsyncActivity { request, binding } => Box::pin(async move {
                 let binding = binding.ok_or_else(unbound_async_activity)?;

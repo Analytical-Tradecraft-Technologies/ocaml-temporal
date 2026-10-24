@@ -74,7 +74,9 @@ See [runtime invariants](runtime-invariants.md), [Core ownership](core-bridge.md
 
 - Public TLS trust/mTLS/API-key configuration and secure connectivity acceptance.
   HTTP(S) URL handling alone is not authentication or Temporal Cloud support.
-- Protobuf-JSON history input, replaying the seeded
+- Protobuf-JSON history input (an SDK-only route is
+  `Client.fetch_history`, #1137; CLI JSON exports still need conversion),
+  replaying the seeded
   [history corpus](history-corpus.md) across SDK/Core/server upgrades (#524),
   local-activity recovery, interaction recovery and deployment routing.
 - Concurrency/load/resource qualification and operational guidance. Shutdown

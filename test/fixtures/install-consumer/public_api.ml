@@ -1143,6 +1143,12 @@ let _client_terminate :
     ('input, 'output) T.Client.handle -> (unit, T.Error.t) result =
   T.Client.terminate
 
+let _client_fetch_history :
+    ?page_size:int ->
+    ?rpc_timeout:T.Duration.t ->
+    ('input, 'output) T.Client.handle -> (T.Replay.History.t, T.Error.t) result =
+  T.Client.fetch_history
+
 let _client_list_visibility :
     ?page_size:int ->
     ?page_token:string ->

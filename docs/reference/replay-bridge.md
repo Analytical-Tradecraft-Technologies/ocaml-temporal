@@ -278,7 +278,11 @@ derives a Rust-specific JSON form instead of accepting that one, so the public
 API accepts the binary protobuf and documents conversion rather than adding a
 JSON-history converter to production; the
 [task-failure fixtures](../../test/integration/temporal/task_failure/histories/README.md)
-were converted that way.
+were converted that way. An application that can reach the server needs no
+export at all: `Temporal.Client.fetch_history` (#1137) returns the complete
+binary history of a run as a `Replay.History.t`, with every page fetched and
+concatenated inside the bridge (see the
+[client protocol](client-protocol.md#fetch-the-complete-history-of-a-run-1137)).
 
 ## Ownership and shutdown
 

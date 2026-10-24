@@ -128,6 +128,12 @@ type visibility_request = {
   rpc_deadline : rpc_deadline option;
 }
 
+type history_request = {
+  execution : execution;
+  page_size : int option;
+  rpc_deadline : rpc_deadline option;
+}
+
 type visibility_status =
   [ `Running
   | `Completed
@@ -758,6 +764,27 @@ let encode_visibility_request (value : visibility_request) =
           ("next_page_token", token);
         ]
         @ rpc))
+
+let encode_history_request (value : history_request) =
+  let* () = validate_identifier "$.namespace" value.execution.namespace in
+  let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
+  match value.page_size with
+  | Some size when size < 1 || size > 1_000 ->
+      Error (invalid ~path:"$.page_size" "page_size must be between 1 and 1000")
+  | page_size ->
+      let* rpc = rpc_timeout_member value.rpc_deadline in
+      let page =
+        match page_size with None -> [] | Some size -> [ ("page_size", `Int size) ]
+      in
+      encode_object
+        (`Assoc
+          ([
+             ("namespace", json_string value.execution.namespace);
+             ("workflow_id", json_string value.execution.workflow_id);
+             ("run_id", json_string value.execution.run_id);
+           ]
+          @ page @ rpc))
 
 (** Prefix Rust uses for a Temporal [WorkflowExecutionStatus] it does not
     name, followed by the canonical decimal wire value (for example

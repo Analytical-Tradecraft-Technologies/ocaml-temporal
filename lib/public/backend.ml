@@ -155,6 +155,14 @@ type query_request = {
           it. *)
 }
 
+(** One complete-history fetch (#1137); see the interface. *)
+type history_request = {
+  workflow_id : string;
+  run_id : string;
+  page_size : int option;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+}
+
 (** One bounded visibility query. The continuation token is opaque to callers
     and remains encoded only at the native protocol boundary. *)
 type visibility_request = {
@@ -2020,6 +2028,45 @@ let client_list_visibility client request =
   match client with
   | Mock_client client -> mock_client_list_visibility client request
   | Native_client client -> native_client_list_visibility client request
+
+(** Fetches one run's complete history as a submitted call (#1137). Rust
+    follows every page and returns the binary [History] protobuf, which is
+    passed on unchanged for [Temporal.Replay] to validate. A gRPC failure,
+    including an expired deadline or an unknown run, arrives as the closed
+    [rpc] document with the [Connection] status, as for visibility. *)
+let native_client_fetch_history (client : native_client)
+    (request : history_request) : (string, Error.t) result =
+  if Atomic.get client.closed then Error (bridge_error "client is shut down")
+  else
+    let request : Client_protocol.history_request =
+      {
+        execution =
+          {
+            namespace = client.namespace;
+            workflow_id = request.workflow_id;
+            run_id = request.run_id;
+          };
+        page_size = request.page_size;
+        rpc_deadline = request.rpc_deadline;
+      }
+    in
+    match Native.call client.supervisor (Native.Rpc_history request) with
+    | Error Native.Closed -> Error (bridge_error "client is shut down")
+    | Error (Native.Backend { Bridge.status = Bridge.Connection; message } as error)
+      -> (
+        match Client_protocol.decode_client_error message with
+        | Ok (Client_protocol.Rpc _ as client_error) ->
+            Error (native_client_error ~namespace:client.namespace client_error)
+        | Ok _ | Error _ -> Error (native_supervisor_error error))
+    | Error error -> Error (native_supervisor_error error)
+    | Ok history -> Ok history
+
+(** Fetches one run's history; the deterministic mock records none. *)
+let client_fetch_history client request =
+  match client with
+  | Mock_client _ ->
+      Error (defect "the deterministic mock client does not record workflow histories")
+  | Native_client client -> native_client_fetch_history client request
 
 (** Converts a public update request to the namespace-bound JSON protocol. *)
 let native_update_request client (request : update_request) :

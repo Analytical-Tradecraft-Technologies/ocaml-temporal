@@ -134,6 +134,7 @@ for executable in "$@"; do
     test/integration/client_request_ids/regression.exe|\
     test/integration/completed_queries/regression.exe|\
     test/integration/concurrent_client/regression.exe|\
+    test/integration/fetch_history/regression.exe|\
     test/integration/split_worker_task_types/regression.exe|\
     test/integration/worker_metrics/regression.exe|\
     test/integration/worker_resource_options/regression.exe|\

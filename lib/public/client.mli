@@ -17,7 +17,8 @@
       and {!wait} reports [Timed_out].
     - An RPC deadline ([?rpc_timeout] on {!start}, {!signal}, {!query},
       {!query_with_input}, {!start_update}, {!cancel}, {!terminate},
-      {!reset}, and {!list_visibility}) bounds one client call and never
+      {!reset}, {!list_visibility}, and {!fetch_history}) bounds one client
+      call and never
       affects the workflow. The deadline is fixed on a monotonic clock when
       the call begins, so it covers the time the request waits to be
       submitted, the RPC, and the transport retries the SDK performs inside
@@ -27,8 +28,8 @@
       typed defects returned before any request is sent. When omitted, each
       operation keeps its built-in budget: 10 seconds for {!start} and
       {!list_visibility}, 3 seconds for {!signal}, {!cancel}, {!terminate},
-      and {!reset}, and 30 seconds for queries and for {!start_update}'s
-      acceptance wait. {!wait} and {!wait_update} have no RPC deadline: they
+      and {!reset}, and 30 seconds for queries, for {!fetch_history}'s whole
+      fetch, and for {!start_update}'s acceptance wait. {!wait} and {!wait_update} have no RPC deadline: they
       wait for the workflow or update, with bounded internal polls. Their
       optional [timeout] is a caller-side bound on the whole wait instead,
       described with each function.
@@ -550,6 +551,31 @@ val query :
   ('workflow_input, 'workflow_output) handle ->
   query:'query Query.t ->
   ('query, Error.t) result
+
+(** Fetches the complete recorded history of the run [handle] addresses
+    (#1137), ready for {!Replay.replay}. This is the SDK-only route to a
+    replay gate: no Temporal CLI export or protobuf conversion is needed.
+
+    The bridge follows every [GetWorkflowExecutionHistory] page itself and
+    returns one {!Replay.History.t} under the handle's workflow ID.
+    [page_size] (1 to 1000, default the server's) sets only the events per
+    round trip; the result is the same history for any page size. A
+    current-run handle from {!get_handle} fetches the run that is current
+    when the first page is served. The fetch never waits for new events: an
+    open run yields the events recorded so far, which replay accepts but
+    which prove compatibility only for the tasks they contain.
+
+    [rpc_timeout] bounds the whole fetch, every page included (default 30
+    seconds); see {{!section-rpc_deadlines} RPC deadlines}. An unknown run
+    is an error with {!val-rpc_status} [Some `Not_found]. A history larger
+    than {!Replay.History.max_bytes} is a typed error rather than a
+    truncated result. An invalid [page_size] is a typed defect returned
+    before any request is sent. *)
+val fetch_history :
+  ?page_size:int ->
+  ?rpc_timeout:Duration.t ->
+  ('workflow_input, 'workflow_output) handle ->
+  (Replay.History.t, Error.t) result
 
 (** Lists one bounded page of workflow executions using Temporal's visibility
     query language. [page_token] is opaque and may be passed unchanged to a

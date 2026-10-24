@@ -608,6 +608,34 @@ let test_client_visibility_listing () =
     (Temporal.Client.list_visibility client ~page_size:0 ~query:"" ());
   unwrap (Temporal.Client.shutdown client)
 
+(** [Client.fetch_history] (#1137) validates its options before any request:
+    a page size outside 1..1000 and a non-positive [rpc_timeout] are typed
+    defects. The deterministic mock records no histories, so a valid fetch
+    is a typed defect too, and a shut-down client reports the closed-client
+    error. The native path is covered by the live replay regression. *)
+let test_client_fetch_history_validation () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let handle =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow
+         ~task_queue:"unit-test" ~id:"history-a" ~input:"a" ())
+  in
+  expect_error_message_contains "defect" "page_size"
+    (Temporal.Client.fetch_history ~page_size:0 handle);
+  expect_error_message_contains "defect" "page_size"
+    (Temporal.Client.fetch_history ~page_size:1_001 handle);
+  expect_error "defect"
+    (Temporal.Client.fetch_history ~rpc_timeout:(Temporal.Duration.of_ms 0L) handle);
+  expect_error_message_contains "defect" "does not record workflow histories"
+    (Temporal.Client.fetch_history ~page_size:1 handle);
+  unwrap (Temporal.Client.shutdown client);
+  expect_error_message_contains "bridge" "client is shut down"
+    (Temporal.Client.fetch_history handle)
+
 (** A continuation identity can be turned back into a typed exact-run handle
     without starting a second execution. Using the mock ledger's existing run
     proves the returned handle retained the workflow's output codec: [wait]
@@ -1815,6 +1843,7 @@ let () =
   test_mock_start_id_reuse_policy ();
   test_client_execution_policy_validation ();
   test_client_visibility_listing ();
+  test_client_fetch_history_validation ();
   test_follow_continued_as_new_handle ();
   test_follow_rejects_malformed_successor_identity ();
   test_follow_rejects_cross_namespace_execution ();
