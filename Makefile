@@ -1,3 +1,8 @@
+# Refresh the final OS trust store for every supported image build without
+# invalidating the compiler or locked dependency layers. Compose inherits the
+# exported value; a new Make invocation always generates another.
+export CA_CERTIFICATES_REFRESH := $(shell python3 -c 'import uuid; print(uuid.uuid4())')
+
 TEMPORAL_FIXTURE_DIR := $(CURDIR)/test/integration/temporal
 TEMPORAL_COMPOSE_FILE := $(TEMPORAL_FIXTURE_DIR)/compose.yaml
 TEMPORAL_COMPOSE_PROJECT ?= ocaml-temporal-integration
@@ -1398,7 +1403,7 @@ native-rust-bridge:
 	$(RUST_PROFILE_ENV) $(NATIVE_ENV) OCAML_TEMPORAL_BUILD_PROFILE=$(RUST_BRIDGE_BUILD_PROFILE) sh scripts/rust-bridge-artifact.sh pack . "$(RUST_BRIDGE_DIR)" "$(RUST_BRIDGE_KEY)"
 
 rust-bridge:
-	docker build -f Dockerfile.rust-ci -t ocaml-temporal-rust-bridge:local .
+	docker build --build-arg CA_CERTIFICATES_REFRESH="$(CA_CERTIFICATES_REFRESH)" -f Dockerfile.rust-ci -t ocaml-temporal-rust-bridge:local .
 	docker run --rm --user $(HOST_UID):$(HOST_GID) --volume "$(CURDIR):/workspace" \
 		ocaml-temporal-rust-bridge:local make native-rust-bridge \
 		RUST_BRIDGE_DIR=/workspace/_build/rust-bridge RUST_BRIDGE_KEY="$(RUST_BRIDGE_KEY)" \
