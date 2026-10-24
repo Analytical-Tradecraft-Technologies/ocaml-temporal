@@ -23,6 +23,30 @@ val failure_diagnostic : Workflow_protocol.failure -> string
     [Temporal_base.Error.make]. *)
 val application_failure_type : Workflow_protocol.failure -> string option
 
+(** Classifies where a failure originated (#1143): the first layer of the
+    bounded [cause] chain that is not an activity, child-workflow or Nexus
+    operation wrapper, or an [Absent] layer that has a cause. The result is
+    the polymorphic variant [Temporal_base.Error.origin] uses; a chain made
+    only of wrappers is [`Other]. *)
+val failure_origin :
+  Workflow_protocol.failure ->
+  [ `Application
+  | `Timeout of
+    [ `Start_to_close | `Schedule_to_start | `Schedule_to_close | `Heartbeat | `Unspecified ]
+  | `Server
+  | `Cancelled
+  | `Terminated
+  | `Other ]
+
+(** Collects the application and cancellation detail payloads of every layer
+    of the bounded [cause] chain, outer to inner. Heartbeat details of timeout
+    and reset layers are excluded; see {!last_heartbeat_details}. *)
+val failure_details : Workflow_protocol.failure -> Workflow_protocol.payload list
+
+(** Collects the [last_heartbeat_details] of every timeout and reset layer of
+    the bounded [cause] chain, outer to inner (#1143). *)
+val last_heartbeat_details : Workflow_protocol.failure -> Workflow_protocol.payload list
+
 (** Bound on the JSON-encoded length of a sanitized inbound type, equal to
     [Temporal_base.Error.max_error_type_bytes]. *)
 val max_inbound_error_type_encoded_length : int

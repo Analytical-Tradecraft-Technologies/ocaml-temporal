@@ -47,9 +47,44 @@ raises (#1011). Malformed UTF-8 becomes U+FFFD, each ASCII control character
 becomes a visible `\uXXXX` escape (a Python type `"Invalid\tInput"` reads as
 `"Invalid\u0009Input"`), and a type whose encoded length exceeds 65,536
 characters is cut at a character boundary and ends in `...`. Valid types are
-unchanged, and replay always yields the same text. The cause
-chain itself is not yet preserved as structure: inbound causes appear only in
-the error message, and outbound OCaml failures carry no `cause`. Every failure
+unchanged, and replay always yields the same text.
+
+An inbound error also records where the failure originated (#1143), so
+workflow code can tell a timeout from a business failure or a server failure
+without parsing `Error.message`. `Error.origin` walks the cause chain from
+the outside inward past the wrappers that only name the failed operation
+(activity, child workflow, Nexus operation) and classifies the first other
+layer. The category is unchanged, so an activity timeout is still
+`` `Activity ``:
+
+| First non-wrapper layer | `Error.origin` | Notes |
+| --- | --- | --- |
+| Application failure, any SDK | `` Some `Application `` | `Error.error_type` names it |
+| Timeout | `` Some (`Timeout t) `` | `t` is `` `Start_to_close ``, `` `Schedule_to_start ``, `` `Schedule_to_close ``, `` `Heartbeat `` or `` `Unspecified ``; `Error.timeout_type` returns it. A child's run or execution timeout arrives as `` `Start_to_close `` |
+| Server failure | `` Some `Server `` | For example a result over a namespace limit |
+| Cancellation, termination | `` Some `Cancelled ``, `` Some `Terminated `` | |
+| Reset, Nexus handler error, a kind a newer server adds, or wrappers only | `` Some `Other `` | |
+| Not received from Temporal | `None` | Unless the application passed `~origin` to `Error.make`, which it may do to test such branches |
+
+A timeout that ends an activity's retries still wraps the last attempt's
+failure, so `Error.error_type` may name that application failure while
+`Error.origin` is the timeout. `(Error.view e).details` holds only
+application and cancellation details. The `last_heartbeat_details` that
+Temporal records on a timeout or reset layer are returned separately by
+`Error.last_heartbeat_details`, so an activity's error-details codec never
+decodes a heartbeat payload. The same classification applies to failures a
+client `wait` or `wait_update` decodes, and a `wait` that ends cancelled,
+terminated or timed out reports `` `Cancelled ``, `` `Terminated `` or
+`` `Timeout `Unspecified `` (Temporal does not record which workflow timeout
+expired). `Temporal.Testing` does not simulate
+activity timeouts (#1160); its virtual-deadline errors are created by the
+SDK, so their origin is `None`.
+
+Neither the origin nor the heartbeat details are transmitted: an error that
+an activity or workflow returns is sent with only its category, message,
+retryability, details and type. Otherwise the cause chain is not preserved as
+structure. Inbound causes appear in the error message, and outbound OCaml
+failures carry no `cause`. Every failure
 the SDK emits uses the source `"ocaml-temporal"`.
 
 `non_retryable=false` permits Temporal's configured workflow retry policy to

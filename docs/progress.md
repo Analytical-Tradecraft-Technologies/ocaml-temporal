@@ -6210,6 +6210,24 @@ same child ID is refused under `` `Reject_duplicate `` and reused under
 The parent's error is not yet a typed timeout kind (#1143), and child memo
 and search attributes remain blocked by #512.
 
+## 2026-10-24: Typed failure origin and heartbeat details (#1143)
+
+`Temporal.Error.origin` classifies an error received from Temporal by the
+first layer of its cause chain past the activity, child-workflow and Nexus
+operation wrappers: `` `Application ``, `` `Timeout t `` (with the timeout
+type, also through `Error.timeout_type`), `` `Server ``, `` `Cancelled ``,
+`` `Terminated `` or `` `Other ``; it is `None` for an error the SDK or
+application created. Workflow code can therefore tell an activity timeout
+from a business or server failure without parsing the message, and the
+category stays `` `Activity `` or `` `Child_workflow ``. Heartbeat payloads of
+timeout and reset layers are no longer merged into `details`; they are
+returned by `Error.last_heartbeat_details`. The native workflow path and the
+client's `wait` share the classification (`Failure_diagnostic`). Covered by
+focused protocol tests and a native-worker test that resolves an activity
+with a heartbeat timeout. `Error.make` accepts `?origin` and
+`?last_heartbeat_details` for tests; neither is transmitted. A live
+cross-SDK timeout check (#517) remains open.
+
 ## 2026-10-24: Live timer cancellation regression (#1134)
 
 `test/integration/timer_cancellation` runs in

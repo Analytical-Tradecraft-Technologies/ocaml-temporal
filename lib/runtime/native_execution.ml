@@ -316,36 +316,12 @@ let is_null_protocol_payload (value : Protocol.payload) =
   | [ ("encoding", bytes) ] -> Bytes.equal bytes (Bytes.of_string "binary/null")
   | _ -> false
 
-(** Collects application and cancellation details through an activity wrapper.
-    Temporal commonly reports an activity failure as an outer [Activity] record
-    whose [cause] contains the application failure and its payloads. The bounded
-    walk preserves details from every such layer without allowing a malformed
-    recursive value to consume unbounded stack or memory. *)
-let failure_details (failure : Protocol.failure) =
-  let rec loop depth reversed (value : Protocol.failure) =
-    let reversed =
-      match value.info with
-      | Protocol.Application { details; _ } | Protocol.Canceled { details; _ }
-        ->
-          List.rev_append details reversed
-      | Protocol.Timeout_failure { last_heartbeat_details; _ }
-      | Protocol.Reset_workflow { last_heartbeat_details } ->
-          List.rev_append last_heartbeat_details reversed
-      | Protocol.Activity _ | Protocol.Child_workflow _ | Protocol.Terminated _
-      | Protocol.Server _ | Protocol.Nexus_operation _ | Protocol.Nexus_handler _
-      | Protocol.Absent ->
-          reversed
-    in
-    match value.cause with
-    | Some cause when depth < 128 -> loop (depth + 1) reversed cause
-    | None | Some _ -> List.rev reversed
-  in
-  loop 0 [] failure
-
 (** Converts one protocol failure to the broad typed error used by workflow
-    futures. The error view retains the primary category, details, and the
-    innermost application failure type (so OCaml code can branch on a business
-    error type raised by an activity or child in any SDK), while the protocol's
+    futures. The error view retains the primary category, application and
+    cancellation details, and the innermost application failure type (so
+    OCaml code can branch on a business error type raised by an activity or
+    child in any SDK). The failure's origin and its heartbeat details, kept
+    apart from [details], are recorded too (#1143), while the protocol's
     richer recursive fields are included in its diagnostic. *)
 let runtime_error_of_failure path ~category (failure : Protocol.failure) =
   let rec details_loop reversed = function
@@ -354,12 +330,16 @@ let runtime_error_of_failure path ~category (failure : Protocol.failure) =
         let* payload = runtime_payload (path ^ ".details") payload in
         details_loop (payload :: reversed) rest
   in
-  let details = failure_details failure in
-  let* details = details_loop [] details in
+  let* details = details_loop [] (Failure_diagnostic.failure_details failure) in
+  let* last_heartbeat_details =
+    details_loop [] (Failure_diagnostic.last_heartbeat_details failure)
+  in
   let non_retryable = Protocol.failure_non_retryable failure in
   let error_type = Failure_diagnostic.application_failure_type failure in
   Ok
-    (Temporal_base.Error.make ~non_retryable ?error_type ~details ~category
+    (Temporal_base.Error.make ~non_retryable ?error_type ~details
+       ~origin:(Failure_diagnostic.failure_origin failure)
+       ~last_heartbeat_details ~category
        ~message:(Failure_diagnostic.failure_diagnostic failure)
        ())
 

@@ -245,6 +245,66 @@ let sanitize_inbound_error_type value =
     Buffer.add_string buffer marker;
     Buffer.contents buffer
 
+(** Classifies the first non-wrapper layer (#1143). Wrappers only say which
+    operation failed, so they defer to their cause, as for
+    [application_failure_type]; a malformed chain deeper than the bound is
+    [`Other]. *)
+let failure_origin (failure : failure) =
+  let rec loop depth (value : failure) =
+    let inward () =
+      match value.cause with
+      | Some cause when depth < max_cause_depth -> loop (depth + 1) cause
+      | None | Some _ -> `Other
+    in
+    match value.info with
+    | Application _ -> `Application
+    | Timeout_failure { timeout_type; _ } ->
+        `Timeout
+          (match timeout_type with
+          | Timeout_start_to_close -> `Start_to_close
+          | Timeout_schedule_to_start -> `Schedule_to_start
+          | Timeout_schedule_to_close -> `Schedule_to_close
+          | Timeout_heartbeat -> `Heartbeat
+          | Timeout_unspecified -> `Unspecified)
+    | Server _ -> `Server
+    | Canceled _ -> `Cancelled
+    | Terminated _ -> `Terminated
+    | Activity _ | Child_workflow _ | Nexus_operation _ -> inward ()
+    | Absent when Option.is_some value.cause -> inward ()
+    | Absent | Reset_workflow _ | Nexus_handler _ -> `Other
+  in
+  loop 0 failure
+
+(** Walks the bounded [cause] chain, appending the payloads [select] picks
+    from each layer, outer to inner. *)
+let collect_payloads select (failure : failure) =
+  let rec loop depth reversed (value : failure) =
+    let reversed = List.rev_append (select value.info) reversed in
+    match value.cause with
+    | Some cause when depth < max_cause_depth -> loop (depth + 1) reversed cause
+    | None | Some _ -> List.rev reversed
+  in
+  loop 0 [] failure
+
+(** Application and cancellation details only; heartbeat payloads are a
+    timeout's or reset's own record, not error details (#1143). *)
+let failure_details =
+  collect_payloads (function
+    | Application { details; _ } | Canceled { details; _ } -> details
+    | Timeout_failure _ | Reset_workflow _ | Activity _ | Child_workflow _
+    | Terminated _ | Server _ | Nexus_operation _ | Nexus_handler _ | Absent ->
+        [])
+
+(** The heartbeat payloads [failure_details] leaves out. *)
+let last_heartbeat_details =
+  collect_payloads (function
+    | Timeout_failure { last_heartbeat_details; _ }
+    | Reset_workflow { last_heartbeat_details } ->
+        last_heartbeat_details
+    | Application _ | Canceled _ | Activity _ | Child_workflow _ | Terminated _
+    | Server _ | Nexus_operation _ | Nexus_handler _ | Absent ->
+        [])
+
 (** Searches outer-to-inner for the first [Application] layer. In the standard
     Temporal shapes that layer is the innermost meaningful failure: Core wraps
     an application failure as [Activity -> Application] or

@@ -9,6 +9,9 @@ let of_base (error : Temporal_base.Error.t) : Error.t =
   let view = Temporal_base.Error.view error in
   Error.make ~non_retryable:view.non_retryable ?error_type:view.error_type
     ~details:(List.map Payload_private.of_base view.details)
+    ?origin:(Temporal_base.Error.origin error)
+    ~last_heartbeat_details:
+      (List.map Payload_private.of_base (Temporal_base.Error.last_heartbeat_details error))
     ~category:view.category ~message:view.message ()
 
 (* Copies a public error into the base representation required by Core. *)
@@ -18,4 +21,7 @@ let to_base (error : Error.t) : Temporal_base.Error.t =
   let view = Error.view error in
   Temporal_base.Error.make ~non_retryable:view.non_retryable
     ?error_type:view.error_type ~details:(List.map Payload_private.to_base view.details)
+    ?origin:(Error.origin error)
+    ~last_heartbeat_details:
+      (List.map Payload_private.to_base (Error.last_heartbeat_details error))
     ~category:view.category ~message:view.message ()

@@ -2109,6 +2109,98 @@ let test_activity_command_retires_lease () =
   if Hashtbl.length supervisor.leased <> 0 then
     failwith "activity command left a native lease outstanding"
 
+(** An activity that exhausts its heartbeat timeout reaches workflow code as
+    a typed timeout (#1143): the error keeps the [`Activity] category and the
+    inner application type, [Error.origin] reports [`Timeout `Heartbeat], the
+    application detail stays in [details], and the heartbeat payload is only
+    in [Error.last_heartbeat_details]. *)
+let test_activity_timeout_origin () =
+  let observed = ref None in
+  let activity =
+    Temporal.Activity.remote ~name:"native_worker_timed_out_activity"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+  in
+  let workflow =
+    Temporal.Workflow.define ~name:"native_worker_activity_timeout_origin"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        match Temporal.Activity.execute activity () with
+        | Ok () -> Error (Temporal.Error.defect ~message:"timed-out activity succeeded")
+        | Error error ->
+            observed := Some error;
+            Ok ())
+  in
+  let payload text : Protocol.payload = { metadata = []; data = Bytes.of_string text } in
+  let layer info cause : Protocol.failure =
+    { message = "layer"; source = "test"; stack_trace = ""; encoded_attributes = None; cause; info }
+  in
+  let failure =
+    layer
+      (Protocol.Activity
+         {
+           scheduled_event_id = 5L;
+           started_event_id = 6L;
+           identity = "worker";
+           activity_type = "native_worker_timed_out_activity";
+           activity_id = "1";
+           retry_state = Protocol.Timeout;
+         })
+      (Some
+         (layer
+            (Protocol.Timeout_failure
+               {
+                 timeout_type = Protocol.Timeout_heartbeat;
+                 last_heartbeat_details = [ payload "progress-42" ];
+               })
+            (Some
+               (layer
+                  (Protocol.Application
+                     {
+                       type_name = "LastAttempt";
+                       non_retryable = false;
+                       details = [ payload "business" ];
+                       category = Protocol.Application_category_unspecified;
+                       next_retry_delay = None;
+                     })
+                  None))))
+  in
+  let run_id = "run-activity-timeout-origin" in
+  let supervisor = fake_supervisor () in
+  enqueue supervisor
+    (activation ~run_id
+       [ initialize ~run_id ~workflow_type:"native_worker_activity_timeout_origin" ]);
+  let worker = worker supervisor [ Adapter.register workflow ] in
+  begin match Worker.poll worker with
+  | Ok (Adapter.Completed { terminal = false; _ }) -> ()
+  | Ok _ -> failwith "activity timeout fixture did not suspend"
+  | Error error -> failwith ("activity timeout setup failed: " ^ error.message)
+  end;
+  enqueue supervisor
+    (activation ~run_id [ Protocol.Resolve_activity { seq = 1L; result = Protocol.Failed failure } ]);
+  begin match Worker.poll worker with
+  | Ok (Adapter.Completed { terminal = true; _ }) -> ()
+  | Ok _ -> failwith "activity timeout did not complete the workflow"
+  | Error error -> failwith ("activity timeout resolution failed: " ^ error.message)
+  end;
+  let error =
+    match !observed with
+    | Some error -> error
+    | None -> failwith "activity timeout never reached workflow code"
+  in
+  let data payloads = List.map (fun (value : Temporal.Payload.t) -> Bytes.to_string value.data) payloads in
+  let view = Temporal.Error.view error in
+  if view.category <> `Activity then failwith "activity timeout lost its category";
+  if Temporal.Error.origin error <> Some (`Timeout `Heartbeat) then
+    failwith "activity timeout origin was not a heartbeat timeout";
+  if Temporal.Error.timeout_type error <> Some `Heartbeat then
+    failwith "activity timeout type was not heartbeat";
+  if Temporal.Error.error_type error <> Some "LastAttempt" then
+    failwith "activity timeout lost the last attempt's application type";
+  if data view.details <> [ "business" ] then
+    failwith "activity timeout details contained heartbeat payloads";
+  if data (Temporal.Error.last_heartbeat_details error) <> [ "progress-42" ] then
+    failwith "activity timeout heartbeat details were not exposed";
+  Worker.discard worker
+
 (** Proves that [discard] disposes an execution that is blocked awaiting an
     activity result, and therefore lives only in the run registry
     ([adapter.runs]), never in the pending-completion table. Native worker
@@ -3311,6 +3403,7 @@ let () =
   test_failure_completion_exception_is_typed ();
   test_resumed_defect_discards_run ();
   test_activity_command_retires_lease ();
+  test_activity_timeout_origin ();
   test_discard_shuts_down_blocked_execution ();
   test_child_command_and_resolution_lifecycle ();
   test_child_terminal_before_start_retires_parent_lease ();

@@ -400,10 +400,30 @@ let _error_make :
     ?non_retryable:bool ->
     ?error_type:string ->
     ?details:T.Payload.t list ->
+    ?origin:T.Error.origin ->
+    ?last_heartbeat_details:T.Payload.t list ->
     category:T.Error.category ->
     message:string ->
     unit -> T.Error.t =
   T.Error.make
+
+let _error_origin : T.Error.t -> T.Error.origin option = T.Error.origin
+let _error_timeout_type : T.Error.t -> T.Error.timeout_type option =
+  T.Error.timeout_type
+let _error_last_heartbeat_details : T.Error.t -> T.Payload.t list =
+  T.Error.last_heartbeat_details
+
+let _error_origin_cases : T.Error.origin -> int = function
+  | `Application -> 1
+  | `Timeout `Start_to_close -> 2
+  | `Timeout `Schedule_to_start -> 3
+  | `Timeout `Schedule_to_close -> 4
+  | `Timeout `Heartbeat -> 5
+  | `Timeout `Unspecified -> 6
+  | `Server -> 7
+  | `Cancelled -> 8
+  | `Terminated -> 9
+  | `Other -> 10
 
 let _error_view : T.Error.t -> T.Error.view = T.Error.view
 let _error_kind : T.Error.t -> string = T.Error.kind
