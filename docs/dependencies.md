@@ -640,7 +640,7 @@ version comment recorded beside a commit pin.
 
 | Action | Pinned ref | Release | License | Used for |
 |---|---|---|---|---|
-| `actions/checkout` | `v7` | v7 | MIT | Repository checkout |
+| `actions/checkout` | `3d3c42e5aac5ba805825da76410c181273ba90b1` | v7 | MIT | Repository checkout |
 | `actions/attest-build-provenance` | `4d101475d8b20a2381f78447822ac1eab6504dd8` | v4.2.2 | MIT | Signing SLSA build provenance for the published release assets |
 | `actions/cache/restore` | `caa296126883cff596d87d8935842f9db880ef25` | v5 | MIT | Restoring verified Rust bridge bundles |
 | `actions/cache/save` | `caa296126883cff596d87d8935842f9db880ef25` | v5 | MIT | Saving verified Rust bridge bundles |
@@ -651,8 +651,8 @@ version comment recorded beside a commit pin.
 | `ocaml/setup-ocaml` | `93303b622b2522e4411e295f9e77411a24912ac7` | v3.9.0 | MIT | Native macOS and Windows OCaml compilers |
 | `taiki-e/install-action` | `a4d3f3f761dcd95cce1b72cb61cb6d1963438177` | v2.87.30 | Apache-2.0 OR MIT | Installing the pinned CI-only quality tools |
 
-`actions/checkout` is referenced by its major-version tag rather than an
-immutable commit; every other action is pinned by commit.
+Every action, `actions/checkout` included (#1150), is pinned by commit, and
+the quality contract rejects a mutable reference in any workflow.
 
 `actions/attest-build-provenance` runs only in the Release workflow's publish
 job. From v4 it is a composite wrapper around `actions/attest`, which it pins

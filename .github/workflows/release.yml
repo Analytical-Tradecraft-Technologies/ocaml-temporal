@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out the exact requested commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Validate the version and release source
         env:
           RELEASE_TAG: ${{ inputs.tag }}
@@ -74,7 +74,7 @@ jobs:
       sha256: ${{ steps.archive.outputs.sha256 }}
     steps:
       - name: Check out the exact requested commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Every archive redistributes the statically linked Rust graph, so its
       # licence texts are copied from the locked package sources that
       # `cargo metadata --locked` downloads, or for crates that publish none
@@ -132,7 +132,7 @@ jobs:
       ARCHIVE_SHA256: ${{ needs.source-archive.outputs.sha256 }}
     steps:
       - name: Check out the exact requested commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set up the exact OCaml compiler
         uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3.9.0
         with:
@@ -183,7 +183,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out the exact tested commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Download all four tested bridge bundles
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:

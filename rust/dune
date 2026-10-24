@@ -1,0 +1,8 @@
+;; The Rust workspace is a Dune [source_tree] input of the bridge rule in
+;; [lib/core_bridge/dune], which copies it into the sandbox and rebuilds the
+;; bridge whenever it changes. Cargo's output ([target], the default of a
+;; plain [cargo] run here) and any unpacked [vendor] tree are build products,
+;; not sources: without this exclusion every [dune build] would scan them,
+;; potentially gigabytes, and rebuild the bridge after any [cargo test]
+;; (#1150). The offline source archive's [vendor.tar] is a file and is kept.
+(dirs :standard \ target vendor)
