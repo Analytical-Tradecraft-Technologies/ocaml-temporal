@@ -533,13 +533,14 @@ test-live-acceptance-inventory-contract:
 	sh test/smoke/test_live_acceptance_inventory_contract.sh .
 
 # The license-policy fixtures (#1150) need `opam show`, so they run in the
-# Compose development image; the native lanes override this with their own
-# OCaml toolchain.
-LICENSE_POLICY_RUN ?= $(COMPOSE_RUN)
+# Compose development image. The native macOS lane runs them with its own
+# OCaml toolchain; native Windows skips them because its opam cannot read the
+# MSYS temporary fixture paths, and the policy itself is platform-independent.
+LICENSE_POLICY_TEST ?= $(COMPOSE_RUN) sh test/smoke/test_license_policy.sh .
 
 test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness test-temporal-live-regressions-contract
 	sh test/smoke/test_quality_contract.sh .
-	$(LICENSE_POLICY_RUN) sh test/smoke/test_license_policy.sh .
+	$(LICENSE_POLICY_TEST)
 	sh test/smoke/test_build_jobs_contract.sh .
 	sh test/smoke/test_opam_locked_deps.sh .
 	sh test/smoke/test_release_tag_contract.sh .
@@ -1408,7 +1409,7 @@ native-build:
 # AddressSanitizer and UndefinedBehaviorSanitizer, whose runtimes the Windows
 # MinGW toolchain does not ship, so Windows covers the bridge through the
 # OCaml and Rust suites only; see docs/reference/quality-gates.md.
-native-test: LICENSE_POLICY_RUN = $(NATIVE_RUN)
+native-test: LICENSE_POLICY_TEST = $(if $(filter Darwin,$(shell uname -s)),$(NATIVE_RUN) sh test/smoke/test_license_policy.sh .,@echo "license-policy fixtures skipped: Windows opam cannot read the MSYS fixture paths; Linux and macOS cover the policy")
 native-test: $(NATIVE_RUST_TEST_TARGET) native-test-install test-quality-contract
 	$(NATIVE_ENV) $(NATIVE_RUN) dune runtest $(DUNE_BUILD_ARGS)
 	$(if $(filter Darwin,$(shell uname -s)),$(NATIVE_ENV) sh test/bridge/test_abi.sh,@echo "C ABI harness skipped: no sanitizer runtimes in the Windows MinGW toolchain")

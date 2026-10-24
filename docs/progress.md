@@ -6079,7 +6079,8 @@ for cancel-before/after-fire.
 
 - The OPAM license-policy fixtures (`test/smoke/test_license_policy.sh`) now
   run in `make test-quality-contract`: in the Compose image on Linux and
-  with the native OCaml toolchain on the native lanes. They take the
+  with the native OCaml toolchain on macOS. Windows skips them, because its
+  opam cannot read the MSYS temporary fixture paths. They take the
   repository root as an argument, so they no longer depend on the working
   directory. A mutant allow-list that admits GPL fails them.
 - `rust/dune` excludes `target` and `vendor` from Dune's source tree. With a
