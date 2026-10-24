@@ -107,6 +107,16 @@ CASES = {
         "Child run started with those options; it reads them through "
         "Workflow.info.",
     ),
+    # corpus-v3-random (#1155).
+    "random-parent": (
+        ["timer", "child-workflow", "deterministic-randomness"],
+        "Parent draws uuid4, random_bytes and random_float, then uuid4 again "
+        "after a timer, and starts a child under an ID built from the draws.",
+    ),
+    "random-child": (
+        ["child-workflow", "child-side"],
+        "Child run started under the drawn ID.",
+    ),
 }
 
 # Patch lifecycle cases (issue #531). Each stage of the lifecycle captures the

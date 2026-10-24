@@ -6128,6 +6128,27 @@ resolution and an idempotent late cancel, cancellation during backoff, and no
 command after completion or for an already-cancelled scope. Live
 qualification of local cancellation remains open.
 
+## 2026-10-24: Replay-safe uuid4, random_float and random_bytes (#1155)
+
+`Workflow.uuid4`, `random_float` and `random_bytes ~length` draw from the
+run's seeded stream, like `random_int`, so replay sees the same values and a
+reset continues from its recorded seed. The new draws see each stream word
+through the SplitMix64 output finalizer, so even a small seed gives well-mixed
+bits. `random_int` keeps the raw words, so earlier histories replay
+unchanged. `test/runtime/test_workflow_random.ml` checks:
+
+- same-seed equality and reset behavior;
+- a pinned golden stream;
+- the UUID v4 layout;
+- the float and byte bounds;
+- the defects outside a workflow and in update validators.
+
+Capture `live-2026-10-24-random` adds a `corpus.random_parent` history,
+whose child workflow ID is built from the draws, and its child. The negative
+control `negative-random-reordered` draws in another order and must report
+nondeterminism. All 88 cases pass. The workflow guide shows a `uuid4`
+fan-out.
+
 ## 2026-10-24: Bounded Client.wait and wait_update (#1136)
 
 `Client.wait ?timeout` and `Client.wait_update ?timeout` bound the caller's

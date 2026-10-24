@@ -199,6 +199,26 @@ val update_random_seed : t -> randomness_seed:string -> unit
     owner Domain.  Invalid bounds and lifecycle misuse are typed defects. *)
 val random_int : t -> bound:int -> (int, Temporal_base.Error.t) result
 
+(** Draws a float [x] with [0. <= x < 1.] from the same stream (#1155): the
+    top 53 bits of one (finalized) word scaled by 2{^-53}. Lifecycle misuse is a typed
+    defect, as for {!random_int}. The float, bytes and UUID draws see each
+    stream word through the SplitMix64 output finalizer; {!random_int}
+    keeps the raw words. *)
+val random_float : t -> (float, Temporal_base.Error.t) result
+
+(** Largest length {!random_bytes} accepts. *)
+val max_random_bytes : int
+
+(** Draws [length] bytes (0 to {!max_random_bytes}) from the same stream,
+    one word per eight bytes, little-endian (#1155). An out-of-range length
+    and lifecycle misuse are typed defects. *)
+val random_bytes : t -> length:int -> (string, Temporal_base.Error.t) result
+
+(** Draws a version-4 UUID from the same stream (#1155), as 36 lowercase
+    hexadecimal characters with hyphens, built from one {!random_bytes} draw
+    of 16 bytes with the RFC 9562 version and variant bits set. *)
+val uuid4 : t -> (string, Temporal_base.Error.t) result
+
 (** Runs a callback in the read-only mode used by live update validators.
     Deterministic workflow helpers that would mutate execution state, such as
     [random_int], return a typed defect while this callback is active. *)

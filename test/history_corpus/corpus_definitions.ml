@@ -736,6 +736,65 @@ let cancellation_workflows =
     plain options_child_workflow;
   ]
 
+(** {1 Deterministic randomness workflows (#1155)}
+
+    Frozen with the [corpus-v3-random] capture. Replay compares commands,
+    not payloads, so the parent turns its draws into its child's workflow
+    ID, which Core does check: a stream that changed between capture and
+    replay starts a child with another ID and is nondeterministic. *)
+
+let random_parent_workflow_type = "corpus.random_parent"
+let random_child_workflow_type = "corpus.random_child"
+
+(** [corpus.random_child]: completes at once. *)
+let random_child_workflow =
+  Temporal.Workflow.define ~name:random_child_workflow_type ~input:Temporal.Codec.unit
+    ~output:Temporal.Codec.string (fun () -> Ok "RANDOM:CHILD")
+
+(** Hex-encodes drawn bytes for the child ID. *)
+let hex text =
+  String.concat ""
+    (List.map (fun c -> Printf.sprintf "%02x" (Char.code c)) (List.of_seq (String.to_seq text)))
+
+(** The child ID built from the draws, in the frozen order [uuid4],
+    [random_bytes ~length:6], [random_float] before a timer and [uuid4]
+    after it, so draws on both sides of a workflow task boundary count. *)
+let random_child_id ~reordered =
+  let open Temporal.Result_syntax in
+  let* first, bytes, float =
+    if reordered then
+      (* The negative control draws the float first. *)
+      let* float = Temporal.Workflow.random_float () in
+      let* first = Temporal.Workflow.uuid4 () in
+      let* bytes = Temporal.Workflow.random_bytes ~length:6 in
+      Ok (first, bytes, float)
+    else
+      let* first = Temporal.Workflow.uuid4 () in
+      let* bytes = Temporal.Workflow.random_bytes ~length:6 in
+      let* float = Temporal.Workflow.random_float () in
+      Ok (first, bytes, float)
+  in
+  let* () = Temporal.Workflow.sleep corpus_timer in
+  let* second = Temporal.Workflow.uuid4 () in
+  Ok
+    (Printf.sprintf "random-%s-%s-%06d-%s" first (hex bytes)
+       (int_of_float (float *. 1_000_000.))
+       second)
+
+(** [corpus.random_parent] with the frozen or the reordered draws: runs
+    [corpus.random_child] under the drawn ID and returns that ID. *)
+let random_parent ~reordered =
+  Temporal.Workflow.define ~name:random_parent_workflow_type ~input:Temporal.Codec.unit
+    ~output:Temporal.Codec.string (fun () ->
+      let open Temporal.Result_syntax in
+      let* id = random_child_id ~reordered in
+      let* _ = Temporal.Child_workflow.execute ~id random_child_workflow () in
+      Ok id)
+
+(** Every [corpus-v3-random] registration. *)
+let random_workflows =
+  [ plain (random_parent ~reordered:false); plain random_child_workflow ]
+
 (** {1 Reused fixture definitions} *)
 
 (** The corrected generation of [test/integration/temporal/task_failure]. The
@@ -808,6 +867,9 @@ let definition_sets =
     ("corpus-lifecycle-removed", lifecycle_workflows Lifecycle_removed);
     ("corpus-v2-cancellation", cancellation_workflows);
     ("negative-timer-cancel-dropped", [ plain timer_cancel_dropped_workflow ]);
+    ("corpus-v3-random", random_workflows);
+    ( "negative-random-reordered",
+      [ plain (random_parent ~reordered:true); plain random_child_workflow ] );
   ]
 
 (** Set names in declaration order. *)

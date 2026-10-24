@@ -265,6 +265,38 @@ Activities are the place for external work such as calling an LLM. The
 activity result is recorded by Temporal, so replay can use that recorded result
 without calling the external service again.
 
+### Random values and generated IDs
+
+`Workflow.random_int`, `random_float`, `random_bytes` and `uuid4` draw from a
+stream that Temporal seeds for each run (#1155). Replay sees exactly the same
+values, and a workflow reset continues with the reset's recorded seed, so
+these are the replay-safe replacements for `Random`. A common use is a fan-out
+whose child workflow IDs must differ between runs but stay identical on
+replay:
+
+```ocaml
+let summarize_all documents =
+  let open Temporal.Result_syntax in
+  let* children =
+    List.fold_right
+      (fun document children ->
+        let* children = children in
+        let* id = Temporal.Workflow.uuid4 () in
+        Ok
+          (Temporal.Child_workflow.start ~id:("summarize-" ^ id) summarize_child
+             document
+          :: children))
+      documents (Ok [])
+  in
+  Temporal.Future.await (Temporal.Future.all children)
+```
+
+Draw in a deterministic order (here, the order of the input list), because
+the stream is shared by every draw in the run. A UUID drawn this way is not a
+security token: the seed is recorded in the run's history. There is no
+generic "side effect" API for reading the outside world; run such code in a
+local activity, whose result is recorded.
+
 ### Update indexed search attributes
 
 Workflows can publish indexed search attributes by emitting one deterministic

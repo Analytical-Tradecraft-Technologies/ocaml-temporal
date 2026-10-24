@@ -197,6 +197,7 @@ Several entries may share one history file; they must agree on its checksum.
 | `task-failure-2026-09-20` | `task-failure-body`, `-encoder`, `-missing`, `-business-retryable`, `-business-permanent` | Copied byte for byte from the [#511 workflow-task failure gate](workflow-failures.md) (`make test-temporal-task-failure-live`), whose own manifest retains run IDs and binary hashes. |
 | `initial-signals-synthetic` | `initial-signals` | The synthetic history from the [#694 regression](../../test/integration/temporal/initial_signals/README.md); not from a server. |
 | `live-2026-10-24` | `timer-cancel-before-fire`, `timer-cancel-after-fire`, `condition-timeout`, `condition-satisfied`, `options-parent`, `options-child` | Captured for [#1134](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/1134) and [#1135](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/1135) with only the `corpus-v2-cancellation` generation, against Temporal Server 1.32.0 (Compose stack, digest-pinned), Core `8fe478ee`, OCaml 5.4.1, from a clean tree at the recorded `sdk_commit`. The worker ran natively on macOS. Scoped timers cancelled before and after firing, a bounded condition that times out and one satisfied by a signal, and a child started with execution/run/task timeouts and an ID reuse policy. |
+| `live-2026-10-24-random` | `random-parent`, `random-child` | Captured for [#1155](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/1155) with only the `corpus-v3-random` generation, against Temporal Server 1.32.0 (Compose stack, digest-pinned), Core `8fe478ee`, OCaml 5.4.1, from a clean tree at the recorded `sdk_commit`. The worker ran natively on macOS. A parent draws `uuid4`, `random_bytes` and `random_float`, then `uuid4` again after a timer, and starts a child under an ID built from the draws. |
 | `live-2026-10-11` | `lifecycle-{multi,loop,handlers}-{legacy,patched,deprecated,removed}`, `lifecycle-handover` | Captured for [#531](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/531) with only the four `corpus-lifecycle-*` generations, against Temporal Server 1.32.0 (Compose stack, digest-pinned), Core `95e97686`, OCaml 5.4.1, from a clean tree at the recorded `sdk_commit`. The worker ran natively on macOS. The handover run was started by the legacy process and finished by a fresh patched process. |
 
 Derived cases reuse those histories against other definition sets:
@@ -211,6 +212,12 @@ generation). Core reports both as `[TMPRL1100]` nondeterminism. A third,
 history against a definition whose long timer is unscoped and never cancelled:
 history records `TimerCanceled` with no matching command, so Core must report
 nondeterminism, which shows the corpus checks the cancellation itself.
+A fourth, `negative-random-reordered`, replays the `live-2026-10-24-random`
+parent history against a definition that draws its float before its first
+UUID. Replay compares commands, not payloads, so the parent builds its child
+workflow ID from its draws: the reordered draws start the child under another
+ID, which Core must report as nondeterminism. This shows the corpus checks
+the random stream itself.
 
 The `live-2026-10-11` histories are each replayed against every other
 lifecycle generation: `compat-lifecycle-<workflow>-<history stage>-on-<code
@@ -365,6 +372,7 @@ with a `not yet captured` feature and requires exactly those two problems.
 | `timer-cancellation` | replayed | `live-2026-10-24-timer-cancel-before-fire`, `-timer-cancel-after-fire`, `-condition-satisfied` |
 | `condition-timeout` | replayed | `live-2026-10-24-condition-timeout`, `-condition-satisfied` |
 | `child-start-options` | replayed | `live-2026-10-24-options-parent`, `-options-child` |
+| `deterministic-randomness` | replayed | `live-2026-10-24-random-random-parent` |
 | `activity` | replayed | `live-2026-10-08-activity` and others |
 | `activity-retry` | replayed | `live-2026-10-08-activity-retry` |
 | `signal` | replayed | `live-2026-10-08-interaction`, lifecycle handler cases |

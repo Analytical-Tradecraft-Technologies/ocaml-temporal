@@ -271,6 +271,26 @@ let random_int ~bound =
       Temporal_sdk_kernel.Workflow_context_store.random_int context ~bound
       |> Result.map_error Error_private.of_base
 
+(** Runs one draw of the current run's deterministic stream, or reports
+    [name] used outside a workflow execution. *)
+let with_stream name draw =
+  match Temporal_sdk_kernel.Workflow_context_store.current () with
+  | None ->
+      Error
+        (Error.defect
+           ~message:("Temporal.Workflow." ^ name ^ " used outside a workflow execution"))
+  | Some context -> draw context |> Result.map_error Error_private.of_base
+
+(** Deterministic float, bytes and UUID draws (#1155); see the interface. *)
+let random_float () =
+  with_stream "random_float" Temporal_sdk_kernel.Workflow_context_store.random_float
+
+let random_bytes ~length =
+  with_stream "random_bytes" (fun context ->
+      Temporal_sdk_kernel.Workflow_context_store.random_bytes context ~length)
+
+let uuid4 () = with_stream "uuid4" Temporal_sdk_kernel.Workflow_context_store.uuid4
+
 (** Reads the deployment identity retained for the current activation. The
     runtime clears this field before every task, so [None] cannot accidentally
     report a previous task's build. *)
