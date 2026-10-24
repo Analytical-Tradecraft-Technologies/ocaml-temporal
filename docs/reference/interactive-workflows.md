@@ -39,7 +39,9 @@ The `update_run_close` live regression (#520) pins the typed result every
 update caller receives when the run completes, is cancelled, or is terminated
 before the update finishes; see
 [Update callers when the run closes](#update-callers-when-the-run-closes).
-Query deadlines and broader interaction coverage remain future work.
+A query is bounded by `Client.query ?rpc_timeout` (default 30 seconds; see
+the [client protocol](client-protocol.md#rpc-deadlines-499)); broader
+interaction coverage remains future work.
 
 `Temporal.Client.query` is a separate control-plane operation: it asks an
 already registered workflow for an output-only query through an exact

@@ -6097,6 +6097,30 @@ OCaml `test_child_timeout_options` decodes, and
 under #1135: memo and search attributes (blocked by #512), a live
 run-timeout regression and a corpus history.
 
+## 2026-10-24: Interface and reference corrections from the second audit (#1146)
+
+Eight rows of the #1146 audit are corrected against the code:
+
+- `Activity.Context.info` now says `Temporal.Testing` contexts carry task
+  metadata, with virtual-clock times; only the `mock://` backend's do not.
+  `Async_context.info` was already accurate, because `Temporal.Testing` does
+  not run asynchronous activities.
+- The `Temporal.Testing` differences now list that workflow timeouts are
+  always `None` and that activity times come from the virtual clock.
+- The start-metadata reference now says Testing records a child's retry
+  policy.
+- The workflow-failures reference now names `Client.start ?retry_policy`.
+- The observability reference now describes the post-#790 validator rule
+  and the handler rule after acceptance.
+- `Update.Handler.make` now documents what a handler `Error` does.
+- The interactive-workflows reference now names `Client.query ?rpc_timeout`.
+- The runtime invariants now describe the one `Obj`-based store,
+  `Workflow_context.Local`, and why the value restriction makes it sound.
+
+Two rows are left to the issues that change the code: the detached Core
+finalizer's unbounded drop (#1149) and the `backend.ml` details comment
+(#1143, which removes that function).
+
 ## 2026-10-24: Release from the tag, not the master tip (#1144)
 
 The Release workflow is now dispatched from the version tag

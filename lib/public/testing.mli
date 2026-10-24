@@ -58,6 +58,14 @@
       start command but not enforced, so a child never times out.
     - Identifiers (workflow IDs, run IDs, update IDs) are deterministic
       counters, so repeated runs of a test observe identical values.
+    - [Workflow.Info.execution_timeout], [run_timeout] and [task_timeout]
+      are always [None], whereas a native worker normally reports the 10 s
+      task timeout Temporal records by default. [Workflow.Info.retry_policy]
+      is recorded only for a child started with one.
+    - An activity's {!Activity.Info.scheduled_time} is the virtual time at
+      which it was scheduled, and its {!Activity.Info.started_time} and
+      {!Activity.Info.current_attempt_scheduled_time} are the virtual time at
+      which the attempt ran, not server timestamps.
 
     Threading: an environment and its handles must be used from one system
     thread, and workflow or activity code must not call back into the

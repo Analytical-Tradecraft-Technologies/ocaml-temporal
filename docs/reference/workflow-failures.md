@@ -88,10 +88,10 @@ failures carry no `cause`. Every failure
 the SDK emits uses the source `"ocaml-temporal"`.
 
 `non_retryable=false` permits Temporal's configured workflow retry policy to
-start another run. It does not itself install a retry policy. The current
-public `Client.start` has no workflow-retry-policy argument; absent a server
-retry policy, either flag closes the original run. Explicit child retry
-policies remain supported and are passed to Core unchanged. A defect's
+start another run. It does not itself install a retry policy: pass one with
+`Client.start ?retry_policy` (#499) or a child's `?retry_policy`, which are
+sent to Temporal unchanged. Absent a retry policy, either flag closes the
+original run. A defect's
 `non_retryable` diagnostic field does **not** prevent workflow-task retries,
 since it is no longer emitted as a workflow-execution failure. There is no
 worker-wide opt-in to make unexpected defects terminal. A workflow that
