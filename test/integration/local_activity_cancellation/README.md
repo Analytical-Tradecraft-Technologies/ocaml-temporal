@@ -9,13 +9,16 @@ make test-local-activity-cancellation-live RUN='opam exec --' \
 ```
 
 The driver creates a unique queue and one execution for each cancellation
-policy. A retryable local activity failure requests a 120-second delay. After
-the driver observes the durable timer in history, a signal cancels the original
-operation twice. The fixture requires the original future to resolve as
+policy, plus one whose local activity belongs to a scope. Workflow code uses
+only the public API (#1156): `Activity.start_local_handle` with an explicit
+policy, cancelled through `Activity.cancel`, or `Activity.start_local ~scope`
+with the local default policy, cancelled through `Scope.cancel`. A retryable
+local activity failure requests a 120-second delay. After the driver observes
+the durable timer in history, a signal cancels the original operation twice. The fixture requires the original future to resolve as
 cancelled, the workflow to complete, exactly one local activity marker, and
 cancellation of that exact timer. No timer may fire or workflow task fail.
 
-It replaces the worker process and queries all three completed executions,
+It replaces the worker process and queries all four completed executions,
 requiring Core to replay their histories and reconstruct the same cancelled
 state. An activity-side attempt log must still contain exactly one invocation
 per execution after replay. The driver terminates its remaining executions and
