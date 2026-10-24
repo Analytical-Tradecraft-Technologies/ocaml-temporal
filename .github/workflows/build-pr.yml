@@ -292,7 +292,9 @@ jobs:
     needs: [changes, rust-amd64, rust-arm64]
     name: OCaml ${{ matrix.label }} / ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # The job normally takes 21-29 minutes, most of it compiling the smoke
+    # executables, so a 30-minute limit cancelled healthy merge-group builds.
+    timeout-minutes: 45
     env:
       TEMPORAL_RUST_BRIDGE_DIR: /workspace/_build/rust-bridge
       OCAML_ARTIFACT_COMMIT: ${{ github.sha }}
