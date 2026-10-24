@@ -136,9 +136,9 @@ module Adapter = struct
       this private registry; keeping the optional query list here lets this
       test exercise the owner-Domain query path without a native handle. *)
   let register ?(signal_handlers = []) ?(query_handlers = [])
-      ?(update_handlers = []) definition =
+      ?(update_handlers = []) ?versioning_behavior definition =
     Raw_adapter.register ~signal_handlers ~query_handlers ~update_handlers
-      (base_workflow definition)
+      ?versioning_behavior (base_workflow definition)
 end
 
 (** Keeps workflow fixture sequencing on the same typed-result path as the
@@ -395,6 +395,47 @@ let test_terminal_workflow () =
   | Ok Adapter.Not_ready -> ()
   | _ -> failwith "empty queue did not report Not_ready"
   end
+
+(** A registration's versioning behavior (#1159) is declared on each
+    successful completion of its runs, while a registration without one and
+    a run's eviction acknowledgement leave it unspecified. *)
+let test_workflow_versioning_behavior () =
+  let supervisor = fake_supervisor () in
+  let activity =
+    Temporal.Activity.remote ~name:"native_worker_versioned_activity"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+  in
+  let define name =
+    Temporal.Workflow.define ~name ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+      (fun () -> Temporal.Activity.execute activity ())
+  in
+  let pinned = define "native_worker_versioned_pinned" in
+  let plain = define "native_worker_versioned_plain" in
+  let worker =
+    worker supervisor
+      [
+        Adapter.register ~versioning_behavior:Protocol.Versioning_pinned pinned;
+        Adapter.register plain;
+      ]
+  in
+  let first_completion ~run_id ~workflow_type =
+    enqueue supervisor (activation ~run_id [ initialize ~run_id ~workflow_type ]);
+    expect_completed ~terminal:false (Result.get_ok (Worker.poll worker));
+    (latest_completion supervisor).versioning_behavior
+  in
+  if first_completion ~run_id:"run-pinned" ~workflow_type:"native_worker_versioned_pinned"
+     <> Some Protocol.Versioning_pinned
+  then failwith "a pinned registration did not declare its behavior";
+  if first_completion ~run_id:"run-plain" ~workflow_type:"native_worker_versioned_plain"
+     <> None
+  then failwith "a registration without a behavior declared one";
+  enqueue supervisor
+    (activation ~run_id:"run-pinned"
+       [ Protocol.Remove_from_cache { message = "versioning eviction"; reason = Protocol.Cache_full } ]);
+  ignore (Worker.poll worker);
+  if (latest_completion supervisor).versioning_behavior <> None then
+    failwith "an eviction acknowledgement declared a versioning behavior";
+  Worker.discard worker
 
 (** Completed executions answer queries from retained local state without
     restarting their fibers. Core eviction releases that state, and a later
@@ -3374,6 +3415,7 @@ let () =
   test_update_defect_discards_acceptance_and_commands ();
   test_update_validator_defect_rejects ();
   test_terminal_workflow ();
+  test_workflow_versioning_behavior ();
   test_completed_workflow_queries ();
   test_activation_metadata_hook ();
   test_completion_metadata_hook_runs_after_acknowledgement ();
