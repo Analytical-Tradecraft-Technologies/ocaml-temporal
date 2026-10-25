@@ -254,8 +254,11 @@ Unlike Core, which only logs a failed background send, any failed send ends
 the token's interval, so the next heartbeat is sent at once and returns the
 server's own answer (`NotFound` closes the handle as before). A terminal
 `complete`, `fail`, or `cancel` first evicts the token, as Core evicts a
-completed activity: a sleeping trailing send is cancelled, and before a
-cancellation the pending details are flushed as Core does.
+completed activity: a sleeping trailing send is cancelled. Pending details
+that were never sent are kept as Core keeps them: a `fail` carries them as
+the request's `last_heartbeat_details` (#1207), so the retried attempt
+resumes from them, and a `cancel` is preceded by a heartbeat that flushes
+them. A `complete` drops them, because no attempt follows.
 
 Each token with state has one driver task on Core's Tokio runtime that owns
 a client and performs every send for it. Disconnect and runtime close abort
