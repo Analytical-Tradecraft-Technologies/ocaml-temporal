@@ -4856,8 +4856,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new_with_telemetr
 /// [`ocaml_temporal_core_v4_runtime_free`]), except that it holds a
 /// reference to `shared`'s Core instead of building its own. That reference
 /// keeps Core alive until the graph is released, even if `shared` is
-/// released first. A `shared` handle that was already released fails with
-/// `STATUS_INVALID_STATE`; a null one with `STATUS_INVALID_ARGUMENT`.
+/// released first. A null `shared` fails with `STATUS_INVALID_ARGUMENT`; a
+/// released handle is freed memory and must not be passed (#1226).
 ///
 /// # Safety
 ///
@@ -4974,8 +4974,8 @@ unsafe fn release_shared_runtime_slot(shared: *mut *mut SharedRuntime, wait: boo
 /// records nothing at all. The handle references Core's meter, not Core, so
 /// it may outlive the shared handle and every attached graph; it must be
 /// released exactly once with [`ocaml_temporal_core_v4_metric_meter_free`].
-/// A null `shared` fails with `STATUS_INVALID_ARGUMENT`, a released one with
-/// `STATUS_INVALID_STATE`.
+/// A null `shared` fails with `STATUS_INVALID_ARGUMENT`; a released handle
+/// is freed memory and must not be passed (#1226).
 ///
 /// # Safety
 ///
