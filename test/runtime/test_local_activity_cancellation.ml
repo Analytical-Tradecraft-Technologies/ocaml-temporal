@@ -62,7 +62,9 @@ let before_backoff ~is_replaying policy =
       cancel ();
       expect "repeated cancellation emitted work" [] (Context.take_commands context))
 
-(** A cancel during backoff removes the timer and resolves exactly once. *)
+(** A cancel during backoff removes the timer and resolves exactly once,
+    without a Core cancel: Core no longer owns an attempt and would reject it
+    as nondeterministic (#1208). *)
 let during_backoff ~is_replaying policy =
   with_activity ~is_replaying policy (fun context future drain cancel ->
       backoff context;
@@ -72,9 +74,7 @@ let during_backoff ~is_replaying policy =
         (Context.take_commands context);
       cancel ();
       expect_cancelled future;
-      expect "cancellation commands"
-        [Activation.Request_cancel_local_activity { seq = 1L };
-         Activation.Cancel_timer { seq = 2L }]
+      expect "cancellation commands" [Activation.Cancel_timer { seq = 2L }]
         (Context.take_commands context);
       cancel ();
       expect "repeated cancellation emitted work" [] (Context.take_commands context);
@@ -95,8 +95,7 @@ let before_timer_work ~is_replaying policy =
       | Error _ -> () | Ok () -> failwith "duplicate queued backoff was accepted");
       cancel ();
       expect_cancelled future;
-      expect "queued backoff cancellation"
-        [Activation.Request_cancel_local_activity { seq = 1L }]
+      expect "queued backoff cancellation emits no Core cancel" []
         (Context.take_commands context);
       drain ();
       expect "cancelled queued backoff started a timer" [] (Context.take_commands context);
@@ -114,8 +113,7 @@ let before_retry_work ~is_replaying policy =
       expect "retry emitted during the job pass" [] (Context.take_commands context);
       cancel ();
       expect_cancelled future;
-      expect "queued retry cancellation"
-        [Activation.Request_cancel_local_activity { seq = 1L }]
+      expect "queued retry cancellation emits no Core cancel" []
         (Context.take_commands context);
       drain ();
       expect "cancelled queued retry rescheduled activity" []

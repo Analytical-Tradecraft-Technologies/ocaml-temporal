@@ -58,7 +58,9 @@ type activity_resolution =
       [Schedule_local_activity] is queued.
 
     Every non-idle phase rejects a further Core backoff job for the sequence
-    and lets cancellation settle the operation without involving Core. *)
+    and lets cancellation settle the operation without involving Core: no
+    [Request_cancel_local_activity] is emitted then, because Core no longer
+    owns an attempt and rejects the cancel (#1208). *)
 type local_activity_backoff =
   | Backoff_idle
   | Backoff_timer_queued
@@ -950,17 +952,30 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
                     "unknown or completed activity sequence %Ld" seq))
         | None -> Ok ()
         | Some _ when !cancellation_requested -> Ok ()
-        | Some _ ->
-            (* Core's request-cancel command identifies the activity by sequence
-               only, so the handle exposes no ignored reason argument. *)
-            emit context
-              (if local then
-                 Activation.Request_cancel_local_activity { seq }
-               else Activation.Request_cancel_activity { seq });
+        | Some _ -> (
             cancellation_requested := true;
-            (match Hashtbl.find_opt context.local_activities seq with
-            | Some { backoff = Backoff_idle; _ } | None -> Ok ()
-            | Some state -> cancel_local_activity_backoff context ~seq state))
+            match Hashtbl.find_opt context.local_activities seq with
+            | Some ({ backoff = Backoff_timer_queued | Backoff_timer _
+                              | Backoff_retry_queued; _ } as state) ->
+                (* A local activity in a language-owned retry backoff has no
+                   attempt in Core: after reporting [DoBackoff], Core's
+                   local-activity machine has left [RequestSent], and in the
+                   same workflow task it rejects a cancel as an invalid
+                   transition, which fails the task as nondeterministic
+                   (#1208). The language layer owns the operation now, so it
+                   cancels the backoff timer and settles the future itself.
+                   The cancel command records no history event, so omitting
+                   it keeps every recorded history replayable. *)
+                cancel_local_activity_backoff context ~seq state
+            | Some { backoff = Backoff_idle; _ } | None ->
+                (* Core's request-cancel command identifies the activity by
+                   sequence only, so the handle exposes no ignored reason
+                   argument. *)
+                emit context
+                  (if local then
+                     Activation.Request_cancel_local_activity { seq }
+                   else Activation.Request_cancel_activity { seq });
+                Ok ()))
     | _ ->
         Error
           (Temporal_base.Error.defect
