@@ -173,3 +173,8 @@
   (language c)
   (names signal_test_stubs)
   (flags :standard -Wall -Wextra -Werror)))
+
+; Lifecycle strings at the documented 65,536-byte limit reach native code (#1224).
+(test
+ (name test_lifecycle_config_limits)
+ (libraries temporal_core_bridge))

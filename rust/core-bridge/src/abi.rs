@@ -106,14 +106,31 @@ pub const STATUS_ASYNC_HEARTBEAT_REJECTED: Status = 14;
 /// `MAX_PENDING_CALLS` (#796).
 pub const STATUS_RESOURCE_EXHAUSTED: Status = 15;
 
-/// Maximum accepted lifecycle configuration document size.
-const MAX_LIFECYCLE_CONFIG_BYTES: usize = 64 * 1024;
 /// Private transport-safety ceiling for one string crossing the bridge.
 ///
 /// This is deliberately not a claim about Temporal Server identifier limits,
 /// which can be namespace-configurable and differ by field. Core and Server
 /// remain responsible for those semantic checks.
 const MAX_TRANSPORT_STRING_BYTES: usize = 64 * 1024;
+/// Most bounded strings one lifecycle configuration document carries: a
+/// worker's namespace, task queue, build ID, and its versioning deployment
+/// name and build ID. A client document carries two (target URL, identity).
+const MAX_LIFECYCLE_STRING_FIELDS: usize = 5;
+/// Largest JSON encoding of one string byte: `\u00XX` for a control
+/// character.
+const MAX_JSON_ESCAPED_BYTE: usize = 6;
+/// Maximum accepted lifecycle configuration document size.
+///
+/// It admits every document whose strings each satisfy
+/// [`MAX_TRANSPORT_STRING_BYTES`], even if every byte needs the longest JSON
+/// escape, plus 64 KiB for the fixed fields (#1224). The per-field limit that
+/// OCaml validates and documents is therefore attainable: before, a single
+/// 65,536-byte identity already exceeded a 64 KiB document cap, and the
+/// failure surfaced late as a bridge error. The cap stays a bound on parser
+/// allocation (about 2 MiB) for a document that only the SDK itself writes;
+/// the per-field checks reject anything larger first.
+const MAX_LIFECYCLE_CONFIG_BYTES: usize =
+    MAX_LIFECYCLE_STRING_FIELDS * MAX_TRANSPORT_STRING_BYTES * MAX_JSON_ESCAPED_BYTE + 64 * 1024;
 /// Prevents accidental allocation of unreasonable in-process worker state.
 const MAX_WORKER_COUNT: u32 = 1_000_000;
 /// Largest explicit Tokio worker-thread count one runtime accepts (#832).

@@ -441,7 +441,11 @@ copy: the current logging policy does not expose those private diagnostics.
 Lifecycle configuration parser failures follow the same fail-closed rule. Rust
 returns only `invalid lifecycle configuration JSON`; Serde's syntax, location,
 and unknown-field details are kept inside Rust so application-controlled input
-cannot become a diagnostic at the C/OCaml boundary.
+cannot become a diagnostic at the C/OCaml boundary. The document cap (about
+2 MiB) admits every document whose identifiers each satisfy the 65,536-byte
+per-field limit, even when every byte needs a six-byte JSON escape, so that
+limit is reachable and the per-field check, not the cap, rejects an oversized
+value (#1224).
 
 Client connection failures are the documented exception (#833). Because a
 constant message made DNS, refused, TLS, and timeout failures
