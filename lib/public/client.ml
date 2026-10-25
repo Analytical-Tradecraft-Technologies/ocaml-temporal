@@ -801,9 +801,10 @@ let query ?rpc_timeout (handle : ('workflow_input, 'workflow_output) handle)
         Result.bind (Backend.client_query handle.client.backend request)
           (fun payload -> Codec.decode (Query.output query) payload)
 
-(** Lists one bounded visibility page through the client's backend. The public
-    layer validates caller-controlled query metadata before the request enters
-    either the deterministic mock or the native supervisor. *)
+(** Fetches one run's complete history through the client's backend. The
+    deadline and page size are validated before anything is sent, and the
+    backend's binary [History] is checked and wrapped by
+    [Replay.History.of_protobuf] under the handle's workflow ID. *)
 let fetch_history ?page_size ?rpc_timeout
     (handle : ('workflow_input, 'workflow_output) handle) =
   match rpc_deadline rpc_timeout with
@@ -828,6 +829,9 @@ let fetch_history ?page_size ?rpc_timeout
             Result.bind (Backend.client_fetch_history handle.client.backend request)
               (Replay.History.of_protobuf ~workflow_id:handle.workflow_id))
 
+(** Lists one bounded visibility page through the client's backend. The public
+    layer validates caller-controlled query metadata before the request enters
+    either the deterministic mock or the native supervisor. *)
 let list_visibility ?(page_size = 100) ?page_token ?rpc_timeout client ~query
     () =
   (* The deadline is checked before the closed flag, so a malformed deadline

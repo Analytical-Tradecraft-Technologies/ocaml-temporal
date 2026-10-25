@@ -6539,6 +6539,26 @@ requires a fresh 32-digit hex nonce on each invocation. It fails against the
 previous Makefile. It shadows Python rather than trimming `PATH`, because
 make on Windows needs the rest of `PATH` to find `sh`.
 
+## 2026-10-26: Fetchable large histories and response-shaped JSON pages (#1210)
+
+`Client.fetch_history` shared one budget, at most 60 s, across every page.
+Temporal Server serves at most 256 events per page by default, so a history
+at the server's default limits needs hundreds of sequential round trips, and
+on a high-latency link no allowed budget covered them; each retry also
+restarted at page one. Each page round trip now has its own `rpc_timeout`
+budget (default 30 s), as Core's own history paginator does. The fetch stays
+bounded by the bridge payload limit. `history_fetch_budgets_each_page`
+fetches three pages that each take 300 ms under a 700 ms budget, which fails
+with `deadline_exceeded` against the previous bridge.
+
+The interface now says the server caps `page_size` at its
+`limit.historyMaxPageSize` (256 by default). A misplaced doc comment on
+`fetch_history` and `list_visibility` is fixed. The README JSON-to-protobuf
+converter unwraps a `GetWorkflowExecutionHistory` response's `history` field
+and fails on a page with no events. Before, such a page was silently dropped,
+which could truncate a history to a prefix that replays as `PASS`. The
+oversized or event-free history error is typed by #1223.
+
 ## 2026-10-24: Concurrent bounded waits and bounded update waits live (#1136)
 
 The `concurrent_client` live regression now covers the last #1136 criteria.

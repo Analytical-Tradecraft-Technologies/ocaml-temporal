@@ -384,13 +384,22 @@ def normalize_field(value, field):
     return normalize(value, field.message_type)
 
 
-# Each JSON file is the whole history or one page of it; the events of every
-# page are appended in the order the files are given.
+# Each JSON file is the whole history or one page of it, either a bare
+# History or a GetWorkflowExecutionHistory response wrapping it in "history";
+# the events of every page are appended in the order the files are given. A
+# page without events would silently truncate the history, so it is an error.
 history = History()
 for json_path in json_paths:
     with open(json_path) as source:
-        page = normalize(json.load(source), History.DESCRIPTOR)
-    history.MergeFrom(json_format.ParseDict(page, History(), ignore_unknown_fields=True))
+        page = json.load(source)
+    if isinstance(page, dict) and isinstance(page.get("history"), dict):
+        page = page["history"]
+    parsed = json_format.ParseDict(
+        normalize(page, History.DESCRIPTOR), History(), ignore_unknown_fields=True
+    )
+    if not parsed.events:
+        sys.exit(f"{json_path}: no history events (is it a history export?)")
+    history.MergeFrom(parsed)
 with open(protobuf_path, "wb") as target:
     target.write(history.SerializeToString())
 EOF
@@ -409,7 +418,9 @@ receives the binary form directly, but each response holds only one page:
 keep requesting with the returned `next_page_token` until it is empty, then
 concatenate the serialized `history` of every response in order (serialized
 `History` messages concatenate into one valid `History`), or pass every JSON
-page to the script above. A history cut off after the first page passes
+page to the script above, which accepts each page as a bare `History` or as
+the whole response with its `history` field. `Temporal.Client.fetch_history`
+does all of this for you. A history cut off after the first page passes
 replay's input checks and can report `PASS` while checking only the tasks in
 that page. The export needs read access to the namespace; replaying the
 exported file does not.

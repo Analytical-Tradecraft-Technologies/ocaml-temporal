@@ -28,8 +28,8 @@
       typed defects returned before any request is sent. When omitted, each
       operation keeps its built-in budget: 10 seconds for {!start} and
       {!list_visibility}, 3 seconds for {!signal}, {!cancel}, {!terminate},
-      and {!reset}, and 30 seconds for queries, for {!fetch_history}'s whole
-      fetch, and for {!start_update}'s acceptance wait. {!wait} and {!wait_update} have no RPC deadline: they
+      and {!reset}, and 30 seconds for queries, for each {!fetch_history}
+      page, and for {!start_update}'s acceptance wait. {!wait} and {!wait_update} have no RPC deadline: they
       wait for the workflow or update, with bounded internal polls. Their
       optional [timeout] is a caller-side bound on the whole wait instead,
       described with each function.
@@ -559,14 +559,19 @@ val query :
     The bridge follows every [GetWorkflowExecutionHistory] page itself and
     returns one {!Replay.History.t} under the handle's workflow ID.
     [page_size] (1 to 1000, default the server's) sets only the events per
-    round trip; the result is the same history for any page size. A
+    round trip; the result is the same history for any page size. Temporal
+    Server caps it at its [limit.historyMaxPageSize] setting, 256 by default,
+    so a larger value changes nothing on a default server. A
     current-run handle from {!get_handle} fetches the run that is current
     when the first page is served. The fetch never waits for new events: an
     open run yields the events recorded so far, which replay accepts but
     which prove compatibility only for the tasks they contain.
 
-    [rpc_timeout] bounds the whole fetch, every page included (default 30
-    seconds); see {{!section-rpc_deadlines} RPC deadlines}. An unknown run
+    [rpc_timeout] bounds each page's round trip (default 30 seconds), as
+    Core's own history paginator does, so a history of hundreds of pages is
+    fetchable on a high-latency link (#1210); the first page's bound also
+    covers the time the request waited to be sent, and later pages get the
+    budget that remained then. See {{!section-rpc_deadlines} RPC deadlines}. An unknown run
     is an error with {!val-rpc_status} [Some `Not_found]. A history larger
     than {!Replay.History.max_bytes} is a typed error rather than a
     truncated result. An invalid [page_size] is a typed defect returned

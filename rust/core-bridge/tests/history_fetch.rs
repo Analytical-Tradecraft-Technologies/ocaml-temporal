@@ -5,8 +5,10 @@
 //! so the tests are deterministic and run in every Rust test job. It serves
 //! `GetWorkflowExecutionHistory` for three workflow IDs: [`PAGED`] returns
 //! one event per page and a continuation token until the last event,
-//! [`MISSING`] fails with `NOT_FOUND`, and any other ID (the tests use
-//! `empty`) returns a page with no events. Every other RPC succeeds with an empty message.
+//! [`SLOW`] does the same but answers each page after [`SLOW_PAGE_DELAY`]
+//! (#1210), [`MISSING`] fails with `NOT_FOUND`, and any other ID (the tests
+//! use `empty`) returns a page with no events. Every other RPC succeeds with
+//! an empty message.
 
 use std::io::Read as _;
 use std::net::SocketAddr;
@@ -37,6 +39,11 @@ const CALL_HISTORY: u32 = 13;
 
 /// Workflow ID whose history the double serves one event per page.
 const PAGED: &str = "paged";
+/// Workflow ID whose history the double serves like [`PAGED`]'s, one event
+/// per page, but only after [`SLOW_PAGE_DELAY`] per page.
+const SLOW: &str = "slow";
+/// How long the double waits before answering each [`SLOW`] page.
+const SLOW_PAGE_DELAY: Duration = Duration::from_millis(300);
 /// Workflow ID the double answers with `NOT_FOUND`.
 const MISSING: &str = "missing";
 /// The closed failure of a Core conversion; its text never crosses the ABI.
@@ -88,7 +95,7 @@ fn history_page(request: &GetWorkflowExecutionHistoryRequest) -> Result<Vec<u8>,
         .unwrap_or_default();
     match workflow_id {
         MISSING => Err("5"),
-        PAGED => {
+        PAGED | SLOW => {
             let next: i64 = if request.next_page_token.is_empty() {
                 1
             } else {
@@ -178,6 +185,13 @@ async fn answer(
         let history_request = GetWorkflowExecutionHistoryRequest::decode(received.as_slice())
             .expect("Core sends a valid history request");
         let outcome = history_page(&history_request);
+        let slow = history_request
+            .execution
+            .as_ref()
+            .is_some_and(|execution| execution.workflow_id == SLOW);
+        if slow {
+            tokio::time::sleep(SLOW_PAGE_DELAY).await;
+        }
         observed
             .lock()
             .expect("observed lock")
@@ -361,6 +375,32 @@ fn history_fetch_concatenates_every_page() {
         assert_eq!(request.next_page_token, token);
     }
     drop(requests);
+    close_runtime(runtime);
+}
+
+/// Each page round trip has its own `rpc_timeout_ms` budget (#1210): three
+/// pages that each take [`SLOW_PAGE_DELAY`] complete under a budget shorter
+/// than their sum but longer than any one of them. A whole-fetch budget
+/// would expire on the third page, and every retry would restart at page one.
+#[test]
+fn history_fetch_budgets_each_page() {
+    let observed = Observed::default();
+    let runtime = start_runtime(spawn_server(Arc::clone(&observed)));
+    let started = Instant::now();
+    let (status, value, message) = fetch(
+        runtime,
+        r#"{"namespace":"default","workflow_id":"slow","run_id":"","page_size":1,"rpc_timeout_ms":700}"#,
+    );
+    assert_eq!(status, STATUS_OK, "{message}");
+    assert!(
+        started.elapsed() >= SLOW_PAGE_DELAY * 3,
+        "every page was delayed"
+    );
+    let expected = History {
+        events: (1..=PAGED_EVENTS).map(event).collect(),
+    };
+    assert_eq!(value, expected.encode_to_vec());
+    assert_eq!(observed.lock().expect("observed lock").len(), 3);
     close_runtime(runtime);
 }
 

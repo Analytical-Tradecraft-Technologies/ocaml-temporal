@@ -196,7 +196,7 @@ type history_request = {
 (** One complete-history fetch (#1137). An empty run ID selects the current
     run. [page_size] (1 to 1000) only sets the events per round trip; Rust
     follows every page and returns one binary [History] message.
-    [rpc_deadline] bounds the whole fetch, every page included. *)
+    [rpc_deadline] bounds each page's round trip (#1210). *)
 
 type visibility_status =
   [ `Running

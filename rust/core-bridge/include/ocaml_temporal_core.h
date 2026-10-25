@@ -281,8 +281,9 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_wait_workflow_json(
  * "paused" (in that precedence) when the latest send reported that state.
  * HISTORY has no synchronous symbol (#1137). Its document is
  * {"namespace","workflow_id","run_id"} (an empty run ID selects the current
- * run) with optional "page_size" (1 to 1000) and "rpc_timeout_ms", which
- * bounds the whole fetch (default 30 s). The bridge follows every page and
+ * run) with optional "page_size" (1 to 1000; the server caps it, at 256 by
+ * default) and "rpc_timeout_ms", which bounds each page's round trip
+ * (default 30 s, #1210). The bridge follows every page and
  * its success value is binary, not JSON: one serialized
  * temporal.api.history.v1.History message of at most the payload safety
  * limit, the form Temporal.Replay.History.of_protobuf accepts. */

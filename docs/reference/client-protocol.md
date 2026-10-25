@@ -1280,11 +1280,16 @@ symbol. The closed request
 carries the connected namespace, the handle's workflow ID, its run ID (empty
 for a current-run handle, which Temporal resolves on the first page and pins
 through the continuation token), an optional `page_size` from 1 through
-1,000, and the optional `rpc_timeout_ms`. Unlike visibility, pagination is
+1,000 (Temporal Server caps it at its `limit.historyMaxPageSize`, 256 by
+default), and the optional `rpc_timeout_ms`. Unlike visibility, pagination is
 internal: Rust calls `GetWorkflowExecutionHistory` with every event type,
 without waiting for new events, and follows `next_page_token` until it is
-empty. All pages share one budget, 30 seconds by default, and expiry is the
-usual retryable `deadline_exceeded` RPC error. Each page's `History` is
+empty. Each page round trip has its own budget, 30 seconds by default, as
+Core's own history paginator does (#1210): a history at the server's default
+limits needs hundreds of sequential pages, which one shared budget could not
+cover on a high-latency link, and a retried whole fetch would restart at page
+one. Expiry of a page's budget is the usual retryable `deadline_exceeded` RPC
+error. The fetch as a whole is bounded by the payload safety limit below. Each page's `History` is
 re-encoded and appended; because `History` has only the repeated `events`
 field, the concatenation is the same message a single page would have
 carried, whatever the page size.

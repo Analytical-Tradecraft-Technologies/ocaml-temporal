@@ -20,7 +20,7 @@
       "type": "integer",
       "minimum": 1,
       "maximum": 60000,
-      "description": "Optional caller deadline in milliseconds for the whole fetch, every page included. Omitted means 30 seconds."
+      "description": "Optional caller deadline in milliseconds for each page round trip. Omitted means 30 seconds."
     }
   }
 }
