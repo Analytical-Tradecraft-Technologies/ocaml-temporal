@@ -135,6 +135,61 @@ class LibraryArtifactTests(unittest.TestCase):
             ARTIFACT.check_files(dict.fromkeys(ARTIFACT.REQUIRED), "windows-amd64")
 
 
+class HostIdentityTests(unittest.TestCase):
+    """Refuse an older C library or macOS before installation (#1147)."""
+
+    def setUp(self):
+        """Pack a bundle whose producer recorded a host identity."""
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.count = 0
+
+    def bundle(self, platform, producer_host):
+        """Pack a fixture bundle for [platform] with [producer_host] lines."""
+        self.count += 1
+        stage = self.root / f"stage{self.count}"
+        stage_sdk(stage, platform=platform)
+        (stage / "environment.txt").write_text(abi(platform=platform) + producer_host)
+        bundle = self.root / f"bundle{self.count}"
+        ARTIFACT.pack(stage, bundle, COMMIT, VERSION, platform, "ci", "fixture-key")
+        return bundle
+
+    def unpack(self, bundle, platform, consumer_host):
+        """Install [bundle] on a consumer reporting [consumer_host]."""
+        env = self.root / f"env{self.count}"
+        env.write_text(abi(platform=platform) + consumer_host)
+        ARTIFACT.unpack(bundle, self.root / f"prefix{self.count}", env,
+                        COMMIT, VERSION, platform, "ci")
+
+    def test_older_glibc_is_refused_naming_both_versions(self):
+        """A glibc 2.35 host cannot take a glibc 2.36 bundle; 2.39 can."""
+        produced = "host-libc: glibc 2.36\nhost-cc: gcc (Debian 12.2.0-14) 12.2.0\n"
+        bundle = self.bundle(PLATFORM, produced)
+        with self.assertRaisesRegex(ValueError, "built for glibc 2.36, this host has glibc 2.35"):
+            self.unpack(bundle, PLATFORM, "host-libc: glibc 2.35\nhost-cc: gcc 11\n")
+        self.assertFalse((self.root / f"prefix{self.count}").exists())
+        with self.assertRaisesRegex(ValueError, "this host has unknown"):
+            self.unpack(bundle, PLATFORM, "host-cc: gcc 13\n")
+        self.unpack(bundle, PLATFORM, "host-libc: glibc 2.39\nhost-cc: gcc 13.2.0\n")
+        self.assertTrue((self.root / f"prefix{self.count}").exists())
+
+    def test_older_macos_is_refused(self):
+        """A macOS 14 host cannot take a bundle targeting macOS 15."""
+        produced = "host-macos: 15.4\nhost-macos-deployment-target: 15.0\nhost-cc: clang 17\n"
+        bundle = self.bundle("macos-arm64", produced)
+        with self.assertRaisesRegex(ValueError, "built for 15.0, this host has 14.7"):
+            self.unpack(bundle, "macos-arm64", "host-macos: 14.7\nhost-cc: clang 16\n")
+        self.unpack(bundle, "macos-arm64", "host-macos: 15.0.1\nhost-cc: clang 18\n")
+
+    def test_bundle_without_host_identity_is_not_checked(self):
+        """Bundles produced before #1147 keep installing on any host."""
+        bundle = self.bundle(PLATFORM, "")
+        self.unpack(bundle, PLATFORM, "host-libc: glibc 2.17\n")
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        self.assertEqual(manifest["host"], {})
+
+
 class LibraryReleaseTests(unittest.TestCase):
     """Publish only the complete tested compiler matrix with matching Rust input."""
 

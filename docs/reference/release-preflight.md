@@ -123,7 +123,8 @@ archive keeps the licence texts of the statically linked Rust packages with it
 Compatible applications link the OCaml SDK, C stubs and Rust bridge
 directly without rebuilding them. Each SDK records its exact compiler and compiled
 dependency identities; incompatible environments must use matching dependencies
-or build from source. Linux assets target Debian 12/glibc, not musl/Alpine.
+or build from source. Linux assets target Debian 12 and need glibc 2.36 or newer, not musl/Alpine;
+the installer refuses an older host before unpacking (#1147).
 
 For the next version, first update the three version files and `SDK_VERSION`,
 and add the version's release notes as `docs/releases/<tag>.md` (see the

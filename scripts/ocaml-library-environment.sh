@@ -26,3 +26,22 @@ for package in stdlib unix threads logs yojson; do
     /^[ \t]+[0-9a-f]+[ \t]+[A-Za-z_]/ { print $1 " " $2 }
   '
 done
+# Host identity (#1147), as `host-` lines that the installer compares by
+# minimum version rather than exactly: a newer C library or macOS on the
+# consumer is fine, an older one fails at link time. The C compiler is
+# recorded for diagnosis only.
+case "$(uname -s)" in
+  Linux)
+    # "glibc 2.36" on glibc systems; empty on musl, which has no such query.
+    libc=$(getconf GNU_LIBC_VERSION 2>/dev/null || true)
+    printf 'host-libc: %s\n' "${libc:-unknown}"
+    ;;
+  Darwin)
+    macos=$(sw_vers -productVersion | tr -d '\r')
+    printf 'host-macos: %s\n' "$macos"
+    # Objects target MACOSX_DEPLOYMENT_TARGET when set, else the running OS.
+    printf 'host-macos-deployment-target: %s\n' "${MACOSX_DEPLOYMENT_TARGET:-$macos}"
+    ;;
+esac
+cc_version=$(cc --version 2>/dev/null | head -n 1 | tr -d '\r' || true)
+printf 'host-cc: %s\n' "${cc_version:-unknown}"

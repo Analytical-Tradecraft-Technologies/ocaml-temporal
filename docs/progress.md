@@ -6132,6 +6132,22 @@ OCaml `test_child_timeout_options` decodes, and
 under #1135: memo and search attributes (blocked by #512), a live
 run-timeout regression and a corpus history.
 
+## 2026-10-25: Prebuilt bundles record and check the host identity (#1147)
+
+`scripts/ocaml-library-environment.sh` now ends with `host-` lines:
+`host-libc` (`getconf GNU_LIBC_VERSION`) on Linux, `host-macos` and
+`host-macos-deployment-target` on macOS, and the C compiler's version line
+(`host-cc`). `ocaml-library-artifact.py` still compares the compiler and
+dependency ABI exactly, but compares the host lines by minimum version. It
+refuses an older or missing glibc, or a macOS older than the producer's
+deployment target, before unpacking, and the message names both versions; a
+newer host is accepted, and `host-cc` is informational. The bundle manifest
+also carries a structured `host` object. Bundles made before this change have
+no host lines and are not checked. `test_ocaml_library_artifact.py` covers
+both refusals, the accepted newer hosts and the legacy bundle. The Docker
+bridge cache key needed no change, because `Dockerfile.rust-ci`, which pins
+the base image digest, is already part of its source hash.
+
 ## 2026-10-24: Interface and reference corrections from the second audit (#1146)
 
 Eight rows of the #1146 audit are corrected against the code:
