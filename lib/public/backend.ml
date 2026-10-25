@@ -1040,8 +1040,8 @@ let retire_mock_client client =
     Option.iter Shared_runtime.release client.lease)
 
 (** Retires a mock client or worker that became unreachable without
-    shutdown (#1222). Native instances have the supervisor's finalizer
-    ([Sdk_supervisor.Make.cleanup_abandoned]); without this, an abandoned
+    shutdown (#1222). Native instances are retired by their private
+    supervisor's own abandoned-instance finalizer; without this, an abandoned
     mock value kept its shared-runtime lease, so [Runtime.shutdown] reported
     it as still attached forever, and a mock client kept its service
     reference. The finalizer only starts a thread: retiring takes mutexes
