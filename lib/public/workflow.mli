@@ -380,5 +380,11 @@ val upsert_search_attributes : (string * Payload.t) list -> unit
     workflow task, like any propagated [Codec] error: no continue-as-new
     command is emitted and the run stays open so a corrected worker can replay
     it. Calling it outside workflow execution is programmer misuse and raises
-    [Invalid_argument]. *)
+    [Invalid_argument].
+
+    The fiber ends through a private exception that cleanup code
+    ([Fun.protect ~finally]) observes but must let through. Do not wrap the
+    call in a catch-all ([try ... with _ ->]): the run still continues as
+    new, but whatever the handler returns is ignored with a
+    [workflow_result_after_abort_ignored] warning (#1225). *)
 val continue_as_new : ('input, 'output) t -> 'input -> 'value

@@ -277,10 +277,35 @@ let valid_protocol_instance_id id =
     scheduler separately releases the actual OCaml continuations. *)
 let clear_pending_updates execution = Hashtbl.clear execution.pending_updates
 
+(** Reports that root code returned after a terminal operation had already
+    buffered the run's terminal command and aborted its fiber: a catch-all
+    such as [with _ -> Ok ...] around [Workflow.continue_as_new] swallowed
+    the private abort (#1225). The result is ignored. *)
+let report_result_after_abort execution =
+  report ~src:Observability.Source.workflow Logs.Warning
+    ~tags:
+      (Observability.tags ~operation:"workflow_result_after_abort_ignored"
+         ~workflow_type:(workflow_type execution) ())
+    "workflow code returned after its run had already ended (a catch-all \
+     caught the terminal operation's abort); the result is ignored"
+
 (** Emits the workflow's completion, failure, or cancellation command once and
-    immediately releases every paused fiber. *)
+    immediately releases every paused fiber.
+
+    When a terminal command is already buffered (continue-as-new or
+    [terminate] buffer theirs and abort the fiber), the call comes from root
+    code that caught that abort, so it is ignored with a warning (#1225).
+    Emitting would log a [workflow_completed] record for a run that did not
+    complete, and shutting the scheduler down mid-drain would strand the
+    continuations already queued, which then neither continue nor run their
+    cleanup. The activation finalizes the buffered terminal after the drain
+    instead, and its shutdown discontinues them. *)
 let emit_terminal execution command =
-  if not execution.terminal then (
+  if
+    (not execution.terminal)
+    && Workflow_context_store.has_buffered_terminal execution.context
+  then report_result_after_abort execution
+  else if not execution.terminal then (
     execution.terminal <- true;
     Workflow_context_store.emit execution.context command;
     clear_pending_updates execution;
@@ -384,6 +409,14 @@ let task_failure execution = execution.task_failure
     its category, goes through {!fail_task}, which drops it (#1021). *)
 let fail execution error =
   if is_task_failure error || execution.evicted then fail_task execution error
+  else if
+    (not execution.terminal)
+    && Workflow_context_store.has_buffered_terminal execution.context
+  then
+    (* As in [emit_terminal]: root code returned this error after catching a
+       terminal operation's abort (#1225), so no [workflow_failed] record is
+       logged for a run that ended otherwise. *)
+    report_result_after_abort execution
   else begin
   if not execution.terminal then (
     let tags =

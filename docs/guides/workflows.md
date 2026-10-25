@@ -955,7 +955,11 @@ Use `Temporal.Workflow.continue_as_new` when the current execution should end
 and Temporal should start the same workflow type with a new input and a fresh
 history. The operation is terminal: it never returns to the current workflow
 fiber, so code after the call is unreachable. The input is encoded with the
-definition's codec before the command is emitted.
+definition's codec before the command is emitted. The fiber ends through a
+private exception, so `Fun.protect ~finally` cleanup still runs, but do not
+wrap the call in a catch-all `try ... with _ ->`. The run still continues as
+new, and the result such a handler returns is ignored with a
+`workflow_result_after_abort_ignored` warning (#1225).
 
 ```ocaml
 let process_batch batch =
