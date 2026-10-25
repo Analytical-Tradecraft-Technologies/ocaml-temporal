@@ -14,7 +14,9 @@
     - a running worker that polls activity tasks (it registers at least one
       activity) holds one more Domain for its activity lane while {!run} is
       active, so a slow activity cannot hold up workflow tasks. A
-      workflow-only worker needs none;
+      workflow-only worker needs none: its activity lane, which only rejects
+      local activities its workflows schedule without registering them,
+      runs on a system thread of the Domain that called {!run} (#1211);
     - the workflow lane runs on the thread that called {!run}, and the
       activation watchdog is a system thread on the supervisor's Domain, so
       neither costs a Domain of its own.

@@ -1,8 +1,9 @@
 (** Private scheduler for two independent native worker lanes.
 
     The workflow adapter executes on the caller Domain; one activity Domain,
-    spawned only for a worker that polls activity tasks, executes at most one
-    callback at a time. The adapters still serialize their
+    spawned only for a worker that registers activities, executes at most one
+    callback at a time. A workflow-only worker's activity lane runs no user
+    code, so it runs on a system thread instead (see {!activity_lane}). The adapters still serialize their
     own task leases, and every native operation uses the same supervisor. *)
 
 (** Scheduling summary returned by one lane poll. *)
@@ -13,6 +14,20 @@ type progress =
       (** The lane had no work at this instant. *)
   | Retry_pending
       (** The exact retained completion needs a bounded backoff before retry. *)
+
+(** Where [run] executes the activity lane.
+
+    - [No_activity_lane]: none; [poll_activity] is never called.
+    - [Activity_domain]: a dedicated Domain, for a worker whose activity
+      callbacks run there, so a slow callback cannot hold up the workflow
+      lane.
+    - [Activity_thread]: a system thread of the calling Domain. It is for a
+      lane that runs no user code. A workflow-only worker's lane is one: its
+      only tasks are local activities its own workflows schedule, which it
+      rejects as unregistered. Without the lane those tasks were never
+      serviced, and the workflow lane spun on their readiness (#1211). It
+      uses no Domain, preserving #1042's budget. *)
+type activity_lane = No_activity_lane | Activity_domain | Activity_thread
 
 (** Bounds how long [run] waits for the activity lane once the workflow lane
     has returned (#495). [deadline ()] is called once, when the workflow lane
@@ -53,18 +68,17 @@ val idle_detach_allowance_s : float
 
 (** Runs both lanes until [closed] or a fatal lane result.
 
-    With [activity_lane = false] (a workflow-only worker) no activity Domain
-    is spawned and [poll_activity] is never called; the workflow lane then
-    runs alone and always takes the native-wait token when idle. When the
-    activity Domain cannot be spawned, typically because the runtime's Domain
-    limit is reached, [run] returns [Error (lane_unavailable exn)] with the
-    [Domain.spawn] exception before either lane polls, so nothing needs
-    stopping and the caller may run again later (#1042).
- With [detach = None]
-    the activity Domain is always joined before returning, so the caller may
-    then safely drain adapters and release the native graph. With [Some detach]
-    the join is bounded as described on {!activity_detach}: a detached
-    activity Domain keeps running its callback, still holding the activity
+    With [No_activity_lane] no activity lane runs and [poll_activity] is
+    never called; the workflow lane then runs alone and always takes the
+    native-wait token when idle. When the activity Domain (or, for
+    [Activity_thread], its system thread) cannot be started, typically
+    because the runtime's Domain limit is reached, [run] returns
+    [Error (lane_unavailable exn)] with the spawn exception before either
+    lane polls, so nothing needs stopping and the caller may run again later
+    (#1042). With [detach = None] the activity lane is always joined before
+    returning, so the caller may then safely drain adapters and release the
+    native graph. With [Some detach] the join is bounded as described on
+    {!activity_detach}: a detached activity lane keeps running its callback, still holding the activity
     adapter's lock, and exits on its own once the callback returns, because
     the stop signal is already set. The caller must then treat the activity
     adapter as possibly busy. An error in either lane stops the other through
@@ -83,7 +97,7 @@ val idle_detach_allowance_s : float
     [retry_pending] must apply a real bounded backoff even if unrelated work is
     ready, so an uncertain completion cannot spin or rerun its callback. *)
 val run :
-  activity_lane:bool ->
+  activity_lane:activity_lane ->
   lane_unavailable:(exn -> 'error) ->
   detach:activity_detach option ->
   closed:(unit -> bool) ->

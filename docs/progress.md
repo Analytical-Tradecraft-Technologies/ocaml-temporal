@@ -6208,6 +6208,29 @@ control `negative-random-reordered` draws in another order and must report
 nondeterminism. All 88 cases pass. The workflow guide shows a `uuid4`
 fan-out.
 
+## 2026-10-25: Workflow-only workers service local-activity tasks again (#1211)
+
+Since #1042 a workflow-only worker ran no activity lane, but the bridge still
+enables local activities for every worker with workflows. A local activity
+one of its workflows scheduled was therefore never polled: the lone workflow
+lane spun at full CPU on the combined readiness wait, and the workflow
+waited for its start-to-close timeout. `Native_worker_loop.run` now takes an
+`activity_lane` variant (`No_activity_lane`, `Activity_domain`,
+`Activity_thread`). A workflow-only worker runs `Activity_thread`, an activity
+lane on a system thread of the calling Domain. That lane runs no user code
+and rejects such a task as unregistered at once, so the worker still uses no
+extra Domain.
+
+- `test_worker_domain_budget` (run with `OCAMLRUNPARAM=d=1`) runs the
+  thread-hosted lane with only the main Domain available and checks it polls
+  on that Domain.
+- The `split_worker_task_types` live regression gains a workflow on the
+  workflow-only worker that schedules an unregistered single-attempt local
+  activity, and requires a non-timeout rejection within 30 s. Against the
+  local Compose stack it passes in about 2 s. With the workflow-only worker
+  forced back to `No_activity_lane` it fails ("probe returned timed out")
+  after the 10 s timeout, at about 68% CPU.
+
 ## 2026-10-24: Bounded Client.wait and wait_update (#1136)
 
 `Client.wait ?timeout` and `Client.wait_update ?timeout` bound the caller's
