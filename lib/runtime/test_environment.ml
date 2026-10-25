@@ -921,10 +921,19 @@ let attempt_duration_ms environment request ~attempt =
   | Some (Code (_, durations)) -> pick attempt durations
   | Some (Unsupported _) | None -> 0L
 
+(** A configured activity timeout, with zero read as unset: Temporal
+    treats a zero timeout as absent, and the native activity adapter
+    normalizes it to [None] the same way. *)
+let configured_timeout = function
+  | Some milliseconds when Int64.compare milliseconds 0L > 0 -> Some milliseconds
+  | Some _ | None -> None
+
 (** The virtual instant at which [request]'s schedule-to-close timeout
     expires, measured from the first attempt's scheduling as on a server. *)
 let schedule_to_close_deadline request =
-  Option.map (saturating_add request.scheduled_ms) request.schedule_to_close_timeout
+  Option.map
+    (saturating_add request.scheduled_ms)
+    (configured_timeout request.schedule_to_close_timeout)
 
 (** The error an expired activity timeout produces, in the shape the native
     worker decodes from Temporal's [TimeoutFailure] (#1143): category
@@ -962,7 +971,9 @@ let rec run_activity environment run seq request ~attempt =
   let duration = attempt_duration_ms environment request ~attempt in
   let result = attempt_activity environment run request ~attempt in
   let finished = saturating_add started duration in
-  let from_start = Option.map (saturating_add started) in
+  let from_start timeout =
+    Option.map (saturating_add started) (configured_timeout timeout)
+  in
   let deadlines =
     [
       (`Schedule_to_close, schedule_to_close_deadline request);

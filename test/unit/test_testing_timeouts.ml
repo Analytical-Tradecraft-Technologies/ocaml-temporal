@@ -334,6 +334,19 @@ let test_timeout_ignores_error_types () =
   in
   expect "timeout retried" "ok done-2" report
 
+(** A zero heartbeat timeout means unset, as on a native worker, so it
+    never expires (Codex review on #1206). *)
+let test_zero_heartbeat_timeout_is_unset () =
+  let workflow =
+    probe "zero_heartbeat" (fun () ->
+        T.Activity.execute ~heartbeat_timeout:(T.Duration.of_ms 0L) slow ())
+  in
+  let report, elapsed =
+    run_probe ~activities:[ T.Testing.activity ~durations:[ seconds 5L ] slow ] workflow
+  in
+  expect "zero heartbeat timeout" "ok done-1" report;
+  expect_ms "attempt duration" 5_000L elapsed
+
 (** Runs every timeout scenario as one dune test. *)
 let () =
   test_start_to_close ();
@@ -347,4 +360,5 @@ let () =
   test_wait_cancellation_completed ();
   test_mock_durations ();
   test_callback_origin_is_ignored ();
-  test_timeout_ignores_error_types ()
+  test_timeout_ignores_error_types ();
+  test_zero_heartbeat_timeout_is_unset ()
