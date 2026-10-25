@@ -286,6 +286,44 @@ let test_catch_all_during_teardown ending =
   expect "catch-all teardown is not a task failure" None
     (Execution.task_failure execution)
 
+(** A root catch-all around continue-as-new (#1225): the catch-all swallows
+    the private abort and returns a result, here [Ok ()] or a workflow
+    failure. The terminal command stays continue-as-new, no task fails, and
+    a handler continuation that was already queued in the same activation is
+    still discontinued, so its cleanup runs exactly once. Before the fix the
+    returned result shut the scheduler down mid-drain, so that continuation
+    was stranded and its cleanup never ran. *)
+let test_catch_all_around_continue_as_new ~returns_error =
+  let finalizers = ref 0 in
+  let handler () =
+    Fun.protect ~finally:(fun () -> incr finalizers) (fun () -> sleep ())
+  in
+  let root () =
+    match
+      match sleep () with
+      | Error _ as error -> error
+      | Ok () -> T.Workflow.continue_as_new successor ()
+    with
+    | result -> result
+    | exception _ ->
+        if returns_error then Error (application_error ()) else Ok ()
+  in
+  let execution, job = execution Signal ~root ~handler in
+  ignore (Execution.activate execution [ Activation.Start_workflow ]);
+  ignore (Execution.activate execution [ job ]);
+  let commands =
+    Execution.activate execution
+      [ Activation.Fire_timer { seq = 1L }; Activation.Fire_timer { seq = 2L } ]
+  in
+  expect "catch-all keeps continue-as-new"
+    [ Activation.Continue_as_new { workflow_type = "successor"; input = [] } ]
+    commands;
+  expect "catch-all result is not a task failure" None
+    (Execution.task_failure execution);
+  expect "queued handler continuation cleanup" 1 !finalizers;
+  Execution.shutdown execution;
+  expect "repeated shutdown cleanup" 1 !finalizers
+
 (** The teardown exemption must not hide a defect raised before the run ended:
     a handler that fails while the root is completing in the same activation
     still discards the whole batch. *)
@@ -402,6 +440,8 @@ let () =
     [ Signal; Update ];
   test_catch_all_during_teardown Complete;
   test_catch_all_during_teardown Evict;
+  test_catch_all_around_continue_as_new ~returns_error:false;
+  test_catch_all_around_continue_as_new ~returns_error:true;
   test_defect_before_terminal_still_fails ();
   test_native_eviction_acknowledges_cleanly ~poisoned:false;
   test_native_eviction_acknowledges_cleanly ~poisoned:true;

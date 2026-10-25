@@ -6040,6 +6040,24 @@ only, not rollback evidence (#508). The
 whole corpus replays in about a second. Every current capture comes from Core
 `95e97686`, so the first Core bump will be the first cross-revision replay.
 
+## 2026-10-25: A catch-all around continue-as-new no longer strands queued fibers (#1225)
+
+A root catch-all such as `with _ -> Ok summary` around
+`Workflow.continue_as_new` swallowed the private abort and returned a result.
+The root wrapper then logged `workflow_completed` (or `workflow_failed`) for
+a run that had continued as new, and shut the scheduler down mid-drain. A
+continuation already queued in the same activation was then neither
+continued nor discontinued, so its cleanup never ran. `emit_terminal` and
+the non-task branch of `fail` now ignore a result returned after a terminal
+command was buffered, with a `workflow_result_after_abort_ignored` warning.
+The activation then finalizes the buffered terminal after the drain, and
+its shutdown discontinues the queued continuations. In
+`test_handler_teardown`, `test_catch_all_around_continue_as_new` (returning
+`Ok ()` and returning an error) requires the continue-as-new command, no
+task failure, and the queued handler's cleanup exactly once. It fails
+against the previous runtime. `workflow.mli` and the guide warn against the
+catch-all.
+
 ## 2026-10-24: Corpus histories for timer cancellation and child options (#1134, #1135, #503)
 
 Capture `live-2026-10-24` adds the frozen `corpus-v2-cancellation`
