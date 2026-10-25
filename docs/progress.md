@@ -6236,6 +6236,21 @@ is returned rather than dropped, and a wait or update poll whose deadline has
 already passed is not submitted at all. Like `?rpc_timeout`, the bound does
 not interrupt the owner's network-free admission of a request.
 
+## 2026-10-25: Client.start's rpc_timeout is Core's retry window (#1220)
+
+`start_workflow` was the one budgeted client RPC that bypassed
+`budgeted_request`, so a start's `rpc_timeout` bounded only the outer
+timer. Core retried transient failures within its default 10 s window, and
+a start with a longer budget reported an uncertain outcome after 10 s,
+although budget remained. It now builds its request with `budgeted_request`
+and maps statuses through `budget_status`, like cancel, reset, signal,
+query, visibility and update. The scripted-transport test
+`start_rpc_timeout_extends_cores_retry_window` keeps a server unavailable
+under a 16 s budget and requires the start to retry past 11 s (about 14 s
+here). The previous code stopped at about 9.5 s.
+`start_attempts_carry_the_budget_deadline` checks that a retried start is
+byte-identical.
+
 ## 2026-10-24: Bounded condition waits (#1134, second slice)
 
 `Condition.wait_until ?timeout` and `wait_until_result ?timeout` bound a

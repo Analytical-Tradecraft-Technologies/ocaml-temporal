@@ -2110,6 +2110,10 @@ const START_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// request and idempotency key across transport attempts within one deadline.
 ///
 /// The deadline is the request's `rpc_timeout_ms` or [`START_RPC_TIMEOUT`].
+/// Like every other budgeted client RPC ([`budgeted_request`]), it is both
+/// the outer timeout and Core's retry window and per-attempt gRPC deadline,
+/// so a start with a long `rpc_timeout` keeps retrying a transient failure
+/// for that long instead of stopping at Core's default 10 s window (#1220).
 /// It bounds only this client call; the workflow timeouts and retry policy
 /// are separate server-side execution policies copied into the request.
 pub async fn start_workflow(
@@ -2130,13 +2134,14 @@ pub async fn start_workflow(
     let workflow_run_timeout = optional_milliseconds_to_core(request.run_timeout_ms)?;
     let workflow_task_timeout = optional_milliseconds_to_core(request.task_timeout_ms)?;
     let budget = rpc_budget(request.rpc_timeout_ms, START_RPC_TIMEOUT);
+    let started = tokio::time::Instant::now();
     let workflow_id = request.workflow_id.clone();
     // Connection owns Core's retry policy; its underlying workflow service
     // skips that policy and gives up on the first transient transport error.
     let mut service = connection.clone();
     let response = match tokio::time::timeout(
         budget,
-        service.start_workflow_execution(
+        service.start_workflow_execution(budgeted_request(
             StartWorkflowExecutionRequest {
                 namespace: request.namespace.clone(),
                 input: Some(payloads),
@@ -2166,13 +2171,15 @@ pub async fn start_workflow(
                 // Cron schedules and start delays are deliberately not sent:
                 // OCaml workers reject them (#499 keeps them deferred).
                 ..Default::default()
-            }
-            .into_request(),
-        ),
+            },
+            budget,
+        )),
     )
     .await
     {
-        Ok(result) => result.map_err(|status| map_start_status(&workflow_id, status))?,
+        Ok(result) => result.map_err(budget_status(started, budget, |status| {
+            map_start_status(&workflow_id, status)
+        }))?,
         Err(_elapsed) => {
             return Err(ClientOperationError::Rpc {
                 code: "deadline_exceeded".to_owned(),

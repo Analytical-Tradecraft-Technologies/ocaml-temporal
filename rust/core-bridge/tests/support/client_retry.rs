@@ -18,7 +18,8 @@ use temporalio_common::protos::temporal::api::{
         GetWorkflowExecutionHistoryResponse, ListWorkflowExecutionsResponse,
         PollWorkflowExecutionUpdateResponse, QueryWorkflowResponse as CoreQueryResponse,
         RequestCancelWorkflowExecutionResponse, ResetWorkflowExecutionResponse,
-        SignalWorkflowExecutionResponse, TerminateWorkflowExecutionResponse,
+        SignalWorkflowExecutionResponse, StartWorkflowExecutionResponse,
+        TerminateWorkflowExecutionResponse,
     },
 };
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, TokioRuntimeBuilder};
@@ -633,4 +634,79 @@ fn update_poll_retries_a_transient_failure() {
     ));
     assert_eq!(probe.count(), 2);
     probe.assert_identical_attempts("PollWorkflowExecutionUpdate");
+}
+
+/// A start request with an explicit `rpc_timeout_ms`.
+fn start_request(rpc_timeout_ms: Option<u64>) -> StartWorkflowRequest {
+    StartWorkflowRequest {
+        request_id: "start-request-1".to_owned(),
+        namespace: "default".to_owned(),
+        workflow_id: "workflow-1".to_owned(),
+        workflow_type: "Workflow".to_owned(),
+        task_queue: "queue".to_owned(),
+        input: Vec::new(),
+        memo: Vec::new(),
+        search_attributes: Vec::new(),
+        id_conflict_policy: IdConflictPolicy::Fail,
+        id_reuse_policy: IdReusePolicy::AllowDuplicate,
+        execution_timeout_ms: None,
+        run_timeout_ms: None,
+        task_timeout_ms: None,
+        retry_policy: None,
+        rpc_timeout_ms,
+    }
+}
+
+/// A retried start re-sends the identical request, so its request ID stays
+/// the idempotency key, and every attempt carries a gRPC deadline. The
+/// regression for #1220 itself, the budget becoming Core's retry window, is
+/// [`start_rpc_timeout_extends_cores_retry_window`].
+#[test]
+fn start_attempts_carry_the_budget_deadline() {
+    let (core, connection, probe) = scripted_connection(
+        1,
+        Code::Unavailable,
+        StartWorkflowExecutionResponse {
+            run_id: "run-1".to_owned(),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    let response = core
+        .tokio_handle()
+        .block_on(start_workflow(connection, start_request(Some(5_000))))
+        .expect("the retried start is accepted");
+    assert_eq!(response.execution.run_id, "run-1");
+    assert_eq!(probe.count(), 2);
+    probe.assert_identical_attempts("StartWorkflowExecution");
+    let attempts = probe.attempts.lock().unwrap();
+    assert!(attempts.iter().all(|attempt| attempt.has_deadline));
+}
+
+/// A start `rpc_timeout` longer than Core's default 10 s retry window is
+/// Core's retry window too (#1220). Core stops once its next backoff would end
+/// past the window, so against a server that stays unavailable a start with
+/// the default window gives up near 10 s; with a 16 s budget it keeps retrying
+/// past 11 s (backoffs of 0.1 s growing by 1.7 to 5 s, jittered by 20%), and
+/// ends with an uncertain outcome before the budget plus scheduling slack.
+#[test]
+fn start_rpc_timeout_extends_cores_retry_window() {
+    let (core, connection, probe) = scripted_connection(
+        usize::MAX,
+        Code::Unavailable,
+        StartWorkflowExecutionResponse::default().encode_to_vec(),
+    );
+    let started = Instant::now();
+    let result = core
+        .tokio_handle()
+        .block_on(start_workflow(connection, start_request(Some(16_000))));
+    let elapsed = started.elapsed();
+    let error = result.expect_err("an unavailable server cannot accept the start");
+    assert!(error.uncertain_start(), "unexpected error {error:?}");
+    assert!(
+        elapsed >= Duration::from_millis(11_000),
+        "Core stopped retrying after {elapsed:?}, inside the 16 s budget"
+    );
+    assert!(elapsed < Duration::from_millis(17_500), "took {elapsed:?}");
+    assert!(probe.count() > 1);
 }
