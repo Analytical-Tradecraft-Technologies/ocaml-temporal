@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 
 use ocaml_temporal_core_bridge::protocol::{
     self, COMPATIBILITY_VERSION, Envelope, MAX_COLLECTION_ITEMS, MAX_DEPTH, MAX_DOCUMENT_BYTES,
-    MAX_NODES, MAX_PAYLOAD_BYTES, Request,
+    MAX_NODES, MAX_PAYLOAD_BYTES, MAX_STRING_BYTES, Request,
 };
 
 /// Locates a shared fixture from the Rust crate within the repository tree.
@@ -137,4 +137,34 @@ fn validates_operation_specific_objects() {
     );
     assert!(protocol::decode_object("[]").is_err());
     assert!(protocol::encode_object(&protocol::JsonValue::Array(Vec::new())).is_err());
+}
+
+/// The string limit applies to decoded bytes, as `validate_tree` and the OCaml
+/// validators measure it (#1226). A string of escapes is measured by what it
+/// decodes to: `\u0001` is 1 byte, a surrogate pair 4, `\n` 1. The preflight
+/// counter used to count the hex digits, so 16,385 `\u00XX` escapes (16,385
+/// decoded bytes) were refused as over the 65,536-byte limit.
+#[test]
+fn string_limit_counts_decoded_escape_bytes() {
+    let document =
+        |escape: &str, count: usize| format!(r#"{{"reason":"{}"}}"#, escape.repeat(count));
+    for (escape, bytes) in [
+        ("\\u0001", 1),
+        ("\\u00e9", 2),
+        ("\\u20ac", 3),
+        ("\\ud83d\\ude00", 4),
+        ("\\n", 1),
+    ] {
+        let at_limit = MAX_STRING_BYTES / bytes;
+        assert!(
+            protocol::decode_object(&document(escape, at_limit)).is_ok(),
+            "{at_limit} copies of {escape} decode to at most the limit"
+        );
+        assert!(
+            protocol::decode_object(&document(escape, at_limit + 1)).is_err(),
+            "{} copies of {escape} decode past the limit",
+            at_limit + 1
+        );
+    }
+    assert!(protocol::decode_object(&document("\\u0001", 16_385)).is_ok());
 }

@@ -448,7 +448,27 @@ pub fn encode_payload(bytes: &[u8]) -> Result<String, ProtocolError> {
     Ok(output)
 }
 
+/// Number of UTF-8 bytes a `\\uXXXX` escape with code unit `unit` decodes
+/// to. A surrogate half counts 2, so a pair (one supplementary character)
+/// counts its 4 bytes; a lone surrogate is left for serde to reject.
+fn unicode_escape_bytes(unit: u32) -> usize {
+    match unit {
+        0..=0x7f => 1,
+        0x80..=0x7ff => 2,
+        0xd800..=0xdfff => 2,
+        _ => 3,
+    }
+}
+
 /// Rejects excessive bytes or nesting before recursive serde allocation.
+///
+/// A string is measured by the bytes it decodes to, the length `validate_tree`
+/// and the OCaml validators check: a simple escape such as `\\n` counts 1 and
+/// a `\\uXXXX` escape counts its UTF-8 length (#1226). Counting the escape's
+/// hex digits instead made a string of more than 16,384 `\\u00XX` control
+/// characters exceed the 65,536-byte limit, although the decoded text and the
+/// OCaml side accept it. A malformed escape is counted per byte and rejected
+/// by serde.
 fn preflight(input: &str, string_limit: usize) -> Result<(), ProtocolError> {
     if input.len() > MAX_DOCUMENT_BYTES {
         return Err(ProtocolError::invalid("$", "document byte limit exceeded"));
@@ -456,23 +476,52 @@ fn preflight(input: &str, string_limit: usize) -> Result<(), ProtocolError> {
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
+    // Hex digits of the `\\u` escape being read, and how many remain.
+    let mut unicode_unit = 0u32;
+    let mut unicode_digits = 0u8;
     let mut string_bytes = 0usize;
     for byte in input.bytes() {
         if in_string {
-            if escaped {
+            let decoded = if unicode_digits > 0 {
+                match char::from(byte).to_digit(16) {
+                    Some(digit) => {
+                        unicode_unit = unicode_unit * 16 + digit;
+                        unicode_digits -= 1;
+                        if unicode_digits == 0 {
+                            unicode_escape_bytes(unicode_unit)
+                        } else {
+                            0
+                        }
+                    }
+                    None => {
+                        unicode_digits = 0;
+                        1
+                    }
+                }
+            } else if escaped {
                 escaped = false;
+                if byte == b'u' {
+                    unicode_unit = 0;
+                    unicode_digits = 4;
+                    0
+                } else {
+                    1
+                }
             } else if byte == b'\\' {
                 escaped = true;
+                0
             } else if byte == b'"' {
                 in_string = false;
+                0
             } else {
-                string_bytes += 1;
-                if string_bytes > string_limit {
-                    return Err(ProtocolError::invalid(
-                        "$",
-                        "JSON string byte limit exceeded",
-                    ));
-                }
+                1
+            };
+            string_bytes += decoded;
+            if string_bytes > string_limit {
+                return Err(ProtocolError::invalid(
+                    "$",
+                    "JSON string byte limit exceeded",
+                ));
             }
         } else {
             match byte {

@@ -6253,6 +6253,27 @@ activation, zero and unbounded waits, a predicate error, and the detached
 defect. The live scenario and corpus histories for cancel-before/after-fire
 remain open under #1134.
 
+## 2026-10-25: Four small bridge defects (#1226)
+
+- `core_log_filter` now lists `ocaml_temporal_core_bridge`, so the bridge's
+  own `debug` records reach the Core log sink at `debug`. Examples are the
+  metrics endpoint's rejected-connection and connection-cap records, which
+  the docs already promised. They were previously capped at `warn`.
+- `metric_meter_register_json` reports a document over 8 KiB as
+  `STATUS_CONFIGURATION`, as documented, instead of `STATUS_PROTOCOL`.
+- The strict parser's preflight measures strings by decoded bytes: an
+  escape counts what it decodes to (`\u00XX` 1 to 3 bytes, a surrogate pair
+  4, `\n` 1) rather than its hex digits. More than 16,384 escaped control
+  characters, valid on the OCaml side, were refused.
+- `SharedRuntime.core` is no longer an `Option`: the handle is consumed by
+  its release, so the "released shared runtime" `INVALID_STATE` branch was
+  unreachable and is gone. The header now says a freed handle must not be
+  passed and a NULL one fails with `INVALID_ARGUMENT`.
+
+`connection_diagnostics`, `sdk_metrics` and the new
+`string_limit_counts_decoded_escape_bytes` in `protocol.rs` cover the first
+three, and each fails against the previous code.
+
 ## 2026-10-24: Per-workflow versioning behavior (#1159)
 
 `Worker.workflow ?versioning_behavior:[ `Pinned | `Auto_upgrade ]` declares a
