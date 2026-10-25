@@ -59,7 +59,7 @@ platforms does not establish live compatibility there.
 | Child workflows | Success, propagated failure, explicit child cancellation, child retry, and duplicate-ID start failure are live-tested. Separate controllers verify exact parent/child replay after worker replacement and a child failing after replay while its parent recovers. |
 | Client and interactions | Exact-run start/wait/cancel/terminate, continue-as-new following, direct and external signals, both query forms, typed update completion, unknown-handler rejection, and external cancellation have live assertions. External signal rejection against a completed target and wrong-run cancellation rejection are also exercised. Reset, visibility, and interaction recovery/deadline coverage remain incomplete. |
 | Recovery and patching | Live controllers exercise graceful replacement, forced crash recovery, sticky-cache eviction, parent/child recovery, and marker-free to active, active to deprecated, and deprecated to removed patch histories. These fixtures do not establish arbitrary-history compatibility. |
-| Cancellation | [`Temporal.Scope`](docs/reference/workflow-scopes.md) wakes observers and invokes exactly-once cancellation hooks for remote activities and child workflows started with `~scope`. This is implemented and focused-tested; it does not preempt an activity callback or implicitly cancel timers or losing futures. |
+| Cancellation | [`Temporal.Scope`](docs/reference/workflow-scopes.md) wakes observers and invokes exactly-once cancellation hooks for remote and local activities, child workflows and durable timers started with `~scope` (a scoped timer is cancelled with `Cancel_timer`). This is implemented and focused-tested; it does not preempt an activity callback, and unscoped operations and losing futures are not cancelled implicitly. |
 | Native boundary | An OCaml-owned supervisor manages the private C/Rust/Core graph. Focused tests cover copied payloads, strict protocol validation, handle ownership, retryable completion drainage, and shutdown. |
 
 ## What is deliberately still pending
@@ -74,8 +74,10 @@ platforms does not establish live compatibility there.
   cancellation only cooperatively, at its heartbeats, and worker shutdown
   through `Activity.Context.is_worker_shutting_down`; an asynchronous handle
   observes cancellation, pause and reset only through the result of
-  `Activity.Async_handle.heartbeat` and is not told about worker shutdown.
-  Bounded operational shutdown qualification remains incomplete.
+  `Activity.Async_handle.heartbeat`, and worker shutdown through
+  `Async_handle.is_worker_shutting_down` and a retryable `"WorkerShutdown"`
+  heartbeat error (#1157). Bounded operational shutdown qualification remains
+  incomplete.
 - Workflow-level cooperative cancellation and durable cleanup are not
   supported ([#514](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/514)):
   `Client.cancel` closes the run as cancelled without letting workflow code

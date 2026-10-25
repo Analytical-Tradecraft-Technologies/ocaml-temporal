@@ -278,20 +278,22 @@ replay:
 let summarize_all documents =
   let open Temporal.Result_syntax in
   let* children =
-    List.fold_right
-      (fun document children ->
+    List.fold_left
+      (fun children document ->
         let* children = children in
         let* id = Temporal.Workflow.uuid4 () in
         Ok
           (Temporal.Child_workflow.start ~id:("summarize-" ^ id) summarize_child
              document
           :: children))
-      documents (Ok [])
+      (Ok []) documents
   in
-  Temporal.Future.await (Temporal.Future.all children)
+  Temporal.Future.await (Temporal.Future.all (List.rev children))
 ```
 
-Draw in a deterministic order (here, the order of the input list), because
+Draw in a deterministic order (here, the order of the input list:
+`List.fold_left` draws and starts each child in turn, and `List.rev` restores
+that order for the results), because
 the stream is shared by every draw in the run. A UUID drawn this way is not a
 security token: the seed is recorded in the run's history. There is no
 generic "side effect" API for reading the outside world; run such code in a
@@ -601,10 +603,14 @@ response to a heartbeat, so schedule such an activity with a
   acknowledged with `Async_handle.cancel`, and a retryable one is a pause or
   reset, to be reported with `Async_handle.fail` and that error. The heartbeat
   is still recorded and the handle stays live until one of those calls.
-  Handles are not told about worker shutdown, so cleanup on shutdown is
-  available only to synchronous activities. A worker shutdown waits for an
-  unfinished handle for the graceful shutdown period and then closes it as a
-  lost completion; a handle that is never finished expires once Temporal must
+  Once the worker begins to stop, `Async_handle.is_worker_shutting_down` (and
+  `Async_context.is_worker_shutting_down` during the callback) returns `true`,
+  and a heartbeat that would otherwise succeed returns a retryable
+  `` `Cancelled `` error of type `"WorkerShutdown"` (#1157). Failing the handle
+  with that error before the graceful shutdown period ends hands the attempt
+  back for Temporal to retry, normally on another worker. A worker shutdown
+  waits for an unfinished handle for the graceful shutdown period and then
+  closes it as a lost completion; a handle that is never finished expires once Temporal must
   have timed its attempt out (#1043). Later handle calls return a
   non-retryable error, and Temporal retries the attempt after its heartbeat,
   start-to-close or schedule-to-close timeout.
