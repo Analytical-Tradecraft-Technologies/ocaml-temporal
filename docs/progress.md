@@ -6071,6 +6071,21 @@ Locally, the mode refused a work directory under `/tmp`, which the macOS
 wrapper leaves writable. The release checklist now lists the Linux job and no
 longer makes the opam install a manual post-publication step.
 
+## 2026-10-25: Action pins refreshed everywhere; release jobs bounded (#1227)
+
+Dependabot's `github-actions` entry covered only `.github/workflows`. The
+composite `rust-bridge` action therefore still used an older
+`actions/upload-artifact` pin, and `actions/cache` had never been
+refreshed; the inventory accepted both upload pins. The entry now also scans
+`/.github/actions/*`, the composite action uses the workflows' pin, and
+`check-dependency-inventory.sh` fails when one action is pinned to two refs:
+restoring the old pin makes it report `actions/upload-artifact`. The
+release workflow's `validate`, `source-archive` and `publish` jobs, which hold
+release permissions, now have 15-, 60- and 30-minute timeouts.
+`quality-gates.md` no longer says GitHub actions may use major-version tags,
+and its matrix table names the two sandboxed opam jobs. `dependencies.md`
+gives Dependabot's real 06:00 schedule.
+
 ## 2026-10-24: Scoped durable-timer cancellation (#1134, first slice)
 
 `Workflow.start_sleep` and `Workflow.sleep` take `?scope`. The runtime timer

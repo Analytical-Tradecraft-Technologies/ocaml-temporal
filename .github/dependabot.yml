@@ -113,7 +113,11 @@ updates:
   cooldown:
     default-days: 3
 - package-ecosystem: github-actions
-  directory: /
+  # The default scope is .github/workflows only; the composite rust-bridge
+  # action pins actions too, and was never refreshed without this (#1227).
+  directories:
+  - /
+  - /.github/actions/*
   schedule:
     interval: cron
     cronjob: 0 6 * * *

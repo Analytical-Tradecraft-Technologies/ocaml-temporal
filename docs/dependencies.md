@@ -412,7 +412,7 @@ deadlock shutdown. Temporal Core already selected and used the locked Tokio
 runtime, so the bridge does not create a second executor.
 
 Dependabot checks the Cargo workspace under `/rust` every calendar day at
-07:00 Australia/Sydney and targets `master`, with a three-day release cooldown
+06:00 Australia/Sydney and targets `master`, with a three-day release cooldown
 and a maximum of ten open Cargo version-update PRs. Its explicit
 `allow: dependency-type: all` policy includes direct and transitive Cargo
 dependencies; without that rule, routine version updates cover only direct
@@ -635,8 +635,10 @@ policy.
 
 Workflows and the composite `rust-bridge` action use these external actions.
 They run only on CI runners and are not linked into or redistributed with the
-SDK. Dependabot's `github-actions` ecosystem refreshes them. "Release" is the
-version comment recorded beside a commit pin.
+SDK. Dependabot's `github-actions` ecosystem refreshes them in the workflows
+and, through its second directory, in `.github/actions/*` (#1227). Each action
+has exactly one pin; the inventory check fails if an update leaves a second
+one behind. "Release" is the version comment recorded beside a commit pin.
 
 | Action | Pinned ref | Release | License | Used for |
 |---|---|---|---|---|
@@ -644,7 +646,6 @@ version comment recorded beside a commit pin.
 | `actions/attest-build-provenance` | `4d101475d8b20a2381f78447822ac1eab6504dd8` | v4.2.2 | MIT | Signing SLSA build provenance for the published release assets |
 | `actions/cache/restore` | `caa296126883cff596d87d8935842f9db880ef25` | v5 | MIT | Restoring verified Rust bridge bundles |
 | `actions/cache/save` | `caa296126883cff596d87d8935842f9db880ef25` | v5 | MIT | Saving verified Rust bridge bundles |
-| `actions/upload-artifact` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | v7 | MIT | Passing bridges, reports, and release inputs between jobs |
 | `actions/upload-artifact` | `cf430e030ddbb5b0abf93d22962f4752f3646cd9` | v7 | MIT | Passing bridges, reports, and release inputs between jobs |
 | `actions/download-artifact` | `9000827ccba6bdab643e8b6fd33ac0654aef8333` | v8 | MIT | Consuming those artifacts |
 | `msys2/setup-msys2` | `ec48f7c5447b3140e2b088413ae3a55687bccb6e` | v2 | MIT | MinGW build tools for the Windows Rust producer |

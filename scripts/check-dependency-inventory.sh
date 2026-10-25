@@ -281,6 +281,15 @@ grep -h 'uses:' "$root"/.github/workflows/*.yml "$root"/.github/actions/*/action
     }' > "$scratch/expected"
 doc_table '## GitHub Actions' | columns 1,2,3 > "$scratch/documented"
 compare 'GitHub Actions'
+# One action, one pin (#1227): two refs for the same action mean one copy was
+# left behind by an update, typically in the composite action that Dependabot
+# did not scan, and both would otherwise match the table.
+duplicated=$(cut -f1,2 "$scratch/expected" | sort -u | cut -f1 | uniq -d)
+if [ -n "$duplicated" ]; then
+  printf 'dependency inventory: actions pinned to more than one ref: %s\n' \
+    "$(printf '%s' "$duplicated" | tr '\n' ' ')" >&2
+  failed=1
+fi
 
 if [ "$failed" -ne 0 ]; then
   echo "update docs/dependencies.md (and review each changed licence) to match the pinned sources" >&2
