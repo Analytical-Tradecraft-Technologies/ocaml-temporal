@@ -6307,6 +6307,20 @@ handle observes the run's termination, and shutdown during a bounded wait
 ends it promptly with the closed-client error. It passed locally against the
 pinned Compose stack.
 
+## 2026-10-25: Stress seeds cannot carry shell (#1219)
+
+The scheduled stress workflow's `seed` input was checked on its first
+character only, and the Makefile pastes seeds into quoted recipe words, so
+`1"; <command>; "` ran on the runner. The workflow now requires the whole
+value to match `0x[0-9a-fA-F]+|[0-9]+`. The Makefile checks the four seed
+variables itself, in Make alone and before any recipe runs: each must be one
+word of decimal digits or `0x` plus hexadecimal digits. The check reads the
+unexpanded text, so a `$(shell ...)` seed is refused, not evaluated.
+`test/smoke/test_make_seed_validation.sh` (in `test-quality-contract`) dry-runs
+`test-parser-fuzz` with injection-shaped seeds from the command line and the
+environment. It asserts each is refused with the seed diagnostic and that
+nothing it carried ran; it fails against the previous Makefile.
+
 ## 2026-10-24: Client.fetch_history (#1137)
 
 `Temporal.Client.fetch_history ?page_size ?rpc_timeout handle` returns the

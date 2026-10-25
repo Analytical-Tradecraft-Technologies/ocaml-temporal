@@ -140,6 +140,20 @@ CONCURRENT_STRESS_GRAPHS ?= 3
 CONCURRENT_STRESS_OCAML_ROUNDS ?= 6
 CONCURRENT_STRESS_OCAML_DOMAINS ?= 4
 CONCURRENT_STRESS_ENV = CONCURRENT_STRESS_SEED="$(CONCURRENT_STRESS_SEED)" CONCURRENT_STRESS_ROUNDS="$(CONCURRENT_STRESS_ROUNDS)" CONCURRENT_STRESS_THREADS="$(CONCURRENT_STRESS_THREADS)" CONCURRENT_STRESS_GRAPHS="$(CONCURRENT_STRESS_GRAPHS)" CONCURRENT_STRESS_OCAML_ROUNDS="$(CONCURRENT_STRESS_OCAML_ROUNDS)" CONCURRENT_STRESS_OCAML_DOMAINS="$(CONCURRENT_STRESS_OCAML_DOMAINS)" LIFECYCLE_STRESS_SEED="$(LIFECYCLE_STRESS_SEED)"
+# Seeds are pasted into recipe shell words ("$(..._SEED)"), and the scheduled
+# stress workflow takes one from a dispatch input, so a seed that closed the
+# quotes would run as shell (#1219). Each seed is therefore checked here, in
+# Make alone and before any recipe runs, to be one word of decimal digits or
+# 0x followed by hexadecimal digits. The check reads the unexpanded text
+# ($(value ...)), so a seed such as $(shell ...) is rejected, not run.
+# test/smoke/test_make_seed_validation.sh covers it.
+seed_decimal_digits := 0 1 2 3 4 5 6 7 8 9
+seed_hex_digits := $(seed_decimal_digits) a b c d e f A B C D E F
+# $(call seed_strip,TEXT,CHARACTERS) deletes every listed character from TEXT.
+seed_strip = $(if $(2),$(call seed_strip,$(subst $(firstword $(2)),,$(1)),$(wordlist 2,$(words $(2)),$(2))),$(1))
+# $(call seed_valid,TEXT) is non-empty exactly when TEXT is an accepted seed.
+seed_valid = $(and $(filter 1,$(words $(1))),$(if $(filter 0x%,$(1)),$(and $(patsubst 0x%,%,$(1)),$(if $(call seed_strip,$(patsubst 0x%,%,$(1)),$(seed_hex_digits)),,ok)),$(if $(call seed_strip,$(1),$(seed_decimal_digits)),,ok)))
+$(foreach seed,STRUCTURED_FUZZ_SEED DECODER_FUZZ_SEED LIFECYCLE_STRESS_SEED CONCURRENT_STRESS_SEED,$(if $(call seed_valid,$(value $(seed))),,$(error $(seed) must be decimal digits or 0x followed by hexadecimal digits)))
 # CI supplies a verified, immutable bridge bundle. Each OCaml consumer still
 # builds its C stubs and runs its own tests; Rust-only checks belong to the
 # producer. Explicit test-rust/lint-rust targets always remain available.
@@ -548,6 +562,7 @@ test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inve
 	sh test/smoke/test_release_tag_commit_contract.sh .
 	sh test/smoke/test_prebuilt_install_tag_contract.sh .
 	sh test/smoke/test_make_docker_commands.sh .
+	sh test/smoke/test_make_seed_validation.sh .
 	sh test/smoke/test_rust_bridge_artifact.sh .
 	sh test/smoke/test_examples_live_contract.sh .
 

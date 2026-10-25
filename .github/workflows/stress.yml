@@ -56,10 +56,13 @@ jobs:
           if [ -z "$seed" ]; then
             seed="$(printf '0x%08x' "$RUN_NUMBER")"
           fi
-          case "$seed" in
-            0x[0-9a-fA-F]*|[0-9]*) ;;
-            *) echo "seed must be decimal or 0x hexadecimal" >&2; exit 1 ;;
-          esac
+          # The whole value must match, not just its first character: the
+          # Makefile also rejects anything else, but the seed must never
+          # reach make with shell metacharacters in it (#1219).
+          if ! printf '%s' "$seed" | grep -Eqx '0x[0-9a-fA-F]+|[0-9]+'; then
+            echo "seed must be decimal or 0x hexadecimal" >&2
+            exit 1
+          fi
           echo "seed=$seed" >> "$GITHUB_OUTPUT"
           echo "Stress seed: $seed" >> "$GITHUB_STEP_SUMMARY"
       - name: Run every fuzzer and stress with the qualification budget
