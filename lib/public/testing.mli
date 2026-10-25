@@ -11,7 +11,11 @@
     failed child run under its retry policy), routes signals and
     cancellations, and fires timers. It delivers each activation's jobs in
     Temporal Core's order, reports activity and child failures with the
-    native worker's error categories, types, and retryability, and, like a
+    native worker's error categories, types, retryability and
+    {!Error.val-origin} (an unregistered type is a ["NotFoundError"], retryable
+    for a remote activity; a cancellation has origin [`Cancelled]), gives a
+    local activity no heartbeat hand-off between attempts, as Core does, and,
+    like a
     server, never dispatches an activity, child start, or external signal
     or cancellation emitted in the same activation that closes the run.
 

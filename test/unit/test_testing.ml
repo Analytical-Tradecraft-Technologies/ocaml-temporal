@@ -633,26 +633,60 @@ let resumable =
           Error (T.Error.make ~category:`Activity ~message:"interrupted" ())
       | payload :: _ -> T.Codec.decode T.Codec.string payload)
 
-(** Runs [resumable] as a local activity, then [compose_greeting]. *)
+(** Runs [resumable] as a remote activity, then [compose_greeting] as a local
+    one. *)
 let local_workflow =
   T.Workflow.define ~name:"local_workflow" ~input:T.Codec.unit
     ~output:T.Codec.string (fun () ->
       let* resumed =
-        T.Activity.execute_local ~retry_policy:(retry_policy ~maximum_attempts:3)
+        T.Activity.execute ~retry_policy:(retry_policy ~maximum_attempts:3)
           resumable ()
       in
       let* greeting = T.Activity.execute_local compose_greeting resumed in
       Ok greeting)
 
-(** Local activities run in the environment, and heartbeat details recorded
-    by one attempt are delivered to the next. *)
+(** Details each [local_checkpoint] attempt saw, newest first. *)
+let local_details_seen = ref []
+
+(** Heartbeats and fails on every attempt, recording the details it sees. *)
+let local_checkpoint =
+  T.Activity.define_with_context ~name:"local_checkpoint" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun context () ->
+      local_details_seen :=
+        List.length (T.Activity.Context.details context) :: !local_details_seen;
+      let* () = T.Activity.Context.heartbeat context T.Codec.string "checkpoint" in
+      Error (T.Error.make ~category:`Activity ~message:"interrupted" ()))
+
+(** Runs [local_checkpoint] as a local activity with three attempts. *)
+let local_checkpoint_workflow =
+  T.Workflow.define ~name:"local_checkpoint_workflow" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      T.Activity.execute_local ~retry_policy:(retry_policy ~maximum_attempts:3)
+        local_checkpoint ())
+
+(** Local activities run in the environment. A remote activity's heartbeat
+    details are delivered to its next attempt; a local activity's are not,
+    as Core builds every local attempt with no details and drops its
+    heartbeats (#1221). *)
 let test_local_activity_and_heartbeat_details () =
   with_environment
-    ~workflows:[ T.Testing.workflow local_workflow ]
-    ~activities:[ T.Testing.activity resumable; T.Testing.activity compose_greeting ]
+    ~workflows:
+      [ T.Testing.workflow local_workflow; T.Testing.workflow local_checkpoint_workflow ]
+    ~activities:
+      [
+        T.Testing.activity resumable;
+        T.Testing.activity compose_greeting;
+        T.Testing.activity local_checkpoint;
+      ]
     (fun environment ->
-      expect "resumed from heartbeat" "Hello, checkpoint"
-        (ok "execute" (T.Testing.execute environment local_workflow ())))
+      expect "remote attempt resumed from heartbeat" "Hello, checkpoint"
+        (ok "execute" (T.Testing.execute environment local_workflow ()));
+      local_details_seen := [];
+      ignore
+        (expect_error "local attempts exhausted" `Activity
+           (T.Testing.execute environment local_checkpoint_workflow ()));
+      expect "every local attempt saw no heartbeat details" [ 0; 0; 0 ]
+        !local_details_seen)
 
 (** Signals the [cart-target] workflow and then closes it. *)
 let sender_workflow =
@@ -935,6 +969,122 @@ let test_native_error_shapes () =
       expect "codec failure uses the native adapter type"
         (Some "ocaml_temporal_native_activity") (T.Error.error_type error))
 
+(** Defined but never registered with the environment. *)
+let unregistered_activity =
+  T.Activity.define ~name:"unregistered" ~input:T.Codec.unit ~output:T.Codec.unit
+    (fun () -> Ok ())
+
+(** Schedules [unregistered_activity] remotely or locally, three attempts. *)
+let unregistered_workflow =
+  T.Workflow.define ~name:"unregistered_workflow" ~input:T.Codec.bool
+    ~output:T.Codec.unit (fun local ->
+      let retry_policy = retry_policy ~maximum_attempts:3 in
+      if local then T.Activity.execute_local ~retry_policy unregistered_activity ()
+      else T.Activity.execute ~retry_policy unregistered_activity ())
+
+(** Runs of [cancelled_failure_child] under [retrying_cancelled_parent]. *)
+let cancelled_child_runs = ref 0
+
+(** Fails with a [Cancelled]-category error and counts its runs. *)
+let counted_cancelled_child =
+  T.Workflow.define ~name:"counted_cancelled_child" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      incr cancelled_child_runs;
+      Error (T.Error.make ~category:`Cancelled ~message:"gave up" ()))
+
+(** Runs [counted_cancelled_child] under a three-attempt workflow retry
+    policy. *)
+let retrying_cancelled_parent =
+  T.Workflow.define ~name:"retrying_cancelled_parent" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      T.Child_workflow.execute ~retry_policy:(retry_policy ~maximum_attempts:3)
+        ~id:"counted-cancelled-child" counted_cancelled_child ())
+
+(** Runs of [counted_terminated_child] under [retrying_terminated_parent]. *)
+let terminated_child_runs = ref 0
+
+(** Fails with a [Terminated]-category error and counts its runs. The
+    native worker serializes that error as an ordinary application failure,
+    so the server retries it. *)
+let counted_terminated_child =
+  T.Workflow.define ~name:"counted_terminated_child" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      incr terminated_child_runs;
+      Error (T.Error.make ~category:`Terminated ~message:"gave up" ()))
+
+(** Runs [counted_terminated_child] under a three-attempt workflow retry
+    policy. *)
+let retrying_terminated_parent =
+  T.Workflow.define ~name:"retrying_terminated_parent" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      T.Child_workflow.execute ~retry_policy:(retry_policy ~maximum_attempts:3)
+        ~id:"counted-terminated-child" counted_terminated_child ())
+
+(** Testing matches the native worker in three more places (#1215):
+    workflow-visible errors carry the native [Error.origin]; an unregistered
+    activity type fails as ["NotFoundError"], retryably for a remote
+    activity (so its policy runs every attempt) and at once for a local one
+    (#1031); and a child failing with a [Cancelled] error is not retried,
+    since the server never retries a canceled failure, while one failing
+    with a [Terminated]-category error is retried and has origin
+    [`Application], as the native worker serializes it as an application
+    failure. *)
+let test_native_origins_and_retryability () =
+  with_environment
+    ~workflows:
+      [
+        T.Testing.workflow unregistered_workflow;
+        T.Testing.workflow cancelled_failure_parent;
+        T.Testing.workflow cancelled_failure_child;
+        T.Testing.workflow retrying_cancelled_parent;
+        T.Testing.workflow counted_cancelled_child;
+        T.Testing.workflow retrying_terminated_parent;
+        T.Testing.workflow counted_terminated_child;
+        T.Testing.workflow flaky_workflow;
+      ]
+    ~activities:[ T.Testing.activity flaky ]
+    (fun environment ->
+      let started = epoch_ms (T.Testing.now environment) in
+      let error =
+        expect_error "remote unregistered activity" `Activity
+          (T.Testing.execute environment unregistered_workflow false)
+      in
+      expect "unregistered type" (Some "NotFoundError") (T.Error.error_type error);
+      expect "remote unregistered type retried under the policy" 3_000L
+        (Int64.sub (epoch_ms (T.Testing.now environment)) started);
+      expect "activity failure origin" (Some `Application) (T.Error.origin error);
+      let started = epoch_ms (T.Testing.now environment) in
+      let error =
+        expect_error "local unregistered activity" `Activity
+          (T.Testing.execute environment unregistered_workflow true)
+      in
+      expect "local unregistered type" (Some "NotFoundError") (T.Error.error_type error);
+      expect "local unregistered type not retried" 0L
+        (Int64.sub (epoch_ms (T.Testing.now environment)) started);
+      let error =
+        expect_error "cancelled-category child" `Child_workflow
+          (T.Testing.execute environment cancelled_failure_parent ())
+      in
+      expect "cancelled child origin" (Some `Cancelled) (T.Error.origin error);
+      cancelled_child_runs := 0;
+      ignore
+        (expect_error "retrying parent of a cancelled child" `Child_workflow
+           (T.Testing.execute environment retrying_cancelled_parent ()));
+      expect "cancelled-category child failure is not retried" 1
+        !cancelled_child_runs;
+      terminated_child_runs := 0;
+      let error =
+        expect_error "retrying parent of a terminated-category child"
+          `Child_workflow
+          (T.Testing.execute environment retrying_terminated_parent ())
+      in
+      expect "terminated-category child failure is retried" 3
+        !terminated_child_runs;
+      expect "terminated-category child origin" (Some `Application)
+        (T.Error.origin error);
+      expect "terminated-category child type" (Some "terminated")
+        (T.Error.error_type error))
+
 (** Answers a query without touching workflow state. *)
 let ping_query = T.Query.define ~name:"ping" ~output:T.Codec.string
 
@@ -1066,4 +1216,5 @@ let () =
   test_core_job_order ();
   test_child_retry_policy ();
   test_native_error_shapes ();
+  test_native_origins_and_retryability ();
   test_time_history_and_mock_order ()

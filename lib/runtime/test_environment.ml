@@ -261,18 +261,31 @@ let native_dispatch_failure_type = "ocaml_temporal_native_activity"
 (** The [error_type] the native worker reports for a child-workflow failure
     caused by [cause]. The native path sets it to the innermost Temporal
     application failure's type ([Failure_diagnostic.application_failure_type]).
-    A workflow failing with a [Cancelled] error is encoded as a canceled
-    failure, and a termination as a terminated failure, so neither carries
-    an application type; every other error is encoded as an application
-    failure typed by {!Error.application_failure_type}. (An activity's
-    error is always encoded as an application failure, so activity
-    failures always carry that type.) *)
+    [Native_execution.protocol_failure] encodes a workflow failing with a
+    [Cancelled] error as a canceled failure, which carries no application
+    type, and every other error, a [Terminated]-category one included, as an
+    application failure typed by {!Error.application_failure_type}. (An
+    activity's error is always encoded as an application failure, so
+    activity failures always carry that type.) *)
 let child_error_type cause =
   match (Error.view cause).category with
-  | `Cancelled | `Terminated -> None
+  | `Cancelled -> None
   | `Activity | `Bridge | `Child_workflow | `Codec | `Defect | `Nexus
-  | `Timeout | `Update | `Workflow ->
+  | `Terminated | `Timeout | `Update | `Workflow ->
       Some (Error.application_failure_type cause)
+
+(** The origin the native worker reports for a child failure caused by
+    [cause] (#1215). [Native_execution.protocol_failure] serializes a
+    workflow failure as a fresh, cause-less failure without the error's own
+    origin: a canceled failure for a [Cancelled] error and an application
+    failure for every other one. The parent classifies that first layer, so
+    an origin [cause] received (a timeout, say) is not forwarded. *)
+let child_origin cause =
+  match (Error.view cause).category with
+  | `Cancelled -> `Cancelled
+  | `Activity | `Bridge | `Child_workflow | `Codec | `Defect | `Nexus
+  | `Terminated | `Timeout | `Update | `Workflow ->
+      `Application
 
 (** Wraps [cause] as the activity or child-workflow failure a workflow
     observes, mirroring the native worker's translation of Core's wrapper
@@ -292,8 +305,11 @@ let wrap ?origin ?last_heartbeat_details ~category ~error_type ~non_retryable
     ?last_heartbeat_details ~category
     ~message:(prefix ^ view.message) ()
 
-(** The error a workflow observes for a cancelled operation or run. *)
-let cancelled message = Error.make ~category:`Cancelled ~message ()
+(** The error a workflow observes for a cancelled operation or run. Its
+    origin is [`Cancelled], as the native worker classifies a received
+    canceled failure (#1215). *)
+let cancelled message =
+  Error.make ~category:`Cancelled ~origin:`Cancelled ~message ()
 
 (** Applies the bridge's identifier rules to a caller-supplied workflow ID. *)
 let validate_workflow_id workflow_id =
@@ -505,7 +521,7 @@ let rec close_chain ?(cancelled = false) ?(retries_exhausted = false)
           | Error error when cancelled -> Error error
           | Error error ->
               Error
-                (wrap ~category:`Child_workflow
+                (wrap ~category:`Child_workflow ~origin:(child_origin error)
                    ~error_type:(child_error_type error)
                    ~non_retryable:
                      (retries_exhausted || (Error.view error).non_retryable)
@@ -554,6 +570,7 @@ and close_run environment run =
               close_chain environment child
                 (Error
                    (Error.make ~non_retryable:true ~category:`Terminated
+                      ~origin:`Terminated
                       ~message:"terminated because the parent workflow closed"
                       ())))
       children
@@ -798,6 +815,16 @@ let finish environment run closure outcome =
   if current run.chain == run then
     let chain = run.chain in
     match (closure, outcome, chain.retry_policy) with
+    | Run_failed, Error error, Some _
+      when (match (Error.view error).category with
+            | `Cancelled -> true
+            | _ -> false) ->
+        (* The native worker encodes such a failure as a canceled failure,
+           which Temporal Server never retries under a workflow retry policy
+           (#1215). A [Terminated]-category error is encoded as an ordinary
+           application failure and is retried; a real termination closes the
+           chain through [close_run] instead. *)
+        close_chain environment chain outcome
     | Run_failed, Error error, (Some _ as policy) -> (
         match retry_delay environment policy ~attempt:run.attempt error with
         | Some delay_ms -> (
@@ -814,22 +841,38 @@ let finish environment run closure outcome =
         close_chain environment chain outcome
 
 (** Runs one attempt of [request] synchronously, outside every workflow
-    context, and returns its encoded output or failure. Activities take zero
-    virtual time. Failures are classified as the native activity adapter
-    classifies them: a task that cannot be dispatched (unknown or
-    unsupported type, bad argument list, codec failure or a raising codec)
-    fails non-retryably with {!native_dispatch_failure_type}, and an
-    exception from the callback itself fails non-retryably as
-    [ocaml_exception]. *)
+    context, and returns its encoded output or failure. Failures are
+    classified as the native activity adapter classifies them (#1031,
+    #1215):
+
+    - an unregistered type fails as ["NotFoundError"], and a bad argument
+      list or an input the codec cannot decode (or that makes it raise) as
+      {!native_dispatch_failure_type}. These are retryable for a remote
+      activity, so its retry policy decides, as a later attempt could reach
+      another worker, and non-retryable for a local one, which always runs
+      here;
+    - an unsupported definition (a remote reference or an asynchronous
+      activity), a definition without an implementation, and an output codec
+      failure fail non-retryably with {!native_dispatch_failure_type};
+    - an exception from the callback itself fails non-retryably as
+      [ocaml_exception].
+
+    A local activity's context has no heartbeat hand-off: its heartbeats are
+    accepted and dropped, and every attempt sees no details, because Core
+    builds every local attempt with empty details and drops heartbeats for
+    local tokens (#1221). *)
 let attempt_activity environment run request ~attempt =
-  let failure ?(error_type = native_dispatch_failure_type) message =
-    Error
-      (Error.make ~non_retryable:true ~error_type ~category:`Activity ~message
-         ())
+  let failure ?(error_type = native_dispatch_failure_type)
+      ?(non_retryable = true) message =
+    Error (Error.make ~non_retryable ~error_type ~category:`Activity ~message ())
+  in
+  (* A task another worker might run fails retryably when it is remote. *)
+  let unrunnable ?error_type message =
+    failure ?error_type ~non_retryable:request.is_local message
   in
   match Name_map.find_opt request.activity_type environment.activities with
   | None ->
-      failure
+      unrunnable ~error_type:"NotFoundError"
         (Printf.sprintf
            "activity type %s is not registered with the test environment"
            request.activity_type)
@@ -846,7 +889,7 @@ let attempt_activity environment run request ~attempt =
             | [] -> Ok (Payload.unit_null ())
             | [ payload ] -> Ok payload
             | _ ->
-                failure
+                unrunnable
                   "activity definitions currently accept exactly one input \
                    value"
           in
@@ -854,10 +897,10 @@ let attempt_activity environment run request ~attempt =
             match Codec.decode (Definition.input definition) payload with
             | Ok input -> Ok input
             | Error error ->
-                failure
+                unrunnable
                   ("activity input decoding failed: " ^ Error.message error)
             | exception exn ->
-                failure
+                unrunnable
                   ("activity input decoder raised: " ^ Printexc.to_string exn)
           in
           let milliseconds = Option.map Temporal_base.Duration.of_ms in
@@ -883,12 +926,18 @@ let attempt_activity environment run request ~attempt =
             }
           in
           let context =
-            Activity_context.create_with_info ~info
-              ~heartbeat:(fun details ->
-                request.heartbeat_details <- details;
-                Ok ())
-              ~details:request.heartbeat_details
-              ~heartbeat_timeout:(milliseconds request.heartbeat_timeout)
+            if request.is_local then
+              Activity_context.create_with_info ~info
+                ~heartbeat:(fun _ -> Ok ())
+                ~details:[]
+                ~heartbeat_timeout:(milliseconds request.heartbeat_timeout)
+            else
+              Activity_context.create_with_info ~info
+                ~heartbeat:(fun details ->
+                  request.heartbeat_details <- details;
+                  Ok ())
+                ~details:request.heartbeat_details
+                ~heartbeat_timeout:(milliseconds request.heartbeat_timeout)
           in
           let result =
             match implementation context input with

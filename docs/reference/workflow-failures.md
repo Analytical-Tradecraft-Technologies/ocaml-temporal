@@ -80,7 +80,11 @@ expired). `Temporal.Testing` simulates activity
 start-to-close, schedule-to-close and heartbeat timeouts in virtual time
 (#1160) and reports them in this shape: category `Activity`, origin
 `` `Timeout t ``, no application type, and the last heartbeat's details; a
-final application failure has origin `` `Application ``. Its other
+final application failure has origin `` `Application ``. Cancellations
+have origin `` `Cancelled ``. A child failure has origin `` `Cancelled ``
+when the child failed with a `Cancelled` error and `` `Application ``
+otherwise, because the native worker serializes a workflow failure without
+its error's origin (#1215). Its other
 virtual-deadline errors (an execute or result `?timeout`, a condition
 timeout) are created by the SDK, so their origin is `None`.
 
