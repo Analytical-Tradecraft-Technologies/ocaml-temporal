@@ -151,8 +151,9 @@ and bridge, read the [documentation guide](../README.md) first.
   an ended workflow.
 - A `Temporal.Scope` signal belongs to the same scheduler as the workflow
   futures it observes. Cancellation resolves that private signal and invokes
-  each registered activity or child-workflow cancellation hook at most once;
-  timers and unscoped operations remain observation-only. Every scope
+  each registered cancellation hook at most once: those of remote and local
+  activities, child workflows and durable timers started with `~scope`
+  (#1134, #1156); unscoped operations remain observation-only. Every scope
   operation is owner-checked. While the scheduler is paused between runs,
   only `is_cancelled` and `check` may also be called by a synchronous query for
   the same live execution; a foreign or stale handle returns a typed defect

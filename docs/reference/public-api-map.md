@@ -97,9 +97,10 @@ for those rules.
   tied to the execution that created it; `await` suspends the current workflow
   fiber rather than blocking an OS thread. `Temporal.Condition` waits on
   replay-safe OCaml state, while `Temporal.Scope` adds typed cancellation to
-  observation of futures. Activities and child workflows started with
-  `~scope` also register exactly-once server-cancellation hooks; timers and
-  unscoped operations remain observation-only. See the
+  observation of futures. Remote and local activities, child workflows and
+  durable timers started with `~scope` also register exactly-once
+  cancellation hooks (a scoped timer emits `Cancel_timer`); unscoped
+  operations remain observation-only. See the
   [workflow-local cancellation scope reference](workflow-scopes.md).
 - `Temporal.Workflow_context` provides execution-local values for workflow
   state. Use it instead of module-level mutable state when the value belongs
