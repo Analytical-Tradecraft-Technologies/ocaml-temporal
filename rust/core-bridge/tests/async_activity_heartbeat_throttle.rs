@@ -460,6 +460,19 @@ fn terminal(runtime: *mut Runtime, token: &str, cancelled: bool) {
     assert_eq!(status, STATUS_OK, "{message}");
 }
 
+/// Fails `token`'s attempt through the async completion call with a
+/// retryable application failure, as a completer does after a pause, reset
+/// or worker-shutdown heartbeat error.
+fn fail(runtime: *mut Runtime, token: &str) {
+    let document = format!(
+        r#"{{"task_token":"{}","result":{{"kind":"failed","failure":{{"message":"paused","source":"","stack_trace":"","encoded_attributes":null,"cause":null,"info":{{"kind":"application","type":"WorkerShutdown","non_retryable":false,"details":[]}}}}}}}}"#,
+        STANDARD.encode(token)
+    );
+    let call = submit(runtime, CALL_ASYNC_ACTIVITY_COMPLETION, &document).expect("fail submission");
+    let (status, _, message) = await_call(call);
+    assert_eq!(status, STATUS_OK, "{message}");
+}
+
 /// The throttle's tracked tokens and retained drivers.
 fn counts(runtime: *mut Runtime) -> (usize, usize) {
     // SAFETY: The runtime is live and only used by this thread.
@@ -694,6 +707,33 @@ fn terminal_requests_evict_the_token() {
         &observed.heartbeats(&cancelled)[1].body,
         b"flushed"
     ));
+    close_runtime(runtime);
+}
+
+/// A failure carries details that the throttle coalesced but had not sent as
+/// `last_heartbeat_details`, as Core's `fail_activity_task` does, so the
+/// retried attempt resumes from them (#1207). Before the fix they were
+/// evicted and dropped, and the server kept the earlier, sent details.
+#[test]
+fn failure_carries_pending_heartbeat_details() {
+    let observed = Arc::new(Observed::default());
+    let runtime = start_runtime(spawn_server(Arc::clone(&observed)), "", "");
+
+    let failed = token("failed");
+    heartbeat_now(runtime, &failed, "offset-100", Some(10_000));
+    heartbeat_now(runtime, &failed, "offset-200", Some(10_000));
+    fail(runtime, &failed);
+    await_empty(runtime);
+    assert_eq!(
+        observed.methods(&failed),
+        ["RecordActivityTaskHeartbeat", "RespondActivityTaskFailed"],
+        "the pending details were sent as a separate heartbeat"
+    );
+    let failure = observed.matching(&failed, "RespondActivityTaskFailed");
+    assert!(
+        contains(&failure[0].body, b"offset-200"),
+        "the failure dropped the pending heartbeat details"
+    );
     close_runtime(runtime);
 }
 

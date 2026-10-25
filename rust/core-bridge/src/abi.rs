@@ -691,6 +691,10 @@ enum AsyncActivityRequest {
     Failed {
         task_token: Vec<u8>,
         failure: Box<temporalio_common::protos::temporal::api::failure::v1::Failure>,
+        /// Heartbeat details the throttle had coalesced but not yet sent,
+        /// attached by [`Self::send_evicting`] so the next attempt resumes
+        /// from them (#1207). Always `None` when decoded.
+        last_heartbeat_details: Option<api_common::Payloads>,
     },
     /// `RespondActivityTaskCanceled` with the canceled failure's details.
     Cancelled {
@@ -725,6 +729,7 @@ impl AsyncActivityRequest {
                 failure: Box::new(
                     workflow_protocol::failure_to_core(failure).map_err(core_conversion_failure)?,
                 ),
+                last_heartbeat_details: None,
             },
             activity_protocol::ActivityCompletionResult::Cancelled { failure } => {
                 let details = match &failure.info {
@@ -778,20 +783,36 @@ impl AsyncActivityRequest {
     /// Sends a terminal request after evicting its token from `throttle`,
     /// as Core evicts a completed activity from its heartbeat manager, so no
     /// trailing heartbeat follows the completion and the token's state is
-    /// freed at once. Like Core, details recorded for a trailing heartbeat
-    /// are flushed first only before a cancellation, which does not carry
-    /// the last heartbeat's details; the flush's outcome is ignored, as Core
-    /// ignores it. A heartbeat request is sent unchanged.
+    /// freed at once. Details recorded for a trailing heartbeat but not yet
+    /// sent are not lost, matching Core's handling of each terminal kind:
+    ///
+    /// - a failure carries them as `last_heartbeat_details`, as Core's
+    ///   `fail_activity_task` does, so a retried attempt resumes from them
+    ///   (#1207);
+    /// - a cancellation, whose request has no such field, is preceded by a
+    ///   heartbeat flushing them, whose outcome is ignored as Core ignores it;
+    /// - a completion drops them, as Core does, because no attempt follows.
+    ///
+    /// When nothing is pending, the server already holds the latest details.
+    /// A heartbeat request is sent unchanged.
     async fn send_evicting(
-        self,
+        mut self,
         client: Client,
         throttle: &HeartbeatThrottle,
     ) -> std::result::Result<(), Failure> {
         if !matches!(self, Self::Heartbeat { .. })
             && let Some(pending) = throttle.evict(self.task_token())
-            && matches!(self, Self::Cancelled { .. })
         {
-            let _ = send_async_heartbeat(client.clone(), self.task_token().to_vec(), pending).await;
+            match &mut self {
+                Self::Failed {
+                    last_heartbeat_details,
+                    ..
+                } => *last_heartbeat_details = pending,
+                Self::Cancelled { task_token, .. } => {
+                    let _ = send_async_heartbeat(client.clone(), task_token.clone(), pending).await;
+                }
+                Self::Completed { .. } | Self::Heartbeat { .. } => {}
+            }
         }
         self.send(client).await
     }
@@ -823,12 +844,14 @@ impl AsyncActivityRequest {
             Self::Failed {
                 task_token,
                 failure,
+                last_heartbeat_details,
             } => {
                 let request = RespondActivityTaskFailedRequest {
                     task_token,
                     failure: Some(*failure),
                     identity,
                     namespace,
+                    last_heartbeat_details,
                     ..Default::default()
                 };
                 (

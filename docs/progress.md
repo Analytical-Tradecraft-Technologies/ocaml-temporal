@@ -6450,6 +6450,20 @@ dropped later pages would be caught (verified with a mutant that stops after
 the first page). It passed locally against the pinned Compose stack.
 `Replay.History.of_json` for CLI exports remains open.
 
+## 2026-10-25: Failing an async handle keeps its coalesced heartbeat details (#1207)
+
+Since async heartbeats are throttled (#1025), `Async_handle.fail` evicted the
+token's pending, not-yet-sent details and sent the failure without them. The
+server therefore kept the earlier details, and the retried attempt resumed
+from stale progress. That is the documented path after a pause, reset or
+`WorkerShutdown` heartbeat error. The bridge now sends those details as the
+failure's `last_heartbeat_details`, as Core's `fail_activity_task` does. A
+cancellation still flushes them in a heartbeat first, and a completion still
+drops them. The Rust test `failure_carries_pending_heartbeat_details`
+heartbeats twice within one interval and then fails. It checks that no
+second heartbeat is sent and that the failure request carries the coalesced
+details.
+
 ## 2026-10-24: Live child start options regression (#1135)
 
 `test/integration/child_start_options` runs against the Compose
