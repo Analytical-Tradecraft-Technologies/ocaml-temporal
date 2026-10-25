@@ -6203,6 +6203,23 @@ resolution and an idempotent late cancel, cancellation during backoff, and no
 command after completion or for an already-cancelled scope. Live
 qualification of local cancellation remains open.
 
+## 2026-10-25: Documented live-suite make targets exist (#1232)
+
+Four suite READMEs and earlier progress entries named `make` targets that
+did not exist: `test-transport-interruption-live`,
+`test-update-run-close-live`, `test-client-policies-live` and
+`test-non-yielding-workflow-live`. The Makefile now defines them in the
+shape of `test-update-outcomes-live`, with the server URL and the official
+CLI path that `run-live-regressions.sh` passes. `make
+test-client-policies-live` passed against the local Compose stack.
+`test_live_regressions_contract.sh` now fails when any Markdown file under
+`README.md`, `docs/`, `test/integration/` or `examples/` names a
+`make test-*-live` target that the Makefile does not define. Removing one of
+the new targets makes it fail. The architecture document's target list now
+uses the real names (`test-temporal-integration`,
+`test-temporal-live-regressions`, `test-history-corpus`, `temporal-start`,
+`temporal-stop`, `temporal-logs`).
+
 ## 2026-10-24: Replay-safe uuid4, random_float and random_bytes (#1155)
 
 `Workflow.uuid4`, `random_float` and `random_bytes ~length` draw from the
