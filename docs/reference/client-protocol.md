@@ -209,7 +209,10 @@ timer fired first. Terminate keeps its `termination_outcome_uncertain`
 classification. A start whose deadline expired produces the `unknown`
 outcome, which the OCaml client reports as the non-retryable `` `Bridge ``
 error with `Error.error_type` `StartOutcomeUncertain`, recognized by
-`Client.is_start_outcome_uncertain`. The deadline is excluded from the
+`Client.is_start_outcome_uncertain`. The error carries the workflow and
+request IDs as one JSON detail payload, so `Client.uncertain_start_request_id`
+returns the request ID to retry with, including an SDK-generated one (#1223).
+The deadline is excluded from the
 pending-start equality check, so a reconciling retry with the same
 `request_id` may use a different deadline.
 
@@ -1178,7 +1181,12 @@ only one stable status code, such as `deadline_exceeded`, `unavailable`, or
 contain user data. Core conversion
 failures use `{"kind":"protocol","code":"core_invalid"}` or
 `core_unsupported`. The complete code vocabulary is enumerated in the JSON
-schema and checked by both Rust and OCaml decoders.
+schema and checked by both Rust and OCaml decoders. The public client reports
+them as non-retryable `` `Bridge `` errors with `Error.error_type`
+`ProtocolCoreInvalid` or `ProtocolCoreUnsupported`, because the server data
+that failed conversion fails the same way on every retry (#1223). Visibility
+and history, which return this body under the `Protocol` status rather than
+as a structured result, are classified the same way.
 
 Status details are server input too. Rust includes an existing run ID only
 when it is non-empty, within the protocol string limit, and free of NUL bytes.

@@ -336,7 +336,10 @@ let check_uncertain_start context =
   in
   (match start ~rpc_timeout:(ms 1L) ~request_id () with
   | Ok handle -> ignore (track context handle)
-  | Error error when Client.is_start_outcome_uncertain error -> ()
+  | Error error when Client.is_start_outcome_uncertain error ->
+      (* The request ID travels structurally (#1223). *)
+      if Client.uncertain_start_request_id error <> Some request_id then
+        fail "uncertain start did not carry its request ID"
   (* The deadline can also expire before the owner Domain sends the start,
      which is a definite, typed rejection rather than an uncertain one. *)
   | Error error when Client.rpc_status error = Some `Deadline_exceeded -> ()

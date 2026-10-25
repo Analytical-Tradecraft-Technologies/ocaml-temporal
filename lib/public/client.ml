@@ -1070,6 +1070,11 @@ let is_start_outcome_uncertain error =
   view.category = `Bridge && view.non_retryable
   && view.error_type = Some Backend.start_outcome_uncertain_error_type
 
+(** Exposes the request ID the backend attached to an uncertain-start error.
+    The backend owns the detail encoding, as for [already_started]. *)
+let uncertain_start_request_id error =
+  Option.map snd (Backend.uncertain_start_request error)
+
 (** Recognizes the backend's capacity rejection by its structural fields
     rather than its diagnostic message, so wording changes cannot alter the
     classification. *)
