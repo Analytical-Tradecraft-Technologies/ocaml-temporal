@@ -6711,6 +6711,22 @@ now carries `{workflow_id, request_id}` as one JSON detail payload, and
 `test/bridge/test_client_rpc_errors.ml` checks both, and the client-policies
 live regression checks the request ID on a real expired start.
 
+## 2026-10-25: The API witness gate requires rigid annotations (#1230)
+
+The completeness gate counted any annotated binding, so `let _cancel : _ =
+T.Scope.cancel`, `let _map : 'a = T.Future.map`, or replacing a concrete type
+with a variable would still compile and pass. `check_api_witness` now also
+walks each annotation and exits 3, listing each binding's line, on a wildcard
+or on a type variable not bound by an explicit `'a.` quantifier. Only
+`Ptyp_any`, `Ptyp_var` and `Ptyp_poly` are matched; `Ast_iterator` traverses
+the rest. The witness's 124 polymorphic annotations were rewritten
+mechanically with `'a 'b.` quantifiers: a compiler-libs pass inserted the
+annotation's free variables at the start of its type. The witness still
+compiles against the in-tree library, so every public value is at least as
+polymorphic as its annotation. A new `runtest` rule requires the gate to exit
+3 on `test/api_witness/weak_witness.ml`. The gate rejects all 124 annotations
+of the previous witness.
+
 ## 2026-10-24: Live timer cancellation regression (#1134)
 
 `test/integration/timer_cancellation` runs in

@@ -43,3 +43,26 @@
    ../../lib/public/temporal.ml
    ../../lib/public
    ../fixtures/install-consumer/public_api.ml)))
+
+; The gate's own negative case (#1230): annotations that pin nothing (a
+; wildcard, a lone variable, a variable without an explicit quantifier) must
+; make it exit 3, so weakening the witness cannot pass. weak_witness.ml is
+; only parsed.
+
+(rule
+ (alias runtest)
+ (package temporal-sdk)
+ (deps
+  ../../lib/public/temporal.ml
+  (glob_files ../../lib/public/*.mli)
+  weak_witness.ml)
+ (action
+  (with-stderr-to
+   %{null}
+   (with-accepted-exit-codes
+    3
+    (run
+     %{exe:check_api_witness.exe}
+     ../../lib/public/temporal.ml
+     ../../lib/public
+     weak_witness.ml)))))

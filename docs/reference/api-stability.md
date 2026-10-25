@@ -41,8 +41,10 @@ witness. It binds every public value to an explicit type annotation written
 against the consumer-visible `Temporal` paths, and aliases every module listed
 by `lib/public/temporal.ml`, so a removed value, changed type, changed or added
 labelled argument, changed result/error contract, or hidden public module fails
-compilation. Type variables stay explicit so an annotation cannot silently
-become monomorphic. The witness has no top-level effects and is a compile
+compilation. Every type variable is bound by an explicit quantifier
+(`'input 'output. ...`), so an annotation is rigid: the value must be at least
+that polymorphic, and a concrete type cannot be replaced by a variable that
+would unify with anything. The witness has no top-level effects and is a compile
 check only: it does not contact Temporal Server, execute a workflow, or assert
 runtime semantics already covered by the unit and live acceptance suites.
 
@@ -68,7 +70,14 @@ package installation. The same rule then runs
    whose body is exactly that value, such as
    `let _scope_cancel : T.Scope.t -> (unit, T.Error.t) result = T.Scope.cancel`.
    A bare use such as `let _ = T.Scope.cancel` does not count, because its
-   type would be inferred and a signature change could pass unnoticed.
+   type would be inferred and a signature change could pass unnoticed; and
+4. fails with status 3, before the completeness report, when an annotation
+   pins nothing (#1230): a wildcard `_` anywhere in it, or a type variable
+   that no enclosing explicit `'a.` quantifier binds. `let _cancel : _ = ...`,
+   `let _map : 'a = ...` and a non-rigid `'a T.Codec.t -> bool` would compile
+   after a signature change, so each is reported with its line. The gate's own
+   negative fixture, `test/api_witness/weak_witness.ml`, must keep failing
+   this way.
 
 The check parses source with the compiler's own parser (`compiler-libs`, part
 of the approved OCaml compiler distribution); it never links the SDK. It
