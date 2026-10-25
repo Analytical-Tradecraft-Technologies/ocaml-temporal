@@ -55,9 +55,14 @@ val workflow :
 type activity
 
 (** Packs a synchronous activity whose callback receives an attempt context.
-    [override] has the same replacement meaning as on {!val-workflow}. *)
+    [override] has the same replacement meaning as on {!val-workflow}.
+    [durations_ms] gives the virtual milliseconds each attempt takes, in
+    attempt order, with the last entry repeating; each must be
+    non-negative. Without it every attempt takes zero virtual time, so no
+    activity timeout can expire. *)
 val activity :
   ?override:bool ->
+  ?durations_ms:int64 list ->
   ( 'input,
     'output,
     Temporal_base.Activity_context.t ->

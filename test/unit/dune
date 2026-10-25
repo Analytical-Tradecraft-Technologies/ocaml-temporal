@@ -46,6 +46,11 @@
  (name test_testing)
  (libraries temporal-sdk unix))
 
+; Activity timeouts in virtual time in Temporal.Testing (#1160).
+(test
+ (name test_testing_timeouts)
+ (libraries temporal-sdk))
+
 ; Metrics-export option validation and bridge document encoding (#500).
 (test
  (name test_metrics_config)

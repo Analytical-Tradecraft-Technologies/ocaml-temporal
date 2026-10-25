@@ -1485,8 +1485,23 @@ an unlimited policy, including the server default, is capped by
 2024-01-01T00:00:00Z unless `?start_time` is given, so repeated runs observe
 identical values.
 
-The simulator is not a server. Activities take zero virtual time and their
-timeouts are not enforced; a workflow task failure (an exception or a
+An activity attempt takes zero virtual time unless its registration declares
+`~durations` (on `Testing.activity` or `Testing.mock_activity`, one entry per
+attempt with the last repeating). Start-to-close, schedule-to-close and
+heartbeat timeouts then expire in virtual time with the same typed error a
+server produces (`Error.timeout_type` names the timeout), and are retried
+under the activity's retry policy; the callback itself still runs at the
+attempt's start, so its heartbeats all happen then. This test makes the first
+attempt time out after a virtual minute and the retry succeed:
+
+```ocaml
+Temporal.Testing.mock_activity charge
+  ~durations:[ Temporal.Duration.of_minutes 5L; Temporal.Duration.of_ms 0L ]
+  (fun order -> Ok (receipt order))
+```
+
+The simulator is not a server. Schedule-to-start timeouts never expire; a
+workflow task failure (an exception or a
 `Defect`, `Codec`, or `Bridge` error) ends the run with that error instead of
 being retried; child cancellation types are not distinguished; and
 asynchronous activities, Nexus, visibility, memos, and workflow ID reuse

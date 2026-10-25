@@ -38,11 +38,17 @@
     ]}
 
     Differences from a server, which a test should not rely on:
-    - Activities complete in zero virtual time; schedule-to-start,
-      start-to-close, schedule-to-close, and heartbeat timeouts are not
-      enforced. Activity and child-workflow retry policies are honored,
-      with backoff delays in virtual time; an unlimited policy is capped
-      (see {!create}).
+    - An activity attempt takes the virtual time its registration declares
+      ([durations] on {!activity} and {!mock_activity}), zero by default.
+      Start-to-close, schedule-to-close and heartbeat timeouts expire in
+      virtual time against that duration and fail with the typed error a
+      server produces ({!Error.val-timeout_type}); see {!mock_activity}. An
+      activity callback still runs to completion at the attempt's start, so
+      its heartbeats all happen then and a timed-out attempt's side effects
+      remain. Schedule-to-start timeouts never expire, because a worker is
+      always polling. Activity and child-workflow retry policies are
+      honored, with backoff delays in virtual time; an unlimited policy is
+      capped (see {!create}).
     - Workflow code is never replayed, so nondeterministic workflow code is
       not detected; use [Temporal.Replay] against recorded histories for
       that.
@@ -108,16 +114,34 @@ type registered_activity
     callback runs as written. A remote reference or an asynchronous
     activity cannot run in-process; every attempt then fails with a
     non-retryable error naming the reason, so replace it with
+    {!mock_activity}. [durations] has the meaning described on
     {!mock_activity}. *)
-val activity : ('input, 'output) Activity.t -> registered_activity
+val activity :
+  ?durations:Duration.t list -> ('input, 'output) Activity.t -> registered_activity
 
 (** Registers [implementation] under the name and codecs of [activity],
     replacing any other registration with that name wherever it appears in
     the list. This is the usual way
     to isolate workflow logic from external I/O: the workflow still encodes
     the input, and the stub's output is still decoded through the
-    activity's codecs. *)
+    activity's codecs.
+
+    [durations] is the virtual time each attempt takes, in attempt order;
+    its last entry applies to every later attempt, and the default is zero.
+    The workflow observes the attempt's outcome that much later. When a
+    timeout's deadline falls strictly before the attempt would finish, the
+    attempt fails at the deadline with an [Activity] error whose
+    {!Error.val-timeout_type} names the timeout and whose
+    {!Error.last_heartbeat_details} are the last heartbeat's: start-to-close
+    and heartbeat deadlines are measured from the attempt's start and
+    schedule-to-close from the first attempt's scheduling. Start-to-close
+    and heartbeat timeouts are retried under the retry policy; an expired
+    schedule-to-close timeout, including one reached while waiting for a
+    retry, ends the activity. So [~durations:[ Duration.of_minutes 5L;
+    Duration.of_ms 0L ]] with a one-minute start-to-close timeout makes the
+    first attempt time out after a virtual minute and the retry succeed. *)
 val mock_activity :
+  ?durations:Duration.t list ->
   ('input, 'output) Activity.t ->
   ('input, 'output) Activity.implementation ->
   registered_activity

@@ -72,8 +72,10 @@ let mock_workflow ?(signals = []) ?(queries = []) ?(updates = []) definition
   |> register_workflow ~override:true ~signals ~queries ~updates
 
 (** Packs an activity, choosing the engine's placeholder for definitions that
-    cannot run synchronously in-process. *)
-let register_activity ~override definition =
+    cannot run synchronously in-process. [durations] are the virtual
+    attempt durations; a placeholder fails every attempt at once, so it
+    ignores them. *)
+let register_activity ~override ?(durations = []) definition =
   let name = Activity.name definition in
   match
     ( Activity.implementation_with_context definition,
@@ -81,7 +83,9 @@ let register_activity ~override definition =
       Activity.implementation_async definition )
   with
   | Some _, _, _ | None, Some _, _ ->
-      Engine.activity ~override (Activity_private.to_base definition)
+      Engine.activity ~override
+        ~durations_ms:(List.map Duration.to_ms durations)
+        (Activity_private.to_base definition)
   | None, None, Some _ ->
       Engine.unsupported_activity ~override ~name
         ~reason:
@@ -97,13 +101,14 @@ let register_activity ~override definition =
             Temporal.Testing.mock_activity for it")
         ()
 
-let activity definition = register_activity ~override:false definition
+let activity ?durations definition =
+  register_activity ~override:false ?durations definition
 
-let mock_activity definition implementation =
+let mock_activity ?durations definition implementation =
   Activity.define ~name:(Activity.name definition)
     ~input:(Activity.input definition) ~output:(Activity.output definition)
     implementation
-  |> register_activity ~override:true
+  |> register_activity ~override:true ?durations
 
 type t = Engine.t
 
