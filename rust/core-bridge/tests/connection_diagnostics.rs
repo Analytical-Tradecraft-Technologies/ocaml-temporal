@@ -105,15 +105,20 @@ fn unresolvable_host_reports_dns_cause() {
 /// A listener that accepts each TCP connection and closes it after `delay`,
 /// like the transport-interruption fault proxy in `Refuse` mode (#824), whose
 /// accept thread may close a socket only after the client has sent its
-/// request. The thread stops when the test process exits; the port is
-/// ephemeral and loopback-only.
+/// request. Each connection is held and dropped on its own thread, so a
+/// client's reconnect attempts never queue behind an earlier connection's
+/// delay; serving them one at a time once stretched a 500 ms delay past the
+/// client's 10 s handshake bound (#1217). The threads stop when the test
+/// process exits; the port is ephemeral and loopback-only.
 fn accept_and_close_listener(delay: std::time::Duration) -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("local address").port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            std::thread::sleep(delay);
-            drop(stream);
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                drop(stream);
+            });
         }
     });
     port

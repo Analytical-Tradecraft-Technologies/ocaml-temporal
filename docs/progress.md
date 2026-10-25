@@ -6055,6 +6055,19 @@ against code that never cancels and must report nondeterminism. New feature
 rows `timer-cancellation`, `condition-timeout` and `child-start-options` are
 `replayed`; the corpus test passes with 85 cases.
 
+## 2026-10-25: Two CI flakes (#1217)
+
+The smoke job's 1.8 GB artifact download stalled past its 10-minute step
+bound on a merge-group and a Dependabot run. The download step now continues
+on error, and one retry step runs only when the first attempt failed or
+timed out; the unpack step still checks every digest. The smoke job's ceiling
+grows from 93 to 103 minutes, still at least the sum of its step timeouts as
+`test_temporal_compose_config.sh` requires. `refused_and_dropped_connections_fail_fast`'s
+dropping listener served connections one at a time, so reconnects queued
+behind a 500 ms delay until the 10 s handshake bound fired. It now drops
+each connection on its own thread. The bundle itself is not shrunk: stripping
+it would change the executables the lane tests.
+
 ## 2026-10-24: Linux bubblewrap install of the source archive in CI (#1148)
 
 `opam-source-sandbox-linux` in `build-pr.yml`, on every tier, and
