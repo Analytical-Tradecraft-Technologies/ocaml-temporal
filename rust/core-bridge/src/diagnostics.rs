@@ -120,16 +120,19 @@ pub(crate) fn core_log_level_from_env() -> Result<Option<CoreLogLevel>, String> 
 
 /// Builds the `tracing` `EnvFilter` directive for `level`.
 ///
-/// Temporal's own crates are filtered at `level`. Third-party crates in Core's
-/// transport stack (tonic, hyper, h2, rustls) are capped at `warn` so that
-/// `debug`/`trace` show Core's decisions without flooding stderr with
-/// per-frame HTTP/2 records.
+/// Temporal's own crates and this bridge are filtered at `level`; the bridge
+/// must be listed, or its own `debug` records (for example the metrics
+/// endpoint's connection rejections) would fall under the `warn` cap and never
+/// appear (#1226). Third-party crates in Core's transport stack (tonic, hyper,
+/// h2, rustls) are capped at `warn` so that `debug`/`trace` show Core's
+/// decisions without flooding stderr with per-frame HTTP/2 records.
 pub fn core_log_filter(level: CoreLogLevel) -> String {
     let core = level.directive();
     let other = level.min(CoreLogLevel::Warn).directive();
     format!(
         "{other},temporalio_common={core},temporalio_sdk_core={core},\
-         temporalio_client={core},temporalio_sdk={core}"
+         temporalio_client={core},temporalio_sdk={core},\
+         ocaml_temporal_core_bridge={core}"
     )
 }
 

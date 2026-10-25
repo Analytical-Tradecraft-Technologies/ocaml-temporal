@@ -320,6 +320,12 @@ fn registration_and_recording_enforce_their_bounds() {
         "{\"kind\":\"counter\",\"name\":\"ocaml_ok\",\"labels\":[{\"name\":\"a\",\"value\":\"x\\ny\"}]}"
             .to_owned(),
         "{\"kind\":\"counter\",\"name\":\"ocaml_ok\",\"description\":\"a\\nb\"}".to_owned(),
+        // A document over the 8 KiB registration bound is rejected like any
+        // other invalid registration (#1226).
+        format!(
+            r#"{{"kind":"counter","name":"ocaml_ok","description":"{}"}}"#,
+            "d".repeat(8 * 1024)
+        ),
     ];
     for document in &rejected {
         let (status, id, error) = register(meter, document);

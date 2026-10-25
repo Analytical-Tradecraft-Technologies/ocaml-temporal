@@ -154,8 +154,9 @@ ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(
  * Create a runtime graph that runs on `shared`'s Core instead of its own.
  * The graph is used and released exactly like one from runtime_new. It holds
  * its own reference to the shared Core, so Core outlives the graph even if
- * `shared` is released first. A released `shared` fails with
- * OCAML_TEMPORAL_CORE_STATUS_INVALID_STATE and leaves `*runtime` NULL.
+ * `shared` is released first. After shared_runtime_free or _dispose the
+ * handle is invalid and must not be passed; a NULL `shared` fails with
+ * OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT and leaves `*runtime` NULL.
  * Concurrent attaches on one live handle are permitted.
  */
 ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_new_attached(
@@ -549,8 +550,9 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_dispose(
  * Create an SDK metrics recorder over `shared`'s Core meter (#500). On
  * success `*meter` receives an owned handle, or stays NULL when the runtime
  * has no metrics exporter. The handle references Core's meter, not Core, so
- * it may outlive `shared`; release it once with metric_meter_free. A
- * released `shared` fails with OCAML_TEMPORAL_CORE_STATUS_INVALID_STATE.
+ * it may outlive `shared`; release it once with metric_meter_free. After
+ * shared_runtime_free or _dispose the handle is invalid and must not be
+ * passed; a NULL `shared` fails with OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT.
  */
 ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_metric_meter(
     const ocaml_temporal_core_shared_runtime *shared,

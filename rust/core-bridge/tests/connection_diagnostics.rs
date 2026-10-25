@@ -220,14 +220,16 @@ fn core_log_level_parsing() {
     assert!(!error.contains("secret"), "{error}");
 }
 
-/// Temporal crates follow the selected level while third-party transport
-/// crates are capped at `warn`.
+/// Temporal crates and the bridge itself follow the selected level while
+/// third-party transport crates are capped at `warn`. Without the bridge's
+/// own directive its `debug` records were capped at `warn` (#1226).
 #[test]
 fn core_log_filter_caps_third_party_crates() {
     assert_eq!(
         core_log_filter(CoreLogLevel::Debug),
         "warn,temporalio_common=debug,temporalio_sdk_core=debug,\
-         temporalio_client=debug,temporalio_sdk=debug"
+         temporalio_client=debug,temporalio_sdk=debug,\
+         ocaml_temporal_core_bridge=debug"
     );
     assert!(core_log_filter(CoreLogLevel::Error).starts_with("error,"));
 }

@@ -624,15 +624,6 @@ fn worker_not_running() -> Failure {
     }
 }
 
-/// The failure for attaching to a shared runtime whose Core reference has
-/// already been released.
-fn shared_runtime_released() -> Failure {
-    Failure {
-        status: STATUS_INVALID_STATE,
-        message: "shared Temporal runtime is already released".to_owned(),
-    }
-}
-
 /// The failure for an async activity request on a runtime that has never
 /// started a worker, and so has no namespace to address.
 fn missing_worker_namespace() -> Failure {
@@ -1313,7 +1304,11 @@ pub struct Runtime {
 /// reference to a plain OS thread instead of destroying Tokio inside an
 /// OCaml finalizer.
 pub struct SharedRuntime {
-    core: Option<Arc<SharedCore>>,
+    /// Always present while the handle exists: [`Self::release`] consumes
+    /// the handle, and the C free path drops the box only through it, so a
+    /// released handle is freed memory rather than a state to report
+    /// (#1226).
+    core: Arc<SharedCore>,
     cleanup: std::sync::mpsc::Sender<SharedRuntimeCleanup>,
 }
 
@@ -1359,32 +1354,29 @@ impl SharedRuntime {
             })?;
         SHARED_RUNTIMES_CREATED.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
-            core: Some(Arc::new(core)),
+            core: Arc::new(core),
             cleanup,
         })
     }
 
     /// Creates one instance graph holding a new reference to this Core.
     fn attach(&self) -> std::result::Result<Runtime, Failure> {
-        let core = self.core.as_ref().ok_or_else(shared_runtime_released)?;
-        Runtime::new(Arc::clone(core))
+        Runtime::new(Arc::clone(&self.core))
     }
 
     /// Transfers this handle's Core reference to the cleanup thread and
     /// optionally waits until it has been dropped. A release with attached
     /// graphs still alive only decrements the count; Core then outlives this
     /// handle until the last graph is closed.
-    fn release(mut self, wait: bool) -> Status {
-        let Some(core) = self.core.take() else {
-            return STATUS_OK;
-        };
+    fn release(self, wait: bool) -> Status {
+        let Self { core, cleanup } = self;
         let (completed, receiver) = if wait {
             let (sender, receiver) = sync_channel(1);
             (Some(sender), Some(receiver))
         } else {
             (None, None)
         };
-        if let Err(error) = self.cleanup.send(SharedRuntimeCleanup { core, completed }) {
+        if let Err(error) = cleanup.send(SharedRuntimeCleanup { core, completed }) {
             // The receiver exits only after a message, so this is a defect in
             // the cleanup thread. Reclaim here to preserve the no-leak rule;
             // both callers run outside any Tokio context.
@@ -4909,8 +4901,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new_with_telemetr
 /// [`ocaml_temporal_core_v4_runtime_free`]), except that it holds a
 /// reference to `shared`'s Core instead of building its own. That reference
 /// keeps Core alive until the graph is released, even if `shared` is
-/// released first. A `shared` handle that was already released fails with
-/// `STATUS_INVALID_STATE`; a null one with `STATUS_INVALID_ARGUMENT`.
+/// released first. A null `shared` fails with `STATUS_INVALID_ARGUMENT`; a
+/// released handle is freed memory and must not be passed (#1226).
 ///
 /// # Safety
 ///
@@ -5027,8 +5019,8 @@ unsafe fn release_shared_runtime_slot(shared: *mut *mut SharedRuntime, wait: boo
 /// records nothing at all. The handle references Core's meter, not Core, so
 /// it may outlive the shared handle and every attached graph; it must be
 /// released exactly once with [`ocaml_temporal_core_v4_metric_meter_free`].
-/// A null `shared` fails with `STATUS_INVALID_ARGUMENT`, a released one with
-/// `STATUS_INVALID_STATE`.
+/// A null `shared` fails with `STATUS_INVALID_ARGUMENT`; a released handle
+/// is freed memory and must not be passed (#1226).
 ///
 /// # Safety
 ///
@@ -5065,7 +5057,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_metric_meter(
                 status: STATUS_INVALID_ARGUMENT,
                 message: "shared runtime handle is null".to_owned(),
             })?;
-            let core = shared.core.as_ref().ok_or_else(shared_runtime_released)?;
+            let core = &shared.core;
             if let Some(temporal_meter) = core.telemetry().get_temporal_metric_meter() {
                 let global_tag_names = core
                     .metrics
@@ -5132,11 +5124,24 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_register_json(
                 message: "metric meter handle is null".to_owned(),
             })?;
             // SAFETY: The caller promises the readable span documented above.
+            // An oversized document is a rejected registration like any
+            // other, so it reports `STATUS_CONFIGURATION` as documented
+            // rather than `input_span`'s generic `STATUS_PROTOCOL` (#1226).
             let bytes = input_span(
                 input,
                 input_len,
                 telemetry::MAX_SDK_INSTRUMENT_DOCUMENT_BYTES,
-            )?;
+            )
+            .map_err(|failure| {
+                if failure.status == STATUS_PROTOCOL {
+                    Failure {
+                        status: STATUS_CONFIGURATION,
+                        ..failure
+                    }
+                } else {
+                    failure
+                }
+            })?;
             let registered = meter.register(bytes)?;
             // SAFETY: The slot was validated above.
             ptr::write(id, registered);
@@ -6379,7 +6384,7 @@ pub unsafe fn test_shared_runtime_stop_core_metrics_server(shared: *const Shared
     let Some(shared) = (unsafe { shared.as_ref() }) else {
         return false;
     };
-    match shared.core.as_ref().and_then(|core| core.metrics.as_ref()) {
+    match shared.core.metrics.as_ref() {
         Some(exporter) => {
             exporter.stop_core_server();
             true
@@ -6401,7 +6406,7 @@ pub unsafe fn test_shared_runtime_core_metrics_server_stopped(
 ) -> Option<bool> {
     // SAFETY: The caller promises a null or live handle.
     let shared = unsafe { shared.as_ref() }?;
-    let exporter = shared.core.as_ref()?.metrics.as_ref()?;
+    let exporter = shared.core.metrics.as_ref()?;
     Some(exporter.core_server_stopped())
 }
 
@@ -6416,7 +6421,7 @@ pub unsafe fn test_shared_runtime_core_metrics_server_stopped(
 pub unsafe fn test_shared_runtime_references(shared: *const SharedRuntime) -> Option<usize> {
     // SAFETY: The caller promises a null or live handle.
     let shared = unsafe { shared.as_ref() }?;
-    shared.core.as_ref().map(Arc::strong_count)
+    Some(Arc::strong_count(&shared.core))
 }
 
 /// Creates a runtime whose Core log writer drains into `sink` instead of
