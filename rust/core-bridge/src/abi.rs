@@ -1466,7 +1466,8 @@ struct ClientConfig {
     max_in_flight_calls: Option<u32>,
 }
 
-/// Strict workflow-only Core worker document received from OCaml as JSON.
+/// Strict Core worker document received from OCaml as JSON; `task_types`
+/// selects which task kinds the worker polls (#805).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerConfigInput {
@@ -2356,7 +2357,8 @@ impl Runtime {
         Ok(encoded.into_bytes())
     }
 
-    /// Constructs and validates one official workflow-only Core worker.
+    /// Constructs and validates one official Core worker for the configured
+    /// task types.
     ///
     /// Validation performs the namespace RPC before the worker enters the
     /// graph. Any construction or validation failure consumes the temporary
@@ -5611,7 +5613,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_release_call(
     }
 }
 
-/// Start and validate one workflow-only official Core worker from strict JSON.
+/// Start and validate one official Core worker from strict JSON.
 /// Success is not exposed until the namespace validation RPC completes.
 ///
 /// # Safety

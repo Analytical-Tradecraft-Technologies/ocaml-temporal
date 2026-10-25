@@ -293,8 +293,9 @@ and bridge, read the [documentation guide](../README.md) first.
   `Temporal.Workflow.patched` returns `not is_replaying`. The first answer for
   an ID is retained for the run: a notification seeds only IDs workflow code
   has not consulted, so it never flips a returned decision. A non-deprecated
-  marker command is emitted on every call whose decision is `true` and never
-  for a `false` replay decision. The unit-returning
+  marker command is emitted on every call whose decision is `true`, and on a
+  call whose decision is `false` only once Core has reported the marker after
+  that decision was fixed (so Core can consume it). The unit-returning
   `Temporal.Workflow.deprecate_patch` retains the same private decision state
   and emits a deprecated marker under the same condition. The runtime does not
   deduplicate same-mode commands or share patch state between runs, but it
@@ -455,7 +456,10 @@ and bridge, read the [documentation guide](../README.md) first.
   was closed. The adapter's async lock covers only the claim of a lease
   (marking it in flight, which refuses a concurrent operation on the same
   handle) and the recording of the outcome, never the RPC. Async heartbeats
-  are not throttled: each is one server round trip. The adapter removes the
+  are throttled per task token like Core's (#1025): the first is sent at
+  once, and later ones within the throttle interval are coalesced into one
+  trailing send (see [Core bridge](core-bridge.md) and
+  [native activity execution](native-activity-execution.md)). The adapter removes the
   lease exactly
   once: on an accepted terminal operation or a retiring error. This decision
   does not change Core worker completion retry policy.

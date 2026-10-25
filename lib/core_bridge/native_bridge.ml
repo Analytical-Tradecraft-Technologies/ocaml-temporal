@@ -1364,7 +1364,7 @@ let shared_runtime_create ?worker_threads () =
     document and binds the endpoint before publishing the handle, so a
     failure leaves nothing running; the empty owner is still closed. *)
 let shared_runtime_create_with_telemetry ?worker_threads ~telemetry () =
-  bridge_call "shared_runtime_create" (fun () ->
+  bridge_call "shared_runtime_create_with_telemetry" (fun () ->
       match validate_runtime_worker_threads worker_threads with
       | Error _ as error -> error
       | Ok () -> (
@@ -1381,7 +1381,7 @@ let shared_runtime_create_with_telemetry ?worker_threads ~telemetry () =
               | Error error ->
                   ignore (shared_runtime_close shared);
                   Error error)))
-  |> report_shared_lifecycle ~operation:"shared_runtime_create"
+  |> report_shared_lifecycle ~operation:"shared_runtime_create_with_telemetry"
        ~ok_message:"shared runtime initialized"
        ~error_message:"shared runtime initialization failed"
 
@@ -1431,10 +1431,13 @@ external metric_record_raw : metric_meter -> int -> int -> int
 [@@noalloc]
 
 let shared_runtime_metric_meter shared =
-  let meter, response = shared_runtime_metric_meter_raw shared in
-  match decode response with
-  | Ok _ -> Ok (if metric_meter_enabled meter then Some meter else None)
-  | Error _ as error -> error
+  (* Wrapped like every other bridge call, so a meter-creation failure
+     produces its bridge record. *)
+  bridge_call "shared_runtime_metric_meter" (fun () ->
+      let meter, response = shared_runtime_metric_meter_raw shared in
+      match decode response with
+      | Ok _ -> Ok (if metric_meter_enabled meter then Some meter else None)
+      | Error _ as error -> error)
 
 (** The registration document's [kind] member. *)
 let metric_kind_name = function

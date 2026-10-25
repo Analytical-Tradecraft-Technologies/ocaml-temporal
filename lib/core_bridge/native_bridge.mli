@@ -40,8 +40,10 @@ type shared_runtime
     sender-side transport validation. *)
 type client_config
 
-(** Validated settings for one workflow-only Core worker. Construction does
-    not perform network access; the supervisor sends it to Rust at start. *)
+(** Validated settings for one Core worker, including the task kinds it
+    polls ({!val-worker_config}'s [workflow_tasks] and [activity_tasks]).
+    Construction does not perform network access; the supervisor sends it to
+    Rust at start. *)
 type worker_config
 
 (** The default workflow versioning behavior for deployment-based workers. *)
@@ -390,8 +392,8 @@ val client_complete_async_activity_json : runtime -> bytes -> (unit, error) resu
 val client_record_async_activity_heartbeat_json :
   runtime -> bytes -> (unit, error) result
 
-(** Constructs a workflow-only worker and completes Core namespace validation
-    before publishing it into the owned graph. *)
+(** Constructs a worker for the configured task kinds and completes Core
+    namespace validation before publishing it into the owned graph. *)
 val worker_start : runtime -> worker_config -> (unit, error) result
 
 (** Constructs the private workflow-only replay worker. It does not require a

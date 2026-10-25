@@ -45,8 +45,9 @@ execution raise `Invalid_argument` because they are programmer defects. Never
 reuse an ID for a different change, derive it from mutable configuration, or
 build it from nondeterministic data.
 
-A call emits `SetPatchMarker` only when its retained decision is `true`. A
-`false` replay decision emits nothing: pinned Core creates a real
+A call emits `SetPatchMarker` when its retained decision is `true`, or after
+a late notification as described above. A `false` replay decision with no
+such notification emits nothing: pinned Core creates a real
 `RecordMarker` command for every `SetPatchMarker` it receives during replay and
 keeps it queued unless a later history command displaces it, so emitting a
 marker for the legacy branch could record a marker contradicting the branch the
@@ -103,8 +104,8 @@ The bridge preserves this order for each workflow task:
 2. OCaml validates the complete activation and installs the execution-local
    replay and patch-notification state before workflow fibers run.
 3. `Temporal.Workflow.patched` fixes the execution-local branch decision on its
-   first call and emits `SetPatchMarker { deprecated = false }` only when that
-   decision is `true`, while `Temporal.Workflow.deprecate_patch` retains the
+   first call and emits `SetPatchMarker { deprecated = false }` when that
+   decision is `true` or a late notification reported the marker, while `Temporal.Workflow.deprecate_patch` retains the
    same private decision state and emits `SetPatchMarker { deprecated = true }`
    under the same condition without exposing a boolean.
 4. Rust validates the completion and converts the marker back to Core's

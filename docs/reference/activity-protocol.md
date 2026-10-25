@@ -139,8 +139,9 @@ primary reason is a pause or reset is instead completed with a retryable
 `ActivityPause` or `ActivityReset` application failure (#1022; see
 [pause and reset](native-activity-execution.md#pause-and-reset)). An asynchronous heartbeat instead
 uses the namespace-bound client path; its separate async lease remains
-non-terminal until an async terminal operation is accepted or a
-non-retryable bridge failure closes and removes it. Its document adds a
+non-terminal until an async terminal operation is accepted or a retiring
+bridge failure (`NotFound`, reported as `Invalid_state`, or an
+unclassified status) closes and removes it, as described below. Its document adds a
 required, nullable `heartbeat_timeout` duration copied from the start task,
 from which the bridge derives the per-token throttle interval (#1025); the
 plain heartbeat decoder rejects that member, and the async one requires it.
@@ -204,11 +205,22 @@ continue to use the normal force-failure path.
 `will_complete_async` is accepted only as the worker handoff. The
 namespace-bound client endpoint rejects a second defer marker and accepts only
 completed, failed, or canceled terminal results. The adapter keeps the copied
-async lease while a request is in flight and retains it for retry only when the
-native supervisor explicitly returns the bilateral `Retryable` status. A
-successful terminal request retires the lease; a generic `Connection`,
-`NotFound`, or other non-retryable bridge failure closes and removes it. No
-transport result reruns the activity callback.
+async lease while a request is in flight. A successful terminal request
+retires it; otherwise the status decides (`Native_worker_policy`, #821, #836,
+#1104):
+
+- `Connection` (an uncertain outcome) or `Retryable` keeps the handle and
+  lease live for an exact retry of the same operation;
+- `Async_heartbeat_rejected`, `Invalid_argument`, `Protocol` or
+  `Configuration` is a definite rejection that leaves the handle live for a
+  corrected or different operation;
+- `Resource_exhausted` was never admitted, so the handle stays live and the
+  caller may retry once capacity frees;
+- any other status, including `Invalid_state` for a server `NotFound`, retires
+  the handle and removes the lease.
+
+[Native activity execution](native-activity-execution.md) has the full table.
+No transport result reruns the activity callback.
 
 ## Schemas and tests
 

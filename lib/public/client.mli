@@ -578,7 +578,9 @@ val fetch_history :
   (Replay.History.t, Error.t) result
 
 (** Lists one bounded page of workflow executions using Temporal's visibility
-    query language. [page_token] is opaque and may be passed unchanged to a
+    query language. [page_size] (default 100) is the most executions the page
+    returns and must be between 1 and 1,000; any other value is a typed
+    defect. [page_token] is opaque and may be passed unchanged to a
     later call; when supplied, it must be non-empty, valid UTF-8, NUL-free, and
     no more than 65,536 bytes. [query] may be empty but must be valid UTF-8,
     NUL-free, and no more than 65,536 bytes. Invalid query metadata is

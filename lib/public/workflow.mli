@@ -328,7 +328,9 @@ val is_replaying : unit -> bool
     it returns [false] and records nothing. The first answer for [id] is
     retained for the workflow run, so later calls and later history
     notifications cannot change it. Calls whose answer is [true] emit Core's
-    idempotent marker command.
+    idempotent marker command. So does a call whose answer was fixed at
+    [false] once Core has since reported the marker: it still returns
+    [false], but Core needs the command to consume the recorded marker.
 
     Patch IDs must be non-empty, valid UTF-8, NUL-free, and at most 65,536
     bytes. Invalid IDs or calls outside workflow execution raise
