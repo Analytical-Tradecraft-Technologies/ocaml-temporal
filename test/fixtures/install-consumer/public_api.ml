@@ -38,6 +38,7 @@ module Workflow_context = T.Workflow_context
    boundary.  Keep the type variables explicit: an annotation that silently
    becomes monomorphic would make this witness weaker than a real consumer. *)
 let _activity_define :
+    'input 'output.
     name:string ->
     input:'input T.Codec.t ->
     output:'output T.Codec.t ->
@@ -46,6 +47,7 @@ let _activity_define :
   T.Activity.define
 
 let _activity_define_with_context :
+    'input 'output.
     name:string ->
     input:'input T.Codec.t ->
     output:'output T.Codec.t ->
@@ -56,6 +58,7 @@ let _activity_define_with_context :
   T.Activity.define_with_context
 
 let _activity_remote :
+    'input 'output.
     name:string ->
     input:'input T.Codec.t ->
     output:'output T.Codec.t ->
@@ -63,6 +66,7 @@ let _activity_remote :
   T.Activity.remote
 
 let _activity_define_async :
+    'input 'output.
     name:string ->
     input:'input T.Codec.t ->
     output:'output T.Codec.t ->
@@ -70,56 +74,68 @@ let _activity_define_async :
     ('input, 'output) T.Activity.t =
   T.Activity.define_async
 
-let _activity_name : ('input, 'output) T.Activity.t -> string = T.Activity.name
+let _activity_name : 'input 'output. ('input, 'output) T.Activity.t -> string = T.Activity.name
 
 let _activity_input :
+    'input 'output.
     ('input, 'output) T.Activity.t -> 'input T.Codec.t =
   T.Activity.input
 
 let _activity_output :
+    'input 'output.
     ('input, 'output) T.Activity.t -> 'output T.Codec.t =
   T.Activity.output
 
 let _activity_implementation :
+    'input 'output.
     ('input, 'output) T.Activity.t ->
     ('input, 'output) T.Activity.implementation option =
   T.Activity.implementation
 
 let _activity_implementation_with_context :
+    'input 'output.
     ('input, 'output) T.Activity.t ->
     ('input, 'output) T.Activity.contextual_implementation option =
   T.Activity.implementation_with_context
 
 let _activity_implementation_async :
+    'input 'output.
     ('input, 'output) T.Activity.t ->
     ('input, 'output) T.Activity.async_implementation option =
   T.Activity.implementation_async
 
 let _activity_async_handle_complete :
+    'output.
     'output T.Activity.async_handle -> 'output -> (unit, T.Error.t) result =
   T.Activity.Async_handle.complete
 
 let _activity_async_handle_fail :
+    'output.
     'output T.Activity.async_handle -> T.Error.t -> (unit, T.Error.t) result =
   T.Activity.Async_handle.fail
 
 let _activity_async_handle_cancel :
+    'output.
     'output T.Activity.async_handle -> T.Payload.t list -> (unit, T.Error.t) result =
   T.Activity.Async_handle.cancel
 
 let _activity_async_handle_heartbeat :
+    'output.
     'output T.Activity.async_handle -> T.Payload.t list -> (unit, T.Error.t) result =
   T.Activity.Async_handle.heartbeat
 
 let _activity_async_handle_is_worker_shutting_down :
+    'output.
     'output T.Activity.async_handle -> bool =
   T.Activity.Async_handle.is_worker_shutting_down
 
 let _activity_async_context_is_worker_shutting_down :
+    'output.
     'output T.Activity.async_context -> bool =
   T.Activity.Async_context.is_worker_shutting_down
 
 let _activity_async_context_handle :
+    'output.
     'output T.Activity.async_context -> 'output T.Activity.async_handle =
   T.Activity.Async_context.handle
 
@@ -128,6 +144,7 @@ let _activity_context_heartbeat_payloads :
   T.Activity.Context.heartbeat_payloads
 
 let _activity_context_heartbeat :
+    'a.
     T.Activity.context -> 'a T.Codec.t -> 'a -> (unit, T.Error.t) result =
   T.Activity.Context.heartbeat
 
@@ -219,6 +236,7 @@ let _activity_info_workflow_fields
   ignore (workflow_type : string)
 
 let _activity_execute :
+    'input 'output.
     ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?task_queue:string ->
@@ -236,10 +254,12 @@ let _activity_execute :
   T.Activity.execute
 
 let _activity_future :
+    'output.
     'output T.Activity.handle -> ('output, T.Error.t) T.Future.t =
   T.Activity.future
 
 let _activity_cancel :
+    'output.
     'output T.Activity.handle -> (unit, T.Error.t) result =
   T.Activity.cancel
 
@@ -273,6 +293,7 @@ let _activity_retry_policy_non_retryable :
   T.Retry_policy.non_retryable_error_types
 
 let _activity_start_handle :
+    'input 'output.
     ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?task_queue:string ->
@@ -289,6 +310,7 @@ let _activity_start_handle :
   T.Activity.start_handle
 
 let _activity_start :
+    'input 'output.
     ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?task_queue:string ->
@@ -305,6 +327,7 @@ let _activity_start :
   T.Activity.start
 
 let _child_start :
+    'input 'output.
     ?scope:T.Scope.t ->
     ?cancellation_type:T.Child_workflow.cancellation_type ->
     ?retry_policy:T.Retry_policy.t ->
@@ -321,6 +344,7 @@ let _child_start :
   T.Child_workflow.start
 
 let _child_start_handle :
+    'input 'output.
     ?scope:T.Scope.t ->
     ?cancellation_type:T.Child_workflow.cancellation_type ->
     ?retry_policy:T.Retry_policy.t ->
@@ -336,19 +360,23 @@ let _child_start_handle :
   T.Child_workflow.start_handle
 
 let _child_future :
+    'output.
     'output T.Child_workflow.handle -> ('output, T.Error.t) T.Future.t =
   T.Child_workflow.future
 
 let _child_started :
+    'output.
     'output T.Child_workflow.handle -> (string, T.Error.t) T.Future.t =
   T.Child_workflow.started
 
 let _child_cancel :
+    'output.
     ?reason:string ->
     'output T.Child_workflow.handle -> (unit, T.Error.t) result =
   T.Child_workflow.cancel
 
 let _child_execute :
+    'input 'output.
     ?scope:T.Scope.t ->
     ?cancellation_type:T.Child_workflow.cancellation_type ->
     ?retry_policy:T.Retry_policy.t ->
@@ -367,6 +395,7 @@ let _child_execute :
 (* Codec construction and the built-in codecs define the payload boundary
    shared by workflows, activities, and the client. *)
 let _codec_make :
+    'a.
     encoding:string ->
     encode:('a -> (bytes, T.Error.t) result) ->
     decode:(bytes -> ('a, T.Error.t) result) ->
@@ -374,18 +403,20 @@ let _codec_make :
   T.Codec.make
 
 let _codec_encode :
+    'a.
     'a T.Codec.t -> 'a -> (T.Codec.payload, T.Error.t) result =
   T.Codec.encode
 
 let _codec_decode :
+    'a.
     'a T.Codec.t -> T.Codec.payload -> ('a, T.Error.t) result =
   T.Codec.decode
 
-let _codec_option : 'a T.Codec.t -> 'a option T.Codec.t = T.Codec.option
+let _codec_option : 'a. 'a T.Codec.t -> 'a option T.Codec.t = T.Codec.option
 let _codec_string : string T.Codec.t = T.Codec.string
 let _codec_bytes : bytes T.Codec.t = T.Codec.bytes
 let _codec_unit : unit T.Codec.t = T.Codec.unit
-let _codec_is_unit : 'a T.Codec.t -> bool = T.Codec.is_unit
+let _codec_is_unit : 'a. 'a T.Codec.t -> bool = T.Codec.is_unit
 let _codec_int : int T.Codec.t = T.Codec.int
 let _codec_int64 : int64 T.Codec.t = T.Codec.int64
 let _codec_bool : bool T.Codec.t = T.Codec.bool
@@ -393,6 +424,7 @@ let _codec_float : float T.Codec.t = T.Codec.float
 let _codec_json : Yojson.Safe.t T.Codec.t = T.Codec.json
 
 let _codec_json_conv :
+    'a.
     to_json:('a -> Yojson.Safe.t) ->
     of_json:(Yojson.Safe.t -> ('a, T.Error.t) result) ->
     'a T.Codec.t =
@@ -447,46 +479,54 @@ let _error_defect : message:string -> T.Error.t = T.Error.defect
 (* The future combinators are intentionally checked separately from workflow
    command starters: they are the public direct-style composition vocabulary. *)
 let _future_await :
+    'value 'error.
     ('value, 'error) T.Future.t -> ('value, 'error) result =
   T.Future.await
 
 let _future_map :
+    'value 'mapped 'error.
     ('value -> 'mapped) ->
     ('value, 'error) T.Future.t ->
     ('mapped, 'error) T.Future.t =
   T.Future.map
 
 let _future_map_error :
+    'error 'mapped_error 'value.
     ('error -> 'mapped_error) ->
     ('value, 'error) T.Future.t ->
     ('value, 'mapped_error) T.Future.t =
   T.Future.map_error
 
 let _future_both :
+    'left 'right.
     ('left, T.Error.t) T.Future.t ->
     ('right, T.Error.t) T.Future.t ->
     ('left * 'right, T.Error.t) T.Future.t =
   T.Future.both
 
 let _future_all :
+    'value.
     ('value, T.Error.t) T.Future.t list ->
     ('value list, T.Error.t) T.Future.t =
   T.Future.all
 
 let _future_race :
+    'left 'right.
     ('left, T.Error.t) T.Future.t ->
     ('right, T.Error.t) T.Future.t ->
     (('left, 'right) T.Future.race, T.Error.t) T.Future.t =
   T.Future.race
 
 let _future_first :
+    'value.
     ('value, T.Error.t) T.Future.t ->
     ('value, T.Error.t) T.Future.t list ->
     ('value, T.Error.t) T.Future.t =
   T.Future.first
 
-let _future_is_ready : ('value, 'error) T.Future.t -> bool = T.Future.is_ready
+let _future_is_ready : 'value 'error. ('value, 'error) T.Future.t -> bool = T.Future.is_ready
 let _future_peek :
+    'value 'error.
     ('value, 'error) T.Future.t -> ('value, 'error) result option =
   T.Future.peek
 
@@ -494,6 +534,7 @@ let _future_peek :
    annotations protect the direct-style authoring API and handler registration
    types without attempting to execute a workflow in this consumer fixture. *)
 let _workflow_define :
+    'input 'output.
     name:string ->
     input:'input T.Codec.t ->
     output:'output T.Codec.t ->
@@ -502,16 +543,18 @@ let _workflow_define :
   T.Workflow.define
 
 let _workflow_remote :
+    'input 'output.
     name:string ->
     input:'input T.Codec.t ->
     output:'output T.Codec.t ->
     ('input, 'output) T.Workflow.t =
   T.Workflow.remote
 
-let _workflow_name : ('input, 'output) T.Workflow.t -> string = T.Workflow.name
-let _workflow_input : ('input, 'output) T.Workflow.t -> 'input T.Codec.t = T.Workflow.input
-let _workflow_output : ('input, 'output) T.Workflow.t -> 'output T.Codec.t = T.Workflow.output
+let _workflow_name : 'input 'output. ('input, 'output) T.Workflow.t -> string = T.Workflow.name
+let _workflow_input : 'input 'output. ('input, 'output) T.Workflow.t -> 'input T.Codec.t = T.Workflow.input
+let _workflow_output : 'input 'output. ('input, 'output) T.Workflow.t -> 'output T.Codec.t = T.Workflow.output
 let _workflow_implementation :
+    'input 'output.
     ('input, 'output) T.Workflow.t ->
     ('input, 'output) T.Workflow.implementation option =
   T.Workflow.implementation
@@ -537,23 +580,27 @@ let _workflow_random_bytes : length:int -> (string, T.Error.t) result =
 
 let _workflow_uuid4 : unit -> (string, T.Error.t) result = T.Workflow.uuid4
 let _workflow_continue_as_new :
+    'input 'output 'value.
     ('input, 'output) T.Workflow.t -> 'input -> 'value =
   T.Workflow.continue_as_new
 
 let _signal_define :
+    'input.
     name:string -> input:'input T.Codec.t -> 'input T.Signal.t =
   T.Signal.define
 
-let _signal_name : 'input T.Signal.t -> string = T.Signal.name
-let _signal_input : 'input T.Signal.t -> 'input T.Codec.t = T.Signal.input
+let _signal_name : 'input. 'input T.Signal.t -> string = T.Signal.name
+let _signal_input : 'input. 'input T.Signal.t -> 'input T.Codec.t = T.Signal.input
 
 let _signal_handler_make :
+    'input.
     'input T.Signal.t ->
     ('input -> (unit, T.Error.t) result) ->
     T.Signal.Handler.t =
   T.Signal.Handler.make
 
 let _signal_handler_handle :
+    'input.
     'input T.Signal.t ->
     ('input -> (unit, T.Error.t) result) ->
     T.Signal.Handler.t =
@@ -567,43 +614,50 @@ let _signal_handler_dispatch_payloads :
   T.Signal.Handler.dispatch_payloads
 
 let _query_define :
+    'output.
     name:string -> output:'output T.Codec.t -> 'output T.Query.t =
   T.Query.define
 
 let _query_define_with_input :
+    'input 'output.
     name:string ->
     input:'input T.Codec.t ->
     output:'output T.Codec.t ->
     ('input, 'output) T.Query.typed =
   T.Query.define_with_input
 
-let _query_name : 'output T.Query.t -> string = T.Query.name
-let _query_output : 'output T.Query.t -> 'output T.Codec.t = T.Query.output
-let _query_name_with_input : ('input, 'output) T.Query.typed -> string =
+let _query_name : 'output. 'output T.Query.t -> string = T.Query.name
+let _query_output : 'output. 'output T.Query.t -> 'output T.Codec.t = T.Query.output
+let _query_name_with_input : 'input 'output. ('input, 'output) T.Query.typed -> string =
   T.Query.name_with_input
-let _query_input : ('input, 'output) T.Query.typed -> 'input T.Codec.t =
+let _query_input : 'input 'output. ('input, 'output) T.Query.typed -> 'input T.Codec.t =
   T.Query.input
 let _query_output_with_input :
+    'input 'output.
     ('input, 'output) T.Query.typed -> 'output T.Codec.t =
   T.Query.output_with_input
 
 let _query_handler_make :
+    'output.
     'output T.Query.t ->
     (unit -> ('output, T.Error.t) result) ->
     T.Query.Handler.t =
   T.Query.Handler.make
 
 let _query_handler_handle :
+    'output.
     'output T.Query.t ->
     (unit -> ('output, T.Error.t) result) ->
     T.Query.Handler.t =
   T.Query.Handler.handle
 let _query_handler_make_with_input :
+    'input 'output.
     ('input, 'output) T.Query.typed ->
     ('input -> ('output, T.Error.t) result) ->
     T.Query.Handler.t =
   T.Query.Handler.make_with_input
 let _query_handler_handle_with_input :
+    'input 'output.
     ('input, 'output) T.Query.typed ->
     ('input -> ('output, T.Error.t) result) ->
     T.Query.Handler.t =
@@ -617,17 +671,19 @@ let _query_handler_dispatch_payloads :
   T.Query.Handler.dispatch_payloads
 
 let _update_define :
+    'input 'output.
     name:string ->
     input:'input T.Codec.t ->
     output:'output T.Codec.t ->
     ('input, 'output) T.Update.t =
   T.Update.define
 
-let _update_name : ('input, 'output) T.Update.t -> string = T.Update.name
-let _update_input : ('input, 'output) T.Update.t -> 'input T.Codec.t = T.Update.input
-let _update_output : ('input, 'output) T.Update.t -> 'output T.Codec.t = T.Update.output
+let _update_name : 'input 'output. ('input, 'output) T.Update.t -> string = T.Update.name
+let _update_input : 'input 'output. ('input, 'output) T.Update.t -> 'input T.Codec.t = T.Update.input
+let _update_output : 'input 'output. ('input, 'output) T.Update.t -> 'output T.Codec.t = T.Update.output
 
 let _update_handler_make :
+    'input 'output.
     ?validator:('input -> (unit, T.Error.t) result) ->
     ('input, 'output) T.Update.t ->
     ('input -> ('output, T.Error.t) result) ->
@@ -635,6 +691,7 @@ let _update_handler_make :
   T.Update.Handler.make
 
 let _update_handler_handle :
+    'input 'output.
     ?validator:('input -> (unit, T.Error.t) result) ->
     ('input, 'output) T.Update.t ->
     ('input -> ('output, T.Error.t) result) ->
@@ -660,20 +717,24 @@ let _interaction_create :
   T.Interaction.create
 
 let _interaction_signal :
+    'input.
     T.Interaction.t -> 'input T.Signal.t -> 'input -> (unit, T.Error.t) result =
   T.Interaction.signal
 
 let _interaction_query :
+    'output.
     T.Interaction.t -> 'output T.Query.t -> ('output, T.Error.t) result =
   T.Interaction.query
 
 let _interaction_query_with_input :
+    'input 'output.
     T.Interaction.t ->
     ('input, 'output) T.Query.typed ->
     'input -> ('output, T.Error.t) result =
   T.Interaction.query_with_input
 
 let _interaction_update :
+    'input 'output.
     T.Interaction.t ->
     ('input, 'output) T.Update.t ->
     'input -> ('output, T.Error.t) result =
@@ -694,6 +755,7 @@ let _client_create :
   T.Client.create
 
 let _client_start :
+    'input 'output.
     T.Client.t ->
     ?request_id:string ->
     ?memo:(string * T.Payload.t) list ->
@@ -728,6 +790,7 @@ let _client_id_reuse_policy_name : T.Client.id_reuse_policy -> string =
   | `Reject_duplicate -> "reject_duplicate"
 
 let _client_follow :
+    'input 'output.
     T.Client.t ->
     workflow:('input, 'output) T.Workflow.t ->
     T.Client.execution ->
@@ -735,6 +798,7 @@ let _client_follow :
   T.Client.follow
 
 let _client_get_handle :
+    'input 'output.
     T.Client.t ->
     ?run_id:string ->
     workflow:('input, 'output) T.Workflow.t ->
@@ -746,6 +810,7 @@ let _client_get_handle :
 (* A completed result carries its output and the optional cron or retry
    successor as an inline record, like the failed and timed-out results. *)
 let _client_completed_fields :
+    'output.
     'output T.Client.terminal_result -> ('output * T.Client.execution option) option =
   function
   | T.Client.Completed { output; successor } -> Some (output, successor)
@@ -755,12 +820,14 @@ let _client_execution_fields (execution : T.Client.execution) : string * string 
   (execution.namespace, execution.workflow_id, execution.run_id)
 
 let _client_wait :
+    'input 'output.
     ?timeout:T.Duration.t ->
     ('input, 'output) T.Client.handle ->
     ('output T.Client.terminal_result, T.Error.t) result =
   T.Client.wait
 
 let _client_cancel :
+    'input 'output.
     ?request_id:string ->
     ?reason:string ->
     ?rpc_timeout:T.Duration.t ->
@@ -769,6 +836,7 @@ let _client_cancel :
   T.Client.cancel
 
 let _client_reset :
+    'input 'output.
     ?request_id:string ->
     ?reason:string ->
     ?rpc_timeout:T.Duration.t ->
@@ -778,6 +846,7 @@ let _client_reset :
   T.Client.reset
 
 let _client_signal :
+    'workflow_input 'workflow_output 'signal.
     ?request_id:string ->
     ?rpc_timeout:T.Duration.t ->
     ('workflow_input, 'workflow_output) T.Client.handle ->
@@ -787,6 +856,7 @@ let _client_signal :
   T.Client.signal
 
 let _client_query :
+    'workflow_input 'workflow_output 'query.
     ?rpc_timeout:T.Duration.t ->
     ('workflow_input, 'workflow_output) T.Client.handle ->
     query:'query T.Query.t ->
@@ -794,6 +864,7 @@ let _client_query :
   T.Client.query
 
 let _client_query_with_input :
+    'workflow_input 'workflow_output 'input 'query.
     ?rpc_timeout:T.Duration.t ->
     ('workflow_input, 'workflow_output) T.Client.handle ->
     query:('input, 'query) T.Query.typed ->
@@ -801,12 +872,13 @@ let _client_query_with_input :
   T.Client.query_with_input
 
 let _client_workflow_id :
+    'input 'output.
     ('input, 'output) T.Client.handle -> string =
   T.Client.workflow_id
 
-let _client_run_id : ('input, 'output) T.Client.handle -> string option =
+let _client_run_id : 'input 'output. ('input, 'output) T.Client.handle -> string option =
   T.Client.run_id
-let _client_started : ('input, 'output) T.Client.handle -> bool = T.Client.started
+let _client_started : 'input 'output. ('input, 'output) T.Client.handle -> bool = T.Client.started
 let _client_already_started : T.Error.t -> T.Client.execution option =
   T.Client.already_started
 let _client_is_at_capacity : T.Error.t -> bool = T.Client.is_at_capacity
@@ -841,6 +913,7 @@ let _client_rpc_status_name : T.Client.rpc_status -> string = function
 let _client_shutdown : T.Client.t -> (unit, T.Error.t) result = T.Client.shutdown
 
 let _worker_workflow :
+    'input 'output.
     ?signals:T.Signal.Handler.t list ->
     ?queries:T.Query.Handler.t list ->
     ?updates:T.Update.Handler.t list ->
@@ -849,6 +922,7 @@ let _worker_workflow :
   T.Worker.workflow
 
 let _worker_activity :
+    'input 'output.
     ('input, 'output) T.Activity.t -> T.Worker.registered_activity =
   T.Worker.activity
 
@@ -1024,6 +1098,7 @@ let _runtime_shutdown : T.Runtime.t -> (unit, T.Error.t) result =
 
 let _scope_create : unit -> (T.Scope.t, T.Error.t) result = T.Scope.create
 let _scope_with_scope :
+    'value.
     (T.Scope.t -> ('value, T.Error.t) result) ->
     ('value, T.Error.t) result =
   T.Scope.with_scope
@@ -1031,6 +1106,7 @@ let _scope_cancel : T.Scope.t -> (unit, T.Error.t) result = T.Scope.cancel
 let _scope_is_cancelled : T.Scope.t -> (bool, T.Error.t) result = T.Scope.is_cancelled
 let _scope_check : T.Scope.t -> (unit, T.Error.t) result = T.Scope.check
 let _scope_await :
+    'value.
     T.Scope.t -> ('value, T.Error.t) T.Future.t -> ('value, T.Error.t) result =
   T.Scope.await
 
@@ -1044,12 +1120,14 @@ let _time_nanoseconds : T.Time.t -> int = T.Time.nanoseconds
 let _time_equal : T.Time.t -> T.Time.t -> bool = T.Time.equal
 let _workflow_context_active : unit -> bool = T.Workflow_context.is_active
 
-let _workflow_local_create : unit -> 'a T.Workflow_context.Local.t =
+let _workflow_local_create : 'a. unit -> 'a T.Workflow_context.Local.t =
   T.Workflow_context.Local.create
 let _workflow_local_get :
+    'a.
     'a T.Workflow_context.Local.t -> ('a option, T.Error.t) result =
   T.Workflow_context.Local.get
 let _workflow_local_set :
+    'a.
     'a T.Workflow_context.Local.t -> 'a -> (unit, T.Error.t) result =
   T.Workflow_context.Local.set
 
@@ -1061,12 +1139,13 @@ let _payload_fields (payload : T.Payload.t) : (string * string) list * bytes =
   (payload.metadata, payload.data)
 
 let _result_bind :
+    'a 'error 'b.
     ('a, 'error) result ->
     ('a -> ('b, 'error) result) ->
     ('b, 'error) result =
   T.Result_syntax.( let* )
 
-let _result_map : ('a, 'error) result -> ('a -> 'b) -> ('b, 'error) result =
+let _result_map : 'a 'error 'b. ('a, 'error) result -> ('a -> 'b) -> ('b, 'error) result =
   T.Result_syntax.( let+ )
 
 (** Installed consumers can inspect start metadata without private types. *)
@@ -1104,6 +1183,7 @@ let _activity_priority_fairness_weight :
   T.Activity.Priority.fairness_weight
 
 let _activity_start_local :
+    'input 'output.
     ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
@@ -1116,6 +1196,7 @@ let _activity_start_local :
   T.Activity.start_local
 
 let _activity_start_local_handle :
+    'input 'output.
     ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
@@ -1128,6 +1209,7 @@ let _activity_start_local_handle :
   T.Activity.start_local_handle
 
 let _activity_execute_local :
+    'input 'output.
     ?scope:T.Scope.t ->
     ?activity_id:string ->
     ?schedule_to_close_timeout:T.Duration.t ->
@@ -1141,12 +1223,14 @@ let _activity_execute_local :
 
 (* Client termination, visibility listing, and workflow updates. *)
 let _client_terminate :
+    'input 'output.
     ?reason:string ->
     ?rpc_timeout:T.Duration.t ->
     ('input, 'output) T.Client.handle -> (unit, T.Error.t) result =
   T.Client.terminate
 
 let _client_fetch_history :
+    'input 'output.
     ?page_size:int ->
     ?rpc_timeout:T.Duration.t ->
     ('input, 'output) T.Client.handle -> (T.Replay.History.t, T.Error.t) result =
@@ -1186,6 +1270,7 @@ let _client_visibility_page_fields (page : T.Client.visibility_page) :
     page.next_page_token )
 
 let _client_start_update :
+    'workflow_input 'workflow_output 'input 'output.
     ?update_id:string ->
     ?rpc_timeout:T.Duration.t ->
     ('workflow_input, 'workflow_output) T.Client.handle ->
@@ -1195,15 +1280,17 @@ let _client_start_update :
   T.Client.start_update
 
 let _client_wait_update :
+    'input 'output.
     ?timeout:T.Duration.t ->
     ('input, 'output) T.Client.update_handle -> ('output, T.Error.t) result =
   T.Client.wait_update
 
-let _client_update_id : ('input, 'output) T.Client.update_handle -> string =
+let _client_update_id : 'input 'output. ('input, 'output) T.Client.update_handle -> string =
   T.Client.update_id
 
 (* Scope cancellation callbacks. *)
 let _scope_on_cancel :
+    'value 'error.
     ?until:('value, 'error) T.Future.t ->
     T.Scope.t ->
     (unit -> (unit, T.Error.t) result) ->
@@ -1311,6 +1398,7 @@ let _worker_health_abandonment : T.Worker.Health.abandonment -> string =
 
 (* External workflow commands and search attributes from workflow code. *)
 let _workflow_signal_external_workflow :
+    'input.
     workflow_id:string ->
     ?run_id:string ->
     signal:'input T.Signal.t ->
@@ -1329,6 +1417,7 @@ let _workflow_upsert_search_attributes :
 
 (* In-process, time-skipping workflow test environment. *)
 let _testing_workflow :
+    'input 'output.
     ?signals:T.Signal.Handler.t list ->
     ?queries:T.Query.Handler.t list ->
     ?updates:T.Update.Handler.t list ->
@@ -1336,6 +1425,7 @@ let _testing_workflow :
   T.Testing.workflow
 
 let _testing_mock_workflow :
+    'input 'output.
     ?signals:T.Signal.Handler.t list ->
     ?queries:T.Query.Handler.t list ->
     ?updates:T.Update.Handler.t list ->
@@ -1345,10 +1435,15 @@ let _testing_mock_workflow :
   T.Testing.mock_workflow
 
 let _testing_activity :
-    ('input, 'output) T.Activity.t -> T.Testing.registered_activity =
+    'input 'output.
+    ?durations:T.Duration.t list ->
+    ('input, 'output) T.Activity.t ->
+    T.Testing.registered_activity =
   T.Testing.activity
 
 let _testing_mock_activity :
+    'input 'output.
+    ?durations:T.Duration.t list ->
     ('input, 'output) T.Activity.t ->
     ('input -> ('output, T.Error.t) result) ->
     T.Testing.registered_activity =
@@ -1371,6 +1466,7 @@ let _testing_skip : T.Testing.t -> T.Duration.t -> (unit, T.Error.t) result =
   T.Testing.skip
 
 let _testing_start :
+    'input 'output.
     ?id:string ->
     T.Testing.t ->
     ('input, 'output) T.Workflow.t ->
@@ -1378,11 +1474,13 @@ let _testing_start :
   T.Testing.start
 
 let _testing_result :
+    'input 'output.
     ?timeout:T.Duration.t ->
     ('input, 'output) T.Testing.handle -> ('output, T.Error.t) result =
   T.Testing.result
 
 let _testing_execute :
+    'input 'output.
     ?id:string ->
     ?timeout:T.Duration.t ->
     T.Testing.t ->
@@ -1390,22 +1488,26 @@ let _testing_execute :
   T.Testing.execute
 
 let _testing_signal :
+    'input 'output 'signal.
     ('input, 'output) T.Testing.handle ->
     'signal T.Signal.t -> 'signal -> (unit, T.Error.t) result =
   T.Testing.signal
 
 let _testing_query :
+    'input 'output 'query.
     ('input, 'output) T.Testing.handle ->
     'query T.Query.t -> ('query, T.Error.t) result =
   T.Testing.query
 
 let _testing_query_with_input :
+    'input 'output 'query_input 'query.
     ('input, 'output) T.Testing.handle ->
     ('query_input, 'query) T.Query.typed ->
     'query_input -> ('query, T.Error.t) result =
   T.Testing.query_with_input
 
 let _testing_update :
+    'input 'output 'update_input 'update_output.
     ?timeout:T.Duration.t ->
     ('input, 'output) T.Testing.handle ->
     ('update_input, 'update_output) T.Update.t ->
@@ -1413,19 +1515,21 @@ let _testing_update :
   T.Testing.update
 
 let _testing_cancel :
+    'input 'output.
     ('input, 'output) T.Testing.handle -> (unit, T.Error.t) result =
   T.Testing.cancel
 
-let _testing_workflow_id : ('input, 'output) T.Testing.handle -> string =
+let _testing_workflow_id : 'input 'output. ('input, 'output) T.Testing.handle -> string =
   T.Testing.workflow_id
 
-let _testing_run_id : ('input, 'output) T.Testing.handle -> string =
+let _testing_run_id : 'input 'output. ('input, 'output) T.Testing.handle -> string =
   T.Testing.run_id
 
 (* Offline history replay against registered workflow definitions. The
    failure match names every constructor so a removed or renamed verdict
    breaks the consumer build. *)
 let _replay_workflow :
+    'input 'output.
     ?signals:T.Signal.Handler.t list ->
     ?queries:T.Query.Handler.t list ->
     ?updates:T.Update.Handler.t list ->

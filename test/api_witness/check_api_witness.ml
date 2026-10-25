@@ -18,6 +18,13 @@
    [Temporal] module, for example
    [let _heartbeat : ... = T.Activity.Context.heartbeat].  An unannotated use
    does not count, because its inferred type would hide a signature change.
+
+   Such an annotation must also pin something (#1230).  A wildcard [_] or a
+   type variable not bound by an explicit [ 'a. ] quantifier unifies with any
+   type, so [let _cancel : _ = T.Scope.cancel] or replacing [int] with ['a]
+   would still compile after a signature change.  A rigid ['a. ...]
+   annotation instead requires the value to be at least that polymorphic.
+   Weak annotations are reported, and the program exits with status 3.
    Type paths, constructors, and record fields are checked by the witness's
    own type annotations instead.
 
@@ -118,6 +125,40 @@ let interface_values ~module_name mli =
   iterator.signature iterator signature;
   List.rev !values
 
+(** [weak_annotation binding] names the first part of [binding]'s type
+    annotation that pins nothing: a wildcard, or a type variable that no
+    enclosing [ 'a. ] quantifier binds.  Locally abstract types, [(type a)],
+    are constructors in the annotation, not variables, so they are rigid
+    already.  Only [Ptyp_any], [Ptyp_var] and [Ptyp_poly] are matched; every
+    other type form is traversed by [Ast_iterator]. *)
+let weak_annotation (binding : Parsetree.value_binding) =
+  let weak = ref None in
+  let bound = ref [] in
+  let iterator =
+    {
+      Ast_iterator.default_iterator with
+      typ =
+        (fun self typ ->
+          match typ.ptyp_desc with
+          | Ptyp_any -> if !weak = None then weak := Some "a wildcard _"
+          | Ptyp_var name ->
+              if !weak = None && not (List.mem name !bound) then
+                weak :=
+                  Some
+                    (Printf.sprintf
+                       "type variable '%s without an explicit '%s. quantifier"
+                       name name)
+          | Ptyp_poly (variables, body) ->
+              let saved = !bound in
+              bound := List.map (fun v -> v.Location.txt) variables @ saved;
+              self.typ self body;
+              bound := saved
+          | _ -> Ast_iterator.default_iterator.typ self typ);
+    }
+  in
+  iterator.value_binding iterator binding;
+  !weak
+
 (** [witness_references witness_ml] returns the set of dotted value paths that
     the witness pins with an explicit type, with the [T] or [Temporal] root
     removed so they compare directly with {!interface_values}. A value counts
@@ -129,6 +170,7 @@ let interface_values ~module_name mli =
 let witness_references witness_ml =
   let structure = parse Parse.implementation witness_ml in
   let references = Hashtbl.create 256 in
+  let weak = ref [] in
   (* Records [expression] when it is a bare [T]/[Temporal]-rooted value path. *)
   let record_identifier expression =
     match expression.Parsetree.pexp_desc with
@@ -154,16 +196,25 @@ let witness_references witness_ml =
       match item.pstr_desc with
       | Pstr_value (_, bindings) ->
           List.iter
-            (fun binding ->
-              Option.iter record_identifier (annotated_body binding))
+            (fun (binding : Parsetree.value_binding) ->
+              match annotated_body binding with
+              | None -> ()
+              | Some body -> (
+                  record_identifier body;
+                  match weak_annotation binding with
+                  | None -> ()
+                  | Some reason ->
+                      let line = binding.pvb_loc.loc_start.pos_lnum in
+                      weak := Printf.sprintf "line %d: %s" line reason :: !weak))
             bindings
       | _ -> ())
     structure;
-  references
+  (references, List.rev !weak)
 
 (** Entry point: [check_api_witness ROOT_ML PUBLIC_DIR WITNESS_ML].  Exits 0
-    when every public value is referenced, 1 with a list of omissions
-    otherwise, and 2 for unusable inputs. *)
+    when every public value is referenced with a rigid annotation, 3 listing
+    any annotation that pins nothing, 1 with a list of omissions otherwise,
+    and 2 for unusable inputs. *)
 let () =
   match Sys.argv with
   | [| _; root_ml; public_dir; witness_ml |] ->
@@ -179,7 +230,16 @@ let () =
                interface_values ~module_name mli)
       in
       if expected = [] then fail "no public values found under %s" public_dir;
-      let referenced = witness_references witness_ml in
+      let referenced, weak = witness_references witness_ml in
+      if weak <> [] then begin
+        Printf.eprintf "%s has %d annotation(s) that pin nothing:\n"
+          witness_ml (List.length weak);
+        List.iter (fun entry -> Printf.eprintf "  %s\n" entry) weak;
+        prerr_endline
+          "Write the exact type, with explicit 'a. quantifiers for its type \
+           variables; see docs/reference/api-stability.md.";
+        exit 3
+      end;
       let missing =
         List.filter (fun value -> not (Hashtbl.mem referenced value)) expected
       in
