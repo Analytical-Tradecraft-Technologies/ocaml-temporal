@@ -6225,6 +6225,21 @@ both refusals, the accepted newer hosts and the legacy bundle. The Docker
 bridge cache key needed no change, because `Dockerfile.rust-ci`, which pins
 the base image digest, is already part of its source hash.
 
+## 2026-10-25: An incomplete scrape request cannot stall other scrapes (#1212, part)
+
+The metrics relay forwarded whatever arrived within its 5 s head timeout
+to Core, then waited up to 5 s for Core's first bytes while holding the
+shared descriptor reserve. Core's scrape server has no header-read timeout,
+so an unterminated head held the reserve the whole time: two such clients
+delayed a real scrape by about 10 s. A head that never reaches its blank
+line is now answered `400` without touching Core or the reserve. The new
+`metrics_partial_head` test sends two incomplete heads and requires a
+concurrent scrape within 3 s and a `400` for each. Against the previous relay
+the scrape took 9.5 s. `observability.md` now documents the 1,024-series and
+label-value registration limits and no longer calls `worker_metrics_unavailable`
+an SDK defect. Releasing a worker's series at shutdown, which would lift the
+cap's effect, needs a Rust unregister API and stays open on #1212.
+
 ## 2026-10-24: Interface and reference corrections from the second audit (#1146)
 
 Eight rows of the #1146 audit are corrected against the code:
