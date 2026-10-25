@@ -416,9 +416,9 @@ releases failed such a task non-retryably.
 Heartbeat-context conversion failures follow the same task-rejection path as
 input codec failures, for both synchronous and asynchronous definitions, but
 unlike an undecodable input they are always non-retryable (see
-[Tasks this worker cannot run](#tasks-this-worker-cannot-run)). For
-example, binary heartbeat metadata which cannot be represented by runtime
-strings produces a bounded non-retryable failure
+[Tasks this worker cannot run](#tasks-this-worker-cannot-run)). Heartbeat
+metadata itself cannot cause one: since #1048 its bytes are carried
+losslessly. A failure that does occur is a bounded non-retryable failure
 for the exact leased token without invoking the callback. The adapter retains
 that validated failure until native acknowledgement, so a transient submission
 failure remains visible to polling and shutdown drain. Once acknowledged,
@@ -651,10 +651,12 @@ supervisor calls take only the mailbox's internal locks.
 A start that a sweep deferred and whose cancellation was deferred too
 completes as cancelled without running its callback (cancellation before
 admission). At shutdown, `drain` records each deferred start as a cancelled
-completion in that case and otherwise as a retryable
-`ocaml_temporal_worker_shutdown` failure, mirroring the bridge's failure of
-tasks it never delivered, so no deferred lease outlives the worker and no user
-code runs during drain.
+completion in that case. Otherwise it mirrors the bridge's retirement of
+tasks it never delivered (`bridge_retirement_result`): a remote start is
+recorded as a retryable `ocaml_temporal_worker_shutdown` failure, and a local
+start as a cancellation (#1209), because Core's local-activity manager would
+retry a retryable local failure in-process and hold shutdown for its backoff.
+No deferred lease outlives the worker and no user code runs during drain.
 
 A callback that never heartbeats never observes a cancellation. Remote
 activities need a `heartbeat_timeout` for prompt delivery: Core throttles

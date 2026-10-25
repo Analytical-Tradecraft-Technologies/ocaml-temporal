@@ -216,9 +216,12 @@ val implementation_async :
     without contacting the server, and later calls return a non-retryable
     error.
 
-    Each operation is one request to the Temporal server, made while the
-    calling thread waits for its answer (up to the client's RPC timeout and
-    retries). The worker's own polling and completions do not wait for it,
+    Each terminal operation is one request to the Temporal server, made
+    while the calling thread waits for its answer (up to the client's RPC
+    timeout and retries). Heartbeats are throttled per handle like Core's
+    (#1025): the first is sent at once, and later ones within the throttle
+    interval only update the details a trailing send carries (see
+    {!Async_handle.heartbeat}). The worker's own polling and completions do not wait for it,
     and operations on different handles proceed independently, but a call
     blocks its caller: do not call it from workflow code. *)
 module Async_handle : sig

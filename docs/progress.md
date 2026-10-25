@@ -6110,6 +6110,21 @@ for cancel-before/after-fire.
   requires a full commit SHA for every remote action in every workflow,
   GitHub-owned ones included, and a mutable `@v7` in `stress.yml` fails it.
 
+## 2026-10-25: Shutdown drain cancels deferred local-activity starts (#1209)
+
+#1081 made the bridge report a retired local-activity token as cancelled,
+because Core's local-activity manager retries a retryable local failure
+in-process after a backoff of a second or more. The OCaml adapter's
+`retire_deferred` still failed a deferred local start retryably, so
+shutdown waited for that retry. It now records a local start as cancelled,
+`undispatched_local_cancellation`, matching `bridge_retirement_result`.
+`test_drain_retires_deferred_starts` adds a deferred local start, and the
+test fails against the previous adapter ("a deferred local start was failed
+retryably"). Three stale passages are corrected: binary heartbeat metadata
+no longer fails a task (#1048), `Async_handle` heartbeats are throttled
+(#1025), and the local-activity cancellation suite uses only the public API
+(#1156).
+
 ## 2026-10-24: Child workflow timeouts and ID reuse policy (#1135, first half)
 
 `Child_workflow.start`, `start_handle` and `execute` take

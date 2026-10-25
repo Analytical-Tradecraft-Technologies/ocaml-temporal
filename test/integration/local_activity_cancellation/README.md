@@ -31,9 +31,8 @@ While waiting for the retry timer, a failed read is logged and polled again
 until a 60-second deadline; a completed history is read up to three times. The
 event assertions are unchanged.
 
-The fixture uses the private runtime scheduling handle because the public local
-activity API currently exposes only a future. It does not introduce a public
-cancellation API. The client, worker, signal, and query paths use the public SDK.
+Workflow, client, worker, signal, and query code all use the public SDK; the
+local activity cancellation API it exercises exists since #1156.
 Deterministic runtime tests separately exercise cancellation before backoff
 delivery, during backoff, after timer firing, and before a retry's later backoff
 under all three policies in live and replay contexts, including repeated calls
