@@ -6313,9 +6313,13 @@ The scheduled stress workflow's `seed` input was checked on its first
 character only, and the Makefile pastes seeds into quoted recipe words, so
 `1"; <command>; "` ran on the runner. The workflow now requires the whole
 value to match `0x[0-9a-fA-F]+|[0-9]+`. The Makefile checks the four seed
-variables itself, in Make alone and before any recipe runs: each must be one
-word of decimal digits or `0x` plus hexadecimal digits. The check reads the
-unexpanded text, so a `$(shell ...)` seed is refused, not evaluated.
+variables itself, in Make alone, at its very top: each seed from the command
+line or environment must be one word of decimal digits or `0x` plus
+hexadecimal digits. The check reads the unexpanded text, so a `$(shell ...)`
+seed is refused, not evaluated. It precedes every `$(shell ...)` because GNU
+Make 4.4 and later expand exported variables, which include command-line
+ones, into each `$(shell)` environment. A first revision placed it after
+the CA nonce's `$(shell)`, and the Windows job's make ran the seed there.
 `test/smoke/test_make_seed_validation.sh` (in `test-quality-contract`) dry-runs
 `test-parser-fuzz` with injection-shaped seeds from the command line and the
 environment. It asserts each is refused with the seed diagnostic and that
