@@ -184,9 +184,9 @@ type history_request = {
   page_size : int option;
       (** Events per page, 1 to 1000; [None] keeps the server's default. *)
   rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
-      (** Caller deadline of the whole fetch, every page included, fixed on
-          the monotonic clock when the call began; [None] keeps the
-          30-second default. *)
+      (** Caller deadline fixed on the monotonic clock when the call began.
+          Its budget remaining at dispatch bounds each page's round trip
+          (#1210); [None] keeps the 30-second default. *)
 }
 
 (** Stable visibility metadata returned for one execution. *)

@@ -608,11 +608,12 @@ pub struct HistoryRequest {
     /// Temporal resolves on the first page and pins through the token.
     pub run_id: String,
     /// Most events per page, between 1 and 1000; absent keeps the server's
-    /// default. Only the number of round trips depends on it.
+    /// default. The server caps it at its `limit.historyMaxPageSize` (256 by
+    /// default). Only the number of round trips depends on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u32>,
-    /// Caller-selected total budget of the whole fetch (every page) in
-    /// milliseconds, replacing the thirty-second default. Absent keeps the
+    /// Caller-selected budget of each page round trip in milliseconds,
+    /// replacing the thirty-second default (#1210). Absent keeps the
     /// default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_timeout_ms: Option<u64>,
@@ -1436,51 +1437,29 @@ pub async fn list_visibility(
 /// Each page is re-encoded and appended; protobuf concatenation of the
 /// repeated `events` field yields the complete history, the same form
 /// `Temporal.Replay.History.of_protobuf` accepts. The fetch never waits for
-/// new events, so an open run yields the events recorded so far. The whole
-/// fetch, every page included, shares one budget; expiry is the typed
-/// `deadline_exceeded` RPC error. A history larger than
+/// new events, so an open run yields the events recorded so far.
+///
+/// Each page round trip has its own budget (`rpc_timeout_ms`, default
+/// [`HISTORY_PAGE_RPC_TIMEOUT`]), as Core's own history paginator does
+/// (#1210). The server serves at most a few hundred events per page, so a
+/// history at the server's default limits needs hundreds of sequential round
+/// trips, which no single bounded budget can cover on a high-latency link; a
+/// retry of a timed-out whole fetch would also restart at page one. Expiry of
+/// one page's budget is the typed `deadline_exceeded` RPC error. The total
+/// fetch is still bounded by the history itself: a history larger than
 /// [`protocol::MAX_PAYLOAD_BYTES`] or one with no events is rejected rather
-/// than returned truncated.
+/// than returned truncated, and client shutdown aborts the task.
 pub async fn fetch_history(
     connection: Connection,
     request: HistoryRequest,
 ) -> Result<Vec<u8>, ClientOperationError> {
-    const HISTORY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
-    let budget = rpc_budget(request.rpc_timeout_ms, HISTORY_RPC_TIMEOUT);
-    let started = tokio::time::Instant::now();
-    match tokio::time::timeout(
-        budget,
-        fetch_history_pages(connection, request, started, budget),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(ClientOperationError::Rpc {
-            code: "deadline_exceeded".to_owned(),
-        }),
-    }
-}
-
-/// Pages through one history for [`fetch_history`], giving each page the
-/// part of `budget` that is left since `started`.
-async fn fetch_history_pages(
-    connection: Connection,
-    request: HistoryRequest,
-    started: tokio::time::Instant,
-    budget: Duration,
-) -> Result<Vec<u8>, ClientOperationError> {
     use prost::Message;
 
+    let budget = rpc_budget(request.rpc_timeout_ms, HISTORY_PAGE_RPC_TIMEOUT);
     let mut encoded = Vec::new();
     let mut next_page_token = Vec::new();
     let mut service = connection.clone();
     loop {
-        let remaining = budget.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Err(ClientOperationError::Rpc {
-                code: "deadline_exceeded".to_owned(),
-            });
-        }
         let page = GetWorkflowExecutionHistoryRequest {
             namespace: request.namespace.clone(),
             execution: Some(WorkflowExecution {
@@ -1488,7 +1467,8 @@ async fn fetch_history_pages(
                 run_id: request.run_id.clone(),
             }),
             // Validation bounds the size to 1..=1000, so it always fits; zero
-            // asks for the server's default.
+            // asks for the server's default. The server caps it at its own
+            // `limit.historyMaxPageSize` (256 by default).
             maximum_page_size: request
                 .page_size
                 .and_then(|size| i32::try_from(size).ok())
@@ -1498,11 +1478,22 @@ async fn fetch_history_pages(
             history_event_filter_type: i32::from(HistoryEventFilterType::AllEvent),
             skip_archival: false,
         };
-        let response = service
-            .get_workflow_execution_history(budgeted_request(page, remaining))
-            .await
-            .map_err(budget_status(started, budget, map_rpc_status))?
-            .into_inner();
+        let started = tokio::time::Instant::now();
+        let response = match tokio::time::timeout(
+            budget,
+            service.get_workflow_execution_history(budgeted_request(page, budget)),
+        )
+        .await
+        {
+            Ok(result) => result
+                .map_err(budget_status(started, budget, map_rpc_status))?
+                .into_inner(),
+            Err(_) => {
+                return Err(ClientOperationError::Rpc {
+                    code: "deadline_exceeded".to_owned(),
+                });
+            }
+        };
         if let Some(history) = response.history
             && !history.events.is_empty()
         {
@@ -1526,6 +1517,10 @@ async fn fetch_history_pages(
     }
     Ok(encoded)
 }
+
+/// The default budget of one history page round trip when the caller gave
+/// no `rpc_timeout_ms` (#1210).
+const HISTORY_PAGE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Requests cancellation of one run (exact, or current for an empty run ID)
 /// through Temporal's official workflow service. The connection is cloned by
