@@ -554,10 +554,12 @@ activity, run, and update IDs, type names, signal names, search-attribute
 names) are never rewritten and keep their strict checks. The OCaml decoder
 applies the matching inbound rules for start-event priority and retry policy,
 activity-task priority, failure-wrapper fields, and an empty continuation run
-ID; every other degraded value satisfies its existing limits.
-Outbound semantic documents (completions, and any activation passed to
-`encode_activation` or `decode_activation`) remain strictly validated; the
-degradation exists only in the Core-to-semantic conversion.
+ID; every other degraded value satisfies its existing limits. An activity
+task's retry policy follows the same interval rule: a negative interval is
+reported as unset (#1213). Completions remain strictly validated, so the
+degradation never reaches a command. Activation documents passed to
+`encode_activation` or `decode_activation` apply the same inbound rules on
+both sides, because they carry what the server recorded.
 
 An activation that still fails conversion (for example a non-normalized
 duration) is failed to Core and its lease retired. After Core accepts that rejection, the native
