@@ -2108,9 +2108,11 @@ let test_worker_shutdown_signal () =
      || Option.is_some (Temporal.Activity.Context.cancellation synthetic)
   then failwith "a synthetic context reported a stop signal"
 
-(** Shutdown drain never runs deferred user code: a deferred start is failed
-    retryably (or cancelled when its cancellation was deferred too), so no
-    lease outlives the worker; a later poll then has nothing to dispatch. *)
+(** Shutdown drain never runs deferred user code: a deferred remote start is
+    failed retryably, a deferred local start is cancelled (#1209: Core would
+    retry a retryable local failure in-process, holding shutdown), and a start
+    whose cancellation was deferred too is cancelled, so no lease outlives the
+    worker; a later poll then has nothing to dispatch. *)
 let test_drain_retires_deferred_starts () =
   let supervisor = fake_supervisor () in
   let calls = ref 0 in
@@ -2127,6 +2129,7 @@ let test_drain_retires_deferred_starts () =
   let unit_input = [ encode_input Temporal.Codec.unit () ] in
   let failed_token = Bytes.of_string "failed" in
   let cancelled_token = Bytes.of_string "cancelled" in
+  let local_token = Bytes.of_string "local" in
   enqueue supervisor
     (start_task ~token:(Bytes.of_string "drain") ~activity_type:"drain_sweeps"
        ~input:unit_input);
@@ -2139,6 +2142,14 @@ let test_drain_retires_deferred_starts () =
   enqueue supervisor
     (cancel_task_with ~reason:Protocol.Cancellation_worker_shutdown
        cancelled_token);
+  enqueue supervisor
+    (match
+       start_task ~token:local_token ~activity_type:"never_dispatched"
+         ~input:unit_input
+     with
+    | { variant = Protocol.Start start; _ } as task ->
+        { task with variant = Protocol.Start { start with is_local = true } }
+    | task -> task);
   let worker =
     worker supervisor [ Adapter.register running; Adapter.register deferred ]
   in
@@ -2171,6 +2182,11 @@ let test_drain_retires_deferred_starts () =
   begin match result_for cancelled_token with
   | Protocol.Cancelled _ -> ()
   | _ -> failwith "a deferred start with a deferred cancellation was not cancelled"
+  end;
+  begin match result_for local_token with
+  | Protocol.Cancelled { info = Protocol.Canceled _; _ } -> ()
+  | Protocol.Failed _ -> failwith "a deferred local start was failed retryably"
+  | _ -> failwith "a deferred local start was not cancelled"
   end;
   match Worker.poll worker with
   | Ok Adapter.Not_ready -> ()

@@ -928,6 +928,24 @@ type deferred_work =
     be ready, so the cap is only a guard against a misbehaving source. *)
 let max_delivery_sweep = 64
 
+(** Builds the cancellation reported for a deferred local-activity start at
+    shutdown (#1209), as the bridge reports every local token it retires
+    ([bridge_retirement_result], #1029). Core's local-activity manager retries
+    a retryable local failure in-process after a backoff of 1 s and more, so
+    the retryable [undispatched_failure] would keep shutdown waiting for that
+    retry; a cancellation is not retried. The workflow task owning the local
+    activity is failed by the same drain, so the next worker re-executes it. *)
+let undispatched_local_cancellation : Protocol.failure =
+  Protocol.
+    {
+      message = "local activity was not dispatched before the worker shut down";
+      source = "ocaml-temporal";
+      stack_trace = "";
+      encoded_attributes = None;
+      cause = None;
+      info = Canceled { details = []; identity = "ocaml-temporal" };
+    }
+
 (** Builds the retryable failure for a start task that a delivery sweep took
     but the worker shut down before dispatching. The callback never ran, so
     Temporal may retry the attempt; this mirrors the bridge's own failure of
@@ -2292,8 +2310,9 @@ module Make (Supervisor : SUPERVISOR) = struct
 
   (** Converts work deferred by delivery sweeps into recorded completions at
       shutdown, without running user code. A deferred start is cancelled when
-      its cancellation was deferred too, and otherwise failed retryably so
-      Temporal can run it on another worker. A bare deferred cancellation owns
+      its cancellation was deferred too. Otherwise a remote start is failed
+      retryably so Temporal can run it on another worker, and a local start
+      is reported as cancelled ({!undispatched_local_cancellation}, #1209). A bare deferred cancellation owns
       no completion and a deferred poll error no longer matters once the lanes
       have stopped, so both are dropped. Returns the first admission error. *)
   let retire_deferred adapter =
@@ -2321,6 +2340,14 @@ module Make (Supervisor : SUPERVISOR) = struct
             let completion, accepted_result =
               match cancel_for token with
               | Some cancel -> cancelled_completion token cancel
+              | None when start.is_local ->
+                  ( Protocol.
+                      {
+                        task_token = Bytes.copy token;
+                        result = Cancelled undispatched_local_cancellation;
+                      },
+                    Completed_result
+                      { kind = Cancelled; cancellation_details = None } )
               | None ->
                   ( Protocol.
                       {
