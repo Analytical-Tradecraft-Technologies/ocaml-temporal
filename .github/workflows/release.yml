@@ -300,7 +300,9 @@ jobs:
           $release_label, built and tested from commit $GITHUB_SHA.
 
           Includes optimized Rust bridge libraries for Linux x64 and ARM64
-          (Debian 12/glibc), macOS ARM64, and Windows x64 GNU/MinGW.
+          (Debian 12; glibc 2.36 or newer), macOS ARM64, and Windows x64
+          GNU/MinGW. The SDK installer refuses a host with an older glibc or
+          macOS than its bundle records.
           Includes compiled OCaml SDK libraries and C stubs for every tested
           compiler/platform combination. Compatible downstream applications
           link these directly without rebuilding the SDK or Rust bridge.

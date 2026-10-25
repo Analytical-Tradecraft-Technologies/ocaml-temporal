@@ -52,6 +52,46 @@ def environment(path):
     return value
 
 
+def split_host(value):
+    """Separate the exactly compared ABI text from the `host-` lines (#1147)."""
+    abi, host = [], {}
+    for line in value.splitlines():
+        if line.startswith("host-") and ": " in line:
+            key, _, text = line.partition(": ")
+            host[key] = text
+        else:
+            abi.append(line)
+    return "\n".join(abi), host
+
+
+def version_tuple(text):
+    """Parse the leading dotted numeric version, such as 2.36 or 15.4.1."""
+    match = re.search(r"\d+(?:\.\d+)*", text or "")
+    return tuple(int(part) for part in match.group(0).split(".")) if match else None
+
+
+def check_host(producer, consumer):
+    """Refuse a consumer older than the producer's C library or macOS target.
+
+    Bundles produced before #1147 carry no host lines and are not checked.
+    A newer consumer is accepted; the C compiler line is informational.
+    """
+    checks = (("host-libc", "host-libc", "C library"),
+              ("host-macos-deployment-target", "host-macos", "macOS"))
+    for produced_key, consumer_key, label in checks:
+        if produced_key not in producer:
+            continue
+        needed = producer[produced_key]
+        have = consumer.get(consumer_key, "unknown")
+        needed_version, have_version = version_tuple(needed), version_tuple(have)
+        same_family = needed.split()[:1] == have.split()[:1] or label == "macOS"
+        if (needed_version is None or have_version is None or not same_family
+                or have_version < needed_version):
+            raise ValueError(
+                f"{label} too old or different for this bundle: it was built for "
+                f"{needed}, this host has {have}; use a newer host or build from source")
+
+
 def check_files(files, platform):
     """Require linkable SDK archives and the platform's native import closure."""
     if (not REQUIRED <= files.keys()
@@ -97,7 +137,8 @@ def pack(stage, output, commit, ocaml, platform, profile, bridge_key):
     manifest = {
         "schema": 1, "commit": commit, "ocaml": ocaml, "platform": platform,
         "profile": profile, "rust_bridge_key": bridge_key,
-        "environment": abi, "files": files, "archive_sha256": sha256(archive),
+        "environment": abi, "host": split_host(abi)[1],
+        "files": files, "archive_sha256": sha256(archive),
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     for name in TOOLS:
@@ -134,8 +175,11 @@ def validate(directory, commit, ocaml, platform, profile):
 def unpack(directory, prefix, env, commit, ocaml, platform, profile):
     """Expose a relocated installation only after ABI and byte checks pass."""
     manifest = validate(directory, commit, ocaml, platform, profile)
-    if environment(env) != manifest["environment"]:
+    consumer_abi, consumer_host = split_host(environment(env))
+    producer_abi, producer_host = split_host(manifest["environment"])
+    if consumer_abi != producer_abi:
         raise ValueError("OCaml compiler or compiled dependency ABI mismatch; use matching dependencies or build from source")
+    check_host(producer_host, consumer_host)
     if prefix.exists() or prefix.is_symlink():
         raise ValueError("installation prefix already exists")
     prefix.parent.mkdir(parents=True, exist_ok=True)

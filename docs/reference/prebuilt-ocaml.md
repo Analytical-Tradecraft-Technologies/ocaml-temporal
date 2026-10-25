@@ -29,10 +29,22 @@ The first release must be published before these example assets are available.
 
 ## Compatibility requirements
 
-- Use the exact OCaml patch and platform on the bundle. Linux bundles target
-  Debian 12/glibc, not Alpine/musl. macOS bundles use the macOS 15 ARM64 runner;
-  Windows bundles use x64 GNU/MinGW, not MSVC. The application still needs the
-  platform's normal native linker and system libraries.
+- Use the exact OCaml patch and platform on the bundle. Linux bundles are
+  built on Debian 12 and need glibc 2.36 or newer, not Alpine/musl. macOS
+  bundles are built on the macOS 15 ARM64 runner and need at least the macOS
+  version they target. Windows bundles use x64 GNU/MinGW, not MSVC. The
+  application still needs the platform's normal native linker and system
+  libraries.
+- Each bundle records its producer's host identity (#1147) in
+  `manifest.json` (the `environment` text and a `host` object): `host-libc`
+  on Linux (from `getconf GNU_LIBC_VERSION`), `host-macos` and
+  `host-macos-deployment-target` on macOS (`MACOSX_DEPLOYMENT_TARGET`, or the
+  build host's version when it is unset), and `host-cc`, the C compiler's
+  version line, for diagnosis. The installer compares the consumer's values
+  with these. It refuses an older glibc, a missing or different C library, or
+  an older macOS before unpacking anything, naming both versions; a newer
+  host is accepted. The C compiler is not compared. Bundles made before this
+  change record no host lines and are not checked.
 - Use the producer's Dune version and compatible compiled `stdlib`, `unix`,
   `threads`, `logs`, and `yojson` libraries. `manifest.json` records the compiler
   configuration, Dune version, dependency versions, and interface/implementation

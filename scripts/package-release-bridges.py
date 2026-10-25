@@ -13,8 +13,8 @@ from pathlib import Path
 
 # Rust-only bundles remain useful for compilers outside the published SDK matrix.
 PLATFORMS = {
-    "linux-amd64": "x86_64-unknown-linux-gnu; Debian 12/glibc",
-    "linux-arm64": "aarch64-unknown-linux-gnu; Debian 12/glibc",
+    "linux-amd64": "x86_64-unknown-linux-gnu; Debian 12/glibc 2.36 or newer",
+    "linux-arm64": "aarch64-unknown-linux-gnu; Debian 12/glibc 2.36 or newer",
     "macos-arm64": "aarch64-apple-darwin",
     "windows-amd64": "x86_64-pc-windows-gnu; GNU/MinGW",
 }
