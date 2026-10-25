@@ -82,7 +82,10 @@ type attempt_outcome =
 (** The activity command fields the engine needs to run, retry, and cancel
     attempts. [heartbeat_details] carries the last details recorded by an
     attempt into the next one, matching Temporal's heartbeat-details
-    hand-off. [scheduled_ms] is the virtual time of the first attempt. *)
+    hand-off. [scheduled_ms] is the virtual time of the first attempt.
+    [cancel_requested] records a cancellation the engine is waiting out
+    under [Wait_cancellation_completed]: the running attempt's outcome
+    still stands, but no further attempt starts. *)
 type activity_request = {
   activity_id : string;
   activity_type : string;
@@ -95,6 +98,7 @@ type activity_request = {
   heartbeat_timeout : int64 option;
   scheduled_ms : int64;
   mutable heartbeat_details : Payload.t list;
+  mutable cancel_requested : bool;
 }
 
 (** A workflow ID's sequence of runs. [current] is [None] only while the
@@ -1021,6 +1025,9 @@ let rec run_activity environment run seq request ~attempt =
     timeout is final at once and stays retryable, as Temporal reports retry
     state [TIMEOUT]; a retry that would start at or after that deadline is
     replaced by the timeout, which a backoff wait observes at the deadline.
+    After a cancellation request the engine waited out
+    ([cancel_requested]), a failure is final and retryable, as Temporal
+    records retry state [CANCEL_REQUESTED] instead of retrying.
     An error with the [Cancelled] category returned by the activity is
     wrapped too: only {!cancel_activity} produces a workflow-visible
     activity cancellation. *)
@@ -1033,6 +1040,7 @@ and settle_activity environment run seq request ~attempt outcome =
     match
       retry_delay ~application environment request.retry_policy ~attempt error
     with
+    | _ when request.cancel_requested -> final ~non_retryable:false
     | None -> final ~non_retryable:true
     | Some delay_ms -> (
         let retry_at = saturating_add environment.now_ms delay_ms in
@@ -1100,7 +1108,10 @@ let cancel_activity environment (run : run) seq =
       event.live <- false;
       Hashtbl.remove run.activity_retries seq;
       push_job environment run (Activation.Resolve_activity { seq; result })
-  | None, Some _ when waits_for_completion () -> ()
+  | None, Some _ when waits_for_completion () -> (
+      match Hashtbl.find_opt run.activities seq with
+      | Some request -> request.cancel_requested <- true
+      | None -> ())
   | None, Some event ->
       event.live <- false;
       Hashtbl.remove run.activity_attempts seq;
@@ -1227,6 +1238,7 @@ let rec apply_command environment run command =
           heartbeat_timeout;
           scheduled_ms = environment.now_ms;
           heartbeat_details = [];
+          cancel_requested = false;
         }
       in
       Hashtbl.replace run.activities seq request;
@@ -1256,6 +1268,7 @@ let rec apply_command environment run command =
           heartbeat_timeout = None;
           scheduled_ms = environment.now_ms;
           heartbeat_details = [];
+          cancel_requested = false;
         }
       in
       Hashtbl.replace run.activities seq request;

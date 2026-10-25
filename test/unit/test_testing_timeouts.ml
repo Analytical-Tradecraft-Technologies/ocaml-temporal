@@ -347,6 +347,33 @@ let test_zero_heartbeat_timeout_is_unset () =
   expect "zero heartbeat timeout" "ok done-1" report;
   expect_ms "attempt duration" 5_000L elapsed
 
+(** A cancellation waited out under [Wait_cancellation_completed] stops
+    retries: the running attempt's timeout is final and retryable, and no
+    second attempt runs (Codex review on #1206). *)
+let test_wait_cancellation_stops_retries () =
+  let workflow =
+    probe "cancel_waits_no_retry" (fun () ->
+        let handle =
+          T.Activity.start_handle ~cancellation_type:T.Activity.Wait_cancellation_completed
+            ~start_to_close_timeout:(seconds 10L)
+            ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:3 ())
+            slow ()
+        in
+        let* () = T.Workflow.sleep (seconds 1L) in
+        let* () = T.Activity.cancel handle in
+        T.Future.await (T.Activity.future handle))
+  in
+  let report, elapsed =
+    run_probe
+      ~activities:[ T.Testing.activity ~durations:[ seconds 20L; seconds 0L ] slow ]
+      workflow
+  in
+  expect "timed out, not retried"
+    "activity timeout=start_to_close non_retryable=false type=- heartbeats=[attempt-1]"
+    report;
+  expect_ms "first attempt's timeout" 10_000L elapsed;
+  expect "one attempt" "1" (String.concat "," (List.map string_of_int !attempts))
+
 (** Runs every timeout scenario as one dune test. *)
 let () =
   test_start_to_close ();
@@ -361,4 +388,5 @@ let () =
   test_mock_durations ();
   test_callback_origin_is_ignored ();
   test_timeout_ignores_error_types ();
-  test_zero_heartbeat_timeout_is_unset ()
+  test_zero_heartbeat_timeout_is_unset ();
+  test_wait_cancellation_stops_retries ()
