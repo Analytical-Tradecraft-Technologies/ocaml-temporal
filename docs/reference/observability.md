@@ -249,7 +249,7 @@ adapter from a public `Worker.run` or `Worker.shutdown` result:
 | `activity_lane_detached` | `Warning` | After a stop, an activity callback was still running when the grace period ended, or any other activity lane had not returned 150 ms after it, so `Worker.run` returned without joining its activity Domain (#495, #1023). A callback keeps running and its result will be discarded. |
 | `worker_shutdown_abandoned_work` | `Warning` | Bounded shutdown stopped waiting for a lane at the end of the grace period (#495). `temporal.error_kind` is `activity_callback`, `workflow_activation`, or `native_call` (a lane blocked in a native call). The abandoned task is failed so Temporal retries it; the process should be restarted. |
 | `worker_shutdown_teardown_detached` | `Warning` | The teardown timeout elapsed before native teardown finished (#495). Shutdown returned; the teardown continues on its own SDK thread. |
-| `worker_metrics_unavailable` | `Warning` | The bridge refused to register the worker's [SDK metric series](#sdk-worker-metrics) (#500); `temporal.error_kind` is the bridge status. The worker runs normally without SDK metrics; Core's own metrics are unaffected. This indicates an SDK defect. |
+| `worker_metrics_unavailable` | `Warning` | The bridge refused to register the worker's [SDK metric series](#sdk-worker-metrics) (#500); `temporal.error_kind` is the bridge status. The worker runs normally without SDK metrics; Core's own metrics are unaffected. The usual causes are the [registration limits](#sdk-metric-registration-limits): a namespace or task queue that cannot be a label value, or a runtime that already holds 1,024 series. |
 
 Submission and acceptance are separate: the SDK emits
 `workflow_activation_completed` only after Core accepted the completion,
@@ -503,6 +503,20 @@ unbounded. Counters and the occupancy gauge are exported at 0 from the moment
 the worker is created, so rate and absence alerts have a baseline; the
 histogram appears with the first callback. Workers on the same runtime,
 namespace and task queue share their series.
+
+#### SDK metric registration limits
+
+One runtime registers at most 1,024 SDK series, and a label value must be 1
+to 256 bytes without control characters (#1212). Each worker registers the
+series above once per namespace and task-queue pair, and series are never
+unregistered while the runtime lives: workers sharing a pair share its
+series, but every new pair adds a full set. About 50 distinct pairs on one
+runtime (per-tenant, per-version or per-test queues) therefore exhaust the
+cap. The next worker then registers only part of its series, which stay at
+zero, logs `worker_metrics_unavailable`, and runs without SDK metrics, as
+does every later pair. A task queue longer than 256 bytes is refused at its
+first series in the same way. Give such workers their own runtime, or keep
+the number of distinct task queues per runtime bounded.
 
 The shutdown series outlive the worker only while the runtime does: they are
 scrapeable after `Worker.shutdown` and until `Runtime.shutdown`, which is the

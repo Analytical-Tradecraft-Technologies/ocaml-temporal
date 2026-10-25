@@ -37,7 +37,14 @@ val disabled : t
 (** [create meter ~namespace ~task_queue] registers this worker's series on
     [meter]. Workers on the same runtime, namespace and task queue share
     their series, so their values add up. A registration the bridge refuses
-    returns its error; callers fall back to {!disabled}. *)
+    returns its error; callers fall back to {!disabled}. Every series
+    carries the same [namespace] and [task_queue] labels, so one that cannot
+    be a label value (empty, over 256 bytes, or containing a control
+    character) fails the first registration, before anything is registered.
+    Series are never unregistered, though, so a runtime's 1,024-series cap
+    can stop registration part-way once many namespace and task-queue pairs
+    exist, leaving the series already registered exported at zero
+    (#1212). *)
 val create :
   Temporal_core_bridge.Native_bridge.metric_meter ->
   namespace:string ->

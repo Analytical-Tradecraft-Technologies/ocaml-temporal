@@ -94,8 +94,9 @@ const ACCEPT_RETRY_MIN: Duration = Duration::from_millis(10);
 /// is logged (at most once per interval).
 const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(1);
 
-/// Longest time a relay waits for a scraper's request head before handling
-/// what it has (or dropping a connection that sent nothing).
+/// Longest time a relay waits for a scraper's complete request head. A
+/// connection that sent nothing by then is dropped, and one whose head is
+/// still incomplete is answered `400` (see [`read_request_head`]).
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Largest request head a relay buffers before connecting to Core; the
@@ -451,7 +452,7 @@ fn report_busy(shared: &RelayShared) {
 /// [`MAX_PENDING_REJECTIONS`] slots, released when the task ends.
 async fn reject_busy(mut client: TcpStream, _permit: OwnedSemaphorePermit) {
     let _ = tokio::time::timeout(REJECTION_TIMEOUT, async {
-        if read_request_head(&mut client).await.is_some() {
+        if !matches!(read_request_head(&mut client).await, RequestHead::Empty) {
             answer_unavailable(&mut client, BUSY_BODY).await;
         }
     })
@@ -480,8 +481,17 @@ async fn relay_scrape(
     _permit: OwnedSemaphorePermit,
 ) {
     let deadline = Instant::now() + RELAY_MAX_LIFETIME;
-    let Some(head) = read_request_head(&mut client).await else {
-        return;
+    let head = match read_request_head(&mut client).await {
+        RequestHead::Complete(head) => head,
+        RequestHead::Empty => return,
+        RequestHead::Incomplete => {
+            // Core's scrape server has no header-read timeout, so forwarding
+            // an unterminated head would hold the descriptor reserve, and
+            // every other scrape queued behind it, for the whole first-
+            // response wait (#1212).
+            answer_bad_request(&mut client).await;
+            return;
+        }
     };
     let mut reserve = shared.reserve.lock().await;
     if shared.core_server.is_finished() {
@@ -596,10 +606,22 @@ fn report_stopped(shared: &RelayShared) {
     }
 }
 
+/// What [`read_request_head`] received within [`REQUEST_HEAD_TIMEOUT`].
+enum RequestHead {
+    /// A head ending in the blank line, which Core can answer at once.
+    Complete(Vec<u8>),
+    /// Some bytes, but no end of head before the timeout, the
+    /// [`REQUEST_HEAD_MAX_BYTES`] bound, or the client closing.
+    Incomplete,
+    /// Nothing at all.
+    Empty,
+}
+
 /// Reads the scraper's request head, bounded by [`REQUEST_HEAD_MAX_BYTES`]
-/// and [`REQUEST_HEAD_TIMEOUT`]. Returns whatever arrived (which may run
-/// past the head), or `None` when the scraper sent nothing.
-async fn read_request_head(client: &mut TcpStream) -> Option<Vec<u8>> {
+/// and [`REQUEST_HEAD_TIMEOUT`]. A complete head is returned with whatever
+/// arrived after it; a head without its terminating blank line is
+/// [`RequestHead::Incomplete`], so it is never forwarded to Core (#1212).
+async fn read_request_head(client: &mut TcpStream) -> RequestHead {
     let mut head = Vec::new();
     let read = async {
         let mut chunk = [0_u8; 1024];
@@ -613,7 +635,26 @@ async fn read_request_head(client: &mut TcpStream) -> Option<Vec<u8>> {
         }
     };
     let _ = tokio::time::timeout(REQUEST_HEAD_TIMEOUT, read).await;
-    (!head.is_empty()).then_some(head)
+    if head.is_empty() {
+        RequestHead::Empty
+    } else if head.windows(4).any(|window| window == b"\r\n\r\n") {
+        RequestHead::Complete(head)
+    } else {
+        RequestHead::Incomplete
+    }
+}
+
+/// Answers `400 Bad Request` and closes, for a request head that never
+/// completed.
+async fn answer_bad_request(client: &mut TcpStream) {
+    let body = "incomplete request head\n";
+    let response = format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = client.write_all(response.as_bytes()).await;
+    let _ = client.shutdown().await;
 }
 
 /// Answers `503 Service Unavailable` with `body` and closes. The request head
