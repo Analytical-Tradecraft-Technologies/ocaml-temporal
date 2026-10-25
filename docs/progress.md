@@ -6338,6 +6338,16 @@ history records `VERSIONING_BEHAVIOR_PINNED`. A mutant that drops the
 declaration fails it because the pinned run moves. It passed locally against
 the pinned Compose stack.
 
+## 2026-10-25: Test C stubs follow the library's warning policy (#1228)
+
+The two test C stubs in `test/bridge` hard-coded `-Werror`, so
+`opam install --with-test`, whose `run-test` is `dune runtest -p`, could fail
+on any new compiler warning, the failure #785 removed from the installed
+library. `test/bridge/dune` now keeps `-Wall -Wextra` in the stubs and adds
+`-Werror` only through a dev-profile `env` stanza, matching
+`lib/core_bridge/dune`. `dune printenv` shows `-Werror` in the dev profile's
+`c_flags` for `test/bridge` and not in the release profile's.
+
 ## 2026-10-24: Local activity cancellation live through the public API (#1156)
 
 `test/integration/local_activity_cancellation` no longer reaches into the
