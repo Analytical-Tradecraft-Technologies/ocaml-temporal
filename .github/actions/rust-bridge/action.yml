@@ -85,7 +85,7 @@ runs:
         fi
     - name: Retain parser fuzz input after a Rust failure
       if: failure()
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: structured-parser-fuzz-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: _build/structured-fuzz/
@@ -93,7 +93,7 @@ runs:
         retention-days: 14
     - name: Retain lifecycle stress reports after a Rust failure
       if: failure()
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: lifecycle-stress-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: _build/lifecycle-stress/
@@ -101,7 +101,7 @@ runs:
         retention-days: 14
     - name: Retain decoder fuzz reproductions after a Rust failure
       if: failure()
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: decoder-fuzz-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: _build/decoder-fuzz/
@@ -109,7 +109,7 @@ runs:
         retention-days: 14
     - name: Retain concurrent stress reports after a Rust failure
       if: failure()
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: concurrent-stress-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: _build/concurrent-stress/
@@ -129,7 +129,7 @@ runs:
         path: _build/rust-bridge
         key: ${{ steps.identity.outputs.key }}
     - name: Upload the verified platform libraries
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: rust-bridge-${{ inputs.platform }}
         path: _build/rust-bridge/

@@ -24,6 +24,9 @@ jobs:
   validate:
     name: Validate release request
     runs-on: ubuntu-24.04
+    # Every job holding release permissions is bounded, like every other job
+    # in the repository, instead of GitHub's 360-minute default (#1227).
+    timeout-minutes: 15
     steps:
       - name: Check out the exact requested commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -68,6 +71,7 @@ jobs:
     name: Create the release source archive
     needs: validate
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       RELEASE_TAG: ${{ inputs.tag }}
     outputs:
@@ -219,6 +223,7 @@ jobs:
     name: Publish the tested release
     needs: [build, metadata, source-archive, source-archive-check, source-archive-check-linux]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     # The contents permission creates the release. The id-token permission
     # lets the attestation step mint the OIDC token that Sigstore exchanges for
     # a short-lived signing certificate, and the attestations permission

@@ -29,10 +29,10 @@ retain the same version gate. These checks are native because their upstream
 projects publish small binaries for supported development platforms; they are
 not SDK dependencies and are intentionally absent from the Compose builder.
 
-Every third-party action reference checked into the build workflows uses an
-immutable full commit SHA. GitHub-owned `actions/*` actions may use readable
-major-version references because the effective Actions policy admits them
-separately. The effective policy can be enforced at repository, organization,
+Every action reference checked into the workflows and the composite action,
+GitHub-owned `actions/*` included (#1150), uses an immutable full commit SHA;
+the quality contract rejects a mutable reference. GitHub-owned actions are
+also admitted separately by the effective Actions policy. The effective policy can be enforced at repository, organization,
 or enterprise level; this source contract neither identifies nor changes that
 external enforcement point. Non-GitHub actions must also be admitted there by
 their exact owner, repository, and commit SHA. Consequently, pinning the
@@ -60,8 +60,8 @@ calls the same workflow with the `master` matrix tier.
 
 | Event | Linux OCaml matrix | Native OCaml matrix | Other build jobs |
 | --- | --- | --- | --- |
-| PR or merge group | amd64 5.2 and 5.5; arm64 5.5 | macOS ARM64 and Windows x64 on 5.5 | Four Rust producers, quality, standalone license audit, and the live Temporal/PostgreSQL smoke on Linux amd64/5.5 |
-| `master` push, schedule, or manual Build dispatch | amd64 and arm64 on 5.2, 5.3, 5.4, and 5.5 | macOS ARM64 and Windows x64 on 5.5 | The same Rust, quality, license, and live smoke jobs |
+| PR or merge group | amd64 5.2 and 5.5; arm64 5.5 | macOS ARM64 and Windows x64 on 5.5 | Four Rust producers, quality, standalone license audit, the live Temporal/PostgreSQL smoke on Linux amd64/5.5, and the sandboxed opam build from the source archive on Linux amd64 (`opam-source-sandbox-linux`, #1148) |
+| `master` push, schedule, or manual Build dispatch | amd64 and arm64 on 5.2, 5.3, 5.4, and 5.5 | macOS ARM64 and Windows x64 on 5.5 | The same Rust, quality, license, live smoke and Linux sandbox jobs, plus the macOS ARM64 sandboxed offline opam build (`opam-source-offline`) |
 
 The required PR and merge-group graph runs even for documentation-only,
 fixture-only, or empty effective diffs. The `changes` job validates the
