@@ -208,6 +208,61 @@ let test_public_ordering () =
     (create_worker ~runtime "mock://shared");
   expect_attached "closed runtime" 0 runtime
 
+(** Creates a mock client and a mock worker attached to [runtime] and drops
+    both without shutting them down. Kept out of line so neither value
+    survives in a caller's frame or register. *)
+let[@inline never] abandon_mock_instances runtime =
+  ignore
+    (Sys.opaque_identity
+       (public_ok "abandoned client"
+          (Temporal.Client.create ~runtime ~target_url:"mock://abandoned"
+             ~namespace:"unit-test" ())));
+  ignore
+    (Sys.opaque_identity
+       (public_ok "abandoned worker" (create_worker ~runtime "mock://abandoned")))
+
+(** Collects until [runtime] reports [expected] attachments, for at most five
+    seconds: the finalizer only starts the release thread. *)
+let await_attached label expected runtime =
+  let deadline = Unix.gettimeofday () +. 5.0 in
+  let rec wait () =
+    Gc.full_major ();
+    if Temporal.Runtime.attached runtime = expected then ()
+    else if Unix.gettimeofday () > deadline then
+      expect_attached label expected runtime
+    else (
+      Thread.delay 0.01;
+      wait ())
+  in
+  wait ()
+
+(** A mock client or worker dropped without shutdown releases its runtime
+    lease once it is collected, so [Runtime.shutdown] can succeed (#1222).
+    Before the fix the runtime stayed attached forever. An instance that was
+    shut down and then collected is not released a second time: a live
+    sibling keeps the count at one. *)
+let test_abandoned_mock_instances_release () =
+  let runtime = public_ok "abandon runtime" (Temporal.Runtime.create ~io_threads:1 ()) in
+  abandon_mock_instances runtime;
+  await_attached "after collecting abandoned mocks" 0 runtime;
+  let live =
+    public_ok "live client"
+      (Temporal.Client.create ~runtime ~target_url:"mock://abandoned"
+         ~namespace:"unit-test" ())
+  in
+  let closed =
+    public_ok "closed client"
+      (Temporal.Client.create ~runtime ~target_url:"mock://abandoned"
+         ~namespace:"unit-test" ())
+  in
+  public_ok "closed client shutdown" (Temporal.Client.shutdown closed);
+  ignore (Sys.opaque_identity closed);
+  for _ = 1 to 5 do Gc.full_major () done;
+  Thread.delay 0.05;
+  expect_attached "shut down then collected" 1 runtime;
+  public_ok "live client shutdown" (Temporal.Client.shutdown live);
+  public_ok "abandon runtime shutdown" (Temporal.Runtime.shutdown runtime)
+
 (** Number of OS threads in this process, where the platform exposes it
     cheaply ([/proc/self/task] on Linux); [None] elsewhere. *)
 let thread_count () =
@@ -259,4 +314,5 @@ let () =
   test_ledger_ordering ();
   test_two_supervisors_share_one_runtime ();
   test_public_ordering ();
+  test_abandoned_mock_instances_release ();
   test_no_thread_leak ()

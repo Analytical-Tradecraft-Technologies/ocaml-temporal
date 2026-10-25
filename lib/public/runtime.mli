@@ -16,7 +16,10 @@
       worker whose {!Worker.shutdown} or {!Worker.shutdown_with_report}
       returned while its native teardown was still running in the background
       ([`Detached] in {!Worker.Shutdown_report.teardown}) stays attached until
-      that teardown finishes;
+      that teardown finishes. A client or worker that is dropped without
+      being shut down, native or [mock://], is detached only after the
+      garbage collector has collected it and its background cleanup has
+      finished (#1222), so shut instances down rather than relying on this;
     - {!shutdown} returns a typed defect, and releases nothing, while any
       client or worker is still attached, so shut those down first;
     - after a successful {!shutdown}, creating a client or worker on the
