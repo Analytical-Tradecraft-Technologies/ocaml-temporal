@@ -6339,6 +6339,22 @@ same child ID is refused under `` `Reject_duplicate `` and reused under
 The parent's error is not yet a typed timeout kind (#1143), and child memo
 and search attributes remain blocked by #512.
 
+## 2026-10-25: The 65,536-byte lifecycle identifier limit is reachable (#1224)
+
+OCaml validates and documents each client and worker identifier (target URL,
+identity, namespace, task queue, build ID, deployment name) as at most
+65,536 bytes. Rust nevertheless capped the whole lifecycle document at 64 KiB,
+so a single maximal identity failed late with a `Configuration` "lifecycle
+configuration exceeds" error after a supervisor and Core runtime had been
+created. The cap is now five strings at the per-field limit, each fully
+`\u00XX`-escaped, plus 64 KiB for fixed fields (about 2 MiB). It still bounds
+parser allocation for a document only the SDK writes. The new
+`test/bridge/test_lifecycle_config_limits.ml` connects with a 65,536-byte
+identity, plain and made of control characters, to a refused endpoint and
+gets a connection error. It also starts a replay worker whose namespace, task
+queue and build ID are each 65,536 bytes. With the old cap it fails with
+"plain identity: rejected by the lifecycle document cap".
+
 ## 2026-10-24: Typed failure origin and heartbeat details (#1143)
 
 `Temporal.Error.origin` classifies an error received from Temporal by the
