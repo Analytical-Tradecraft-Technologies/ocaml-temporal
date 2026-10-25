@@ -6277,8 +6277,11 @@ from the first scheduling. A timeout fails with the native shape from
 the last heartbeat details). Start-to-close and heartbeat timeouts are
 retried under the policy. Schedule-to-close is final and retryable, as
 Temporal reports retry state `TIMEOUT`, and it also cuts short a backoff
-that would end past the deadline. Final application failures now carry the
-`` `Application `` origin. A running attempt is cancelled at once, except
+that would end past the deadline, and the policy's non-retryable error
+types (application types) never stop a timeout's retries. An error a
+callback returns is always an application failure with the
+`` `Application `` origin, whatever origin it carries, because a native
+worker does not transmit origins. A running attempt is cancelled at once, except
 under `Wait_cancellation_completed`, where its outcome arrives when it
 finishes. `test/unit/test_testing_timeouts.ml` covers each timeout, a retry
 after a timeout, a backoff cut short, both cancellation policies and mock

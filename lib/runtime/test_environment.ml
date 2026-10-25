@@ -67,6 +67,18 @@ type update_state =
   | Update_completed of Codec.payload
   | Update_rejected of Error.t
 
+(** An activity timeout the engine enforces in virtual time. *)
+type activity_timeout = [ `Start_to_close | `Schedule_to_close | `Heartbeat ]
+
+(** How one activity attempt ended. [Finished] is what the callback (or a
+    dispatch failure) returned; [Timed_out] is a timeout the engine itself
+    expired. Keeping them apart means an error a callback returns is always
+    an application failure, whatever origin it carries, as on a native
+    worker, which transmits neither its origin nor its heartbeat details. *)
+type attempt_outcome =
+  | Finished of (Codec.payload, Error.t) result
+  | Timed_out of activity_timeout
+
 (** The activity command fields the engine needs to run, retry, and cancel
     attempts. [heartbeat_details] carries the last details recorded by an
     attempt into the next one, matching Temporal's heartbeat-details
@@ -148,8 +160,7 @@ and event = { at : int64; order : int; mutable live : bool; action : action }
 and action =
   | Fire_timer of run * int64
   | Retry_activity of run * int64 * activity_request * int
-  | Settle_activity of
-      run * int64 * activity_request * int * (Codec.payload, Error.t) result
+  | Settle_activity of run * int64 * activity_request * int * attempt_outcome
   | Start_run of run
 
 (** Events ordered by due time and then by creation order, so simultaneous
@@ -267,12 +278,14 @@ let child_error_type cause =
     Temporal's retry state: an activity whose retries ended, or a child
     whose retry policy ended, is non-retryable, while a child without a
     retry policy inherits its cause's flag. [origin], when given, is the
-    classification of the cause's first non-wrapper layer (#1143); the
-    cause's heartbeat details are always kept apart from [details]. *)
-let wrap ?origin ~category ~error_type ~non_retryable ~prefix cause =
+    classification of the cause's first non-wrapper layer and
+    [last_heartbeat_details] the heartbeat payloads a timeout layer
+    records, both kept apart from [details] (#1143). *)
+let wrap ?origin ?last_heartbeat_details ~category ~error_type ~non_retryable
+    ~prefix cause =
   let view = Error.view cause in
   Error.make ~non_retryable ?error_type ~details:view.details ?origin
-    ~last_heartbeat_details:(Error.last_heartbeat_details cause) ~category
+    ?last_heartbeat_details ~category
     ~message:(prefix ^ view.message) ()
 
 (** The error a workflow observes for a cancelled operation or run. *)
@@ -720,8 +733,11 @@ let float_of_bits bits =
     capped at the environment's [max_activity_attempts]. An error with the
     [Cancelled] category is an ordinary failure here: the native worker
     treats it as a cancellation only when Core actually delivered one, and
-    the engine never routes its own cancellations through this function. *)
-let retry_delay environment policy ~attempt error =
+    the engine never routes its own cancellations through this function.
+    [application] (default [true]) says [error] is an application failure;
+    a timeout is not, so the policy's non-retryable error types, which
+    name application failure types, do not apply to it. *)
+let retry_delay ?(application = true) environment policy ~attempt error =
   let view = Error.view error in
   if view.non_retryable then None
   else
@@ -748,7 +764,10 @@ let retry_delay environment policy ~attempt error =
       else environment.max_activity_attempts
     in
     if attempt >= limit then None
-    else if List.mem (Error.application_failure_type error) non_retryable then
+    else if
+      application
+      && List.mem (Error.application_failure_type error) non_retryable
+    then
       None
     else
       let delay =
@@ -974,73 +993,77 @@ let rec run_activity environment run seq request ~attempt =
     Hashtbl.replace run.activity_attempts seq event
   in
   match expiry with
-  | Some (timeout, at) ->
-      settle_at at (Error (activity_timeout_error request timeout))
+  | Some (timeout, at) -> settle_at at (Timed_out timeout)
   | None when Int64.equal duration 0L ->
-      settle_activity environment run seq request ~attempt result
-  | None -> settle_at finished result
+      settle_activity environment run seq request ~attempt (Finished result)
+  | None -> settle_at finished (Finished result)
 
 (** Settles one attempt's outcome: queues a success, schedules the next
     attempt after the retry delay, or queues the final failure. A final
-    failure is wrapped as an [Activity] error with the cause's origin
-    ([`Application] for an error the activity returned) and is
-    non-retryable, as the native worker reports a failure whose retry state
-    is [NON_RETRYABLE_FAILURE] or [MAXIMUM_ATTEMPTS_REACHED]. An expired
-    schedule-to-close timeout is final at once and stays retryable, as
-    Temporal reports retry state [TIMEOUT]; a retry that would start at or
-    after that deadline is replaced by the timeout, which a backoff wait
-    observes at the deadline. An error with the [Cancelled] category
-    returned by the activity is wrapped too: only {!cancel_activity}
-    produces a workflow-visible activity cancellation. *)
-and settle_activity environment run seq request ~attempt result =
-  match result with
-  | Ok payload ->
-      push_job environment run
-        (Activation.Resolve_activity { seq; result = Ok payload })
-  | Error error -> (
-      let timeout = Error.timeout_type error in
+    failure is wrapped as an [Activity] error and is non-retryable, as the
+    native worker reports a failure whose retry state is
+    [NON_RETRYABLE_FAILURE] or [MAXIMUM_ATTEMPTS_REACHED]. A callback's
+    error becomes an application failure with origin [`Application] and its
+    application type; an engine timeout keeps origin [`Timeout t], no type,
+    and the last heartbeat details, and is retried without consulting the
+    policy's non-retryable error types. An expired schedule-to-close
+    timeout is final at once and stays retryable, as Temporal reports retry
+    state [TIMEOUT]; a retry that would start at or after that deadline is
+    replaced by the timeout, which a backoff wait observes at the deadline.
+    An error with the [Cancelled] category returned by the activity is
+    wrapped too: only {!cancel_activity} produces a workflow-visible
+    activity cancellation. *)
+and settle_activity environment run seq request ~attempt outcome =
+  let prefix = Printf.sprintf "activity %s failed: " request.activity_type in
+  let resolve result =
+    push_job environment run (Activation.Resolve_activity { seq; result })
+  in
+  let retry_or_final ~application ~final error =
+    match
+      retry_delay ~application environment request.retry_policy ~attempt error
+    with
+    | None -> final ~non_retryable:true
+    | Some delay_ms -> (
+        let retry_at = saturating_add environment.now_ms delay_ms in
+        match schedule_to_close_deadline request with
+        | Some deadline when Int64.compare retry_at deadline >= 0 ->
+            let event =
+              schedule environment
+                ~delay_ms:(Int64.sub deadline environment.now_ms)
+                (Settle_activity
+                   (run, seq, request, attempt, Timed_out `Schedule_to_close))
+            in
+            Hashtbl.replace run.activity_retries seq event
+        | Some _ | None ->
+            let event =
+              schedule environment ~delay_ms
+                (Retry_activity (run, seq, request, attempt + 1))
+            in
+            Hashtbl.replace run.activity_retries seq event)
+  in
+  match outcome with
+  | Finished (Ok payload) -> resolve (Ok payload)
+  | Finished (Error error) ->
       let final ~non_retryable =
-        let error =
-          wrap ~category:`Activity ~non_retryable
-            ~origin:(Option.value (Error.origin error) ~default:`Application)
-            ~error_type:
-              (match timeout with
-              | Some _ -> None
-              | None -> Some (Error.application_failure_type error))
-            ~prefix:(Printf.sprintf "activity %s failed: " request.activity_type)
-            error
-        in
-        push_job environment run
-          (Activation.Resolve_activity { seq; result = Error error })
+        resolve
+          (Error
+             (wrap ~category:`Activity ~non_retryable ~origin:`Application
+                ~error_type:(Some (Error.application_failure_type error))
+                ~prefix error))
       in
-      match timeout with
-      | Some `Schedule_to_close -> final ~non_retryable:false
-      | Some _ | None -> (
-          match retry_delay environment request.retry_policy ~attempt error with
-          | None -> final ~non_retryable:true
-          | Some delay_ms -> (
-              let retry_at = saturating_add environment.now_ms delay_ms in
-              match schedule_to_close_deadline request with
-              | Some deadline when Int64.compare retry_at deadline >= 0 ->
-                  let event =
-                    schedule environment
-                      ~delay_ms:(Int64.sub deadline environment.now_ms)
-                      (Settle_activity
-                         ( run,
-                           seq,
-                           request,
-                           attempt,
-                           Error
-                             (activity_timeout_error request `Schedule_to_close)
-                         ))
-                  in
-                  Hashtbl.replace run.activity_retries seq event
-              | Some _ | None ->
-                  let event =
-                    schedule environment ~delay_ms
-                      (Retry_activity (run, seq, request, attempt + 1))
-                  in
-                  Hashtbl.replace run.activity_retries seq event)))
+      retry_or_final ~application:true ~final error
+  | Timed_out timeout ->
+      let error = activity_timeout_error request timeout in
+      let final ~non_retryable =
+        resolve
+          (Error
+             (wrap ~category:`Activity ~non_retryable
+                ~origin:(`Timeout (timeout :> Error.timeout_type))
+                ~last_heartbeat_details:request.heartbeat_details
+                ~error_type:None ~prefix error))
+      in
+      if timeout = `Schedule_to_close then final ~non_retryable:false
+      else retry_or_final ~application:false ~final error
 
 (** Applies a workflow's activity cancellation request. An activity waiting
     for a retry is cancelled at once. An attempt that already finished but

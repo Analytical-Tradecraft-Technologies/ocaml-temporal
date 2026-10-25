@@ -79,9 +79,10 @@ let describe = function
 
 (** A retry policy with a fixed initial interval, doubling backoff and an
     attempt budget. *)
-let retry_policy ~initial_ms ~maximum_attempts =
+let retry_policy ?non_retryable_error_types ~initial_ms ~maximum_attempts () =
   ok "retry policy"
-    (T.Retry_policy.make ~initial_interval:(T.Duration.of_ms initial_ms)
+    (T.Retry_policy.make ?non_retryable_error_types
+       ~initial_interval:(T.Duration.of_ms initial_ms)
        ~backoff_coefficient:2.0 ~maximum_interval:(T.Duration.of_ms 60_000L)
        ~maximum_attempts ())
 
@@ -116,7 +117,7 @@ let test_start_to_close () =
   let workflow =
     probe "start_to_close" (fun () ->
         T.Activity.execute ~start_to_close_timeout:(minutes 1L)
-          ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:1)
+          ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:1 ())
           slow ())
   in
   let report, elapsed =
@@ -133,7 +134,7 @@ let test_retry_after_timeout () =
   let workflow =
     probe "retry_after_timeout" (fun () ->
         T.Activity.execute ~start_to_close_timeout:(minutes 1L)
-          ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:3)
+          ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:3 ())
           slow ())
   in
   let report, elapsed =
@@ -161,7 +162,7 @@ let test_schedule_to_close_during_attempt () =
     probe "schedule_to_close_attempt" (fun () ->
         T.Activity.execute ~start_to_close_timeout:(minutes 1L)
           ~schedule_to_close_timeout:(seconds 90L)
-          ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:0)
+          ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:0 ())
           slow ())
   in
   let report, elapsed =
@@ -181,7 +182,7 @@ let test_schedule_to_close_during_backoff () =
   let workflow =
     probe "schedule_to_close_backoff" (fun () ->
         T.Activity.execute ~schedule_to_close_timeout:(seconds 10L)
-          ~retry_policy:(retry_policy ~initial_ms:4_000L ~maximum_attempts:0)
+          ~retry_policy:(retry_policy ~initial_ms:4_000L ~maximum_attempts:0 ())
           failing ())
   in
   let report, elapsed = run_probe ~activities:[ T.Testing.activity failing ] workflow in
@@ -197,7 +198,7 @@ let test_heartbeat_timeout () =
     probe "heartbeat" (fun () ->
         T.Activity.execute ~start_to_close_timeout:(minutes 1L)
           ~heartbeat_timeout:(seconds 5L)
-          ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:1)
+          ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:1 ())
           slow ())
   in
   let report, elapsed =
@@ -215,7 +216,7 @@ let test_application_origin () =
     probe "application_origin" (fun () ->
         match
           T.Activity.execute
-            ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:1)
+            ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:1 ())
             failing ()
         with
         | Error error when T.Error.origin error = Some `Application -> Ok "application"
@@ -266,7 +267,7 @@ let test_mock_durations () =
   let workflow =
     probe "mock_durations" (fun () ->
         T.Activity.execute ~start_to_close_timeout:(seconds 10L)
-          ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:2)
+          ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:2 ())
           slow ())
   in
   let report, elapsed =
@@ -281,6 +282,58 @@ let test_mock_durations () =
   expect "mocked retry" "ok mocked" report;
   expect_ms "timeout, backoff, attempt" 14_000L elapsed
 
+(** Fails with an error that claims a schedule-to-close timeout origin. *)
+let claims_timeout =
+  T.Activity.define ~name:"claims_timeout" ~input:T.Codec.unit
+    ~output:T.Codec.string (fun () ->
+      attempts := 0 :: !attempts;
+      Error
+        (T.Error.make ~category:`Activity ~origin:(`Timeout `Schedule_to_close)
+           ~message:"not really a timeout" ()))
+
+(** An error a callback returns is an application failure whatever origin
+    it carries (Codex review on #1206): it is retried under the policy and
+    reaches the workflow with the [`Application] origin, as on a native
+    worker, which does not transmit the origin. *)
+let test_callback_origin_is_ignored () =
+  let workflow =
+    probe "callback_origin" (fun () ->
+        match
+          T.Activity.execute
+            ~retry_policy:(retry_policy ~initial_ms:1_000L ~maximum_attempts:3 ())
+            claims_timeout ()
+        with
+        | Error error when T.Error.origin error = Some `Application ->
+            Ok "application"
+        | Error error -> Error error
+        | Ok value -> Ok value)
+  in
+  let report, elapsed =
+    run_probe ~activities:[ T.Testing.activity claims_timeout ] workflow
+  in
+  expect "callback origin" "ok application" report;
+  expect "all attempts ran" "3" (string_of_int (List.length !attempts));
+  expect_ms "two backoffs" 3_000L elapsed
+
+(** Non-retryable error types name application failures, so a timeout is
+    retried even when the policy lists the category name ["activity"]
+    (Codex review on #1206). *)
+let test_timeout_ignores_error_types () =
+  let workflow =
+    probe "timeout_error_types" (fun () ->
+        T.Activity.execute ~start_to_close_timeout:(minutes 1L)
+          ~retry_policy:
+            (retry_policy ~non_retryable_error_types:[ "activity" ]
+               ~initial_ms:1_000L ~maximum_attempts:2 ())
+          slow ())
+  in
+  let report, _ =
+    run_probe
+      ~activities:[ T.Testing.activity ~durations:[ minutes 5L; seconds 0L ] slow ]
+      workflow
+  in
+  expect "timeout retried" "ok done-2" report
+
 (** Runs every timeout scenario as one dune test. *)
 let () =
   test_start_to_close ();
@@ -292,4 +345,6 @@ let () =
   test_application_origin ();
   test_cancel_running_attempt ();
   test_wait_cancellation_completed ();
-  test_mock_durations ()
+  test_mock_durations ();
+  test_callback_origin_is_ignored ();
+  test_timeout_ignores_error_types ()
