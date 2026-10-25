@@ -6137,6 +6137,22 @@ unchanged unscoped commands, and foreign-owner rejection. Still open under
 #1134: `Condition.wait_until ~timeout`, a live scenario and corpus histories
 for cancel-before/after-fire.
 
+## 2026-10-25: Client.start's rpc_timeout is Core's retry window (#1220)
+
+`start_workflow` was the one budgeted client RPC that bypassed
+`budgeted_request`, so a start's `rpc_timeout` bounded only the outer
+timer. Core retried transient failures within its default 10 s window, and
+a start with a longer budget reported an uncertain outcome after 10 s,
+although budget remained. It now builds its request with `budgeted_request`
+and maps statuses through `budget_status`, like cancel, reset, signal,
+query, visibility and update. The scripted-transport test
+`start_rpc_timeout_extends_cores_retry_window` keeps a server unavailable
+under a 30 s budget and requires the start to retry past 11 s; Core's
+ten-attempt cap then ends it after at least about 11.8 s. The previous code
+stopped within Core's default 10 s window.
+`start_attempts_carry_the_budget_deadline` checks that a retried start is
+byte-identical.
+
 ## 2026-10-24: Build and CI hygiene (#1150)
 
 - The OPAM license-policy fixtures (`test/smoke/test_license_policy.sh`) now
