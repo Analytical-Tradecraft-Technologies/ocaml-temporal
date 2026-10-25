@@ -509,11 +509,13 @@ and bridge, read the [documentation guide](../README.md) first.
     bridge's own Core waits below except for the final drop of Core itself.
     That drop is not bounded (#1149): when Core's finalizer was detached
     because its workflow processing thread was still alive, dropping Core's
-    Tokio runtime waits for that thread to exit. The caller's bound still
-    holds, but until the thread exits the worker stays attached to its
-    runtime, so `Runtime.shutdown` keeps returning its "still attached"
-    defect instead of hanging. If no thread can be created, the sequence
-    runs on the caller and only the bridge bounds it, with the same
+    Tokio runtime waits for that thread to exit. For a worker with its own
+    runtime the shutdown thread performs that drop, so the caller's bound
+    still holds. For a worker attached to a shared `Runtime.t`, the graph
+    only drops its reference and the worker detaches; the final drop then
+    happens in `Runtime.shutdown`, which can hang until the thread exits
+    (see [Core bridge](core-bridge.md)). If no thread can be created, the
+    sequence runs on the caller and only the bridge bounds it, with the same
     exception.
   - The typed outcome distinguishes abandonment from failure. Abandoned
     callbacks and activations, and the `Outstanding_tasks` status for the

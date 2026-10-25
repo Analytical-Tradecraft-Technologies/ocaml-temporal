@@ -910,11 +910,19 @@ the last Core reference (for a shared runtime, the shared runtime's release
 rather than the graph's) cancels that task only if it is waiting
 asynchronously. Core's `finalize_shutdown` joins its workflow processing
 thread inside `spawn_blocking`, and dropping a Tokio runtime waits without a
-bound for its blocking-pool closures, so while that thread is alive the drop,
-and the cleanup thread performing it, wait for it to exit (#1149). OCaml stays
-bounded because the worker shutdown thread is not awaited past the teardown
-timeout (`Detached`), but the graph then stays attached and `Runtime.shutdown`
-reports it as still attached until the drop finishes.
+bound for its blocking-pool closures, so while that thread is alive the final
+drop, and whichever thread performs it, wait for it to exit (#1149). Where
+that drop happens decides what stays bounded:
+
+- A worker with its own runtime holds Core's last reference, so its graph's
+  cleanup thread performs the drop. `Worker.shutdown` stays bounded, because
+  OCaml does not wait for the shutdown thread past the teardown timeout
+  (`Detached`); that thread then waits for the drop.
+- A worker attached to a shared `Runtime.t` holds only one reference. Its
+  graph's close drops that reference and returns, and the worker detaches.
+  The final drop happens in `Runtime.shutdown`, through
+  `Sdk_shared_runtime.shutdown` and the shared release, which waits for it
+  without a bound. `Runtime.shutdown` can therefore hang in this case.
 
 The OCaml side adds a stricter, typed ordering rule on top of that memory
 safety. `Sdk_shared_runtime` (private) owns the `Native_bridge.shared_runtime`
