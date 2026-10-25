@@ -380,6 +380,17 @@ val already_started_error_type : string
     [Client.is_start_outcome_uncertain] recognizes it. *)
 val start_outcome_uncertain_error_type : string
 
+(** Builds that uncertain-start error for [workflow_id], attaching
+    [request_id] (the caller's or the SDK-generated one) as a JSON detail
+    payload; [reason] explains a lost outcome the bridge did not report.
+    Exposed so tests can check the detail round-trip without a server. *)
+val uncertain_start_error :
+  ?reason:string -> request_id:string -> workflow_id:string -> unit -> Error.t
+
+(** Returns the [(workflow_id, request_id)] attached by
+    [uncertain_start_error], or [None] for any other error (#1223). *)
+val uncertain_start_request : Error.t -> (string * string) option
+
 (** Typed classification of a client RPC failure; see [Client.rpc_status]. *)
 type rpc_status =
   [ `Cancelled
@@ -405,11 +416,21 @@ type rpc_status =
     [Error.error_type] naming the gRPC status (for example ["NotFound"]) and
     [non_retryable] set exactly for permanent statuses; [Query_failed]
     becomes a non-retryable [`Workflow] error with [query_failed_error_type]
-    and the handler's message; [Already_started] becomes the typed
+    and the handler's message; [Protocol] becomes a non-retryable [`Bridge]
+    error typed ["ProtocolCoreInvalid"] or ["ProtocolCoreUnsupported"]
+    (#1223); [Already_started] becomes the typed
     already-started error for [namespace]. Exposed so tests can check the
     classification table without a server. *)
 val native_client_error :
   namespace:string -> Temporal_sdk_kernel.Client_protocol.client_error -> Error.t
+
+(** Converts the failure of a visibility or history call, which has no
+    structured result channel: the closed [rpc] document under the
+    [Connection] status and the closed [protocol] document under the
+    [Protocol] status are classified by [native_client_error]; anything else
+    is a supervisor error. Exposed so tests can check it without a server. *)
+val native_call_error :
+  namespace:string -> Temporal_sdk_kernel.Supervisor.error -> Error.t
 
 (** Recovers the classification attached by [native_client_error] to an RPC
     failure (or by the mock's not-found errors) from the error's category and

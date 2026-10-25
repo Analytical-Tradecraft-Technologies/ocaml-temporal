@@ -141,7 +141,8 @@ for those rules.
   `?run_timeout`, `?task_timeout`, and `?retry_policy` set server-side
   execution policies (#499). Start and the other bounded operations accept a
   per-call `?rpc_timeout`; an expired start deadline is recognized by
-  `Client.is_start_outcome_uncertain`. The client retains the exact workflow/run identity, rebuilds a
+  `Client.is_start_outcome_uncertain`, and `Client.uncertain_start_request_id`
+  returns the request ID to retry it with. The client retains the exact workflow/run identity, rebuilds a
   typed handle for a successor (from `Continued_as_new`, or the optional
   `successor` of `Completed { output; successor }`, `Failed`, or `Timed_out`)
   with `Client.follow`, and requests cancellation, reset, or termination.

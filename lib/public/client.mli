@@ -684,8 +684,19 @@ val already_started : Error.t -> execution option
     [Error.error_type] [Some "StartOutcomeUncertain"], and its message names
     the workflow ID and request ID. Reconcile it by retrying the same start
     with the same [request_id] (Temporal returns the run if the first attempt
-    created it) or by observing the workflow with {!get_handle} and {!wait}. *)
+    created it) or by observing the workflow with {!get_handle} and {!wait}.
+    {!uncertain_start_request_id} returns that request ID, including the one
+    the SDK generated when [start] was called without [request_id]. *)
 val is_start_outcome_uncertain : Error.t -> bool
+
+(** Returns the request ID of the start that produced an error recognized by
+    {!is_start_outcome_uncertain}, or [None] for any other error (#1223).
+    Pass it as [request_id] to a retry of the same start, with the same
+    workflow ID, so Temporal deduplicates it against the first attempt. It is
+    the caller's [request_id] when one was supplied and the SDK-generated one
+    otherwise. The ID travels as one JSON detail payload of the error, so it
+    survives if the error is forwarded unchanged. *)
+val uncertain_start_request_id : Error.t -> string option
 
 (** Returns [true] when [error] means the native client refused a [start] or
     [wait] because its bounded set of in-flight operations was full
@@ -748,7 +759,16 @@ type rpc_status =
     mismatched run as [`Not_found], as a server would. A server
     [ResourceExhausted] is [Some `Resource_exhausted] and is distinct from the
     local refusal recognized by [is_at_capacity], whose error type is the
-    lowercase ["resource_exhausted"]. *)
+    lowercase ["resource_exhausted"].
+
+    A response or recorded server data that the native client could not
+    convert (a malformed close event, query result or history page, or one
+    over the bridge's payload limit) is not an RPC failure, so this returns
+    [None] for it. Such an error has category [`Bridge], is non-retryable
+    because the same server data fails the same way on every retry, and has
+    [Error.error_type] [Some "ProtocolCoreInvalid"] for data that violates
+    the protocol or [Some "ProtocolCoreUnsupported"] for a shape the SDK
+    does not support (#1223). *)
 val rpc_status : Error.t -> rpc_status option
 
 (** Returns [true] when [error] means the workflow's query handler failed, or

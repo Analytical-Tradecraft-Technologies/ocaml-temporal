@@ -6465,6 +6465,24 @@ with a heartbeat timeout. `Error.make` accepts `?origin` and
 `?last_heartbeat_details` for tests; neither is transmitted. A live
 cross-SDK timeout check (#517) remains open.
 
+## 2026-10-26: Typed client protocol errors and the uncertain-start request ID (#1223)
+
+A client response or recorded server data that the bridge could not convert
+(the closed `protocol` error kind, `core_invalid` or `core_unsupported`) was a
+retryable, untyped `Bridge` error, so a caller retrying retryable errors
+repeated a call that could never succeed. It is now non-retryable with
+`Error.error_type` `ProtocolCoreInvalid` or `ProtocolCoreUnsupported`.
+Visibility and history, which report it under the `Protocol` status, are
+decoded the same way, so an oversized or event-free `fetch_history` (#1210)
+is typed too.
+
+The uncertain-start error named its request ID only in the message, although
+the SDK generates that ID when `Client.start` gets no `request_id`. The error
+now carries `{workflow_id, request_id}` as one JSON detail payload, and
+`Client.uncertain_start_request_id` returns the ID to retry with.
+`test/bridge/test_client_rpc_errors.ml` checks both, and the client-policies
+live regression checks the request ID on a real expired start.
+
 ## 2026-10-24: Live timer cancellation regression (#1134)
 
 `test/integration/timer_cancellation` runs in

@@ -750,6 +750,31 @@ let mock_not_found message =
   Error.make ~category:`Bridge ~non_retryable:true ~error_type:"NotFound"
     ~message ()
 
+(** The [Error.error_type] of each closed [protocol] client error code
+    (#1223). The bridge reports one when Temporal's response, or data it
+    recorded (a close event, a query result, a history page), could not be
+    converted: [core_invalid] for data that violates the protocol and
+    [core_unsupported] for a shape this SDK does not support. Part of the
+    documented [Client] error contract. *)
+let protocol_error_types =
+  [
+    ("core_invalid", "ProtocolCoreInvalid");
+    ("core_unsupported", "ProtocolCoreUnsupported");
+  ]
+
+(** Builds the non-retryable [`Bridge] error for a [protocol] client error.
+    The data that triggered it is immutable server state, so repeating the
+    same call fails the same way (#1223). The decoder admits only the codes
+    in [protocol_error_types]; the generic ["Protocol"] fallback keeps a
+    future code typed and non-retryable rather than raising. *)
+let protocol_error code =
+  let error_type =
+    Option.value ~default:"Protocol" (List.assoc_opt code protocol_error_types)
+  in
+  Error.make ~category:`Bridge ~non_retryable:true ~error_type
+    ~message:("Temporal client protocol rejected the response: " ^ code)
+    ()
+
 (** Converts a structured native client operation failure while preserving its
     semantic distinction from a transport/lifecycle error. Temporal's
     duplicate-workflow response is a workflow failure carrying the existing
@@ -760,8 +785,26 @@ let native_client_error ~namespace = function
       already_started_error ~namespace ~workflow_id ~existing_run_id
   | Client_protocol.Rpc { code } -> rpc_error code
   | Client_protocol.Query_failed { message } -> query_failed_error message
-  | Client_protocol.Protocol { code } ->
-      bridge_error ("Temporal client protocol rejected the response: " ^ code)
+  | Client_protocol.Protocol { code } -> protocol_error code
+
+(** Converts the failure of a client call that has no structured error
+    channel of its own (visibility and history). Rust reports a gRPC failure,
+    including an expired RPC deadline (#499), as the closed [rpc] document
+    with the [Connection] status, and a response it could not convert as the
+    closed [protocol] document with the [Protocol] status (#1210, #1223).
+    Both are decoded so [Client.rpc_status] and the protocol error types
+    classify them like every other operation; any other failure, or a body
+    that is not such a document, is a supervisor error. *)
+let native_call_error ~namespace = function
+  | Native.Backend
+      { Bridge.status = (Bridge.Connection | Bridge.Protocol) as status; message }
+    as error -> (
+      match (status, Client_protocol.decode_client_error message) with
+      | Bridge.Connection, Ok (Client_protocol.Rpc _ as client_error)
+      | Bridge.Protocol, Ok (Client_protocol.Protocol _ as client_error) ->
+          native_client_error ~namespace client_error
+      | _, (Ok _ | Error _) -> native_supervisor_error error)
+  | error -> native_supervisor_error error
 
 (** Copies one public payload into the binary-safe protocol representation.
     Metadata values are strings in the public codec API but bytes in the closed
@@ -1150,20 +1193,56 @@ let native_start_request client (request : start_request) : Client_protocol.star
     not prove; [Client.is_start_outcome_uncertain] recognizes it. *)
 let start_outcome_uncertain_error_type = "StartOutcomeUncertain"
 
+(** Metadata marking the single detail payload of an uncertain-start error,
+    following [already_started_detail_metadata]. *)
+let uncertain_start_detail_metadata =
+  [ ("encoding", "json/plain"); ("ocaml-temporal-detail", "start_outcome_uncertain") ]
+
 (** Builds the non-retryable bridge error for a start whose acceptance was
     not observed. The request and workflow IDs identify the logical operation
     so the caller can reconcile it by describing the workflow or by retrying
-    with the same explicit request ID. [reason] explains why the outcome was
-    lost when the bridge itself did not report an [Unknown] outcome. *)
+    with the same request ID. They travel as one JSON detail payload
+    ([{"workflow_id","request_id"}]) that [uncertain_start_request] decodes,
+    because the SDK generates the request ID when the caller supplied none
+    (#1223); the message repeats them for logs. [reason] explains why the
+    outcome was lost when the bridge itself did not report an [Unknown]
+    outcome. *)
 let uncertain_start_error ?reason ~request_id ~workflow_id () =
   let suffix = match reason with None -> "" | Some reason -> ": " ^ reason in
+  let json =
+    `Assoc [ ("workflow_id", `String workflow_id); ("request_id", `String request_id) ]
+  in
   Error.make ~non_retryable:true ~category:`Bridge
     ~error_type:start_outcome_uncertain_error_type
+    ~details:
+      [
+        {
+          Payload.metadata = uncertain_start_detail_metadata;
+          data = Bytes.of_string (Yojson.Safe.to_string json);
+        };
+      ]
     ~message:
       (Printf.sprintf
          "Temporal did not prove whether workflow start %S was accepted (request_id=%S)%s"
          workflow_id request_id suffix)
     ()
+
+(** Recovers the [(workflow_id, request_id)] attached by
+    [uncertain_start_error]. Any other error returns [None]; the structural
+    checks mirror [already_started_execution]. *)
+let uncertain_start_request error =
+  let view = Error.view error in
+  match (view.category, view.non_retryable, view.error_type, view.details) with
+  | `Bridge, true, Some error_type, [ detail ]
+    when String.equal error_type start_outcome_uncertain_error_type
+         && detail.metadata = uncertain_start_detail_metadata -> (
+      match Yojson.Safe.from_string (Bytes.to_string detail.data) with
+      | `Assoc [ ("workflow_id", `String workflow_id); ("request_id", `String request_id) ]
+        ->
+          Some (workflow_id, request_id)
+      | _ -> None
+      | exception Yojson.Json_error _ -> None)
+  | _ -> None
 
 (** Starts one native workflow as a submitted call (#807). The owner Domain
     only validates and submits it; this caller then waits on the call's own
@@ -1876,17 +1955,7 @@ let native_client_list_visibility (client : native_client)
         (Native.Rpc_visibility (native_visibility_request client request))
     with
     | Error Native.Closed -> Error (bridge_error "client is shut down")
-    | Error (Native.Backend { Bridge.status = Bridge.Connection; message } as error)
-      -> (
-        (* Visibility has no structured error channel of its own, so a gRPC
-           failure, including an expired RPC deadline (#499), arrives as the
-           closed [rpc] document with the [Connection] status. Decode it so
-           [Client.rpc_status] classifies it like every other operation. *)
-        match Client_protocol.decode_client_error message with
-        | Ok (Client_protocol.Rpc _ as client_error) ->
-            Error (native_client_error ~namespace:client.namespace client_error)
-        | Ok _ | Error _ -> Error (native_supervisor_error error))
-    | Error error -> Error (native_supervisor_error error)
+    | Error error -> Error (native_call_error ~namespace:client.namespace error)
     | Ok page ->
         Ok
           {
@@ -2052,13 +2121,7 @@ let native_client_fetch_history (client : native_client)
     in
     match Native.call client.supervisor (Native.Rpc_history request) with
     | Error Native.Closed -> Error (bridge_error "client is shut down")
-    | Error (Native.Backend { Bridge.status = Bridge.Connection; message } as error)
-      -> (
-        match Client_protocol.decode_client_error message with
-        | Ok (Client_protocol.Rpc _ as client_error) ->
-            Error (native_client_error ~namespace:client.namespace client_error)
-        | Ok _ | Error _ -> Error (native_supervisor_error error))
-    | Error error -> Error (native_supervisor_error error)
+    | Error error -> Error (native_call_error ~namespace:client.namespace error)
     | Ok history -> Ok history
 
 (** Fetches one run's history; the deterministic mock records none. *)

@@ -116,9 +116,66 @@ let test_lookalikes_are_not_classified () =
           ~category:`Bridge ~message:"x" () );
     ]
 
+(** A [protocol] client error (#1223) is a non-retryable [`Bridge] error
+    with a stable type per code, never an RPC failure. The visibility and
+    history calls, which report it through the [Protocol] status rather than
+    a structured result, classify it the same way, while a malformed body
+    stays an untyped supervisor error. *)
+let test_protocol_errors_are_typed () =
+  let check label error error_type =
+    let view = Error.view error in
+    if view.category <> `Bridge then failwith (label ^ ": category changed");
+    if view.error_type <> Some error_type then
+      failwith (label ^ ": unexpected error type");
+    if not view.non_retryable then failwith (label ^ ": retryable");
+    if Client.rpc_status error <> None then
+      failwith (label ^ ": classified as an RPC failure")
+  in
+  List.iter
+    (fun (code, error_type) ->
+      check code (public_error (Protocol.Protocol { code })) error_type;
+      check (code ^ " via the Protocol status")
+        (Backend.native_call_error ~namespace:"default"
+           (Temporal_sdk_kernel.Supervisor.Backend
+              {
+                Temporal_sdk_kernel.Bridge.status = Temporal_sdk_kernel.Bridge.Protocol;
+                message = Printf.sprintf {|{"kind":"protocol","code":"%s"}|} code;
+              }))
+        error_type)
+    [ ("core_invalid", "ProtocolCoreInvalid"); ("core_unsupported", "ProtocolCoreUnsupported") ];
+  let malformed =
+    Backend.native_call_error ~namespace:"default"
+      (Temporal_sdk_kernel.Supervisor.Backend
+         { Temporal_sdk_kernel.Bridge.status = Temporal_sdk_kernel.Bridge.Protocol; message = "not json" })
+  in
+  assert ((Error.view malformed).error_type = None)
+
+(** The uncertain-start error carries its request ID structurally (#1223),
+    including the SDK-generated one, and no other error yields one. *)
+let test_uncertain_start_request_id () =
+  let error =
+    Backend.uncertain_start_error ~reason:"lost" ~request_id:"generated-request"
+      ~workflow_id:"order-1" ()
+  in
+  assert (Client.is_start_outcome_uncertain error);
+  assert (Client.uncertain_start_request_id error = Some "generated-request");
+  assert (Backend.uncertain_start_request error = Some ("order-1", "generated-request"));
+  List.iter
+    (fun error -> assert (Client.uncertain_start_request_id error = None))
+    [
+      Error.make ~non_retryable:true ~category:`Bridge
+        ~error_type:"StartOutcomeUncertain" ~message:"no detail" ();
+      public_error
+        (Protocol.Already_started
+           { workflow_id = "order-1"; existing_run_id = Some "run" });
+      public_error (Protocol.Rpc { code = "unavailable" });
+    ]
+
 (** Runs the client RPC error classification regressions. *)
 let () =
   test_rpc_codes_are_classified ();
   test_ok_code_falls_back_to_unknown ();
   test_query_failure_is_typed ();
-  test_lookalikes_are_not_classified ()
+  test_lookalikes_are_not_classified ();
+  test_protocol_errors_are_typed ();
+  test_uncertain_start_request_id ()

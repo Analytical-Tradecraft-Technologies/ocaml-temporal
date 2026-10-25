@@ -812,6 +812,8 @@ let _client_already_started : T.Error.t -> T.Client.execution option =
 let _client_is_at_capacity : T.Error.t -> bool = T.Client.is_at_capacity
 let _client_is_start_outcome_uncertain : T.Error.t -> bool =
   T.Client.is_start_outcome_uncertain
+let _client_uncertain_start_request_id : T.Error.t -> string option =
+  T.Client.uncertain_start_request_id
 let _client_is_query_failed : T.Error.t -> bool = T.Client.is_query_failed
 let _client_rpc_status : T.Error.t -> T.Client.rpc_status option =
   T.Client.rpc_status
