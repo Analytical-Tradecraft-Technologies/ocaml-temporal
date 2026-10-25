@@ -551,8 +551,11 @@ let registrations workflows =
          Replay_error (Error.defect ~message))
 
 (** Consecutive idle readiness waits tolerated before a replay is abandoned.
-    Each native wait is bounded to about 100 ms, so this is roughly 30 seconds
-    without any activation; a replay that keeps producing activations is
+    The bound is a count, not a duration: each native wait lasts at most
+    about 100 ms, so it is reached within about 30 seconds without any
+    activation, and sooner when a wait returns at once (for example once the
+    replay lane has shut down). Counting keeps such immediate returns from
+    turning into a busy loop. A replay that keeps producing activations is
     bounded by its history length instead. *)
 let max_idle_waits = 300
 
@@ -587,7 +590,10 @@ let drain (source : Source.t) runner =
         | Error (Supervisor.Backend { status = Bridge.Outstanding_tasks; _ })
           ->
             if idle >= max_idle_waits then
-              Error (replay_error "replay made no progress for 30 seconds")
+              Error
+                (replay_error
+                   "replay made no progress in 300 consecutive waits (at most \
+                    about 30 seconds)")
             else (
               match
                 Supervisor.perform source.native Supervisor.Wait_replay_workflow

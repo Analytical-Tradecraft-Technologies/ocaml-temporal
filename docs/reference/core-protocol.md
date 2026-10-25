@@ -248,8 +248,10 @@ integral JSON preserves every value exactly. Activation-wide internal flags, his
 suggestions, deployment identity, SDK version, and target-deployment change are
 also preserved. Optional `context` and `metadata` objects may be absent for
 older synthetic fixtures, but when present their nested shapes are closed.
-Other Core initialization fields outside this first slice are rejected as
-`unsupported`; they are never discarded silently.
+A cron schedule or a start delay, which OCaml workers do not support, is
+rejected as `unsupported`. The few Core 1.x fields the protocol does not
+carry yet, such as `InitializeWorkflow.original_execution_run_id`, are
+dropped; [Core bridge](core-bridge.md) lists them.
 
 When Core starts a successor run, `context.continuation` is a
 required-nullable nested object. It preserves the previous execution run ID,
@@ -568,7 +570,9 @@ internal 100 ms delay bounds immediate redelivery churn and warning volume.
 A failed Core rejection remains a fatal worker error. The rejection reason is
 static and contains no run ID or payload. Unknown
 protobuf oneofs, enum values outside the advisory enums listed above, or
-omitted Core fields with non-default values fail conversion. Failure kinds are not part of this list.
+other omitted Core fields with non-default values fail conversion; the
+dropped Core 1.x fields listed in [Core bridge](core-bridge.md) are the
+exception. Failure kinds are not part of this list.
 Every pinned `failure_info` kind has a variant, and an absent or future kind
 is `absent`.
 

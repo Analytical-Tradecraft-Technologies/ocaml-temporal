@@ -6305,6 +6305,30 @@ is returned rather than dropped, and a wait or update poll whose deadline has
 already passed is not submitted at all. Like `?rpc_timeout`, the bound does
 not interrupt the owner's network-free admission of a request.
 
+## 2026-10-25: Interface and reference corrections from the third audit (#1231)
+
+The twelve passages that contradicted the code now match it:
+
+- Patch markers: a `false` decision still emits the marker once Core
+  reports it late.
+- Async heartbeats are throttled (#1025).
+- The worker document selects its task types, and the activity lane also
+  carries local activities.
+- The client-call limits are per-connection defaults (#796).
+- A few Core start fields are dropped rather than rejected.
+- The async-lease retention table.
+- The observability identifier lists.
+- `Retry_policy` in the API map.
+- `list_visibility ?page_size`.
+- `Options.max_cached_workflows` reports `None` for the default.
+- The replay idleness bound is 300 waits, at most about 30 seconds.
+- The history corpus now exists.
+
+Two code changes come with them. The telemetry constructor now has its own
+operation name, `shared_runtime_create_with_telemetry`, and
+`shared_runtime_metric_meter` is wrapped in `bridge_call`, so a
+meter-creation failure leaves a bridge record.
+
 ## 2026-10-24: Bounded condition waits (#1134, second slice)
 
 `Condition.wait_until ?timeout` and `wait_until_result ?timeout` bound a

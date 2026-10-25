@@ -307,9 +307,12 @@ enum {
  * until it is read, released, or its runtime closes. On success the value is
  * the call
  * handle "<owner>.<call>" in ASCII decimal: the submitting graph's random
- * owner identity and the call identifier. The RPC runs on a Rust task. Starts and waits
- * keep their 64-entry limits and every call shares a 4,096-entry ceiling;
- * admission beyond a limit returns RESOURCE_EXHAUSTED (status 15). */
+ * owner identity and the call identifier. The RPC runs on a Rust task. The
+ * connection's limits bound admission: distinct waited runs, in-flight start
+ * request IDs, and all calls together. They default to 64, 64 and 4,096 and
+ * are set by the connect document's max_pending_waits, max_pending_starts and
+ * max_in_flight_calls members (#796). Admission beyond a limit returns
+ * RESOURCE_EXHAUSTED (status 15). */
 ocaml_temporal_core_status ocaml_temporal_core_v4_client_submit_json(
     ocaml_temporal_core_runtime *runtime, uint32_t kind, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
@@ -330,7 +333,7 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_await_call(
     ocaml_temporal_core_result *output);
 
 /* Abandon a submitted call without reading it, freeing its slot in the
- * 4,096-call ceiling (an unread completed call keeps counting until it is
+ * connection's in-flight call limit (an unread completed call keeps counting until it is
  * read, released, or its runtime closes). Any published outcome is dropped
  * and a still-running task is aborted, so the call stops holding its wait,
  * start, and in-flight slots at once. Takes no runtime; a mismatched owner,
@@ -354,8 +357,9 @@ ocaml_temporal_core_v4_client_record_async_activity_heartbeat_json(
     size_t input_len, ocaml_temporal_core_result *output);
 
 /*
- * Strictly decode workflow-only worker configuration, construct the official
- * Core worker, and validate its namespace before returning success. A failed
+ * Strictly decode worker configuration (its task types select workflow,
+ * activity, or both, #805), construct the official Core worker, and validate
+ * its namespace before returning success. A failed
  * temporary worker is cleaned before this operation returns.
  */
 ocaml_temporal_core_status ocaml_temporal_core_v4_worker_start_json(
@@ -445,8 +449,10 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_worker_reject_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
-/* Non-blocking task handoff for the independently guarded remote-activity
- * lane. Local activities and Nexus are disabled by worker configuration. */
+/* Non-blocking task handoff for the independently guarded activity lane. It
+ * carries remote activity tasks when the worker enables them and the local
+ * activities that its own workflows schedule (enabled exactly when workflows
+ * are, #805, #1211). Nexus is never enabled. */
 ocaml_temporal_core_status ocaml_temporal_core_v4_worker_try_poll_activity(
     ocaml_temporal_core_runtime *runtime,
     ocaml_temporal_core_result *output);

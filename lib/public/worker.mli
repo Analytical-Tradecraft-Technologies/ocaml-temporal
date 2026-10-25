@@ -409,8 +409,10 @@ val create :
 val run : t -> (unit, Error.t) result
 
 (** The options the worker was created with. The [Options] accessors report
-    each effective setting, defaults included, and none of them carries a
-    credential, so the result is safe to log for diagnostics. *)
+    each effective setting, defaults included, except
+    {!Options.max_cached_workflows}, which is [None] when the worker default
+    applies. None of them carries a credential, so the result is safe to log
+    for diagnostics. *)
 val options : t -> Options.t
 
 (** Reports whether the workflow activation watchdog has detected workflow

@@ -175,8 +175,9 @@ val notify_has_patch : t -> patch_id:string -> unit
 (** Returns this execution's deterministic decision for [patch_id]. The first
     call fixes the decision for the run: true in live execution and false
     during replay unless Core previously notified the marker. Every call whose
-    decision is true emits a non-deprecated marker command; a false decision
-    emits nothing. The ID is copied before retention and emission. Calling this
+    decision is true emits a non-deprecated marker command. A false decision
+    emits one only after Core reported the marker following that decision, so
+    Core can consume it; otherwise it emits nothing. The ID is copied before retention and emission. Calling this
     after shutdown raises [Invalid_argument]. *)
 val patched : t -> patch_id:string -> bool
 
