@@ -128,7 +128,8 @@ type registered_workflow =
       ('input, 'output,
        'input -> ('output, Base_error.t) result)
       Definition.t * Execution.signal_handler list * Execution.query_handler list
-      * Execution.update_handler list ->
+      * Execution.update_handler list
+      * Temporal_protocol.Workflow_protocol.versioning_behavior option ->
       registered_workflow
 
 (** Builds the private scheduler callback package without widening the public
@@ -182,6 +183,10 @@ type run =
         (* Retained from initialization so watchdog diagnostics for later
            activations of the run can name the workflow execution. *)
         workflow_id : string;
+        (* The registration's own versioning behavior (#1159), declared on
+           every successful completion of the run. *)
+        versioning_behavior :
+          Temporal_protocol.Workflow_protocol.versioning_behavior option;
       }
       -> run
 
@@ -259,7 +264,8 @@ type registered_definition =
       ('input, 'output,
        'input -> ('output, Base_error.t) result)
       Definition.t * Execution.signal_handler list * Execution.query_handler list
-      * Execution.update_handler list ->
+      * Execution.update_handler list
+      * Temporal_protocol.Workflow_protocol.versioning_behavior option ->
       registered_definition
 
 (** Bounds diagnostics that may contain application codec messages before they
@@ -471,7 +477,9 @@ let report level ~operation ?error_kind ?workflow_id ?run_id ?replaying () =
 
 (** Adds or rejects one definition in the name map. *)
 let add_definition definitions
-    (Workflow (definition, signal_handlers, query_handlers, update_handlers)) =
+    (Workflow
+      (definition, signal_handlers, query_handlers, update_handlers,
+       versioning_behavior)) =
   let name = Definition.name definition in
   let rec validate_signal_names seen = function
     | [] -> Ok ()
@@ -527,7 +535,8 @@ let add_definition definitions
                 Ok
                   (Run_map.add name
                      (Registered_definition
-                        (definition, signal_handlers, query_handlers, update_handlers))
+                        (definition, signal_handlers, query_handlers, update_handlers,
+                         versioning_behavior))
                      definitions)))
 
 (** Builds the immutable definition registry before publishing any mutable
@@ -909,14 +918,14 @@ module Make (Supervisor : SUPERVISOR) = struct
     let failure = failure_of_error error in
     match query_only_ids activation with
     | Some query_ids ->
-        Protocol.{ run_id = activation.run_id; task_failure = None;
+        Protocol.{ run_id = activation.run_id; versioning_behavior = None; task_failure = None;
           commands = List.map (fun query_id -> Query_result
             { query_id; result = Query_failed failure }) query_ids }
     | None when List.exists (function Protocol.Remove_from_cache _ -> true | _ -> false)
         activation.jobs ->
-        Protocol.{ run_id = activation.run_id; commands = []; task_failure = None }
+        Protocol.{ run_id = activation.run_id; commands = []; versioning_behavior = None; task_failure = None }
     | None ->
-        Protocol.{ run_id = activation.run_id; commands = []; task_failure = Some failure }
+        Protocol.{ run_id = activation.run_id; commands = []; versioning_behavior = None; task_failure = Some failure }
 
   (** Runs the canonical encoder once over a completion built by this adapter
       (a failure or an eviction acknowledgement). An encoder rejection becomes
@@ -1054,7 +1063,7 @@ module Make (Supervisor : SUPERVISOR) = struct
   let submit_eviction_acknowledgement adapter (activation : Protocol.activation)
       ~activation_info =
     let completion =
-      Protocol.{ run_id = activation.run_id; task_failure = None; commands = [] }
+      Protocol.{ run_id = activation.run_id; versioning_behavior = None; task_failure = None; commands = [] }
     in
     let pending =
       {
@@ -1131,7 +1140,7 @@ module Make (Supervisor : SUPERVISOR) = struct
                         | Ok
                             (Registered_definition
                               (definition, signal_handlers, query_handlers,
-                               update_handlers)) ->
+                               update_handlers, versioning_behavior)) ->
                             begin
                               match decode_input definition init.arguments with
                               | Error error -> retire_with_failure adapter activation error
@@ -1144,14 +1153,20 @@ module Make (Supervisor : SUPERVISOR) = struct
                                       ~update_handlers definition input
                                   in
                                   let run =
-                                    Run { definition; execution; workflow_id = init.workflow_id }
+                                    Run
+                                      {
+                                        definition;
+                                        execution;
+                                        workflow_id = init.workflow_id;
+                                        versioning_behavior;
+                                      }
                                   in
                                   adapter.runs <-
                                     Run_map.add activation.run_id run adapter.runs;
                                   begin
                                     match
-                                      Native_execution.activate_translated execution
-                                        translated
+                                      Native_execution.activate_translated
+                                        ?versioning_behavior execution translated
                                     with
                                     | Error error ->
                                         retire_with_failure ~remove_run:true adapter
@@ -1168,9 +1183,10 @@ module Make (Supervisor : SUPERVISOR) = struct
                         retire_with_failure adapter activation
                           (make_error ~path:"$.run_id" "unknown_run_id"
                              "activation does not identify a registered running workflow")
-                    | Some (Run { execution; _ }) ->
+                    | Some (Run { execution; versioning_behavior; _ }) ->
                         (match
-                           Native_execution.activate_translated execution translated
+                           Native_execution.activate_translated ?versioning_behavior
+                             execution translated
                          with
                         | Error error ->
                             let remove_run =
@@ -1431,5 +1447,6 @@ end
 
 (** Exposes registration without exposing its existential constructor. *)
 let register ?(signal_handlers = []) ?(query_handlers = []) ?(update_handlers = [])
-    definition =
-  Workflow (definition, signal_handlers, query_handlers, update_handlers)
+    ?versioning_behavior definition =
+  Workflow
+    (definition, signal_handlers, query_handlers, update_handlers, versioning_behavior)

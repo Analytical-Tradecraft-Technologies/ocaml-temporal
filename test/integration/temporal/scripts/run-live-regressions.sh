@@ -147,7 +147,8 @@ for executable in "$@"; do
     test/integration/timer_cancellation/regression.exe|\
     test/integration/transport_interruption/regression.exe|\
     test/integration/update_outcomes/regression.exe|\
-    test/integration/update_run_close/regression.exe)
+    test/integration/update_run_close/regression.exe|\
+    test/integration/worker_versioning/regression.exe)
       cli_argument=$container_cli ;;
     test/integration/activity_worker_crash/regression.exe)
       # The CLI path, then the suite's evidence directory (#519) for its

@@ -828,7 +828,7 @@ let test_query_workflow_translation_and_activation () =
     Protocol.
       {
         run_id = "run-native-translation";
-        task_failure = None;
+        versioning_behavior = None; task_failure = None;
         commands =
           [ Query_result
               { query_id; result = Query_succeeded (protocol_payload "answer") } ];
@@ -840,7 +840,7 @@ let test_query_workflow_translation_and_activation () =
        (query_completion "query-expected"));
   expect_error_code "missing query result" "invalid_message"
     (Native_execution.validate_completion_for_activation query_activation
-       { Protocol.run_id = "run-native-translation"; task_failure = None; commands = [] });
+       { Protocol.run_id = "run-native-translation"; versioning_behavior = None; task_failure = None; commands = [] });
   expect_error_code "mismatched query result" "invalid_message"
     (Native_execution.validate_completion_for_activation query_activation
        (query_completion "query-other"));
@@ -860,7 +860,7 @@ let test_query_workflow_translation_and_activation () =
     (Native_execution.validate_completion_for_activation query_activation
        {
          Protocol.run_id = "run-native-translation";
-         task_failure = None;
+         versioning_behavior = None; task_failure = None;
          commands =
            [ Query_result
                {

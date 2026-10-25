@@ -308,11 +308,13 @@ end
 (** Wraps a public workflow definition in the private existential registration
     used by [Make]. Remote definitions are accepted by this constructor so the
     registry can report a typed configuration error at [create] rather than
-    silently pretending they are executable. *)
+    silently pretending they are executable. [versioning_behavior] (#1159)
+    is declared on every successful completion of the type's runs. *)
 val register :
   ?signal_handlers:signal_handler list ->
   ?query_handlers:query_handler list ->
   ?update_handlers:update_handler list ->
+  ?versioning_behavior:Temporal_protocol.Workflow_protocol.versioning_behavior ->
   ('input, 'output,
    'input -> ('output, Temporal_base.Error.t) result)
   Temporal_base.Definition.t ->

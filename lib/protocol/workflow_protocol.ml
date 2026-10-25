@@ -479,12 +479,19 @@ type completion_command =
   | Continue_as_new of { workflow_type : string; input : payload list }
   | Cancel_workflow_execution
 
+type versioning_behavior = Versioning_pinned | Versioning_auto_upgrade
+
 type completion = {
   run_id : string;
   commands : completion_command list;
   task_failure : failure option;
   (** [Some] fails the workflow task through Core, never the execution. Failed
       tasks carry no commands. [None] preserves the successful command batch. *)
+  versioning_behavior : versioning_behavior option;
+  (** The workflow type's own versioning behavior (#1159), sent with a
+      successful completion of a versioned worker. [None] leaves it
+      unspecified, so Core applies the worker's default. A failed task never
+      carries one. *)
 }
 type error = { code : string; path : string; message : string }
 type error_view = { code : string; path : string; message : string }
@@ -3384,8 +3391,11 @@ let validate_patch_marker_modes path commands =
 let completion_from_json json =
   let fields =
     match json with
-    | `Assoc entries when List.mem_assoc "task_failure" entries ->
-        [ "run_id"; "commands"; "task_failure" ]
+    | `Assoc entries ->
+        [ "run_id"; "commands" ]
+        @ List.filter
+            (fun name -> List.mem_assoc name entries)
+            [ "task_failure"; "versioning_behavior" ]
     | _ -> [ "run_id"; "commands" ]
   in
   let* entries = exact_object "$" fields json in
@@ -3402,9 +3412,23 @@ let completion_from_json json =
     | None | Some `Null -> Ok None
     | Some value -> Result.map Option.some (failure "$.task_failure" value)
   in
+  let* versioning_behavior =
+    match List.assoc_opt "versioning_behavior" entries with
+    | None | Some `Null -> Ok None
+    | Some (`String "pinned") -> Ok (Some Versioning_pinned)
+    | Some (`String "auto_upgrade") -> Ok (Some Versioning_auto_upgrade)
+    | Some _ ->
+        Error
+          (invalid "$.versioning_behavior"
+             "versioning_behavior must be pinned or auto_upgrade")
+  in
   if Option.is_some task_failure && commands <> [] then
     Error (invalid "$.commands" "failed workflow task cannot contain commands")
-  else Ok { run_id; task_failure; commands }
+  else if Option.is_some task_failure && Option.is_some versioning_behavior then
+    Error
+      (invalid "$.versioning_behavior"
+         "a failed workflow task cannot carry a versioning behavior")
+  else Ok { run_id; task_failure; commands; versioning_behavior }
 
 (** Strictly decodes one completion through the shared JSON foundation. *)
 let decode_completion input =
@@ -3422,6 +3446,13 @@ let encode_completion value =
     | Some value ->
         let* failure = failure_json value in
         Ok [ ("task_failure", failure) ]
+  in
+  let fields =
+    match value.versioning_behavior with
+    | None -> fields
+    | Some Versioning_pinned -> fields @ [ ("versioning_behavior", `String "pinned") ]
+    | Some Versioning_auto_upgrade ->
+        fields @ [ ("versioning_behavior", `String "auto_upgrade") ]
   in
   let json =
     `Assoc ([ ("run_id", `String value.run_id); ("commands", commands) ] @ fields)

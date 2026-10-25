@@ -1272,7 +1272,7 @@ let command_to_protocol command =
     ordering, run-id bounds, payload limits, and all nested fields; its output
     is kept so the worker can submit those same bytes instead of encoding the
     completion a second time in the supervisor (issue #846). *)
-let encoded_completion_of_commands ~run_id commands =
+let encoded_completion_of_commands ?versioning_behavior ~run_id commands =
   let rec loop reversed = function
     | [] -> Ok (List.rev reversed)
     | command :: rest ->
@@ -1280,7 +1280,7 @@ let encoded_completion_of_commands ~run_id commands =
         loop (command :: reversed) rest
   in
   let* commands = loop [] commands in
-  let completion = Protocol.{ run_id; task_failure = None; commands } in
+  let completion = Protocol.{ run_id; versioning_behavior; task_failure = None; commands } in
   match encode_completion completion with
   | Ok encoded -> Ok { completion; encoded }
   | Error error -> Error (protocol_error error)
@@ -1356,7 +1356,8 @@ let validate_completion_for_activation activation completion =
     already needs the translation for registry lookup and observer metadata
     before it can choose an execution (issue #846). [translated_activation] is
     private, so the argument can only have come from [translate_activation]. *)
-let activate_translated execution (translated : translated_activation) =
+let activate_translated ?versioning_behavior execution
+    (translated : translated_activation) =
   let activation = translated.source in
   let* () =
     match translated.initialization with
@@ -1491,7 +1492,11 @@ let activate_translated execution (translated : translated_activation) =
   let* checked =
     match (translated.cache_removal, Execution.task_failure execution) with
     | None, None ->
-        encoded_completion_of_commands ~run_id:translated.run_id commands
+        (* Only a successful completion declares the workflow type's
+           versioning behavior (#1159); an eviction or a failed task does
+           not. *)
+        encoded_completion_of_commands ?versioning_behavior
+          ~run_id:translated.run_id commands
     | Some _, _ ->
         (* A pure cache eviction is always acknowledged with an empty
            completion: Core rejects anything else, and because workflow
@@ -1504,7 +1509,7 @@ let activate_translated execution (translated : translated_activation) =
     | None, Some error ->
         let* failure = protocol_failure "$.task_failure" error in
         let completion = Protocol.{
-          run_id = translated.run_id; commands = []; task_failure = Some failure
+          run_id = translated.run_id; commands = []; versioning_behavior = None; task_failure = Some failure
         } in
         let* encoded =
           encode_completion completion |> Result.map_error protocol_error

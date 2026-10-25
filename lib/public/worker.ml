@@ -6,7 +6,7 @@ module Bridge = Temporal_sdk_kernel.Bridge
 type registered_workflow =
   | Workflow :
       ('input, 'output) Workflow.t * Signal.Handler.t list * Query.Handler.t list
-      * Update.Handler.t list ->
+      * Update.Handler.t list * [ `Pinned | `Auto_upgrade ] option ->
       registered_workflow
 
 (** Immutable validated settings for one worker construction. Keeping this
@@ -545,8 +545,9 @@ type registered_activity =
   | Activity : ('input, 'output) Activity.t -> registered_activity
 
 (** Packs a workflow definition for the heterogeneous registration list. *)
-let workflow ?(signals = []) ?(queries = []) ?(updates = []) definition =
-  Workflow (definition, signals, queries, updates)
+let workflow ?(signals = []) ?(queries = []) ?(updates = []) ?versioning_behavior
+    definition =
+  Workflow (definition, signals, queries, updates, versioning_behavior)
 
 (** Packs an activity definition for the heterogeneous registration list. *)
 let activity definition = Activity definition
@@ -567,6 +568,9 @@ type workflow_entry =
       (* Update handlers are run synchronously on the owner Domain in the
          current native slice; their callbacks remain paired with codecs. *)
       updates : Update.Handler.t list;
+      (* The workflow type's own versioning behavior (#1159); [create] accepts
+         it only on a deployment-versioned worker. *)
+      versioning_behavior : [ `Pinned | `Auto_upgrade ] option;
       (* This callback has the same input and output types as [definition], so
          the existential package cannot pair a function with another codec. *)
       implementation : ('input, 'output) Workflow.implementation;
@@ -647,7 +651,8 @@ let validate_name field value =
 
 (** Adds a workflow to the registry while rejecting duplicate names and remote
     references that do not contain executable OCaml code. *)
-let add_workflow registry (Workflow (definition, signals, queries, updates)) =
+let add_workflow registry
+    (Workflow (definition, signals, queries, updates, versioning_behavior)) =
   let name = Workflow.name definition in
   match Workflow.implementation definition with
   | None ->
@@ -662,7 +667,8 @@ let add_workflow registry (Workflow (definition, signals, queries, updates)) =
         Result.map
           (fun () ->
             Name_map.add name
-              (Workflow_entry { definition; signals; queries; updates; implementation })
+              (Workflow_entry
+                 { definition; signals; queries; updates; versioning_behavior; implementation })
               registry)
           (Interaction.create ~signals ~queries ~updates ()
           |> Result.map (fun _ -> ()))
@@ -716,6 +722,31 @@ let collect_activities definitions =
       Result.bind result (fun registry -> add_activity registry definition))
     (Ok Name_map.empty) definitions
 
+(** Accepts per-workflow versioning behaviors (#1159) only on a worker whose
+    options use deployment-based versioning with [use_worker_versioning]:
+    elsewhere the behavior could never be honoured, so a registration that
+    sets one is a typed defect naming the workflow. Returns [workflows]
+    unchanged when valid. *)
+let validate_versioning_behaviors options workflows =
+  let versioned =
+    match Options.versioning options with
+    | Options.Deployment_based { use_worker_versioning; _ } -> use_worker_versioning
+    | Options.No_versioning | Options.Legacy_build_id _ -> false
+  in
+  match
+    Name_map.bindings workflows
+    |> List.find_opt (fun (_, Workflow_entry { versioning_behavior; _ }) ->
+           Option.is_some versioning_behavior)
+  with
+  | Some (name, _) when not versioned ->
+      Error
+        (Error.defect
+           ~message:
+             ("workflow " ^ name
+            ^ " sets a versioning behavior, which requires a worker with \
+               deployment-based versioning and use_worker_versioning"))
+  | Some _ | None -> Ok workflows
+
 (** Creates the private backend only after all local registration invariants are
     proven. This ordering prevents leaked graphs on invalid definitions. *)
 let create ?identity ?(options = Options.default) ?io_threads ?runtime
@@ -767,7 +798,10 @@ let create ?identity ?(options = Options.default) ?io_threads ?runtime
           match validate_name "identity" identity with
           | Error error -> Error error
           | Ok () -> (
-              match collect_workflows workflows with
+              match
+                Result.bind (collect_workflows workflows) (fun workflows ->
+                    validate_versioning_behaviors options workflows)
+              with
               | Error error -> Error error
               | Ok workflows -> (
                   match collect_activities activities with
@@ -819,11 +853,18 @@ let create ?identity ?(options = Options.default) ?io_threads ?runtime
                       else
                         let native_workflows =
                           Name_map.bindings workflows
-                          |> List.map (fun (_, Workflow_entry { definition; signals; queries; updates; _ }) ->
+                          |> List.map
+                               (fun
+                                 ( _,
+                                   Workflow_entry
+                                     { definition; signals; queries; updates; versioning_behavior; _ }
+                                 )
+                               ->
                                  Native_worker.register_workflow
                                    ~signals
                                    ~queries
                                    ~updates
+                                   ?versioning_behavior
                                    (Workflow_private.to_base definition))
                         in
                         let native_activities =

@@ -6253,6 +6253,22 @@ activation, zero and unbounded waits, a predicate error, and the detached
 defect. The live scenario and corpus histories for cancel-before/after-fire
 remain open under #1134.
 
+## 2026-10-24: Per-workflow versioning behavior (#1159)
+
+`Worker.workflow ?versioning_behavior:[ `Pinned | `Auto_upgrade ]` declares a
+workflow type's own behavior on a deployment-versioned worker, overriding
+the worker default. Every successful completion carries it in the new
+optional `versioning_behavior` member of the completion document, validated
+by OCaml and Rust, and Rust sends it as Core's `Success.versioning_behavior`.
+Evictions and failed tasks carry none. `Worker.create` rejects it on a
+worker without deployment-based versioning and `use_worker_versioning`. The
+new `worker_versioning` live regression runs builds `v1` and `v2` of one
+deployment with an `Auto_upgrade` default. After `v2` becomes current, the
+auto-upgrade run moves to `v2`, while the pinned run stays on `v1` and its
+history records `VERSIONING_BEHAVIOR_PINNED`. A mutant that drops the
+declaration fails it because the pinned run moves. It passed locally against
+the pinned Compose stack.
+
 ## 2026-10-24: Local activity cancellation live through the public API (#1156)
 
 `test/integration/local_activity_cancellation` no longer reaches into the

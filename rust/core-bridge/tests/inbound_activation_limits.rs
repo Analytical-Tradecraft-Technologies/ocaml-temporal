@@ -161,6 +161,7 @@ fn truncates_oversized_failure_text_at_utf8_boundary() {
     // A workflow that rethrows the received failure produces an outbound
     // completion; the truncated text must satisfy outbound validation too.
     let completion = workflow_protocol::Completion {
+        versioning_behavior: None,
         task_failure: None,
         run_id: "run-802".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::FailWorkflow {
@@ -298,6 +299,7 @@ fn caps_deeply_nested_failure_causes() {
     // Rethrowing the capped chain as the cause of a new workflow failure
     // still fits the outbound completion's nesting limit.
     let completion = workflow_protocol::Completion {
+        versioning_behavior: None,
         task_failure: None,
         run_id: "run-802".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::FailWorkflow {
@@ -547,6 +549,7 @@ fn initialize_drops_unaddressable_header_and_memo_keys() {
 #[test]
 fn semantic_documents_remain_strict() {
     let oversized = workflow_protocol::Completion {
+        versioning_behavior: None,
         task_failure: None,
         run_id: "run-802".to_owned(),
         commands: vec![workflow_protocol::CompletionCommand::FailWorkflow {
