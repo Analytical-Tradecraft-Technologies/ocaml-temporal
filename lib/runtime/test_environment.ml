@@ -261,34 +261,31 @@ let native_dispatch_failure_type = "ocaml_temporal_native_activity"
 (** The [error_type] the native worker reports for a child-workflow failure
     caused by [cause]. The native path sets it to the innermost Temporal
     application failure's type ([Failure_diagnostic.application_failure_type]).
-    A workflow failing with a [Cancelled] error is encoded as a canceled
-    failure, and a termination as a terminated failure, so neither carries
-    an application type; every other error is encoded as an application
-    failure typed by {!Error.application_failure_type}. (An activity's
-    error is always encoded as an application failure, so activity
-    failures always carry that type.) *)
+    [Native_execution.protocol_failure] encodes a workflow failing with a
+    [Cancelled] error as a canceled failure, which carries no application
+    type, and every other error, a [Terminated]-category one included, as an
+    application failure typed by {!Error.application_failure_type}. (An
+    activity's error is always encoded as an application failure, so
+    activity failures always carry that type.) *)
 let child_error_type cause =
   match (Error.view cause).category with
-  | `Cancelled | `Terminated -> None
+  | `Cancelled -> None
   | `Activity | `Bridge | `Child_workflow | `Codec | `Defect | `Nexus
-  | `Timeout | `Update | `Workflow ->
+  | `Terminated | `Timeout | `Update | `Workflow ->
       Some (Error.application_failure_type cause)
 
 (** The origin the native worker reports for a child failure caused by
-    [cause] (#1215): its first non-wrapper layer is a canceled failure for a
-    [Cancelled] error, a terminated failure for a [Terminated] one, and an
-    application failure otherwise. An origin [cause] already carries (a
-    timeout, say) is kept. *)
+    [cause] (#1215). [Native_execution.protocol_failure] serializes a
+    workflow failure as a fresh, cause-less failure without the error's own
+    origin: a canceled failure for a [Cancelled] error and an application
+    failure for every other one. The parent classifies that first layer, so
+    an origin [cause] received (a timeout, say) is not forwarded. *)
 let child_origin cause =
-  match Error.origin cause with
-  | Some origin -> origin
-  | None -> (
-      match (Error.view cause).category with
-      | `Cancelled -> `Cancelled
-      | `Terminated -> `Terminated
-      | `Activity | `Bridge | `Child_workflow | `Codec | `Defect | `Nexus
-      | `Timeout | `Update | `Workflow ->
-          `Application)
+  match (Error.view cause).category with
+  | `Cancelled -> `Cancelled
+  | `Activity | `Bridge | `Child_workflow | `Codec | `Defect | `Nexus
+  | `Terminated | `Timeout | `Update | `Workflow ->
+      `Application
 
 (** Wraps [cause] as the activity or child-workflow failure a workflow
     observes, mirroring the native worker's translation of Core's wrapper
@@ -820,11 +817,13 @@ let finish environment run closure outcome =
     match (closure, outcome, chain.retry_policy) with
     | Run_failed, Error error, Some _
       when (match (Error.view error).category with
-            | `Cancelled | `Terminated -> true
+            | `Cancelled -> true
             | _ -> false) ->
-        (* The native worker encodes such a failure as a canceled or
-           terminated failure, which Temporal Server never retries under a
-           workflow retry policy (#1215). *)
+        (* The native worker encodes such a failure as a canceled failure,
+           which Temporal Server never retries under a workflow retry policy
+           (#1215). A [Terminated]-category error is encoded as an ordinary
+           application failure and is retried; a real termination closes the
+           chain through [close_run] instead. *)
         close_chain environment chain outcome
     | Run_failed, Error error, (Some _ as policy) -> (
         match retry_delay environment policy ~attempt:run.attempt error with

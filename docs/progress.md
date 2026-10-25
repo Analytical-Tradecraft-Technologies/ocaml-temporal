@@ -6452,15 +6452,18 @@ queue and build ID are each 65,536 bytes. With the old cap it fails with
 Four Testing behaviours had drifted from the native worker:
 
 - Workflow-visible errors carry the native `Error.origin`: `Cancelled` for
-  an activity, child or run cancellation; the cause's origin for a child
-  failure; `Terminated` for a child terminated with its parent.
+  an activity, child or run cancellation; for a child failure, `Cancelled`
+  when the child failed with a `Cancelled` error and `Application`
+  otherwise, since the native worker serializes a workflow failure as a
+  fresh canceled or application failure without its error's origin.
 - An unregistered activity type fails as `NotFoundError`. It and an
   undecodable input are retryable for a remote activity, so the retry policy
   runs, and non-retryable for a local one, as #1031 made the native adapter
   do.
-- A child failing with a `Cancelled` or `Terminated` error is no longer
-  retried under its workflow retry policy, as the server never retries a
-  canceled or terminated failure.
+- A child failing with a `Cancelled` error is no longer retried under its
+  workflow retry policy, as the server never retries a canceled failure. A
+  `Terminated`-category error is serialized as an application failure, so it
+  is still retried.
 - A local activity's attempts get no heartbeat hand-off: their heartbeats
   are dropped and every attempt sees no details, as Core does.
 

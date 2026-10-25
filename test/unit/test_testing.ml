@@ -1000,12 +1000,35 @@ let retrying_cancelled_parent =
       T.Child_workflow.execute ~retry_policy:(retry_policy ~maximum_attempts:3)
         ~id:"counted-cancelled-child" counted_cancelled_child ())
 
+(** Runs of [counted_terminated_child] under [retrying_terminated_parent]. *)
+let terminated_child_runs = ref 0
+
+(** Fails with a [Terminated]-category error and counts its runs. The
+    native worker serializes that error as an ordinary application failure,
+    so the server retries it. *)
+let counted_terminated_child =
+  T.Workflow.define ~name:"counted_terminated_child" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      incr terminated_child_runs;
+      Error (T.Error.make ~category:`Terminated ~message:"gave up" ()))
+
+(** Runs [counted_terminated_child] under a three-attempt workflow retry
+    policy. *)
+let retrying_terminated_parent =
+  T.Workflow.define ~name:"retrying_terminated_parent" ~input:T.Codec.unit
+    ~output:T.Codec.unit (fun () ->
+      T.Child_workflow.execute ~retry_policy:(retry_policy ~maximum_attempts:3)
+        ~id:"counted-terminated-child" counted_terminated_child ())
+
 (** Testing matches the native worker in three more places (#1215):
     workflow-visible errors carry the native [Error.origin]; an unregistered
     activity type fails as ["NotFoundError"], retryably for a remote
     activity (so its policy runs every attempt) and at once for a local one
     (#1031); and a child failing with a [Cancelled] error is not retried,
-    since the server never retries a canceled failure. *)
+    since the server never retries a canceled failure, while one failing
+    with a [Terminated]-category error is retried and has origin
+    [`Application], as the native worker serializes it as an application
+    failure. *)
 let test_native_origins_and_retryability () =
   with_environment
     ~workflows:
@@ -1015,6 +1038,8 @@ let test_native_origins_and_retryability () =
         T.Testing.workflow cancelled_failure_child;
         T.Testing.workflow retrying_cancelled_parent;
         T.Testing.workflow counted_cancelled_child;
+        T.Testing.workflow retrying_terminated_parent;
+        T.Testing.workflow counted_terminated_child;
         T.Testing.workflow flaky_workflow;
       ]
     ~activities:[ T.Testing.activity flaky ]
@@ -1046,7 +1071,19 @@ let test_native_origins_and_retryability () =
         (expect_error "retrying parent of a cancelled child" `Child_workflow
            (T.Testing.execute environment retrying_cancelled_parent ()));
       expect "cancelled-category child failure is not retried" 1
-        !cancelled_child_runs)
+        !cancelled_child_runs;
+      terminated_child_runs := 0;
+      let error =
+        expect_error "retrying parent of a terminated-category child"
+          `Child_workflow
+          (T.Testing.execute environment retrying_terminated_parent ())
+      in
+      expect "terminated-category child failure is retried" 3
+        !terminated_child_runs;
+      expect "terminated-category child origin" (Some `Application)
+        (T.Error.origin error);
+      expect "terminated-category child type" (Some "terminated")
+        (T.Error.error_type error))
 
 (** Answers a query without touching workflow state. *)
 let ping_query = T.Query.define ~name:"ping" ~output:T.Codec.string
