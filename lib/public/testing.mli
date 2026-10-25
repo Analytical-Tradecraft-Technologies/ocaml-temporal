@@ -12,7 +12,7 @@
     cancellations, and fires timers. It delivers each activation's jobs in
     Temporal Core's order, reports activity and child failures with the
     native worker's error categories, types, retryability and
-    {!Error.origin} (an unregistered type is a ["NotFoundError"], retryable
+    {!Error.val-origin} (an unregistered type is a ["NotFoundError"], retryable
     for a remote activity; a cancellation has origin [`Cancelled]), gives a
     local activity no heartbeat hand-off between attempts, as Core does, and,
     like a
