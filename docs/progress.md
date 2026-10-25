@@ -6377,9 +6377,11 @@ generated with host `python3`. Without it the nonce was empty and the image
 builds failed at their `test -n` guard, which contradicted the README's
 "Docker and GNU Make" requirement. The Makefile now takes 16 random bytes
 from `/dev/urandom` through POSIX `od` and `tr`.
-`test/smoke/test_make_docker_commands.sh` parses the Makefile with a `PATH`
-that has no `python3` and requires a fresh 32-digit hex nonce on each
-invocation. It fails against the previous Makefile.
+`test/smoke/test_make_docker_commands.sh` parses the Makefile with a
+`python3` (and `python`) that always fails placed first on `PATH`, and
+requires a fresh 32-digit hex nonce on each invocation. It fails against the
+previous Makefile. It shadows Python rather than trimming `PATH`, because
+make on Windows needs the rest of `PATH` to find `sh`.
 
 ## 2026-10-24: Concurrent bounded waits and bounded update waits live (#1136)
 

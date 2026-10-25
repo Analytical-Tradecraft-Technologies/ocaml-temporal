@@ -3,7 +3,7 @@
 # exported value; a new Make invocation always generates another. The nonce is
 # 16 random bytes in hex from POSIX od, so the Docker path needs nothing on the
 # host beyond Docker and GNU Make (#1216); test_make_docker_commands.sh checks
-# it with python3 off PATH.
+# it with a failing python3 first on PATH.
 export CA_CERTIFICATES_REFRESH := $(shell od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 
 TEMPORAL_FIXTURE_DIR := $(CURDIR)/test/integration/temporal
