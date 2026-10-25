@@ -607,8 +607,6 @@ fn worker_not_running() -> Failure {
     }
 }
 
-/// The failure for attaching to a shared runtime whose Core reference has
-/// already been released.
 /// The failure for an async activity request on a runtime that has never
 /// started a worker, and so has no namespace to address.
 fn missing_worker_namespace() -> Failure {
