@@ -1436,11 +1436,14 @@ let _testing_mock_workflow :
 
 let _testing_activity :
     'input 'output.
-    ('input, 'output) T.Activity.t -> T.Testing.registered_activity =
+    ?durations:T.Duration.t list ->
+    ('input, 'output) T.Activity.t ->
+    T.Testing.registered_activity =
   T.Testing.activity
 
 let _testing_mock_activity :
     'input 'output.
+    ?durations:T.Duration.t list ->
     ('input, 'output) T.Activity.t ->
     ('input -> ('output, T.Error.t) result) ->
     T.Testing.registered_activity =
