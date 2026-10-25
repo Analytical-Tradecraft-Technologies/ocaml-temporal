@@ -6297,6 +6297,22 @@ error fails it with a lost completion. It passed locally against the pinned
 Compose stack. The cooperative-cleanup example's asynchronous completer
 releases its reservation and fails retryably on shutdown.
 
+## 2026-10-25: Abandoned mock clients and workers release their runtime lease (#1222)
+
+A `mock://` client or worker attached to a shared `Runtime` released its
+lease only in `shutdown`, and the mock backend had no finalizer, so one
+dropped without shutdown kept `Runtime.shutdown` refusing forever. Each mock
+client and worker now registers a `Gc.finalise`, mirroring the native
+supervisor's `cleanup_abandoned`. The finalizer only starts a thread, which
+runs the same idempotent retirement as `shutdown` and releases the lease and
+the client's mock-service reference: retirement takes mutexes the collecting
+thread might hold. `test_shared_runtime` abandons a mock client and worker
+and collects them until the runtime reports no attachment; it then shuts the
+runtime down. It also checks that an instance shut down before it is collected
+is not released twice. Without the fix it fails with "2 attached, expected 0".
+`runtime.mli` now says that abandoned instances detach only after
+collection.
+
 ## 2026-10-24: Bounded waits live (#1136)
 
 The `concurrent_client` live regression gained a bounded-wait check on a

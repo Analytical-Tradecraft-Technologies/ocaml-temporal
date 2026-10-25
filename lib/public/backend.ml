@@ -1019,6 +1019,44 @@ let release_mock_service (service : mock_service) =
             Hashtbl.remove mock_services service.key
         | Some _ | None -> ())
 
+(** Retires a mock client once: flips its lifecycle bit under the service
+    mutex, then drops its service reference and releases its shared-runtime
+    lease. Repeated and concurrent calls are no-ops, so an explicit
+    [client_shutdown] and the abandoned-instance finalizer may both run. *)
+let retire_mock_client client =
+  let service = client.service in
+  let should_release =
+    Mutex.lock service.mutex;
+    Fun.protect
+      ~finally:(fun () -> Mutex.unlock service.mutex)
+      (fun () ->
+        if client.closed then false
+        else (
+          client.closed <- true;
+          true))
+  in
+  if should_release then (
+    release_mock_service service;
+    Option.iter Shared_runtime.release client.lease)
+
+(** Retires a mock client or worker that became unreachable without
+    shutdown (#1222). Native instances have the supervisor's finalizer
+    ([Sdk_supervisor.Make.cleanup_abandoned]); without this, an abandoned
+    mock value kept its shared-runtime lease, so [Runtime.shutdown] reported
+    it as still attached forever, and a mock client kept its service
+    reference. The finalizer only starts a thread: retiring takes mutexes
+    (the service's, the registry's, the lease owner's) that the collecting
+    thread might itself hold, and OCaml's error-checking mutexes refuse such
+    a re-lock. If no thread can be created the value is not retired, as for
+    a native instance whose cleanup thread cannot start. *)
+let retire_when_abandoned retire value =
+  Gc.finalise
+    (fun value ->
+      match Thread.create (fun value -> try retire value with _ -> ()) value with
+      | _thread -> ()
+      | exception _ -> ())
+    value
+
 (** Constructs either the deterministic mock ledger or the real native client.
     Native creation first validates the endpoint, then creates the complete
     supervisor graph, connects the official Rust client, and cleans up the
@@ -1043,14 +1081,17 @@ let client_create ?io_threads ?runtime ?(limits = Bridge.default_client_limits)
       if String.starts_with ~prefix:"mock://" config.target_url then
         Result.map
           (fun lease ->
-            Mock_client
+            let client =
               {
                 service =
                   acquire_mock_service ~target_url:config.target_url
                     ~namespace:config.namespace;
                 closed = false;
                 lease;
-              })
+              }
+            in
+            retire_when_abandoned retire_mock_client client;
+            Mock_client client)
           (acquire_runtime_lease runtime)
       else
         match
@@ -2174,20 +2215,7 @@ let client_poll_update ?deadline_ns client request =
     public closed bit before returning an error cannot strand a live handle. *)
 let client_shutdown = function
   | Mock_client client ->
-      let service = client.service in
-      let should_release =
-        Mutex.lock service.mutex;
-        Fun.protect
-          ~finally:(fun () -> Mutex.unlock service.mutex)
-          (fun () ->
-            if client.closed then false
-            else (
-              client.closed <- true;
-              true))
-      in
-      if should_release then (
-        release_mock_service service;
-        Option.iter Shared_runtime.release client.lease);
+      retire_mock_client client;
       Ok ()
   | Native_client client ->
       if Atomic.exchange client.closed true then Ok ()
@@ -2199,6 +2227,17 @@ let client_shutdown = function
 (** The canonical empty payload used by the deterministic mock worker tasks. *)
 let unit_payload =
   { Payload.metadata = [ ("encoding", "binary/null") ]; data = Bytes.empty }
+
+(** Closes a mock worker once, releasing its shared-runtime lease on the first
+    call. Idempotent under the worker mutex, so the abandoned-instance
+    finalizer and an explicit [worker_shutdown] may both run. *)
+let retire_mock_worker worker =
+  Mutex.lock worker.mutex;
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock worker.mutex)
+    (fun () ->
+      if not worker.closed then Option.iter Shared_runtime.release worker.lease;
+      worker.closed <- true)
 
 (** Registers one mock task per local definition. The input is [unit] so tests
     can observe dispatch without adding a test-only payload protocol. *)
@@ -2237,20 +2276,23 @@ let worker_create ?runtime config ~workflow_names ~activity_names =
           activity_names;
         Result.map
           (fun lease ->
-            Mock_worker
-             {
-               _namespace = config.namespace;
-               _task_queue = Option.get config.task_queue;
-               closed = false;
-               mutex = Mutex.create ();
-               workflow_tasks;
-               activity_tasks;
-               outstanding_workflows = Hashtbl.create 16;
-               outstanding_activities = Hashtbl.create 16;
-               idle_workflow_polls = 0;
-               idle_activity_polls = 0;
-               lease;
-             })
+            let worker =
+              {
+                _namespace = config.namespace;
+                _task_queue = Option.get config.task_queue;
+                closed = false;
+                mutex = Mutex.create ();
+                workflow_tasks;
+                activity_tasks;
+                outstanding_workflows = Hashtbl.create 16;
+                outstanding_activities = Hashtbl.create 16;
+                idle_workflow_polls = 0;
+                idle_activity_polls = 0;
+                lease;
+              }
+            in
+            retire_when_abandoned retire_mock_worker worker;
+            Mock_worker worker)
           (acquire_runtime_lease runtime)
 
 (** Polls the workflow queue and records ownership before exposing a task. *)
@@ -2330,10 +2372,5 @@ let worker_complete_activity (Mock_worker worker) completion =
 (** Closes worker admission; Core-backed implementations will first drain
     pollers and outstanding leases before returning from this function. *)
 let worker_shutdown (Mock_worker worker) =
-  Mutex.lock worker.mutex;
-  Fun.protect
-    ~finally:(fun () -> Mutex.unlock worker.mutex)
-    (fun () ->
-      if not worker.closed then Option.iter Shared_runtime.release worker.lease;
-      worker.closed <- true;
-      Ok ())
+  retire_mock_worker worker;
+  Ok ()
