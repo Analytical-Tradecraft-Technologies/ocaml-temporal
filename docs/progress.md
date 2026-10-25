@@ -6156,6 +6156,22 @@ Two rows are left to the issues that change the code: the detached Core
 finalizer's unbounded drop (#1149) and the `backend.ml` details comment
 (#1143, which removes that function).
 
+## 2026-10-25: Cancelling a local activity in backoff no longer sends Core a cancel (#1208)
+
+Cancelling a local activity while it waited in a language-owned retry
+backoff emitted `Request_cancel_local_activity` before cancelling the backoff
+timer. After reporting `DoBackoff`, Core's local-activity machine has left
+`RequestSent`. In the workflow task that delivered the backoff it rejects that
+cancel as an invalid transition, failing the task as nondeterministic on
+every retry. In a backoff phase the operation now only cancels its timer and
+settles the future; the Core cancel is emitted only while Core owns a running
+attempt. The command records no history event, so recorded histories still
+replay. The deterministic cancellation and scope tests now require no Core
+cancel in each backoff phase. The `local_activity_cancellation` live
+regression (all policies, scope, fresh-worker replay) passes against the
+local Compose stack. Staging the same-task race deterministically against a
+live server is not possible, so it has no live case.
+
 ## 2026-10-24: Release from the tag, not the master tip (#1144)
 
 The Release workflow is now dispatched from the version tag

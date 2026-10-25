@@ -122,8 +122,9 @@ let test_handle_cancel () =
   Workflow_context_store.shutdown context
 
 (** A local activity waiting in a language-owned retry backoff has no running
-    attempt: scope cancellation requests cancellation, cancels the backoff
-    timer, and settles the future immediately. *)
+    attempt: scope cancellation cancels the backoff timer and settles the
+    future immediately, without a Core cancel, which Core would reject
+    (#1208). *)
 let test_scope_cancels_backoff () =
   let scheduler = Scheduler.create () in
   let context = Workflow_context_store.create scheduler in
@@ -148,9 +149,8 @@ let test_scope_cancels_backoff () =
   in
   run_in context scheduler (fun () ->
       ignore (Temporal.Scope.cancel (Option.get !scope_ref)));
-  expect "backoff cancellation"
-    [ Activation.Request_cancel_local_activity { seq };
-      Activation.Cancel_timer { seq = timer_seq } ]
+  ignore seq;
+  expect "backoff cancellation" [ Activation.Cancel_timer { seq = timer_seq } ]
     (Workflow_context_store.take_commands context);
   expect_cancelled "backoff future" (Temporal.Future.peek (Option.get !future_ref));
   Workflow_context_store.shutdown context

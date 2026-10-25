@@ -567,12 +567,16 @@ treated as a remote RPC.
 Workflow code cancels a local activity through `Activity.start_local_handle`
 and `Activity.cancel`, or by passing `~scope` to `start_local`,
 `start_local_handle` or `execute_local` and cancelling that scope (#1156).
-Either path emits Core's `RequestCancelLocalActivity` once; Core then resolves
-the future with a typed cancellation as the recorded policy dictates
-(`Wait_cancellation_completed`, the local default, waits for the running
-attempt to stop). A local activity sitting in a language-owned `DoBackoff`
-timer has no running attempt, so cancellation also cancels that timer and
-settles the future immediately under every policy. Local activities remain experimental. The live baseline executes
+For a running attempt either path emits Core's `RequestCancelLocalActivity`
+once; Core then resolves the future with a typed cancellation as the recorded
+policy dictates (`Wait_cancellation_completed`, the local default, waits for
+the running attempt to stop). A local activity in a language-owned `DoBackoff`
+phase has no attempt in Core, so cancellation cancels the backoff timer and
+settles the future immediately under every policy, and emits no
+`RequestCancelLocalActivity`. Core would reject that command as an invalid
+transition in the workflow task that delivered the backoff, failing the task
+as nondeterministic (#1208), and it records no history event, so omitting it
+leaves recorded histories replayable. Local activities remain experimental. The live baseline executes
 `smoke.local_activity` and requires `LOCAL`; the [audited live evidence](live-acceptance-coverage.md)
 records its successful run. Local backoff/retry, cancellation and replay/restart
 combinations still need dedicated live cases, and interceptors remain absent.
