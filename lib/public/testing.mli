@@ -42,7 +42,7 @@
       ([durations] on {!activity} and {!mock_activity}), zero by default.
       Start-to-close, schedule-to-close and heartbeat timeouts expire in
       virtual time against that duration and fail with the typed error a
-      server produces ({!Error.timeout_type}); see {!mock_activity}. An
+      server produces ({!Error.val-timeout_type}); see {!mock_activity}. An
       activity callback still runs to completion at the attempt's start, so
       its heartbeats all happen then and a timed-out attempt's side effects
       remain. Schedule-to-start timeouts never expire, because a worker is
@@ -131,7 +131,7 @@ val activity :
     The workflow observes the attempt's outcome that much later. When a
     timeout's deadline falls strictly before the attempt would finish, the
     attempt fails at the deadline with an [Activity] error whose
-    {!Error.timeout_type} names the timeout and whose
+    {!Error.val-timeout_type} names the timeout and whose
     {!Error.last_heartbeat_details} are the last heartbeat's: start-to-close
     and heartbeat deadlines are measured from the attempt's start and
     schedule-to-close from the first attempt's scheduling. Start-to-close
