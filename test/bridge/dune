@@ -1,3 +1,13 @@
+;; Warnings in the test C stubs are fatal only in the development profile
+;; used by CI and local builds, as for the library (lib/core_bridge/dune,
+;; #785). [opam install --with-test] runs [dune runtest -p temporal-sdk], which
+;; selects the release profile, so a new warning from a user's C compiler
+;; cannot fail the package's tests (#1228).
+(env
+ (dev
+  (c_flags
+   (:standard -Werror))))
+
 (test
  (name test_ocaml_bridge)
  (libraries temporal-sdk temporal_core_bridge unix))
@@ -37,7 +47,7 @@
   (language c)
   (names response_borrow_gate_test_stubs)
   (include_dirs ../../lib/core_bridge)
-  (flags :standard -Wall -Wextra -Werror)))
+  (flags :standard -Wall -Wextra)))
 
 (test
  (name test_ocaml_protocol)
@@ -172,7 +182,7 @@
  (foreign_stubs
   (language c)
   (names signal_test_stubs)
-  (flags :standard -Wall -Wextra -Werror)))
+  (flags :standard -Wall -Wextra)))
 
 ; Lifecycle strings at the documented 65,536-byte limit reach native code (#1224).
 (test
