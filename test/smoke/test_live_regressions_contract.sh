@@ -162,4 +162,17 @@ printf '(executable\n (name regression))\n' >"$fixture/test/integration/new_suit
 printf '%s\n' test/integration/new_suite/regression.exe >>"$fixture/scripts/ci-smoke-executables.txt"
 expect_rejected "test/integration/new_suite/regression.exe has no invocation in run-live-regressions.sh"
 
+# Every `make test-...-live` target that documentation, a suite README or an
+# example names must exist, so a documented way to run a suite cannot fail
+# with "No rule to make target" (#1232). A name followed by another name
+# character (test-temporal-live-ci) is matched whole, not as its prefix.
+documented="$scratch/documented-live-targets"
+find "$root/README.md" "$root/docs" "$root/test/integration" "$root/examples" \
+  -name '*.md' -type f -exec grep -ohE 'make test-[a-z0-9-]+-live([^a-z0-9-]|$)' {} + \
+  | sed -E 's/^make //; s/[^a-z0-9-]$//' | sort -u >"$documented"
+while IFS= read -r target; do
+  grep -Eq "^$target:" "$makefile" \
+    || fail "documentation names make $target, which the Makefile does not define"
+done <"$documented"
+
 echo "live regressions contract: ok ($(wc -l <"$scratch/declared" | tr -d ' ') regression executables)"

@@ -325,13 +325,14 @@ The development contract is Makefile-first. Expected targets include:
 - `make build`
 - `make test`
 - `make test-unit`
-- `make test-integration`
-- `make test-replay`
+- `make test-history-corpus` (offline replay; `make test` runs it too)
+- `make test-temporal-integration`
+- `make test-temporal-live-regressions`
 - `make lint`
 - `make fmt`
-- `make up`
-- `make down`
-- `make logs`
+- `make temporal-start`
+- `make temporal-stop`
+- `make temporal-logs`
 - `make clean`
 - `make docs`
 - `make bench`

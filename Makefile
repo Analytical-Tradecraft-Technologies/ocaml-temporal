@@ -1203,6 +1203,26 @@ test-update-outcomes-live:
 test-interaction-recovery-live:
 	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/interaction_recovery/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
 
+# The four suites below take the same server URL and official Temporal CLI
+# path as run-live-regressions.sh passes them; their READMEs name these
+# targets (#1232). Each requires a disposable server with a `default`
+# namespace.
+.PHONY: test-transport-interruption-live
+test-transport-interruption-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/transport_interruption/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
+.PHONY: test-update-run-close-live
+test-update-run-close-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/update_run_close/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
+.PHONY: test-client-policies-live
+test-client-policies-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/client_policies/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
+.PHONY: test-non-yielding-workflow-live
+test-non-yielding-workflow-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/non_yielding_workflow/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI)
+
 # (header)
 
 test-runtime:
