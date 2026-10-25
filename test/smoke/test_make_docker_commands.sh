@@ -140,4 +140,31 @@ if grep -Fq 'expected OCaml' "$temporary_root/stderr"; then
   exit 1
 fi
 
+# Every Docker-backed image build requires a non-empty trust-store refresh
+# nonce, and the README promises that path needs only Docker and GNU Make on the
+# host (#1216). Parse the Makefile with a PATH that offers the POSIX tools it
+# uses but no python3, and require a fresh 32-digit hex nonce on each run.
+make_program=$(command -v make)
+mkdir "$temporary_root/no-python-bin"
+for tool in od tr uname id sed; do
+  if path=$(command -v "$tool"); then
+    ln -s "$path" "$temporary_root/no-python-bin/$tool"
+  fi
+done
+read_nonce() {
+  PATH="$temporary_root/no-python-bin" "$make_program" --no-print-directory \
+    -f "$source_root/Makefile" -p -n -q ca-refresh-nonce-probe 2>/dev/null |
+    sed -n 's/^CA_CERTIFICATES_REFRESH := //p' | head -n 1
+}
+first_nonce=$(read_nonce)
+second_nonce=$(read_nonce)
+if ! printf '%s\n' "$first_nonce" | grep -Eqx '[0-9a-f]{32}'; then
+  echo "CA_CERTIFICATES_REFRESH is not 32 hex digits without python3: '$first_nonce'" >&2
+  exit 1
+fi
+if [ "$first_nonce" = "$second_nonce" ]; then
+  echo 'CA_CERTIFICATES_REFRESH did not change between Make invocations' >&2
+  exit 1
+fi
+
 echo 'Make Docker command output and error propagation: ok'

@@ -6370,6 +6370,17 @@ replacement, so a fresh worker replays the cancel or the firing without a
 nondeterminism error. History-corpus entries for these runs remain open
 under #1134 (#503).
 
+## 2026-10-25: Docker builds no longer need host python3 (#1216)
+
+The trust-store refresh nonce that every image build requires (#1184) was
+generated with host `python3`. Without it the nonce was empty and the image
+builds failed at their `test -n` guard, which contradicted the README's
+"Docker and GNU Make" requirement. The Makefile now takes 16 random bytes
+from `/dev/urandom` through POSIX `od` and `tr`.
+`test/smoke/test_make_docker_commands.sh` parses the Makefile with a `PATH`
+that has no `python3` and requires a fresh 32-digit hex nonce on each
+invocation. It fails against the previous Makefile.
+
 ## 2026-10-24: Concurrent bounded waits and bounded update waits live (#1136)
 
 The `concurrent_client` live regression now covers the last #1136 criteria.

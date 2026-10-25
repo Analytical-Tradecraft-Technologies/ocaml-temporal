@@ -1,7 +1,10 @@
 # Refresh the final OS trust store for every supported image build without
 # invalidating the compiler or locked dependency layers. Compose inherits the
-# exported value; a new Make invocation always generates another.
-export CA_CERTIFICATES_REFRESH := $(shell python3 -c 'import uuid; print(uuid.uuid4())')
+# exported value; a new Make invocation always generates another. The nonce is
+# 16 random bytes in hex from POSIX od, so the Docker path needs nothing on the
+# host beyond Docker and GNU Make (#1216); test_make_docker_commands.sh checks
+# it with python3 off PATH.
+export CA_CERTIFICATES_REFRESH := $(shell od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 
 TEMPORAL_FIXTURE_DIR := $(CURDIR)/test/integration/temporal
 TEMPORAL_COMPOSE_FILE := $(TEMPORAL_FIXTURE_DIR)/compose.yaml
