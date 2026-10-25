@@ -76,9 +76,13 @@ decodes a heartbeat payload. The same classification applies to failures a
 client `wait` or `wait_update` decodes, and a `wait` that ends cancelled,
 terminated or timed out reports `` `Cancelled ``, `` `Terminated `` or
 `` `Timeout `Unspecified `` (Temporal does not record which workflow timeout
-expired). `Temporal.Testing` does not simulate
-activity timeouts (#1160); its virtual-deadline errors are created by the
-SDK, so their origin is `None`.
+expired). `Temporal.Testing` simulates activity
+start-to-close, schedule-to-close and heartbeat timeouts in virtual time
+(#1160) and reports them in this shape: category `Activity`, origin
+`` `Timeout t ``, no application type, and the last heartbeat's details; a
+final application failure has origin `` `Application ``. Its other
+virtual-deadline errors (an execute or result `?timeout`, a condition
+timeout) are created by the SDK, so their origin is `None`.
 
 Neither the origin nor the heartbeat details are transmitted: an error that
 an activity or workflow returns is sent with only its category, message,

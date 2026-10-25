@@ -6265,6 +6265,26 @@ exactly one local-activity marker, completes, and replays on a fresh worker
 with the same query result and no new attempt. It passed locally against the
 pinned Compose stack. A corpus history remains open.
 
+## 2026-10-25: Activity timeouts in Temporal.Testing (#1160)
+
+`Temporal.Testing.activity` and `mock_activity` take `?durations`, the
+virtual time each attempt takes (the last entry repeats; zero by default).
+The simulator runs the callback at the attempt's start and settles the
+attempt when it finishes or when a timeout expires first: start-to-close
+and heartbeat deadlines run from the attempt's start, schedule-to-close
+from the first scheduling. A timeout fails with the native shape from
+#1143 (category `Activity`, origin `` `Timeout t ``, no application type,
+the last heartbeat details). Start-to-close and heartbeat timeouts are
+retried under the policy. Schedule-to-close is final and retryable, as
+Temporal reports retry state `TIMEOUT`, and it also cuts short a backoff
+that would end past the deadline. Final application failures now carry the
+`` `Application `` origin. A running attempt is cancelled at once, except
+under `Wait_cancellation_completed`, where its outcome arrives when it
+finishes. `test/unit/test_testing_timeouts.ml` covers each timeout, a retry
+after a timeout, a backoff cut short, both cancellation policies and mock
+durations, and asserts the virtual time each took. Schedule-to-start, task
+retry, memos, search attributes and ID policies remain unsimulated.
+
 ## 2026-10-24: Asynchronous handles observe worker shutdown (#1157)
 
 `Activity.Async_handle.is_worker_shutting_down` and
