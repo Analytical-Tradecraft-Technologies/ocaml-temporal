@@ -278,8 +278,13 @@ public API.
 `Temporal.Worker.run` holds the worker lifecycle mutex while two OCaml Domains
 run: the calling Domain polls and executes workflow activations, and one
 dedicated Domain polls and executes activity tasks. A workflow-only worker
-spawns no activity Domain and runs its workflow lane alone (#1042; see
-[Domain budget](#domain-budget)). Both Domains send native
+spawns no activity Domain (#1042; see [Domain budget](#domain-budget)). Its
+activity lane runs on a system thread of the calling Domain instead (#1211).
+That lane can execute no user code: its only tasks are local activities that
+its own workflows schedule, and it rejects them as unregistered so the
+workflow sees the failure at once. Without that lane, from #1042 until #1211,
+such a task was never polled and the lone workflow lane spun at full CPU on
+its readiness. Both Domains send native
 operations through the same owner-Domain supervisor mailbox. Each lane waits
 in turn on the bounded combined readiness operation when both are idle, and
 uses a short adaptive local yield while its sibling is busy (#994). A slow activity callback
@@ -489,6 +494,7 @@ throughput cost as well as a cap (#1042).
 | `Client`, `Replay`, `Worker` | 1 supervisor (owner) Domain | from `create` until `shutdown` |
 | `Worker` that registers at least one activity | 1 activity-lane Domain | while `run` is active |
 | Workflow lane | none: the thread that called `run` | while `run` is active |
+| Workflow-only worker's activity lane | none: a system thread of the Domain that called `run` (#1211) | while `run` is active |
 | Activation watchdog | none: a system thread on the worker's supervisor Domain | while `run` is active |
 
 Before #1042 a running worker held three Domains whatever it registered: its

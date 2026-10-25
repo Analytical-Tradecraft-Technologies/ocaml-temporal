@@ -3,7 +3,9 @@
     Workflow activations stay on the calling Domain. One dedicated activity
     Domain polls and executes activity callbacks, so a slow activity cannot
     prevent an unrelated workflow activation from reaching Core. A worker that
-    polls no activity tasks spawns no activity Domain (#1042). Both lanes
+    registers no activities spawns no activity Domain (#1042); its activity
+    lane, which only rejects the local-activity tasks its workflows schedule,
+    runs on a system thread of the calling Domain instead (#1211). Both lanes
     still enter the same owner-Domain supervisor mailbox for native operations.
     The activity lane admits only one task at a time; a retained completion is
     retried after a bounded backoff before another activity is polled. *)
@@ -12,6 +14,8 @@ type progress =
   | Progress
   | Not_ready
   | Retry_pending
+
+type activity_lane = No_activity_lane | Activity_domain | Activity_thread
 
 (** The first fatal lane outcome is published across Domains without changing
     the worker's shutdown flag. A later explicit shutdown must still own native
@@ -124,6 +128,7 @@ let detach_due ~now ~deadline ~callback_running =
     It runs on a detached system thread and is never awaited. *)
 let run ~activity_lane ~lane_unavailable ~detach ~closed ~poll_workflow
     ~poll_activity ~wait_for_lane ~retry_pending =
+  let has_activity_lane = activity_lane <> No_activity_lane in
   let stop = Atomic.make false in
   let first_failure = Atomic.make None in
   let workflow_busy = Atomic.make false in
@@ -140,7 +145,8 @@ let run ~activity_lane ~lane_unavailable ~detach ~closed ~poll_workflow
   let guarded ~poll ~workflow_lane ~busy ~sibling_busy =
     try
       match
-        run_lane ~stopped ~poll ~busy ~sibling_busy ~has_sibling:activity_lane
+        run_lane ~stopped ~poll ~busy ~sibling_busy
+          ~has_sibling:has_activity_lane
           ~wait_token
           ~prefer_workflow ~wait_epoch ~workflow_lane
           ~wait:(fun ~native_wait -> wait_for_lane ~workflow_lane ~native_wait)
@@ -150,23 +156,29 @@ let run ~activity_lane ~lane_unavailable ~detach ~closed ~poll_workflow
       | Error error -> publish (Source_error error)
     with exception_ -> publish (Raised exception_)
   in
+  (* [activity_finished] is the lane's last action on its Domain or thread,
+     so the bounded join below can poll it without blocking. *)
+  let activity_body () =
+    Fun.protect
+      ~finally:(fun () -> Atomic.set activity_finished true)
+      (fun () ->
+        guarded ~poll:poll_activity ~workflow_lane:false ~busy:activity_busy
+          ~sibling_busy:workflow_busy)
+  in
   let spawned =
-    if not activity_lane then begin
-      (* No activity lane: the join below is immediate and skipped. *)
-      Atomic.set activity_finished true;
-      Ok None
-    end
-    else
-      match
-        Domain.spawn (fun () ->
-            Fun.protect
-              ~finally:(fun () -> Atomic.set activity_finished true)
-              (fun () ->
-                guarded ~poll:poll_activity ~workflow_lane:false
-                  ~busy:activity_busy ~sibling_busy:workflow_busy))
-      with
-      | domain -> Ok (Some domain)
-      | exception exception_ -> Error (lane_unavailable exception_)
+    match activity_lane with
+    | No_activity_lane ->
+        (* No activity lane: the join below is immediate and skipped. *)
+        Atomic.set activity_finished true;
+        Ok None
+    | Activity_domain -> (
+        match Domain.spawn activity_body with
+        | domain -> Ok (Some (`Domain domain))
+        | exception exception_ -> Error (lane_unavailable exception_))
+    | Activity_thread -> (
+        match Thread.create activity_body () with
+        | thread -> Ok (Some (`Thread thread))
+        | exception exception_ -> Error (lane_unavailable exception_))
   in
   match spawned with
   | Error _ as error ->
@@ -217,7 +229,12 @@ let run ~activity_lane ~lane_unavailable ~detach ~closed ~poll_workflow
                 false
               end
         in
-        if joined then Option.iter Domain.join activity_domain;
+        if joined then
+          Option.iter
+            (function
+              | `Domain domain -> Domain.join domain
+              | `Thread thread -> Thread.join thread)
+            activity_domain;
         match Atomic.get first_failure with
         | None -> Ok ()
         | Some (Source_error error) -> Error error

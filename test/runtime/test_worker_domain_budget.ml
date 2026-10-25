@@ -2,8 +2,8 @@
 
     Dune runs this executable with [OCAMLRUNPARAM=d=1], which leaves the
     runtime its main Domain only. Anything that still spawned a Domain would
-    therefore fail here: a workflow-only run loop and the activation watchdog
-    must both work without one, and a run loop that does need its activity
+    therefore fail here: a workflow-only run loop, its thread-hosted activity
+    lane (#1211) and the activation watchdog must all work without one, and a run loop that does need its activity
     Domain must report the spawn failure as a typed error instead of raising.
     OCaml 5.2 ignores the [d] parameter (its limit is fixed at 128), so the
     checks that depend on exhaustion are skipped there. *)
@@ -48,7 +48,7 @@ let test_workflow_only_loop_spawns_no_domain () =
     Ok ()
   in
   match
-    Loop.run ~activity_lane:false
+    Loop.run ~activity_lane:Loop.No_activity_lane
       ~lane_unavailable:(fun _ -> failwith "no Domain should be spawned")
       ~detach:None ~closed ~poll_workflow
       ~poll_activity:(fun () -> failwith "absent activity lane was polled")
@@ -60,6 +60,42 @@ let test_workflow_only_loop_spawns_no_domain () =
         failwith "the workflow lane never waited for readiness"
   | Error () -> failwith "workflow-only loop failed"
 
+(** A workflow-only worker's activity lane runs on a system thread (#1211):
+    with only the main Domain available it still starts, polls on the
+    calling Domain, takes native waits alternately with the workflow lane,
+    and is joined when the loop closes. Before the fix such a worker ran no
+    activity lane, so a local-activity task its workflow scheduled was never
+    polled. *)
+let test_workflow_only_activity_lane_uses_a_thread () =
+  let self = Domain.self () in
+  let activity_polls = Atomic.make 0 in
+  let foreign_domain = Atomic.make false in
+  let closed () = Atomic.get activity_polls >= 4 in
+  let poll_workflow () = Ok Loop.Not_ready in
+  let poll_activity () =
+    if (Domain.self () :> int) <> (self :> int) then
+      Atomic.set foreign_domain true;
+    (* The first poll finds the pending local-activity task and rejects it. *)
+    if Atomic.fetch_and_add activity_polls 1 = 0 then Ok Loop.Progress
+    else Ok Loop.Not_ready
+  in
+  match
+    Loop.run ~activity_lane:Loop.Activity_thread
+      ~lane_unavailable:(fun exception_ -> `Unavailable exception_)
+      ~detach:None ~closed ~poll_workflow ~poll_activity
+      ~wait_for_lane:(fun ~workflow_lane:_ ~native_wait:_ ->
+        Thread.yield ();
+        Ok ())
+      ~retry_pending:(fun ~workflow_lane:_ -> failwith "nothing to retry")
+  with
+  | Ok () ->
+      if Atomic.get foreign_domain then
+        failwith "the thread-hosted activity lane ran on another Domain"
+  | Error (`Unavailable exception_) ->
+      failwith
+        ("thread-hosted activity lane did not start: "
+        ^ Printexc.to_string exception_)
+
 (** When the activity Domain cannot be spawned, [run] returns the caller's
     typed error carrying the spawn exception and runs neither lane, so the
     worker can simply be run again once a Domain is free. *)
@@ -70,7 +106,7 @@ let test_activity_domain_failure_is_typed () =
     Ok Loop.Not_ready
   in
   match
-    Loop.run ~activity_lane:true
+    Loop.run ~activity_lane:Loop.Activity_domain
       ~lane_unavailable:(fun exception_ -> `Domain_unavailable exception_)
       ~detach:None
       ~closed:(fun () -> false)
@@ -118,6 +154,7 @@ let test_watchdog_needs_no_domain () =
 let () =
   let exhausted = domains_exhausted () in
   test_workflow_only_loop_spawns_no_domain ();
+  test_workflow_only_activity_lane_uses_a_thread ();
   test_watchdog_needs_no_domain ();
   if exhausted then begin
     test_activity_domain_failure_is_typed ();

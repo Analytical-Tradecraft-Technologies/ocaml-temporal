@@ -87,7 +87,7 @@ let run worker ~poll_workflow ~poll_activity =
         Owner.leave worker.owner;
         Mutex.unlock worker.run_mutex)
       (fun () ->
-        Loop.run ~activity_lane:true ~lane_unavailable:raise ~detach:None
+        Loop.run ~activity_lane:Loop.Activity_domain ~lane_unavailable:raise ~detach:None
           ~closed:(fun () ->
             Atomic.get worker.closed || Atomic.get worker.stop_requested)
           ~poll_workflow

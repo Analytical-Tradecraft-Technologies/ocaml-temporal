@@ -842,7 +842,7 @@ let test_unrepresentable_context_retires_lease () =
                 | Error error -> Error error
                 | _ -> failwith "queued activity did not make progress"
               in
-              (match Loop.run ~activity_lane:true ~lane_unavailable:raise ~detach:None ~closed:(fun () -> Atomic.get good_calls = 1)
+              (match Loop.run ~activity_lane:Loop.Activity_domain ~lane_unavailable:raise ~detach:None ~closed:(fun () -> Atomic.get good_calls = 1)
                  ~poll_workflow:(fun () -> Ok Loop.Not_ready) ~poll_activity
                  ~wait_for_lane:(fun ~workflow_lane ~native_wait:_ ->
                    if not workflow_lane then failwith "unexpected activity wait";

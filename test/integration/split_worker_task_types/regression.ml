@@ -4,6 +4,13 @@
     activity tasks and failed them non-retryably as unregistered, so most
     executions failed. Every execution must now complete.
 
+    The workflow-only worker also runs a workflow that schedules a local
+    activity nobody registered (#1211). Local activities run on the worker
+    that scheduled them, so the workflow-only worker must poll the task and
+    reject it as unregistered, and the workflow sees that failure at once.
+    Before the fix that worker ran no activity lane: the task was never
+    polled, its workflow lane spun at full CPU, and the run never finished.
+
     Run against a disposable Temporal Server only:
     [dune exec test/integration/split_worker_task_types/regression.exe -- check
     http://127.0.0.1:7233]. [TEMPORAL_NAMESPACE] defaults to
@@ -33,6 +40,35 @@ let compose =
   Workflow.define ~name:"split-worker.compose" ~input:Codec.string
     ~output:Codec.string (fun input -> Activity.execute render input)
 
+(** Registered with no worker, so a local activity of this type can only be
+    rejected as unregistered by the worker that schedules it. *)
+let unregistered =
+  Activity.define ~name:"split-worker.unregistered" ~input:Codec.string
+    ~output:Codec.string (fun input -> Ok input)
+
+(** Executed only by the workflow-only worker. It schedules [unregistered] as a
+    single-attempt local activity and reports how it failed, so the run
+    completes as soon as that worker rejects the task (#1211). A task nobody
+    polls fails only when its start-to-close timeout expires, which is
+    reported as ["timed out"], so that regression cannot pass. *)
+let local_probe =
+  Workflow.define ~name:"split-worker.unregistered-local" ~input:Codec.string
+    ~output:Codec.string (fun input ->
+      let retry_policy =
+        get
+          (Retry_policy.make ~initial_interval:(Duration.of_ms 1_000L)
+             ~backoff_coefficient:2.0 ~maximum_interval:(Duration.of_ms 1_000L)
+             ~maximum_attempts:1 ())
+      in
+      match
+        Activity.execute_local ~start_to_close_timeout:(Duration.of_seconds 10L)
+          ~retry_policy unregistered input
+      with
+      | Ok _ -> Ok "unexpectedly ran"
+      | Error error when Option.is_some (Error.timeout_type error) ->
+          Ok "timed out"
+      | Error _ -> Ok "rejected")
+
 (** Runs one worker on its own Domain so both share this process. *)
 let start_worker worker = Domain.spawn (fun () -> Worker.run worker)
 
@@ -48,7 +84,8 @@ let check address =
     get
       (Worker.create ~target_url:address ~namespace ~task_queue:queue
          ~identity:"split-worker-workflows"
-         ~workflows:[ Worker.workflow compose ] ~activities:[] ())
+         ~workflows:[ Worker.workflow compose; Worker.workflow local_probe ]
+         ~activities:[] ())
   in
   let activity_worker =
     get
@@ -75,6 +112,16 @@ let check address =
           | Client.Completed _ -> failwith "split worker returned a wrong result"
           | _ -> failwith "split worker execution did not complete")
         handles;
+      let probe =
+        get
+          (Client.start client ~workflow:local_probe ~task_queue:queue
+             ~id:(queue ^ "-unregistered-local") ~input:"probe" ())
+      in
+      (match get (Client.wait ~timeout:(Duration.of_seconds 30L) probe) with
+      | Client.Completed { output = "rejected"; _ } -> ()
+      | Client.Completed { output; _ } ->
+          failwith ("unregistered local activity probe returned " ^ output)
+      | _ -> failwith "unregistered local activity probe did not complete");
       Ok ()
     with exception_ -> Error exception_
   in
@@ -85,7 +132,8 @@ let check address =
   match body with
   | Ok () ->
       Printf.printf
-        "split worker task types live regression: %d executions completed\n%!"
+        "split worker task types live regression: %d executions completed, \
+         unregistered local activity rejected\n%!"
         executions
   | Error exception_ -> raise exception_
 

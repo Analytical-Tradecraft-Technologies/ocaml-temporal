@@ -751,11 +751,20 @@ let activity_lane_unavailable exception_ =
 
 (** Runs both lanes through the generic loop and converts an escaped lane
     exception into a defect result that names the exception. A workflow-only
-    worker runs no activity lane, so it spawns no Domain here (#1042). *)
+    worker spawns no Domain here (#1042), but it still runs an activity lane,
+    on a system thread: the bridge enables local activities for every worker
+    with workflows, so a local activity one of its workflows schedules must be
+    polled and rejected as unregistered, as before #1042. Without that lane
+    the task was never serviced and the workflow lane spun on its readiness
+    (#1211). No activity callback can run on that thread, because the worker
+    registers none. *)
 let run_lanes worker =
   let pacing = make_lane_pacing () in
   try
-    Worker_loop.run ~activity_lane:worker.activity_tasks
+    Worker_loop.run
+      ~activity_lane:
+        (if worker.activity_tasks then Worker_loop.Activity_domain
+         else Worker_loop.Activity_thread)
       ~lane_unavailable:activity_lane_unavailable
       ~detach:(Some (activity_detach worker))
       ~closed:(fun () -> stop_observed worker)
@@ -782,8 +791,9 @@ let run_lanes worker =
            ("native worker execution lane failed: " ^ bounded_message cause))
 
 (** Runs workflow execution on this Domain and capacity-one activity execution
-    on a dedicated Domain, spawned only when the worker polls activity tasks
-    (#1042). Both adapters continue to use the same serialized
+    on a dedicated Domain, spawned only when the worker registers activities
+    (#1042); a workflow-only worker runs its reject-only activity lane on a
+    system thread instead (#1211). Both adapters continue to use the same serialized
     supervisor mailbox. [run_mutex] remains held until the activity Domain is
     joined, so later shutdown can drain and release the graph safely, unless
     a callback outlives the lanes deadline after a stop: the Domain is then
