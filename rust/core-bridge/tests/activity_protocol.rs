@@ -485,3 +485,71 @@ fn retry_maximum_attempts_accepts_signed_i32_boundaries() {
         decode_task(&json).expect("signed i32 boundary should decode");
     }
 }
+
+/// Temporal Server skips retry-policy validation when `maximum_attempts` is
+/// 1, so a peer SDK can schedule an activity with negative intervals (#1213).
+/// The task must convert, with those intervals reported as unset, and survive
+/// the JSON round trip, instead of being rejected before the activity runs.
+/// A non-normalized non-negative interval is still refused.
+#[test]
+fn activity_retry_policy_accepts_server_valid_negative_intervals() {
+    use temporalio_common::protos::temporal::api::common::v1 as api_common;
+
+    let task = |initial: prost_wkt_types::Duration, maximum: prost_wkt_types::Duration| {
+        core_activity_task::ActivityTask {
+            task_token: vec![1, 2, 3],
+            variant: Some(core_activity_task::activity_task::Variant::Start(
+                core_activity_task::Start {
+                    workflow_namespace: "default".to_owned(),
+                    workflow_type: "example.workflow".to_owned(),
+                    workflow_execution: Some(api_common::WorkflowExecution {
+                        workflow_id: "workflow-1".to_owned(),
+                        run_id: "run-1".to_owned(),
+                    }),
+                    activity_id: "activity-1".to_owned(),
+                    activity_type: "example.activity".to_owned(),
+                    retry_policy: Some(api_common::RetryPolicy {
+                        initial_interval: Some(initial),
+                        backoff_coefficient: 2.0,
+                        maximum_interval: Some(maximum),
+                        maximum_attempts: 1,
+                        non_retryable_error_types: Vec::new(),
+                    }),
+                    ..Default::default()
+                },
+            )),
+        }
+    };
+    let duration = |seconds, nanos| prost_wkt_types::Duration { seconds, nanos };
+    // A non-negative interval is copied; a negative one is reported as unset.
+    let expected = |value: &prost_wkt_types::Duration| {
+        (value.seconds >= 0 && value.nanos >= 0).then_some(Duration {
+            seconds: value.seconds,
+            nanoseconds: value.nanos,
+        })
+    };
+
+    for (initial, maximum) in [
+        (duration(-1, 0), duration(-5, 0)),
+        (duration(0, -1), duration(60, 0)),
+        (duration(1, 0), duration(-1, -500)),
+    ] {
+        let (expected_initial, expected_maximum) = (expected(&initial), expected(&maximum));
+        let semantic = task_from_core(&task(initial, maximum))
+            .expect("a server-valid retry policy must convert");
+        let ActivityTaskVariant::Start(start) = &semantic.variant else {
+            panic!("Core start must remain a start task");
+        };
+        let policy = start.retry_policy.as_ref().expect("retry policy is kept");
+        assert_eq!(policy.initial_interval, expected_initial);
+        assert_eq!(policy.maximum_interval, expected_maximum);
+        assert_eq!(policy.maximum_attempts, 1);
+        let encoded = encode_task(&semantic).expect("the converted task should encode");
+        assert_eq!(decode_task(&encoded), Ok(semantic));
+    }
+
+    assert!(
+        task_from_core(&task(duration(1, 1_000_000_000), duration(60, 0))).is_err(),
+        "a non-normalized interval must still be rejected"
+    );
+}

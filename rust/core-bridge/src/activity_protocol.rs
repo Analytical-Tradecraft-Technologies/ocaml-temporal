@@ -694,21 +694,26 @@ fn timestamp_from_core(value: &prost_wkt_types::Timestamp) -> Timestamp {
 }
 
 /// Copies effective Core retry policy without floating-point JSON.
+///
+/// Temporal Server skips retry-policy validation when `maximum_attempts` is
+/// 1, so a peer SDK can schedule an activity whose policy carries a negative
+/// interval. Such an interval becomes `None` (unset), as Temporal itself
+/// treats it, mirroring the workflow start event's inbound rule (#1016,
+/// #1213); refusing it would fail the task before the activity ever ran. A
+/// non-negative interval that is not normalized is still rejected.
 fn retry_policy_from_core(
     value: &api_common::RetryPolicy,
 ) -> Result<RetryPolicy, CoreConversionError> {
+    let interval = |duration: Option<&prost_wkt_types::Duration>| match duration {
+        Some(duration) if duration.seconds >= 0 && duration.nanos >= 0 => {
+            workflow_protocol::duration_from_core(duration).map(Some)
+        }
+        Some(_) | None => Ok(None),
+    };
     Ok(RetryPolicy {
-        initial_interval: value
-            .initial_interval
-            .as_ref()
-            .map(workflow_protocol::duration_from_core)
-            .transpose()?,
+        initial_interval: interval(value.initial_interval.as_ref())?,
         backoff_coefficient_bits: value.backoff_coefficient.to_bits().to_string(),
-        maximum_interval: value
-            .maximum_interval
-            .as_ref()
-            .map(workflow_protocol::duration_from_core)
-            .transpose()?,
+        maximum_interval: interval(value.maximum_interval.as_ref())?,
         maximum_attempts: value.maximum_attempts,
         non_retryable_error_types: value.non_retryable_error_types.clone(),
     })

@@ -6188,6 +6188,19 @@ mutation that drops the ancestry check fails it. The quality contract pins the
 validate job's ref and ancestry checks. The checklist, preflight guide and
 attestation verification (`--source-ref refs/tags/<tag>`) are updated.
 
+## 2026-10-25: Activity tasks accept server-valid negative retry intervals (#1213)
+
+Temporal Server skips retry-policy validation when `maximum_attempts` is 1,
+so a peer SDK can schedule an activity whose policy has a negative initial
+or maximum interval. #1062 relaxed this for the workflow start event; the
+activity-task converter still rejected such a task before the activity ran.
+It now reports a negative interval as unset (`None`), as Temporal treats it,
+and still rejects a non-normalized one. The Rust test
+`activity_retry_policy_accepts_server_valid_negative_intervals` converts and
+round-trips three such policies; it fails against the previous converter.
+`core-protocol.md` no longer claims that activation documents are strictly
+validated. Only completions are.
+
 ## 2026-10-24: Local activity cancellation from workflow code (#1156)
 
 `Activity.start_local`, `execute_local` and the new `start_local_handle` take
