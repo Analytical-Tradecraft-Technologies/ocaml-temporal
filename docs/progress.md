@@ -6101,8 +6101,9 @@ although budget remained. It now builds its request with `budgeted_request`
 and maps statuses through `budget_status`, like cancel, reset, signal,
 query, visibility and update. The scripted-transport test
 `start_rpc_timeout_extends_cores_retry_window` keeps a server unavailable
-under a 16 s budget and requires the start to retry past 11 s (about 14 s
-here). The previous code stopped at about 9.5 s.
+under a 30 s budget and requires the start to retry past 11 s; Core's
+ten-attempt cap then ends it after at least about 11.8 s. The previous code
+stopped within Core's default 10 s window.
 `start_attempts_carry_the_budget_deadline` checks that a retried start is
 byte-identical.
 

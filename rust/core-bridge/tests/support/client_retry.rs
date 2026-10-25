@@ -684,11 +684,13 @@ fn start_attempts_carry_the_budget_deadline() {
 }
 
 /// A start `rpc_timeout` longer than Core's default 10 s retry window is
-/// Core's retry window too (#1220). Core stops once its next backoff would end
-/// past the window, so against a server that stays unavailable a start with
-/// the default window gives up near 10 s; with a 16 s budget it keeps retrying
-/// past 11 s (backoffs of 0.1 s growing by 1.7 to 5 s, jittered by 20%), and
-/// ends with an uncertain outcome before the budget plus scheduling slack.
+/// Core's retry window too (#1220). With Core's default window, a start
+/// against a server that stays unavailable gives up within 10 s. With a 30 s
+/// budget the window no longer stops it: Core's ten-attempt cap does, after
+/// nine backoffs of 0.1 s growing by 1.7 up to 5 s, which take at least about
+/// 11.8 s even when every 20% jitter draw is at its minimum. (A 16 s budget
+/// was too close: a jittered 5 s backoff could end past it after about
+/// 10.8 s.)
 #[test]
 fn start_rpc_timeout_extends_cores_retry_window() {
     let (core, connection, probe) = scripted_connection(
@@ -699,14 +701,14 @@ fn start_rpc_timeout_extends_cores_retry_window() {
     let started = Instant::now();
     let result = core
         .tokio_handle()
-        .block_on(start_workflow(connection, start_request(Some(16_000))));
+        .block_on(start_workflow(connection, start_request(Some(30_000))));
     let elapsed = started.elapsed();
     let error = result.expect_err("an unavailable server cannot accept the start");
     assert!(error.uncertain_start(), "unexpected error {error:?}");
     assert!(
         elapsed >= Duration::from_millis(11_000),
-        "Core stopped retrying after {elapsed:?}, inside the 16 s budget"
+        "Core stopped retrying after {elapsed:?}, inside the 30 s budget"
     );
-    assert!(elapsed < Duration::from_millis(17_500), "took {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(31_500), "took {elapsed:?}");
     assert!(probe.count() > 1);
 }
