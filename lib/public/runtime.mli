@@ -129,6 +129,10 @@ val attached : t -> int
     and call [shutdown] again. This includes a worker whose shutdown
     returned with a [`Detached] native teardown: poll {!attached} or retry
     until that teardown has finished. Repeating a successful call returns [Ok ()].
+    One wait is unbounded (#1149): if an attached worker's Temporal Core
+    finalizer was abandoned after its timeout because Core's workflow
+    processing thread was still running, the final release of Core here
+    waits for that thread to exit.
     A native release failure is a [`Bridge] error, and the runtime is
     nevertheless closed. *)
 val shutdown : t -> (unit, Error.t) result

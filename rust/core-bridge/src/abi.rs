@@ -3457,10 +3457,13 @@ fn drop_runtime_graph(
                 // is the last-resort reclaim path.
                 drop(worker);
             }
-            // A detached finalizer still owns the worker; dropping the last
-            // Core reference shuts down its Tokio runtime, which ends that
-            // task. On a shared runtime the task ends when the last holder
-            // releases Core, still bounded by that runtime's lifetime.
+            // A detached finalizer still owns the worker. Dropping the last
+            // Core reference shuts down its Tokio runtime, which cancels the
+            // task if it is waiting asynchronously but waits without a bound
+            // if Core is joining its workflow processing thread in
+            // `spawn_blocking` (#1149). On a shared runtime that happens when
+            // the last holder releases Core. The OCaml teardown timeout, not
+            // this thread, bounds the caller.
             BoundedFinalize::Finalized | BoundedFinalize::Panicked | BoundedFinalize::Detached => {}
         }
     }

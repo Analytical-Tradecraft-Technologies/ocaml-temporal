@@ -507,8 +507,17 @@ and bridge, read the [documentation guide](../README.md) first.
     most the teardown timeout after the release began. If the release has
     not finished, the caller returns a report with teardown `Detached`; the
     shutdown thread still owns and completes the one release, bounded by the
-    bridge's own Core waits below. If no thread can be created, the sequence
-    runs on the caller and only the bridge bounds it.
+    bridge's own Core waits below except for the final drop of Core itself.
+    That drop is not bounded (#1149): when Core's finalizer was detached
+    because its workflow processing thread was still alive, dropping Core's
+    Tokio runtime waits for that thread to exit. For a worker with its own
+    runtime the shutdown thread performs that drop, so the caller's bound
+    still holds. For a worker attached to a shared `Runtime.t`, the graph
+    only drops its reference and the worker detaches; the final drop then
+    happens in `Runtime.shutdown`, which can hang until the thread exits
+    (see [Core bridge](core-bridge.md)). If no thread can be created, the
+    sequence runs on the caller and only the bridge bounds it, with the same
+    exception.
   - The typed outcome distinguishes abandonment from failure. Abandoned
     callbacks and activations, and the `Outstanding_tasks` status for the
     leases they held, are an `Ok` report. A retained completion that could

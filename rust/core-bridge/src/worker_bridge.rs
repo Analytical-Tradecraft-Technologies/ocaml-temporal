@@ -424,8 +424,11 @@ pub enum BoundedFinalize {
     /// Core's finalizer panicked. The worker was released while unwinding.
     Panicked,
     /// The bound elapsed. The finalizer task still owns the worker and
-    /// completes in the background, or is cancelled when the Tokio runtime
-    /// itself shuts down.
+    /// completes in the background. Shutting down the Tokio runtime cancels
+    /// it only while it awaits asynchronously: Core's `finalize_shutdown`
+    /// joins its workflow processing thread in `spawn_blocking`, and a Tokio
+    /// runtime's drop waits for blocking-pool closures without a bound, so
+    /// that drop waits for the thread to exit (#1149).
     Detached,
 }
 
