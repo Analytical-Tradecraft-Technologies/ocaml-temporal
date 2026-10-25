@@ -905,9 +905,16 @@ on a plain OS thread (a cleanup thread, or an OCaml thread with the runtime
 lock released), never on a Tokio worker, where dropping a Tokio runtime
 panics. Field order in `SharedCore` drops Core before closing the log writer,
 so Core's shutdown records are still flushed. A Core worker finalizer that
-was detached after a bounded timeout ends when the last reference is dropped,
-which for a shared runtime is the shared runtime's release rather than the
-graph's.
+was detached after its bounded timeout keeps running in a Tokio task. Dropping
+the last Core reference (for a shared runtime, the shared runtime's release
+rather than the graph's) cancels that task only if it is waiting
+asynchronously. Core's `finalize_shutdown` joins its workflow processing
+thread inside `spawn_blocking`, and dropping a Tokio runtime waits without a
+bound for its blocking-pool closures, so while that thread is alive the drop,
+and the cleanup thread performing it, wait for it to exit (#1149). OCaml stays
+bounded because the worker shutdown thread is not awaited past the teardown
+timeout (`Detached`), but the graph then stays attached and `Runtime.shutdown`
+reports it as still attached until the drop finishes.
 
 The OCaml side adds a stricter, typed ordering rule on top of that memory
 safety. `Sdk_shared_runtime` (private) owns the `Native_bridge.shared_runtime`
