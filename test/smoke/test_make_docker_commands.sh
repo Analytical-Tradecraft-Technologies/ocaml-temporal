@@ -140,4 +140,31 @@ if grep -Fq 'expected OCaml' "$temporary_root/stderr"; then
   exit 1
 fi
 
+# Every Docker-backed image build requires a non-empty trust-store refresh
+# nonce, and the README promises that path needs only Docker and GNU Make on the
+# host (#1216). Parse the Makefile with a python3 (and python) first on PATH
+# that always fails, so a nonce that still depended on Python would come out
+# empty, and require a fresh 32-digit hex nonce on each run. Shadowing keeps
+# the rest of PATH, which make on Windows needs to find sh and its DLLs.
+mkdir "$temporary_root/failing-python"
+for interpreter in python3 python; do
+  printf '#!/bin/sh\nexit 1\n' >"$temporary_root/failing-python/$interpreter"
+  chmod +x "$temporary_root/failing-python/$interpreter"
+done
+read_nonce() {
+  PATH="$temporary_root/failing-python:$PATH" make --no-print-directory \
+    -f "$source_root/Makefile" -p -n -q ca-refresh-nonce-probe 2>/dev/null |
+    sed -n 's/^CA_CERTIFICATES_REFRESH := //p' | head -n 1
+}
+first_nonce=$(read_nonce)
+second_nonce=$(read_nonce)
+if ! printf '%s\n' "$first_nonce" | grep -Eqx '[0-9a-f]{32}'; then
+  echo "CA_CERTIFICATES_REFRESH is not 32 hex digits with python3 failing: '$first_nonce'" >&2
+  exit 1
+fi
+if [ "$first_nonce" = "$second_nonce" ]; then
+  echo 'CA_CERTIFICATES_REFRESH did not change between Make invocations' >&2
+  exit 1
+fi
+
 echo 'Make Docker command output and error propagation: ok'
