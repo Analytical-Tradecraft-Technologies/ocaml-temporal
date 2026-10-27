@@ -6,4 +6,4 @@
 # matching Dependabot docker entry tracks exactly this tag and refreshes only
 # its manifest-index digest (#1027). Never change the tag to another series
 # here; add or remove a directory together with scripts/ci-matrix.py instead.
-FROM ocaml/opam:debian-12-ocaml-5.2@sha256:9a6c4e97c6cd133003f89c99fa74093902d88b385494dfcbcd77d22125e82086
+FROM ocaml/opam:debian-12-ocaml-5.2@sha256:2dc415f163a303dc79fe77b5a64a4fe9303b153ad7ea53af85653337037146b6
