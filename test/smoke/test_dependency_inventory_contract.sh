@@ -133,7 +133,6 @@ fi
 fresh_fixture
 edit temporal-sdk.opam.locked 's/"logs" {= "[^"]*"}/"logs" {= "9.9.9"}/'
 edit temporal-sdk.opam 's/^version: ".*"/version: "9.9.9"/'
-edit scripts/docs-tools.locked 's/^odoc .*/odoc 9.9.9/'
 edit test/integration/sdk_interop/python/requirements.lock 's/^temporalio==[0-9.]*/temporalio==9.9.9/'
 edit test/integration/temporal/compose.yaml 's/postgres:[0-9.]*-bookworm/postgres:99.9-bookworm/'
 edit docker/ocaml-5.3/Dockerfile 's/ocaml-5.3@sha256:[0-9a-f]*/ocaml-5.3@sha256:0000000000000000000000000000000000000000000000000000000000000000/'
@@ -142,7 +141,7 @@ edit rust/Cargo.lock '/^name = "tokio"$/{n;s/^version = ".*"/version = "9.9.9"/;
 edit rust/Cargo.toml 's/^uuid = { version = "[^"]*"/uuid = { version = "9.9.9"/'
 edit .github/workflows/build-pr.yml 's/typos@[0-9.]*/typos@9.9.9/'
 edit Makefile 's/^QUALITY_TYPOS_VERSION ?= .*/QUALITY_TYPOS_VERSION ?= 9.9.9/'
-expect_clean 'OPAM, docs-tool, Python, image, toolchain, Cargo, and quality-tool versions'
+expect_clean 'OPAM, Python, image, toolchain, Cargo, and quality-tool versions'
 
 fresh_fixture
 append rust/Cargo.lock '
@@ -177,6 +176,15 @@ expect_drift 'removed inventory row' 'Locked OCaml closure'
 fresh_fixture
 append scripts/opam-lock-overrides.txt '5.4 dune 9.9.9'
 expect_drift 'new compiler override' 'Per-compiler lock overrides'
+
+# The documentation-tool lock has no licence gate, so its versions still count.
+fresh_fixture
+edit scripts/docs-tools.locked 's/^odoc .*/odoc 9.9.9/'
+expect_drift 'documentation tool version' 'CI-only documentation tooling'
+
+fresh_fixture
+edit scripts/docs-tools.locked 's/^tyxml .*/tyxml 9.9.9/'
+expect_drift 'docs-tool LGPL upgrade without a review' 'CI-only documentation tooling'
 
 fresh_fixture
 append scripts/docs-tools.locked 'logs 0.10.0'

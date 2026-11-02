@@ -33,7 +33,7 @@ nor Docker.
 | [Locked OCaml closure](#locked-ocaml-closure) | Every package in `temporal-sdk.opam.locked`, plus `temporal-sdk` itself |
 | [Per-compiler lock overrides](#per-compiler-lock-overrides) | The compiler series and package of each entry in `scripts/opam-lock-overrides.txt` |
 | [Linking-exception scope](#linking-exception-scope) | `ocaml`, `ocaml-base-compiler`, and `ocamlbuild` in `temporal-sdk.opam.locked`, and `tyxml`, `re`, and `camlp-streams` in `scripts/docs-tools.locked` |
-| [CI-only documentation tooling](#ci-only-documentation-tooling) | Every package in `scripts/docs-tools.locked` |
+| [CI-only documentation tooling](#ci-only-documentation-tooling) | Every package and exact version in `scripts/docs-tools.locked`, which no licence gate audits |
 | [CI-only interoperability tooling](#ci-only-interoperability-tooling) | Every package in `test/integration/sdk_interop/python/requirements.lock` |
 | [Builder image tooling](#builder-image-tooling), [toolchain and CI images](#toolchain-and-ci-images), and [local integration service images](#local-integration-service-images) | The repository of every digest-pinned image reference in `Dockerfile.dev`, `docker/ocaml-*/Dockerfile`, `Dockerfile.rust-ci`, `test/integration/temporal/compose.yaml`, and the GitHub workflows and composite actions |
 | [Locked Cargo closure](#locked-cargo-closure) | The Temporal Core revision in `rust/Cargo.toml` |
@@ -153,29 +153,31 @@ installs any package that the manifest does not list. None of these packages
 is an SDK dependency: they are absent from `temporal-sdk.opam` and its lock,
 are not linked into or redistributed with any SDK artifact, and are not
 needed to build or install the SDK. `make license-check` therefore does not
-audit them; adding or removing a tool-lock package must update this table
-instead, which `make check-dependency-inventory` enforces. The reasoning, and the limit that
+audit them. Because no licence gate reads the tool lock, this table is its
+licence review: unlike the Dependabot-managed sources, it records each exact
+version, and any change to the tool lock, including a version bump, must
+update it, which `make check-dependency-inventory` enforces. The reasoning, and the limit that
 it must not be generalized to SDK dependencies, is recorded in
 [quality and security gates](reference/quality-gates.md#rendered-api-documentation).
 Packages the docs stage reuses from the SDK lock (`dune`, `ocamlfind`,
 `ocamlbuild`, and `topkg`) are listed only in the locked OCaml closure.
 
-| Package | License | Role in the odoc closure |
-|---|---|---|
-| odoc | ISC | Documentation compiler and HTML renderer |
-| odoc-parser | ISC | Doc-comment parser used by odoc |
-| astring | ISC | String utilities used by odoc |
-| cmdliner | ISC | Command-line parsing for odoc |
-| cppo | BSD-3-Clause | Build-time preprocessor |
-| crunch | ISC | Embeds odoc's HTML support files at build time |
-| fmt | ISC | Formatting utilities |
-| fpath | ISC | File-path utilities |
-| ptime | ISC | Time values used by crunch |
-| uutf | ISC | UTF-8 handling used by tyxml |
-| seq | compiler virtual package | No independent source; part of OCaml distribution |
-| tyxml | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | HTML generation (see [linking-exception scope](#linking-exception-scope)) |
-| re | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | Regular expressions used by tyxml (see [linking-exception scope](#linking-exception-scope)) |
-| camlp-streams | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | Stream compatibility library used by odoc-parser (see [linking-exception scope](#linking-exception-scope)) |
+| Package | Exact version | License | Role in the odoc closure |
+|---|---:|---|---|
+| odoc | 3.2.1 | ISC | Documentation compiler and HTML renderer |
+| odoc-parser | 3.2.1 | ISC | Doc-comment parser used by odoc |
+| astring | 0.8.5 | ISC | String utilities used by odoc |
+| cmdliner | 2.1.1 | ISC | Command-line parsing for odoc |
+| cppo | 1.8.0 | BSD-3-Clause | Build-time preprocessor |
+| crunch | 4.0.0 | ISC | Embeds odoc's HTML support files at build time |
+| fmt | 0.11.0 | ISC | Formatting utilities |
+| fpath | 0.7.3 | ISC | File-path utilities |
+| ptime | 1.2.0 | ISC | Time values used by crunch |
+| uutf | 1.0.4 | ISC | UTF-8 handling used by tyxml |
+| seq | base | compiler virtual package | No independent source; part of OCaml distribution |
+| tyxml | 4.6.0 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | HTML generation (see [linking-exception scope](#linking-exception-scope)) |
+| re | 1.14.0 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | Regular expressions used by tyxml (see [linking-exception scope](#linking-exception-scope)) |
+| camlp-streams | 5.0.1 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | Stream compatibility library used by odoc-parser (see [linking-exception scope](#linking-exception-scope)) |
 
 ## CI-only interoperability tooling
 

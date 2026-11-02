@@ -9,9 +9,9 @@ set -eu
 #
 # Only dependency names (and the bridge's dependency kinds) are compared.
 # Versions, refs, tags, and digests live solely in the pinning files, so a
-# version-only bump such as a Dependabot PR needs no inventory edit; the one
-# exception is the Temporal Core revision, whose upgrade needs recorded
-# evidence. Licence columns are reviewed from package metadata when a row is
+# version-only bump such as a Dependabot PR needs no inventory edit. The
+# exceptions are the Temporal Core revision, whose upgrade needs recorded
+# evidence, and the documentation-tool lock, which no licence gate audits. Licence columns are reviewed from package metadata when a row is
 # added, and every locked version stays enforced by the OPAM, Cargo, and
 # Python licence gates. Only POSIX tools are used, so the check needs no OPAM,
 # Cargo, or Docker and runs in milliseconds.
@@ -117,10 +117,14 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$root/scripts/opam-lock-overrides.txt" 
 doc_table '#### Per-compiler lock overrides' | columns 1,2 > "$scratch/documented"
 compare 'Per-compiler lock overrides'
 
+# Documentation tools keep their exact versions: no licence gate reads
+# scripts/docs-tools.locked, so this table is the only licence review of that
+# closure and must change with every tool-lock edit. Dependabot does not manage
+# the file.
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$root/scripts/docs-tools.locked" \
-  | awk '{ print $1 }' > "$scratch/expected"
-cp "$scratch/expected" "$scratch/docs-tools"
-doc_table '## CI-only documentation tooling' | columns 1 > "$scratch/documented"
+  | awk '{ print $1 "\t" $2 }' > "$scratch/expected"
+cut -f1 "$scratch/expected" > "$scratch/docs-tools"
+doc_table '## CI-only documentation tooling' | columns 1,2 > "$scratch/documented"
 compare 'CI-only documentation tooling'
 
 # CI-only official Temporal Python SDK closure for the interoperability
