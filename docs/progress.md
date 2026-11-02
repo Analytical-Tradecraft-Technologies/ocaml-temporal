@@ -6794,3 +6794,20 @@ run's slot. A `hold` update accepted by the worker but released
 only by a later signal makes a 1 s `Client.wait_update ?timeout` expire with
 the same error, and later bounded waits on the same update handle return its
 result. It passed locally against the pinned Compose stack.
+
+## 2026-11-02: Dependency inventory tracks names, not versions
+
+Every Dependabot PR for a GitHub Action, image digest, or direct Cargo crate
+failed the standalone license job, because `docs/dependencies.md` repeated each
+version, ref, tag, and digest and `scripts/check-dependency-inventory.sh`
+required them to match. The inventory now records which dependencies the
+project uses and under which licence; versions live only in the pinning files.
+The checker compares dependency names (and the bridge's dependency kinds), so
+an added or removed dependency still needs a reviewed row, while a
+version-only bump needs no edit. The Temporal Core revision stays recorded,
+because a Core upgrade needs its own licence, ABI, replay, and compatibility
+evidence, and so do the exact documentation-tool versions, because no licence
+gate reads `scripts/docs-tools.locked`. Licences of every locked version remain enforced by the OPAM, Cargo,
+and Python licence gates. `make test-dependency-inventory-contract` now
+requires version bumps, a new transitive Cargo package, and an action pin
+move to pass unchanged, and keeps the added and removed dependency cases.
