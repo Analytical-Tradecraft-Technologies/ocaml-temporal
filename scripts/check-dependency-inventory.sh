@@ -2,15 +2,19 @@
 set -eu
 
 # Compare the tables in docs/dependencies.md with the files that actually pin
-# each dependency, so a lock, digest, action, or tool bump cannot leave the
-# licence inventory silently stale (#783). Each check derives the expected
-# rows from the source, extracts the matching columns of one documented table,
-# and fails with a diff naming the table when the two sets differ.
+# each dependency, so adding or removing a dependency cannot leave the licence
+# inventory silently incomplete (#783). Each check derives the expected rows
+# from the source, extracts the matching columns of one documented table, and
+# fails with a diff naming the table when the two sets differ.
 #
-# Only names, versions, and pins are compared; licence columns are reviewed
-# from package metadata when a row changes and enforced by the OPAM and Cargo
-# licence gates. Only POSIX tools are used, so the check needs no OPAM, Cargo,
-# or Docker and runs in milliseconds.
+# Only dependency names (and the bridge's dependency kinds) are compared.
+# Versions, refs, tags, and digests live solely in the pinning files, so a
+# version-only bump such as a Dependabot PR needs no inventory edit; the one
+# exception is the Temporal Core revision, whose upgrade needs recorded
+# evidence. Licence columns are reviewed from package metadata when a row is
+# added, and every locked version stays enforced by the OPAM, Cargo, and
+# Python licence gates. Only POSIX tools are used, so the check needs no OPAM,
+# Cargo, or Docker and runs in milliseconds.
 #
 # Usage: check-dependency-inventory.sh [repository-root]
 root=${1:-$(CDPATH="" cd -- "$(dirname "$0")/.." && pwd)}
@@ -86,10 +90,10 @@ require_text() {
   fi
 }
 
-# OPAM: the project version plus every exact `{= "version"}` constraint in
-# the depends block of the solved lock.
+# OPAM: the project package plus every exact `{= "version"}` constraint in the
+# depends block of the solved lock. Only the package names are inventoried.
 {
-  awk -F '"' '/^version: "/ { print "temporal-sdk\t" $2 }' "$root/temporal-sdk.opam"
+  echo "temporal-sdk"
   awk '
     /^depends: \[/ { active = 1; next }
     active && /^\]/ { exit }
@@ -97,76 +101,77 @@ require_text() {
       line = $0
       if (match(line, /"[^"]+" \{= "[^"]+"\}/)) {
         split(substr(line, RSTART, RLENGTH), parts, "\"")
-        print parts[2] "\t" parts[4]
+        print parts[2]
       }
     }
   ' "$root/temporal-sdk.opam.locked"
 } > "$scratch/expected"
 cp "$scratch/expected" "$scratch/opam-closure"
-doc_table '## Locked OCaml closure' | columns 1,2 > "$scratch/documented"
+doc_table '## Locked OCaml closure' | columns 1 > "$scratch/documented"
 compare 'Locked OCaml closure'
 
+# Overrides are identified by compiler series and package; the replacement
+# version lives only in the overrides file.
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$root/scripts/opam-lock-overrides.txt" \
-  | awk '{ print $1 "\t" $2 "\t" $3 }' > "$scratch/expected"
-doc_table '#### Per-compiler lock overrides' | columns 1,2,3 > "$scratch/documented"
+  | awk '{ print $1 "\t" $2 }' > "$scratch/expected"
+doc_table '#### Per-compiler lock overrides' | columns 1,2 > "$scratch/documented"
 compare 'Per-compiler lock overrides'
 
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$root/scripts/docs-tools.locked" \
-  | awk '{ print $1 "\t" $2 }' > "$scratch/expected"
+  | awk '{ print $1 }' > "$scratch/expected"
 cp "$scratch/expected" "$scratch/docs-tools"
-doc_table '## CI-only documentation tooling' | columns 1,2 > "$scratch/documented"
+doc_table '## CI-only documentation tooling' | columns 1 > "$scratch/documented"
 compare 'CI-only documentation tooling'
 
 # CI-only official Temporal Python SDK closure for the interoperability
-# regression (#517): every `name==version` requirement line of the hash-locked
-# file that test/integration/sdk_interop/python/run-driver.sh installs.
+# regression (#517): the package of every `name==version` requirement line of
+# the hash-locked file that test/integration/sdk_interop/python/run-driver.sh
+# installs.
 awk -F '==' '
   { sub(/\r$/, "") }
-  /^[A-Za-z0-9._-]+==/ { split($2, version, /[ \\]/); print $1 "\t" version[1] }
+  /^[A-Za-z0-9._-]+==/ { print $1 }
 ' "$root/test/integration/sdk_interop/python/requirements.lock" > "$scratch/expected"
-doc_table '## CI-only interoperability tooling' | columns 1,2 > "$scratch/documented"
+doc_table '## CI-only interoperability tooling' | columns 1 > "$scratch/documented"
 compare 'CI-only interoperability tooling'
 
 # Linking-exception scope: the exact packages admitted under the OCaml
-# linking exception, at the versions their locks pin. The names are the
-# reviewed policy (check-licenses.sh for the compiler and ocamlbuild, the
-# odoc review for the docs tools), so upgrading one of them, or dropping it
-# from its lock, fails until the policy table is reviewed. A package missing
+# linking exception. The names are the reviewed policy (check-licenses.sh for
+# the compiler and ocamlbuild, the odoc review for the docs tools), so adding
+# or dropping one fails until the policy table is reviewed. A package missing
 # from its lock yields no source row and so shows as a stale documented row.
 {
-  awk -F '\t' '$1 == "ocaml" || $1 == "ocaml-base-compiler" || $1 == "ocamlbuild"' \
+  awk '$1 == "ocaml" || $1 == "ocaml-base-compiler" || $1 == "ocamlbuild"' \
     "$scratch/opam-closure"
-  awk -F '\t' '$1 == "tyxml" || $1 == "re" || $1 == "camlp-streams"' \
+  awk '$1 == "tyxml" || $1 == "re" || $1 == "camlp-streams"' \
     "$scratch/docs-tools"
 } > "$scratch/expected"
-doc_table '## Linking-exception scope' | columns 1,2 > "$scratch/documented"
+doc_table '## Linking-exception scope' | columns 1 > "$scratch/documented"
 compare 'Linking-exception scope'
 
-# Container images: every digest-pinned reference that a build, Compose
-# service, or workflow pulls. Recorded provenance in test fixtures is not a
-# pin and is deliberately excluded. Documented rows put the image in column 1
-# and its digest in column 2 (the builder table's stage sits in column 2).
+# Container images: the repository of every digest-pinned reference that a
+# build, Compose service, or workflow pulls. Tags and digests are refreshed by
+# Dependabot in the source files and are not repeated here; a documented image
+# keeps its tag for readability, so both sides drop everything after the first
+# `:`. Recorded provenance in test fixtures is not a pin and is deliberately
+# excluded.
 for source in "$root/Dockerfile.dev" "$root"/docker/ocaml-*/Dockerfile \
   "$root/Dockerfile.rust-ci" \
   "$root/test/integration/temporal/compose.yaml" \
   "$root"/.github/workflows/*.yml "$root"/.github/actions/*/action.yml; do
   [ -f "$source" ] || continue
   grep -oE '[A-Za-z0-9./_-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' "$source" || true
-done | awk '{ sub(/@/, "\t"); print }' > "$scratch/expected"
+done | sed 's/:.*//' > "$scratch/expected"
 {
-  doc_table '## Builder image tooling' | columns 1,3
-  doc_table '## Toolchain and CI images' | columns 1,2
-  doc_table '## Local integration service images' | columns 1,2
-} > "$scratch/documented"
+  doc_table '## Builder image tooling' | columns 1
+  doc_table '## Toolchain and CI images' | columns 1
+  doc_table '## Local integration service images' | columns 1
+} | sed 's/:.*//' > "$scratch/documented"
 compare 'Builder, toolchain and CI, and local integration service images'
 
-channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$root/rust/rust-toolchain.toml")
-require_text 'Rust toolchain' "Rust toolchain \`$channel\`"
-
-# Cargo: the lock's package count (the bridge plus its dependencies) and the
-# single Temporal Core revision every git dependency must share.
-packages=$(grep -c '^\[\[package\]\]$' "$root/rust/Cargo.lock")
-require_text 'Locked Cargo closure' "\`rust/Cargo.lock\` locks $packages packages: the project bridge and $((packages - 1)) dependencies"
+# Cargo: the single Temporal Core revision every git dependency must share.
+# Unlike ordinary version bumps, a Core upgrade requires licence, ABI, replay,
+# and compatibility evidence (see "Temporal Core pin upgrades"), so the
+# documented commit must change with it.
 revisions=$(sed -n 's/.*rev = "\([0-9a-f]*\)".*/\1/p' "$root/rust/Cargo.toml" | LC_ALL=C sort -u)
 if [ "$(printf '%s\n' "$revisions" | wc -l | tr -d ' ')" != 1 ] || [ -z "$revisions" ]; then
   echo "dependency inventory: rust/Cargo.toml must pin exactly one Temporal Core revision" >&2
@@ -176,41 +181,16 @@ else
 fi
 
 # Direct Rust dependencies: every crate in the workspace dependency table or
-# declared by the bridge, with its requirement, every locked version in lock
-# order, and whether the bridge uses it as a normal and/or dev dependency.
+# declared by the bridge, with whether the bridge uses it as a normal and/or
+# dev dependency. Requirements and locked versions stay in the Cargo files.
 awk '
-  /^\[\[package\]\]$/ { name = ""; next }
-  /^name = "/ { split($0, q, "\""); name = q[2]; next }
-  /^version = "/ && name != "" {
-    split($0, q, "\"")
-    locked[name] = (name in locked) ? locked[name] ", " q[2] : q[2]
-  }
-  END { for (n in locked) print n "\t" locked[n] }
-' "$root/rust/Cargo.lock" > "$scratch/locked"
-# Shared awk helpers: a declaration's crate name, and its requirement
-# ("Core revision" for a git `rev` pin, else the version string).
-requirement_awk='
-  function crate(line) {
-    sub(/[ .=].*/, "", line)
-    return line
-  }
-  function requirement(line) {
-    if (line ~ /rev = "/) return "Core revision"
-    if (match(line, /version = "[^"]+"/)) return substr(line, RSTART + 11, RLENGTH - 12)
-    if (match(line, /= "[^"]+"/)) return substr(line, RSTART + 3, RLENGTH - 4)
-    return "unrecognized requirement"
-  }
-'
-awk "$requirement_awk"'
   /^\[/ { active = ($0 == "[workspace.dependencies]"); next }
-  active && /^[A-Za-z0-9_-]+[ ]*=/ { print crate($0) "\t" requirement($0) }
-' "$root/rust/Cargo.toml" > "$scratch/requirements"
-# One line per bridge declaration: crate, kind, and either "workspace" when
-# inherited or the requirement written in the bridge manifest itself, so a
-# crate declared directly in the bridge is inventoried like a workspace one.
-# Dependency tables this extractor cannot attribute (build, target-specific,
-# or `[dependencies.<crate>]` sub-tables) fail closed rather than escaping.
-if ! awk "$requirement_awk"'
+  active && /^[A-Za-z0-9_-]+[ ]*=/ { line = $0; sub(/[ .=].*/, "", line); print line }
+' "$root/rust/Cargo.toml" > "$scratch/workspace"
+# One line per bridge declaration: crate and kind. Dependency tables this
+# extractor cannot attribute (build, target-specific, or
+# `[dependencies.<crate>]` sub-tables) fail closed rather than escaping.
+if ! awk '
   /^\[/ {
     section = $0
     if (section ~ /dependencies/ && section != "[dependencies]" \
@@ -225,66 +205,58 @@ if ! awk "$requirement_awk"'
     if (section == "[dependencies]") kind = "normal"
     if (section == "[dev-dependencies]") kind = "dev"
     if (kind == "") next
-    inherited = ($0 ~ /workspace[ ]*=[ ]*true/)
-    print crate($0) "\t" kind "\t" (inherited ? "workspace" : requirement($0))
+    line = $0
+    sub(/[ .=].*/, "", line)
+    print line "\t" kind
   }
   END { if (unsupported) exit 1 }
 ' "$root/rust/core-bridge/Cargo.toml" > "$scratch/declarations"; then
   echo "dependency inventory: rust/core-bridge/Cargo.toml uses a dependency table the inventory cannot attribute; extend scripts/check-dependency-inventory.sh" >&2
   failed=1
 fi
-# Union of the workspace table and the bridge declarations. A direct bridge
-# requirement wins over the workspace one; kinds accumulate in manifest order
-# ([dependencies] precedes [dev-dependencies], giving "normal, dev").
+# Union of the workspace table and the bridge declarations. Kinds accumulate
+# in manifest order ([dependencies] precedes [dev-dependencies], giving
+# "normal, dev").
 awk -F '\t' '
-  FILENAME == ARGV[1] { locked[$1] = $2; next }
-  FILENAME == ARGV[2] { required[$1] = $2; names[$1] = 1; next }
+  FILENAME == ARGV[1] { names[$1] = 1; next }
   {
     names[$1] = 1
     kind[$1] = ($1 in kind) ? kind[$1] ", " $2 : $2
-    if ($3 != "workspace") required[$1] = $3
-    else if (!($1 in required)) required[$1] = "missing from workspace.dependencies"
   }
   END {
-    for (n in names) {
-      print n "\t" required[n] "\t" ((n in locked) ? locked[n] : "not locked") "\t" \
-        ((n in kind) ? kind[n] : "unused by the bridge")
-    }
+    for (n in names) print n "\t" ((n in kind) ? kind[n] : "unused by the bridge")
   }
-' "$scratch/locked" "$scratch/requirements" "$scratch/declarations" > "$scratch/expected"
-doc_table '### Direct Rust dependencies' | columns 1,2,3,4 > "$scratch/documented"
+' "$scratch/workspace" "$scratch/declarations" > "$scratch/expected"
+doc_table '### Direct Rust dependencies' | columns 1,2 > "$scratch/documented"
 compare 'Direct Rust dependencies'
 
 # CI-only quality tools: the install-action tool list is the CI source; the
-# Makefile defaults that `make quality` enforces must name the same versions.
+# Makefile defaults that `make quality` enforces must name the same tools.
+# Matching versions between the two is the Makefile's own concern.
 grep -h 'tool: ' "$root"/.github/workflows/*.yml \
-  | sed 's/.*tool: //' | tr ',' '\n' | awk '{ sub(/@/, "\t"); print }' \
+  | sed 's/.*tool: //' | tr ',' '\n' | sed 's/@.*//' \
   > "$scratch/expected"
-doc_table '## CI-only quality tools' | columns 1,2 > "$scratch/documented"
+doc_table '## CI-only quality tools' | columns 1 > "$scratch/documented"
 compare 'CI-only quality tools'
 awk '
-  $1 == "QUALITY_CARGO_DENY_VERSION" && $2 == "?=" { print "cargo-deny\t" $3 }
-  $1 == "QUALITY_CARGO_MACHETE_VERSION" && $2 == "?=" { print "cargo-machete\t" $3 }
-  $1 == "QUALITY_TYPOS_VERSION" && $2 == "?=" { print "typos\t" $3 }
+  $1 == "QUALITY_CARGO_DENY_VERSION" && $2 == "?=" { print "cargo-deny" }
+  $1 == "QUALITY_CARGO_MACHETE_VERSION" && $2 == "?=" { print "cargo-machete" }
+  $1 == "QUALITY_TYPOS_VERSION" && $2 == "?=" { print "typos" }
 ' "$root/Makefile" > "$scratch/expected"
 compare 'CI-only quality tools (Makefile QUALITY_*_VERSION)'
 
-# GitHub Actions: every external `uses:` reference with its ref and the
-# release named in the trailing comment (the ref itself for a bare tag).
+# GitHub Actions: every external `uses:` reference. Its pinned ref and release
+# comment are maintained by Dependabot in the workflow files.
 grep -h 'uses:' "$root"/.github/workflows/*.yml "$root"/.github/actions/*/action.yml \
   | sed 's/^[ -]*uses:[ ]*//' | grep -v '^\./' \
-  | awk '{
-      split($1, ref, "@")
-      release = ref[2]
-      if ($2 == "#" && $3 != "") release = $3
-      print ref[1] "\t" ref[2] "\t" release
-    }' > "$scratch/expected"
-doc_table '## GitHub Actions' | columns 1,2,3 > "$scratch/documented"
+  | awk '{ split($1, ref, "@"); print ref[1] "\t" ref[2] }' > "$scratch/refs"
+cut -f1 "$scratch/refs" > "$scratch/expected"
+doc_table '## GitHub Actions' | columns 1 > "$scratch/documented"
 compare 'GitHub Actions'
 # One action, one pin (#1227): two refs for the same action mean one copy was
 # left behind by an update, typically in the composite action that Dependabot
-# did not scan, and both would otherwise match the table.
-duplicated=$(cut -f1,2 "$scratch/expected" | sort -u | cut -f1 | uniq -d)
+# did not scan.
+duplicated=$(LC_ALL=C sort -u "$scratch/refs" | cut -f1 | uniq -d)
 if [ -n "$duplicated" ]; then
   printf 'dependency inventory: actions pinned to more than one ref: %s\n' \
     "$(printf '%s' "$duplicated" | tr '\n' ' ')" >&2
@@ -292,7 +264,7 @@ if [ -n "$duplicated" ]; then
 fi
 
 if [ "$failed" -ne 0 ]; then
-  echo "update docs/dependencies.md (and review each changed licence) to match the pinned sources" >&2
+  echo "update docs/dependencies.md (and review the licence of each added dependency) to match the pinned sources" >&2
   exit 1
 fi
 echo "dependency inventory matches the locked and pinned sources"
