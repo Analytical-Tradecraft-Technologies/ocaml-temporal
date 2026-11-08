@@ -174,6 +174,25 @@ The adaptations keep the previous behaviour:
   unset by default. Expiry is reported as the usual `STATUS_CONNECTION` with
   `cause=timeout`, so OCaml still sees a typed `Bridge` error. Workers reuse
   this one runtime connection and have no separate connect path.
+- Name resolution is a separate first phase of that bound (#833). Core's
+  default DNS load balancing resolves the target with `getaddrinfo` inside
+  `Connection::connect`, so a resolver that did not answer expired the bound
+  and read as `cause=timeout`, although no endpoint had been contacted. On
+  GitHub's macOS ARM64 runners the `.invalid` lookup in
+  `unresolvable_host_reports_dns_cause` normally fails in about 30 ms, but in
+  one run it went unanswered for about 30 s, so the test failed with
+  `cause=timeout`. The macOS resolver evidently does not reject `.invalid`
+  locally, and one unanswered query held the lookup until the resolver gave
+  up. The bridge now runs `tokio::net::lookup_host` itself (on Core's blocking
+  pool, which keeps SIGPIPE blocked) against the same deadline that then
+  bounds `Connection::connect`, so the total stays 10 s.
+  `diagnostics::bounded_name_resolution` reports a resolver error, an empty
+  answer, or a lookup still pending at the deadline as `cause=dns`. The
+  addresses are discarded and Core resolves the name again, so DNS load
+  balancing, the TLS server name, and re-resolution are unchanged. A lookup
+  abandoned at the deadline still occupies its blocking thread until the OS
+  resolver returns, and runtime close waits for it, as it already waited for
+  an outstanding Core lookup.
 
 Core 1.x enforces namespace payload limits in the worker by default: an
 oversized activity result or heartbeat becomes a `PayloadsTooLarge` activity

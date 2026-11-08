@@ -8,6 +8,8 @@
 //!   closed [`ConnectionCause`] plus a bounded, sanitized chain of *local*
 //!   transport error text (DNS, TCP, TLS). Server-provided gRPC status
 //!   messages are never copied; only the status code name is.
+//!   [`bounded_name_resolution`] reports the bridge's own name lookup, which
+//!   runs before Core's connect, with the same cause and detail rules.
 //! * [`core_logger`] routes Core's `tracing` records to process stderr. Core
 //!   invokes the consumer ([`CoreLogQueue`]) synchronously on whichever Tokio
 //!   or caller thread emitted the record, so it never touches OCaml or
@@ -21,7 +23,9 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::future::Future;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
@@ -560,6 +564,59 @@ fn connection_failure(
             .or_else(|| classify_chain(error))
             .unwrap_or(ConnectionCause::Other),
         detail: detail.finish(),
+    }
+}
+
+/// Fixed detail reported when a name lookup succeeds but yields no address.
+pub const NAME_RESOLUTION_EMPTY_DETAIL: &str = "name resolution returned no addresses";
+
+/// Awaits the bridge's own name lookup for a client connect until `deadline`,
+/// and reduces a lookup that fails, yields no address, or has not finished by
+/// `deadline` to a `cause=dns` connection-failure message.
+///
+/// Core resolves the target inside `Connection::connect`. When that lookup
+/// outlasted the bridge's handshake bound, the failure was indistinguishable
+/// from a silent server and reported as `cause=timeout`, although no endpoint
+/// had been contacted. Running the lookup first, against the same `deadline`
+/// the handshake uses, attributes every resolver failure to DNS (#833).
+///
+/// `timeout_detail` is the fixed text reported when `deadline` passes first;
+/// the caller supplies it because the caller owns the bound. A resolver error
+/// contributes its bounded local error chain, as Core's own DNS failure does.
+/// The resolved addresses are discarded. Dropping an unfinished lookup does
+/// not stop an OS resolver call already running on a blocking thread; that
+/// call returns on the resolver's own schedule.
+pub async fn bounded_name_resolution<A>(
+    lookup: impl Future<Output = std::io::Result<A>>,
+    deadline: tokio::time::Instant,
+    timeout_detail: &str,
+) -> Result<(), String>
+where
+    A: Iterator<Item = SocketAddr>,
+{
+    match tokio::time::timeout_at(deadline, lookup).await {
+        Err(_elapsed) => Err(connection_failure_message(
+            ConnectionCause::Dns,
+            timeout_detail,
+        )),
+        Ok(Err(error)) => {
+            let mut detail = BoundedText::new(MAX_CONNECTION_DETAIL_BYTES);
+            push_error_chain(&mut detail, &error);
+            Err(connection_failure_message(
+                ConnectionCause::Dns,
+                &detail.finish(),
+            ))
+        }
+        Ok(Ok(mut addresses)) => {
+            if addresses.next().is_some() {
+                Ok(())
+            } else {
+                Err(connection_failure_message(
+                    ConnectionCause::Dns,
+                    NAME_RESOLUTION_EMPTY_DETAIL,
+                ))
+            }
+        }
     }
 }
 
