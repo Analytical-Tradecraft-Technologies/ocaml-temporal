@@ -1,8 +1,20 @@
 # Match Dockerfile.dev's Rust toolchain and Debian 12 C-library baseline.
 # Native amd64/arm64 runners build this image without cross compilation.
 FROM rust:1.99-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29
-RUN rustup component add clippy rustfmt \
-    && apt-get update \
+# rust/rust-toolchain.toml is the single Rust version pin, so this base image
+# only supplies rustup and Debian 12. Installing the pinned channel (a no-op
+# when the base already ships it) and removing any other toolchain means a
+# Rust bump needs no image bump, and the image's rustc is always the one
+# test/smoke/test_rust_toolchain.sh expects.
+COPY rust/rust-toolchain.toml scripts/rust-version.sh /tmp/rust-version/
+RUN rust_version="$(sh /tmp/rust-version/rust-version.sh /tmp/rust-version/rust-toolchain.toml)" \
+    && rustup toolchain install "$rust_version" --profile minimal --component clippy --component rustfmt \
+    && rustup default "$rust_version" \
+    && for toolchain in $(rustup toolchain list | awk '{ print $1 }'); do \
+        case "$toolchain" in "$rust_version"-*) ;; *) rustup toolchain uninstall "$toolchain" ;; esac; \
+    done \
+    && rm -rf /tmp/rust-version
+RUN apt-get update \
     && apt-get install -y --no-install-recommends libprotobuf-dev protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 ENV CARGO_HOME=/workspace/_build/cargo-home \

@@ -12,7 +12,19 @@ ARG RUST_IMAGE=rust:1.99-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b896
 ARG OCAML_IMAGE
 
 FROM ${RUST_IMAGE} AS rust-toolchain
-RUN rustup component add clippy rustfmt
+# rust/rust-toolchain.toml is the single Rust version pin, so this base image
+# only supplies rustup and Debian 12. Installing the pinned channel (a no-op
+# when the base already ships it) and removing any other toolchain means a
+# Rust bump needs no image bump, and the image's rustc is always the one
+# test/smoke/test_rust_toolchain.sh expects.
+COPY rust/rust-toolchain.toml scripts/rust-version.sh /tmp/rust-version/
+RUN rust_version="$(sh /tmp/rust-version/rust-version.sh /tmp/rust-version/rust-toolchain.toml)" \
+    && rustup toolchain install "$rust_version" --profile minimal --component clippy --component rustfmt \
+    && rustup default "$rust_version" \
+    && for toolchain in $(rustup toolchain list | awk '{ print $1 }'); do \
+        case "$toolchain" in "$rust_version"-*) ;; *) rustup toolchain uninstall "$toolchain" ;; esac; \
+    done \
+    && rm -rf /tmp/rust-version
 
 FROM ${OCAML_IMAGE} AS dev-base
 

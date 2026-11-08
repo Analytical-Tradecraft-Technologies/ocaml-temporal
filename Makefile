@@ -194,7 +194,8 @@ ifeq ($(strip $(NATIVE_CARGO_TARGET_DIR)),)
 NATIVE_CARGO_TARGET_DIR := $(CURDIR)/_build/rust
 endif
 NATIVE_OCAML_VERSION ?= 5.5
-NATIVE_RUST_VERSION ?= 1.99.1
+# rust/rust-toolchain.toml is the single Rust version pin (scripts/rust-version.sh).
+NATIVE_RUST_VERSION ?= $(shell sh scripts/rust-version.sh)
 NATIVE_ARCH ?=
 NATIVE_RUST_HOST ?=
 NATIVE_ENV := CARGO_TARGET_DIR="$(NATIVE_CARGO_TARGET_DIR)"
