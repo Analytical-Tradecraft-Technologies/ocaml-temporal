@@ -6827,7 +6827,7 @@ links the 44 live smoke executables beside the `verify` matrix instead of after
 lane (#1300). The live controllers run as three parallel shards selected by
 `TEMPORAL_LIVE_CI_SHARD`, with every `test-temporal-live-ci` line tagged by
 `$(call live_ci_shard,...)`; `temporal-integration-result` keeps the required
-check name and passes only when every shard did. The expected critical path is
-about 40-45 minutes. `make test-temporal-config` checks that the matrix equals
+check name and passes only when every shard did. A PR run with all three
+changes reached the required check in 41 minutes. `make test-temporal-config` checks that the matrix equals
 `LIVE_CI_SHARDS`, that every recipe line is tagged, and that the shards
 together run each line exactly once. See [quality gates](reference/quality-gates.md#merge-queue-time-budget).

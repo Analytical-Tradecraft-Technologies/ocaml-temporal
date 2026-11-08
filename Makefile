@@ -730,8 +730,9 @@ temporal-clean:
 # runner and Compose stack, instead of one sequence of about 28 minutes.
 # Every line is tagged with the shard that runs it. TEMPORAL_LIVE_CI_SHARD
 # selects one shard; left empty, every line runs in order (the local
-# default). Shards are balanced by measured duration, about 9 minutes each in
-# November 2026, not by subject. The temporal-integration matrix in
+# default). Shards are balanced by measured duration, not by subject: each
+# takes 12-14 minutes including artifact download and the first controller's
+# dev-image build (November 2026). The temporal-integration matrix in
 # .github/workflows/build-pr.yml must list exactly LIVE_CI_SHARDS, and
 # test/smoke/test_temporal_compose_config.sh checks that and that every line
 # here is tagged.
@@ -752,7 +753,7 @@ test-temporal-live-ci:
 	$(call live_ci_shard,recovery) bash test/integration/temporal/scripts/run-with-live-diagnostics.sh cache-eviction $(MAKE) test-temporal-worker-cache-eviction
 	$(call live_ci_shard,replay) bash test/integration/temporal/scripts/run-with-live-diagnostics.sh patching $(MAKE) test-temporal-workflow-patching
 	$(call live_ci_shard,replay) bash test/integration/temporal/scripts/run-with-live-diagnostics.sh parent-child-restart $(MAKE) test-temporal-parent-child-restart
-	$(call live_ci_shard,replay) bash test/integration/temporal/scripts/run-with-live-diagnostics.sh child-failure-replay $(MAKE) test-temporal-parent-child-failure-replay
+	$(call live_ci_shard,recovery) bash test/integration/temporal/scripts/run-with-live-diagnostics.sh child-failure-replay $(MAKE) test-temporal-parent-child-failure-replay
 	$(call live_ci_shard,baseline) $(MAKE) test-temporal-examples-live
 
 test-temporal-diagnostics-contract:

@@ -217,7 +217,7 @@ smoke executables) and a single live job running every controller in sequence.
 Three changes shortened it without paid runners: the hosted-runner disk cleanup
 runs only when space is short (about 7-9 minutes), the smoke executables build
 beside `verify` (about 10 minutes), and the live controllers run as three
-shards of about 9 minutes each instead of one sequence of about 28 (about 15
+shards of 12-14 minutes each, setup included, instead of one sequence of about 28 (about 15
 minutes). Keep new live controllers balanced across `LIVE_CI_SHARDS` by
 measured duration, and prefer a new shard over a longer one; each shard costs
 about 5 minutes of runner time for its artifact download and setup.

@@ -160,8 +160,8 @@ jobs:
     # and Compose stack: `make test-temporal-live-ci` reads
     # TEMPORAL_LIVE_CI_SHARD and runs only the recipe lines tagged with it,
     # and the start-metadata and task-failure steps below run in one shard
-    # each. Shards are balanced by measured duration (about 9 minutes each in
-    # November 2026), and this list must equal LIVE_CI_SHARDS in the Makefile
+    # each. Shards are balanced by measured duration (12-14 minutes each with
+    # setup in November 2026), and this list must equal LIVE_CI_SHARDS in the Makefile
     # (test/smoke/test_temporal_compose_config.sh checks both). The required
     # check is temporal-integration-result below.
     strategy:
@@ -268,7 +268,7 @@ jobs:
           retention-days: 14
 
       - name: Run this shard's live Temporal Compose controllers
-        # A shard normally takes about 9 minutes; the bound leaves room for a
+        # This step normally takes 5-12 minutes; the bound leaves room for a
         # controller to reach its own internal timeout (15 minutes for the
         # parent/child driver) and still report. The job timeout reserves
         # time for the always() uploads below after this step times out.
