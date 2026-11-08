@@ -56,6 +56,10 @@ class MatrixTests(unittest.TestCase):
             MATRIX.matrices("unknown")
 
 
+# The archive is zstd-compressed. GitHub-hosted Ubuntu runners (the quality
+# job) always have the command; a local run without it skips rather than
+# fails, but CI never skips.
+@unittest.skipUnless(shutil.which("zstd") or os.environ.get("CI"), "the zstd command is not installed")
 class SmokeTests(unittest.TestCase):
     """Exercise byte integrity, provenance, and extraction safety without Docker."""
 
@@ -80,6 +84,16 @@ class SmokeTests(unittest.TestCase):
         SMOKE.unpack(self.root, self.artifact, COMMIT, VERSION)
         self.assertEqual(self.binary.read_bytes(), self.content)
         self.assertTrue(os.access(self.binary, os.X_OK))
+        self.assertFalse((self.root / "_build/.smoke-unpack").exists())
+
+    def test_archive_is_zstd_with_a_streamed_digest(self):
+        """The manifest names the zstd format and digests the archive file."""
+        archive = self.artifact / SMOKE.ARCHIVE
+        self.assertEqual(archive.read_bytes()[:4], b"\x28\xb5\x2f\xfd")
+        manifest = json.loads((self.artifact / "manifest.json").read_text())
+        self.assertEqual(manifest["schema"], 2)
+        self.assertEqual(manifest["archive_sha256"], SMOKE.digest(archive.read_bytes()))
+        self.assertEqual(SMOKE.file_digest(archive), SMOKE.digest(archive.read_bytes()))
 
     def test_checkout_below_symlinked_ancestor(self):
         """A checkout reached through a symlinked ancestor still unpacks (#826).
@@ -113,17 +127,30 @@ class SmokeTests(unittest.TestCase):
 
     def test_corrupt_archive(self):
         """A transport digest mismatch is fatal, not an Actions warning."""
-        with (self.artifact / "executables.tar.gz").open("ab") as stream:
+        with (self.artifact / SMOKE.ARCHIVE).open("ab") as stream:
             stream.write(b"corrupt")
         with self.assertRaisesRegex(ValueError, "checksum"):
             SMOKE.unpack(self.root, self.artifact, COMMIT, VERSION)
+
+    def test_undecompressable_archive_with_matching_digest(self):
+        """A digest-valid archive that zstd rejects is fatal and leaves nothing."""
+        archive = self.artifact / SMOKE.ARCHIVE
+        archive.write_bytes(b"not a zstd frame")
+        path = self.artifact / "manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest["archive_sha256"] = SMOKE.digest(archive.read_bytes())
+        path.write_text(json.dumps(manifest))
+        with self.assertRaises(ValueError):
+            SMOKE.unpack(self.root, self.artifact, COMMIT, VERSION)
+        self.assertFalse(self.binary.exists())
+        self.assertFalse((self.root / "_build/.smoke-unpack").exists())
 
     def test_unexpected_members_and_missing_binary(self):
         """Even a newly checksummed tar cannot introduce links or traversal."""
         for name, symlink in (("../outside", False), (self.name, True), ("", False)):
             with self.subTest(name=name, symlink=symlink):
-                archive = self.artifact / "executables.tar.gz"
-                with tarfile.open(archive, "w:gz") as tar:
+                archive = self.artifact / SMOKE.ARCHIVE
+                with SMOKE.archive_writer(archive) as tar:
                     if name:
                         member = tarfile.TarInfo(name)
                         if symlink:
@@ -134,11 +161,12 @@ class SmokeTests(unittest.TestCase):
                             tar.addfile(member, io.BytesIO(b"x"))
                 path = self.artifact / "manifest.json"
                 manifest = json.loads(path.read_text())
-                manifest["archive_sha256"] = SMOKE.digest(archive.read_bytes())
+                manifest["archive_sha256"] = SMOKE.file_digest(archive)
                 path.write_text(json.dumps(manifest))
                 with self.assertRaises(ValueError):
                     SMOKE.unpack(self.root, self.artifact, COMMIT, VERSION)
                 self.assertFalse(self.binary.exists())
+                self.assertFalse((self.root / "_build/.smoke-unpack").exists())
 
     def test_compose_executables_in_compile_list(self):
         """Every Compose worker/driver is present in the one-time compile list."""
