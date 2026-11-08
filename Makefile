@@ -725,17 +725,35 @@ temporal-clean:
 # wrapper. A failed scenario stops the suite; workflow finalizers upload all
 # snapshots already captured, including the deliberate collector regressions.
 # The fixed-bug regression suites run first and print their own logs instead.
+#
+# CI splits these lines across parallel jobs ("shards"), each with its own
+# runner and Compose stack, instead of one sequence of about 28 minutes.
+# Every line is tagged with the shard that runs it. TEMPORAL_LIVE_CI_SHARD
+# selects one shard; left empty, every line runs in order (the local
+# default). Shards are balanced by measured duration, about 9 minutes each in
+# November 2026, not by subject. The temporal-integration matrix in
+# .github/workflows/build-pr.yml must list exactly LIVE_CI_SHARDS, and
+# test/smoke/test_temporal_compose_config.sh checks that and that every line
+# here is tagged.
+LIVE_CI_SHARDS := baseline recovery replay
+TEMPORAL_LIVE_CI_SHARD ?=
+# $(call live_ci_shard,NAME) prefixes a recipe line that belongs to shard
+# NAME. It expands to nothing when NAME, or no shard, is selected, and to the
+# silent no-op `@:` otherwise, which turns the rest of the line into ignored
+# arguments. An unknown NAME or TEMPORAL_LIVE_CI_SHARD stops Make, so a
+# misspelt shard cannot silently drop a controller from CI.
+live_ci_shard = $(if $(filter-out $(LIVE_CI_SHARDS),$(1) $(TEMPORAL_LIVE_CI_SHARD)),$(error unknown live CI shard in "$(strip $(1) $(TEMPORAL_LIVE_CI_SHARD))"; expected one of: $(LIVE_CI_SHARDS)))$(if $(filter-out $(1),$(TEMPORAL_LIVE_CI_SHARD)),@:)
 test-temporal-live-ci:
-	$(MAKE) test-temporal-diagnostics-contract
-	$(MAKE) test-temporal-live-regressions
-	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh integration $(MAKE) test-temporal-integration
-	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh restart $(MAKE) test-temporal-worker-restart
-	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh crash $(MAKE) test-temporal-worker-crash-recovery
-	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh cache-eviction $(MAKE) test-temporal-worker-cache-eviction
-	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh patching $(MAKE) test-temporal-workflow-patching
-	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh parent-child-restart $(MAKE) test-temporal-parent-child-restart
-	bash test/integration/temporal/scripts/run-with-live-diagnostics.sh child-failure-replay $(MAKE) test-temporal-parent-child-failure-replay
-	$(MAKE) test-temporal-examples-live
+	$(call live_ci_shard,baseline) $(MAKE) test-temporal-diagnostics-contract
+	$(call live_ci_shard,baseline) $(MAKE) test-temporal-live-regressions
+	$(call live_ci_shard,baseline) bash test/integration/temporal/scripts/run-with-live-diagnostics.sh integration $(MAKE) test-temporal-integration
+	$(call live_ci_shard,recovery) bash test/integration/temporal/scripts/run-with-live-diagnostics.sh restart $(MAKE) test-temporal-worker-restart
+	$(call live_ci_shard,recovery) bash test/integration/temporal/scripts/run-with-live-diagnostics.sh crash $(MAKE) test-temporal-worker-crash-recovery
+	$(call live_ci_shard,recovery) bash test/integration/temporal/scripts/run-with-live-diagnostics.sh cache-eviction $(MAKE) test-temporal-worker-cache-eviction
+	$(call live_ci_shard,replay) bash test/integration/temporal/scripts/run-with-live-diagnostics.sh patching $(MAKE) test-temporal-workflow-patching
+	$(call live_ci_shard,replay) bash test/integration/temporal/scripts/run-with-live-diagnostics.sh parent-child-restart $(MAKE) test-temporal-parent-child-restart
+	$(call live_ci_shard,replay) bash test/integration/temporal/scripts/run-with-live-diagnostics.sh child-failure-replay $(MAKE) test-temporal-parent-child-failure-replay
+	$(call live_ci_shard,baseline) $(MAKE) test-temporal-examples-live
 
 test-temporal-diagnostics-contract:
 	bash test/integration/temporal/scripts/test-live-diagnostics-contract.sh

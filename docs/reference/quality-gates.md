@@ -192,13 +192,35 @@ queued Actions run does not make the local verification boundary ambiguous:
 | `quality` | `make test-ci-artifacts`, then `make quality` | `make quality` | CI checks matrix selection and artifact failure cases before running the pinned native `cargo-deny`, `cargo-machete`, and `typos` scans. The exact binaries must be installed on the host. |
 | `license-audit` | `make license-check OCAML_VERSION=5.2`, `make test-dependency-inventory-contract`, plus the two isolated Python Cargo-license checks | `make license-check OCAML_VERSION=5.2` | The package/OCaml dependency license policy, after `make check-dependency-inventory` confirms that [the dependency inventory](../dependencies.md#keeping-this-inventory-current) still matches every lock file, image digest, action pin, and CI tool version. The locked Cargo license scanner remains a single CI-only step and is not repeated in the OCaml matrix. |
 | `native-macos`, `native-windows` | `sh scripts/opam-locked-deps.sh install --assume-depexts`, then `make native-verify` | the same two commands on a matching native host | The OCaml 5.5 and Rust native link, format, lint, install, and test path. Both platforms run for every PR and merge group and in the `master` tier. |
-| `temporal-integration` | `make test-temporal-start-metadata-live`, `make test-temporal-task-failure-live`, then `make test-temporal-live-ci` | Run the corresponding target when Docker and network access are available | The live CI target runs seven sequential controllers, the fixed-bug live regression suites (`make test-temporal-live-regressions`), and the shipped three-process example application and the self-checking cooperative cancellation example (`make test-temporal-examples-live`), in addition to the workflow-start metadata and task-failure recovery scenarios. Each owns a fresh Temporal/PostgreSQL lifecycle. The 103-minute CI ceiling includes the bilateral parent/child recovery gates and is at least the sum of the per-step timeouts, so evidence uploads still run after a step times out; contract-only results are not live evidence. |
+| `temporal-integration` (three shards) and `temporal-integration-result` | `make test-temporal-live-ci` with `TEMPORAL_LIVE_CI_SHARD` set to the shard; the `recovery` shard first runs `make test-temporal-start-metadata-live` and the `baseline` shard `make test-temporal-task-failure-live` | `make test-temporal-live-ci` (every shard, in order), or the corresponding target, when Docker and network access are available | The live CI target runs seven controllers, the fixed-bug live regression suites (`make test-temporal-live-regressions`), and the shipped three-process example application and the self-checking cooperative cancellation example (`make test-temporal-examples-live`), in addition to the workflow-start metadata and task-failure recovery scenarios. Each owns a fresh Temporal/PostgreSQL lifecycle. CI splits them across the `baseline`, `recovery` and `replay` shards, each on its own runner, and `temporal-integration-result` reports the required check only when every shard passed. Each shard's 91-minute ceiling includes the bilateral parent/child recovery gates and is at least the sum of its per-step timeouts, so evidence uploads still run after a step times out; contract-only results are not live evidence. |
 | `stress` (scheduled `stress.yml`, weekly and on dispatch; not a PR check) | `make stress-qualification` with one seed for every target | `make stress-qualification` (or the individual `test-parser-fuzz`, `test-decoder-fuzz`, `test-lifecycle-stress`, and `test-concurrent-stress` targets) | Every fuzzer and lifecycle stress with long budgets: 20,000 cases per decoder, 1,000 lifecycle cases, and 300 concurrent rounds. A failure keeps every reproduction directory for 30 days. See [decoder fuzzing](bridge-decoder-fuzz.md#scheduled-qualification). |
 
 `make check OCAML_VERSION=5.2` is a convenient Docker-backed local baseline:
 it combines `make verify` and `make license-check`. It does not run
 `make quality`, the native compatibility path, or the real-server smoke; run
 those separately when their respective evidence is needed.
+
+## Merge-queue time budget
+
+The `Queue master changes` ruleset gives a merge group's required checks
+`check_response_timeout_minutes` to report, and removes the group's first PR
+with reason `checks_timed_out` when one is late, even if every check later
+passes. A PR that drops out of the queue with green checks should be checked
+for that reason in its timeline before anything else. The limit was 60 minutes
+until November 2026, when the slowest required check finished 62-71 minutes
+after the group started; it is now 120 minutes as headroom, not as a target.
+
+The critical path is the amd64 Rust producer, then `smoke-build`, then the
+slowest live shard, then `temporal-integration-result`. In November 2026 it was
+one chain of `rust-amd64`, the amd64/5.5 `verify` lane (which also linked the
+smoke executables) and a single live job running every controller in sequence.
+Three changes shortened it without paid runners: the hosted-runner disk cleanup
+runs only when space is short (about 7-9 minutes), the smoke executables build
+beside `verify` (about 10 minutes), and the live controllers run as three
+shards of about 9 minutes each instead of one sequence of about 28 (about 15
+minutes). Keep new live controllers balanced across `LIVE_CI_SHARDS` by
+measured duration, and prefer a new shard over a longer one; each shard costs
+about 5 minutes of runner time for its artifact download and setup.
 
 ## When Actions remain queued
 
