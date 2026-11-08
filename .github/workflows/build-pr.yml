@@ -204,21 +204,15 @@ jobs:
         timeout-minutes: 3
         run: python3 scripts/smoke-artifact.py unpack --directory _build/smoke-artifact --commit "$GITHUB_SHA" --ocaml "$OCAML_VERSION"
       - name: Reclaim disposable GitHub-hosted runner disk
-        # The smoke lane downloads executables that statically link Rust.
-        # Leave enough space for their extraction and the live server images. Reclaim the large
-        # preinstalled SDKs before the first Compose build so a valid native
-        # link cannot fail because the disposable runner ran out of space.
+        # The smoke lane unpacks about 1.8 GB of executables that statically
+        # link Rust, then pulls the live server images. The script deletes the
+        # preinstalled SDKs and images only when less than 25 GiB is free, so
+        # the usual 75 GB-free image skips a 3-5 minute cleanup.
         if: runner.environment == 'github-hosted'
-        # Measured at 37 s to 3 min 47 s on hosted runners; a 4 minute bound
-        # timed out before any test ran.
+        # A cleanup, when it is needed, measured 37 s to 3 min 47 s on hosted
+        # runners; a 4 minute bound timed out before any test ran.
         timeout-minutes: 10
-        shell: bash
-        run: |
-          set -euo pipefail
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
-          docker system prune --all --force --volumes
-          df -h /
+        run: sh scripts/reclaim-runner-disk.sh 25 --prune-docker
       - name: Verify workflow start metadata and exact-history worker replacement
         timeout-minutes: 10
         env:
@@ -332,18 +326,15 @@ jobs:
           path: _build/rust-bridge
       - name: Reclaim disposable GitHub-hosted runner disk
         # Linking the Rust static library into the OCaml test executables can
-        # temporarily require more space than the preinstalled Android, .NET,
-        # and Haskell toolchains leave on the amd64 hosted image. This guard
-        # keeps the destructive cleanup confined to GitHub's disposable
-        # runner; arm64 and any future self-hosted runners are left untouched.
+        # temporarily require more space than an older amd64 hosted image
+        # left free. The script deletes the preinstalled Android, .NET and
+        # Haskell toolchains and Docker images only when less than 40 GiB is
+        # free; the current image has about 86 GB free, so the usual run
+        # skips a 2 minute cleanup. This guard keeps the destructive cleanup
+        # confined to GitHub's disposable runner; arm64 and any future
+        # self-hosted runners are left untouched.
         if: matrix.runner == 'ubuntu-24.04' && runner.environment == 'github-hosted'
-        shell: bash
-        run: |
-          set -euo pipefail
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
-          docker system prune --all --force --volumes
-          df -h /
+        run: sh scripts/reclaim-runner-disk.sh 40 --prune-docker
       - name: Build, lint, and test
         env:
           OCAML_VERSION: ${{ matrix.ocaml }}
