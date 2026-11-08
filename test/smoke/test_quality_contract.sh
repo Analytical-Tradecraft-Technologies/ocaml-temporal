@@ -273,8 +273,22 @@ for platform in macos windows; do
   printf '%s\n' "$section" | grep -Fqx "    needs: [changes, rust-$platform]"
   printf '%s\n' "$section" | grep -Fqx '        run: make native-verify'
 done
+# The smoke executables build beside the verify matrix, not after it, so the
+# live job's start no longer waits for `make verify` in the amd64/5.5 lane.
+# The live job still needs both, and a failed producer fails it (not skips).
+pr_smoke_build=$(sed -n '/^  smoke-build:/,/^  [a-z][a-z-]*:/p' "$pr_workflow")
+printf '%s\n' "$pr_smoke_build" | grep -Fq 'if: ${{ !cancelled()'
+printf '%s\n' "$pr_smoke_build" | grep -Fqx '    needs: [changes, rust-amd64]'
+printf '%s\n' "$pr_smoke_build" | grep -Fqx '      OCAML_VERSION: "5.5.1"'
+printf '%s\n' "$pr_smoke_build" | grep -Fqx '          make build-smoke-executables'
+printf '%s\n' "$pr_smoke_build" | grep -Fqx '          name: temporal-smoke-linux-amd64-ocaml-5.5.1'
+if sed -n '/^  verify:/,/^  smoke-build:/p' "$pr_workflow" | grep -Fq 'build-smoke-executables'; then
+  echo "the verify matrix must not compile the smoke executables again" >&2
+  exit 1
+fi
 pr_smoke=$(sed -n '/^  temporal-integration:/,/^  verify:/p' "$pr_workflow")
-printf '%s\n' "$pr_smoke" | grep -Fqx '    needs: [changes, verify]'
+printf '%s\n' "$pr_smoke" | grep -Fqx '    needs: [changes, verify, smoke-build]'
+printf '%s\n' "$pr_smoke" | grep -Fqx '          test "$SMOKE_BUILD_RESULT" = success'
 printf '%s\n' "$pr_smoke" | grep -Fqx '    name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
 printf '%s\n' "$pr_smoke" | grep -Fqx '      OCAML_VERSION: "5.5.1"'
 printf '%s\n' "$pr_smoke" | grep -Fqx '      TEMPORAL_PREBUILT_SMOKE: "1"'

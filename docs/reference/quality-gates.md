@@ -149,9 +149,13 @@ OPAM license-policy fixtures (`test/smoke/test_license_policy.sh`), which
 fail if `scripts/check-licenses.sh` ever accepts a GPL, missing, mixed or
 unreviewed license. They run on Linux and macOS; the Windows lane skips them
 because its opam cannot read the MSYS temporary fixture paths, and the policy
-does not depend on the platform. One Linux amd64/5.5.1 producer compiles the live
-smoke programs; the downstream Temporal/PostgreSQL job runs those verified
-executables without compiling them again. A cold run compiles Rust four times;
+does not depend on the platform. One Linux amd64/5.5.1 producer job,
+`smoke-build`, compiles the live smoke programs beside the OCaml matrix; the
+downstream Temporal/PostgreSQL job runs those verified executables without
+compiling them again. It used to compile them after `make verify` in the
+amd64/5.5 `verify` lane, which made the live job wait 27-30 minutes for that
+whole lane; linking the 44 executables alone takes about 16 minutes. A cold
+run compiles Rust four times;
 cache hits eliminate those Rust compilations too. Artifact transfer, OCaml/C
 compilation in the producer lanes, application linking, and tests still consume
 runner time.
@@ -184,6 +188,7 @@ queued Actions run does not make the local verification boundary ambiguous:
 | --- | --- | --- | --- |
 | `verify` | `make verify OCAML_VERSION=<matrix version>` with the verified bridge bundle | `make verify OCAML_VERSION=5.2` (or another supported series; each selects the digest-pinned base image in `docker/ocaml-<series>/Dockerfile`) | Docker-backed OCaml build/lint against the exact locked OPAM closure (the image build fails on drift), bridge/install tests, and repository quality contracts. CI gets Rust validation from its producer; the default local command also runs Rust tests. PRs use the representative cells; the `master` tier uses the exhaustive matrix. |
 | `verify` (OCaml 5.2, amd64 only) | `make docs OCAML_VERSION=5.2.1` after `make verify` | `make docs` | The odoc API documentation and package landing page build without any odoc warning, using the exact CI-only odoc closure. |
+| `smoke-build` (OCaml 5.5, amd64) | `make build-smoke-executables`, then `scripts/smoke-artifact.py pack` | `make build-smoke-executables OCAML_VERSION=5.5` | Every program in `scripts/ci-smoke-executables.txt` compiles and links against the verified bridge bundle. CI uploads them, with their commit, compiler and SHA-256 digests, for the live Temporal/PostgreSQL job. |
 | `quality` | `make test-ci-artifacts`, then `make quality` | `make quality` | CI checks matrix selection and artifact failure cases before running the pinned native `cargo-deny`, `cargo-machete`, and `typos` scans. The exact binaries must be installed on the host. |
 | `license-audit` | `make license-check OCAML_VERSION=5.2`, `make test-dependency-inventory-contract`, plus the two isolated Python Cargo-license checks | `make license-check OCAML_VERSION=5.2` | The package/OCaml dependency license policy, after `make check-dependency-inventory` confirms that [the dependency inventory](../dependencies.md#keeping-this-inventory-current) still matches every lock file, image digest, action pin, and CI tool version. The locked Cargo license scanner remains a single CI-only step and is not repeated in the OCaml matrix. |
 | `native-macos`, `native-windows` | `sh scripts/opam-locked-deps.sh install --assume-depexts`, then `make native-verify` | the same two commands on a matching native host | The OCaml 5.5 and Rust native link, format, lint, install, and test path. Both platforms run for every PR and merge group and in the `master` tier. |

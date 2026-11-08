@@ -52,8 +52,10 @@ applications can [link the compiled SDK directly](prebuilt-ocaml.md).
 Local source builds still compile Rust when no bundle is provided. An invalid
 explicit bundle fails instead of falling back to a Rust build.
 
-The Linux x64/5.5.1 OCaml job also compiles every live smoke executable once.
-Other compiler jobs build the installed library, examples, and unit tests;
+A separate Linux x64/5.5.1 job (`smoke-build`) compiles every live smoke
+executable once, beside the OCaml matrix rather than after it, so the live job
+does not wait for `make verify` in that lane before it can start.
+The compiler jobs build the installed library, examples, and unit tests;
 their lint targets use `@install` rather than Dune's all-executables default.
 One downstream smoke job verifies their commit, compiler, platform, file list,
 and SHA-256 digests, then runs all existing Temporal/PostgreSQL controllers.
