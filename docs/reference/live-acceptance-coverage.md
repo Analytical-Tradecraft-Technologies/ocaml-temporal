@@ -120,8 +120,8 @@ make test-bounded-shutdown-live RUN='opam exec --' \
   TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233
 ```
 
-In CI, the controllers' bundles are in the `live-diagnostics-<run>-<attempt>`
-artifact ([live diagnostic artifacts](live-diagnostic-artifacts.md)), and each
+In CI, the controllers' bundles are in the `live-diagnostics-<shard>-<run>-<attempt>`
+artifact of the shard that ran them ([live diagnostic artifacts](live-diagnostic-artifacts.md)), and each
 regression suite's log, plus the official-SDK interoperability evidence, is in
 `live-regressions-<run>-<attempt>`. That artifact also holds
 `activity_worker_crash/`: the suite's `describe` snapshots before and after the

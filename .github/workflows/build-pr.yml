@@ -152,22 +152,36 @@ jobs:
     # Required checks must fail, rather than be skipped, when a producer fails.
     if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     needs: [changes, verify, smoke-build]
-    name: Temporal/PostgreSQL integration smoke (OCaml 5.5)
+    name: Temporal/PostgreSQL live ${{ matrix.shard }} (OCaml 5.5)
     runs-on: ubuntu-24.04
-    # Independent live controllers run sequentially while reusing the
-    # checked-out source and build cache. Parent/child recovery includes a
-    # deliberate 120-second timer and two complete worker generations.
-    # Every step has its own timeout and the job timeout is at least their
-    # sum, so a hung scenario step is stopped by its own timeout and the
-    # always() evidence uploads after it still run before the job is killed
-    # (test/smoke/test_temporal_compose_config.sh checks this). A normal run
-    # takes about 25 minutes.
-    timeout-minutes: 103
+    # The independent live controllers took about 28 minutes in one
+    # sequence, which made this the longest job on the merge-queue critical
+    # path. Each shard runs about a third of them on its own standard runner
+    # and Compose stack: `make test-temporal-live-ci` reads
+    # TEMPORAL_LIVE_CI_SHARD and runs only the recipe lines tagged with it,
+    # and the start-metadata and task-failure steps below run in one shard
+    # each. Shards are balanced by measured duration (12-14 minutes each with
+    # setup in November 2026), and this list must equal LIVE_CI_SHARDS in the Makefile
+    # (test/smoke/test_temporal_compose_config.sh checks both). The required
+    # check is temporal-integration-result below.
+    strategy:
+      # One failing shard must not cancel the others' evidence.
+      fail-fast: false
+      matrix:
+        shard: [baseline, recovery, replay]
+    # Parent/child recovery includes a deliberate 120-second timer and two
+    # complete worker generations. Every step has its own timeout and the job
+    # timeout is at least their sum, so a hung scenario step is stopped by its
+    # own timeout and the always() evidence uploads after it still run before
+    # the job is killed (test/smoke/test_temporal_compose_config.sh checks
+    # this).
+    timeout-minutes: 91
     env:
       # Keep this as one explicit compatibility lane because it starts the
       # complete PostgreSQL/Temporal stack and two OCaml processes.
       OCAML_VERSION: "5.5.1"
       TEMPORAL_PREBUILT_SMOKE: "1"
+      TEMPORAL_LIVE_CI_SHARD: ${{ matrix.shard }}
     steps:
       # Always make failure-reporting scripts available, even if a producer
       # failed and the dependency gate below stops the live test steps.
@@ -218,13 +232,14 @@ jobs:
         run: sh scripts/reclaim-runner-disk.sh 25 --prune-docker
       - name: Verify workflow start metadata and exact-history worker replacement
         timeout-minutes: 10
+        if: matrix.shard == 'recovery'
         env:
           TEMPORAL_COMPOSE_PROJECT: ocaml-temporal-metadata-ci
         run: |
           trap 'make temporal-clean' EXIT
           make test-temporal-start-metadata-live
       - name: Retain synthetic workflow start metadata evidence
-        if: always()
+        if: always() && matrix.shard == 'recovery'
         timeout-minutes: 2
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -239,10 +254,11 @@ jobs:
       - name: Recover the same workflow runs after task failures
         # Independent of the seven existing controllers; any failed
         # assertion fails this job after retaining this gate's evidence.
+        if: matrix.shard == 'baseline'
         timeout-minutes: 5
         run: make test-temporal-task-failure-live
       - name: Retain exact-run task failure recovery evidence
-        if: always()
+        if: always() && matrix.shard == 'baseline'
         timeout-minutes: 2
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -251,10 +267,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Run the live two-OCaml-binary Temporal Compose smoke
-        # The job timeout reserves time for the always() uploads below after
-        # this step times out.
-        timeout-minutes: 40
+      - name: Run this shard's live Temporal Compose controllers
+        # This step normally takes 5-12 minutes; the bound leaves room for a
+        # controller to reach its own internal timeout (15 minutes for the
+        # parent/child driver) and still report. The job timeout reserves
+        # time for the always() uploads below after this step times out.
+        timeout-minutes: 30
         env:
           TEMPORAL_DIAGNOSTICS_DIR: ${{ github.workspace }}/_build/live-diagnostics
         run: make test-temporal-live-ci
@@ -265,7 +283,9 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: live-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          # Artifact names are unique per workflow run, so each shard's
+          # bundle carries the shard name.
+          name: live-diagnostics-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: _build/live-diagnostics/
           retention-days: 7
           if-no-files-found: warn
@@ -275,7 +295,8 @@ jobs:
         # worker logs under _build/live-regressions (#504, #519). The
         # copied admin-tools CLI binary in that directory is deliberately
         # excluded. Upload failure is reported here, not as a scenario failure.
-        if: always()
+        # Only the baseline shard runs the regression suites.
+        if: always() && matrix.shard == 'baseline'
         timeout-minutes: 2
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -294,6 +315,24 @@ jobs:
           LIVE_ARTIFACT_URL: ${{ steps.live-artifacts.outputs.artifact-url }}
           LIVE_UPLOAD_OUTCOME: ${{ steps.live-artifacts.outcome }}
         run: bash test/integration/temporal/scripts/summarize-live-diagnostics.sh
+
+  temporal-integration-result:
+    # The master ruleset requires this exact check name, while the sharded
+    # matrix above reports one name per shard. This job reports the required
+    # name and passes only when every shard passed. It runs even when a shard
+    # or producer failed (rather than being skipped, which a required check
+    # must never be) and then fails.
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    needs: [changes, temporal-integration]
+    name: Temporal/PostgreSQL integration smoke (OCaml 5.5)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every live shard to pass
+        timeout-minutes: 1
+        env:
+          SHARDS_RESULT: ${{ needs.temporal-integration.result }}
+        run: test "$SHARDS_RESULT" = success
 
   verify:
     # Override the implicit success() dependency check so the gate below runs.

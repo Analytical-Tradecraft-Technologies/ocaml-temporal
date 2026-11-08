@@ -6811,3 +6811,23 @@ gate reads `scripts/docs-tools.locked`. Licences of every locked version remain 
 and Python licence gates. `make test-dependency-inventory-contract` now
 requires version bumps, a new transitive Cargo package, and an action pin
 move to pass unchanged, and keeps the added and removed dependency cases.
+
+## 2026-11-08: Merge-queue critical path back under an hour
+
+Merge groups were being removed with `checks_timed_out` although every check
+passed: the required Temporal/PostgreSQL check finished 62-71 minutes after
+the group started, past the queue's 60-minute check timeout. The ruleset now
+allows 120 minutes as headroom, and three PRs shorten the path itself, all on
+standard hosted runners. `scripts/reclaim-runner-disk.sh` deletes the hosted
+image's preinstalled toolchains only when a job lacks its stated free space;
+today's image has 75-86 GB free, so the Rust producer, `verify` and the live
+job no longer spend 2-5 minutes each on it (#1299). A new `smoke-build` job
+links the 44 live smoke executables beside the `verify` matrix instead of after
+`make verify` in the amd64/5.5 lane, so the live job no longer waits for that
+lane (#1300). The live controllers run as three parallel shards selected by
+`TEMPORAL_LIVE_CI_SHARD`, with every `test-temporal-live-ci` line tagged by
+`$(call live_ci_shard,...)`; `temporal-integration-result` keeps the required
+check name and passes only when every shard did. A PR run with all three
+changes reached the required check in 41 minutes. `make test-temporal-config` checks that the matrix equals
+`LIVE_CI_SHARDS`, that every recipe line is tagged, and that the shards
+together run each line exactly once. See [quality gates](reference/quality-gates.md#merge-queue-time-budget).
