@@ -253,3 +253,26 @@ if grep -F ' run --rm ' "$temporary_root/bench" | grep -Fv -- '-e CARGO_BUILD_JO
   echo 'explicit CARGO_BUILD_JOBS did not reach every bench container' >&2
   exit 1
 fi
+
+# Only the live-test executable builds select lld. `make verify`, the
+# installed-library consumer and the SDK's own Dune rules keep the platform
+# linker: lld resolves symbols across archives in any order, so linking every
+# test with it could hide a link-order mistake in the flags the SDK ships.
+grep -F -- '-fuse-ld=lld' "$source_root/scripts/build-temporal-executables.sh" >/dev/null || {
+  echo 'scripts/build-temporal-executables.sh no longer selects lld' >&2
+  exit 1
+}
+other_linkers=$(
+  { printf '%s\n' "$source_root/Makefile" "$source_root/dune-project"
+    find "$source_root/lib" "$source_root/test" "$source_root/examples" "$source_root/bin" \
+      -name dune -not -path '*/_build/*' 2>/dev/null
+    find "$source_root/lib" -name '*.sexp' -not -path '*/_build/*' 2>/dev/null
+  } | while IFS= read -r file; do
+    [ -f "$file" ] && grep -l -- '-fuse-ld' "$file" || true
+  done
+)
+if [ -n "$other_linkers" ]; then
+  echo "only scripts/build-temporal-executables.sh may choose the linker; also found in:" >&2
+  printf '%s\n' "$other_linkers" >&2
+  exit 1
+fi

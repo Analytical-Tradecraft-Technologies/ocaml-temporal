@@ -315,6 +315,17 @@ Temporal Core's generated protobuf crates and standard Google protobuf
 definitions; Protocol Buffers is BSD-3-Clause. Neither tool is intended for
 the eventual minimal runtime image.
 
+Debian's `lld` package, LLVM's linker (Apache-2.0 WITH LLVM-exception), is
+also a build-only tool in the development image. Only
+`scripts/build-temporal-executables.sh` selects it, through
+`OCAMLPARAM=_,ccopt=-fuse-ld=lld`, to link the live-test executables, which
+each statically link the Rust bridge: the 44 CI smoke programs link in 65
+seconds instead of GNU ld's 98 on a standard runner. `make verify`, the
+installed-library consumer and the SDK's own Dune rules keep the platform's
+default linker, because lld resolves symbols across archives in any order and
+could hide a link-order mistake in the flags the SDK ships to applications;
+`test/smoke/test_build_jobs_contract.sh` enforces that boundary.
+
 The Cargo license policy script runs in a separate official Python image in
 the standalone GitHub Actions audit job, and the release preflight uses the
 same image to generate and audit the Cargo SBOM. These containers have no
