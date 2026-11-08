@@ -53,8 +53,10 @@ jobs:
           RUST_HOST: ${{ inputs.platform == 'macos-arm64' && 'aarch64-apple-darwin' || 'x86_64-pc-windows-gnu' }}
         run: |
           set -euo pipefail
-          rustup toolchain install "1.99.1-$RUST_HOST" --profile minimal --component clippy --component rustfmt
-          echo "RUSTUP_TOOLCHAIN=1.99.1-$RUST_HOST" >> "$GITHUB_ENV"
+          # rust/rust-toolchain.toml is the only Rust version pin.
+          toolchain="$(sh scripts/rust-version.sh)-$RUST_HOST"
+          rustup toolchain install "$toolchain" --profile minimal --component clippy --component rustfmt
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
       - name: Prepare verified Rust bridge
         id: bridge
         uses: ./.github/actions/rust-bridge

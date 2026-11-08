@@ -309,7 +309,12 @@ The development image copies the Rust toolchain pinned by
 `rust/rust-toolchain.toml`, Cargo, Clippy, and
 rustfmt from the official multi-architecture Rust image below, and
 `Dockerfile.rust-ci` builds the shared Linux Rust producer from the same
-digest. Rust is dual-licensed Apache-2.0 OR MIT. Debian's `protobuf-compiler`
+digest. That file is the single Rust version pin: both images install its
+exact channel with rustup and remove any other toolchain, the native and
+producer workflows select it through `RUSTUP_TOOLCHAIN`, and the Makefile's
+`NATIVE_RUST_VERSION` reads it, all through `scripts/rust-version.sh`. The
+image therefore only supplies rustup and Debian 12, and a Rust bump edits one
+line. Rust is dual-licensed Apache-2.0 OR MIT. Debian's `protobuf-compiler`
 and `libprotobuf-dev` packages are installed as build-only tools required by
 Temporal Core's generated protobuf crates and standard Google protobuf
 definitions; Protocol Buffers is BSD-3-Clause. Neither tool is intended for
@@ -434,7 +439,9 @@ upgrade; the scheduled freshness check under
 resolution continues to enforce
 upstream version requirements; this policy does not override those constraints.
 Docker, Docker Compose, Rust toolchains, and GitHub Actions have separate daily
-entries. Versions embedded in arbitrary scripts, Makefiles, and action inputs
+entries. Because every gate reads the Rust version from
+`rust/rust-toolchain.toml`, the rust-toolchain entry's PR is a complete Rust
+upgrade on its own; the `rust:` image entry only refreshes the base. Versions embedded in arbitrary scripts, Makefiles, and action inputs
 still require explicit maintenance. OCaml and OPAM are intentionally absent
 because GitHub Dependabot does not support that ecosystem; the locked OPAM
 closure and its per-compiler overrides continue to be reviewed and updated

@@ -1,6 +1,7 @@
-# Must equal the exact compiler every gate uses (Makefile NATIVE_RUST_VERSION,
-# CI workflows, and the rust:1.99 Docker images). test/smoke/test_rust_toolchain.sh
-# fails if this file drifts, so a toolchain bump updates all pins together.
+# The single Rust version pin. The Makefile, CI workflows and both Linux Rust
+# images read this channel through scripts/rust-version.sh, so a bump here
+# (including Dependabot's rust-toolchain update) moves every gate at once.
+# test/smoke/test_rust_toolchain.sh checks that the running rustc matches.
 [toolchain]
 channel = "1.99.1"
 components = ["clippy", "rustfmt"]
