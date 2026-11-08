@@ -215,6 +215,31 @@ exercise the available local gates without weakening required CI or turning an
 unexecuted matrix, platform, or live-server job green; required GitHub checks
 still need to complete successfully when Actions is available again.
 
+## Hosted runner disk
+
+The amd64 Rust producer, the amd64 `verify` lane, the live Temporal/PostgreSQL
+job and the scheduled stress job run `scripts/reclaim-runner-disk.sh` on
+GitHub-hosted runners. It deletes the preinstalled Android, .NET and Haskell
+toolchains (and, for the Docker-heavy lanes, the preinstalled images) only when
+`/` has less free space than the job states it needs:
+
+| Job | Needs free | Also prunes Docker |
+| --- | --- | --- |
+| Rust producer (`ubuntu-24.04`) | 30 GiB | no |
+| `verify` (`ubuntu-24.04`) | 40 GiB | yes |
+| Temporal/PostgreSQL integration smoke | 25 GiB | yes |
+| `stress` | 40 GiB | no |
+
+Older hosted images left about 14 GB free, so these jobs used to delete the
+toolchains unconditionally. In November 2026 the `ubuntu-24.04` image had a
+145 GB disk with 75-86 GB free, and the unconditional cleanup cost 2-5 minutes
+in each of three jobs on the merge-queue critical path without being needed.
+The step log prints `df` and says whether it kept or deleted the toolchains. A
+cleanup that still leaves less than the stated need emits a workflow warning
+instead of failing, so a later out-of-space failure points at it.
+`make test-quality-contract` checks both branches with stubbed `df`, `sudo` and
+`docker` commands (`test/smoke/test_reclaim_runner_disk.sh`).
+
 ## Rust dependency advisories and sources
 
 [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) checks the complete

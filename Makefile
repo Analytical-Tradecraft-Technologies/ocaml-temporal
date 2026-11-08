@@ -574,6 +574,7 @@ test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inve
 	sh test/smoke/test_make_seed_validation.sh .
 	sh test/smoke/test_rust_bridge_artifact.sh .
 	sh test/smoke/test_examples_live_contract.sh .
+	sh test/smoke/test_reclaim_runner_disk.sh .
 
 test-temporal-config:
 	sh test/smoke/test_temporal_compose_config.sh

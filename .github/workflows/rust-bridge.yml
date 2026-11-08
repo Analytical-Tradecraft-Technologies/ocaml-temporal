@@ -31,11 +31,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Reclaim disposable GitHub-hosted runner disk
+        # Deletes the preinstalled SDKs only when less than 30 GiB is free for
+        # the Cargo target directory; the current amd64 image has far more,
+        # so a cache-hit producer no longer spends 2 of its 2-3 minutes here.
         if: inputs.runner == 'ubuntu-24.04' && runner.environment == 'github-hosted'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+        run: sh scripts/reclaim-runner-disk.sh 30
       - name: Set up Windows GNU build tools
         if: inputs.platform == 'windows-amd64'
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
