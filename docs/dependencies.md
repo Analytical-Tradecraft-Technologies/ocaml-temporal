@@ -430,7 +430,15 @@ dependencies (security updates can still cover vulnerable lockfile entries).
 Temporal Core packages remain grouped, but Dependabot does not move a
 `rev =` pin of a Git dependency, so that group has never proposed a Core
 upgrade; the scheduled freshness check under
-[Temporal Core pin upgrades](#temporal-core-pin-upgrades) does that job. Cargo
+[Temporal Core pin upgrades](#temporal-core-pin-upgrades) does that job.
+Crates that one upstream project releases together are also grouped, so a
+release arrives as one PR and one merge-queue run instead of several: tonic,
+the core prost crates, tokio with tokio-macros, the futures crates, tracing,
+opentelemetry, windows-rs, wasm-bindgen with js-sys/web-sys, cc with
+find-msvc-tools, ICU4X (icu_*, zerovec, yoke, zerofrom, tinystr, writeable,
+litemap, potential_utf), serde with serde_core/serde_derive, zerocopy, and bon.
+Unrelated crates keep separate PRs. The GitHub Actions entry groups the
+upload/download artifact actions and the two actions/cache entry points. Cargo
 resolution continues to enforce
 upstream version requirements; this policy does not override those constraints.
 Docker, Docker Compose, Rust toolchains, and GitHub Actions have separate daily
