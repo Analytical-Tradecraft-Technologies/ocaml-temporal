@@ -445,6 +445,25 @@ val worker_wait_workflow : runtime -> (unit, error) result
 val worker_complete_workflow_json :
   runtime -> bytes -> (unit, error) result
 
+(** Validates one completion for a leased workflow activation and admits it
+    without waiting for Temporal Core. Success returns the completion's
+    ticket as decimal ASCII bytes; Rust then owns the completion and
+    publishes exactly one outcome for that ticket. [Error] means nothing was
+    admitted and the activation is still leased. *)
+val worker_submit_workflow_completion_json :
+  runtime -> bytes -> (bytes, error) result
+
+(** Takes every published workflow-completion outcome without waiting. The
+    bytes are one JSON array document, empty when no outcome is ready. *)
+val worker_take_workflow_completions : runtime -> (bytes, error) result
+
+(** Waits for a workflow-completion outcome with the OCaml runtime lock
+    released and the same bounded timeout as [worker_wait_workflow].
+    [`Idle] means no completion is in flight; a timeout is the [Not_ready]
+    error. *)
+val worker_wait_workflow_completion :
+  runtime -> ([ `Ready | `Idle ], error) result
+
 (** Returns the exact Rust-produced activation after an OCaml semantic decode
     failure. Rust reparses and matches the complete retained activation before
     failing Core and retiring its one-shot lease. *)

@@ -445,6 +445,32 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_worker_complete_workflow_json(
     ocaml_temporal_core_runtime *runtime, const uint8_t *input,
     size_t input_len, ocaml_temporal_core_result *output);
 
+/* Validate one workflow completion for a handed-off activation and admit it
+ * without awaiting Temporal Core. Success returns the completion's ticket as
+ * decimal ASCII; a Tokio task then owns the Core completion and publishes one
+ * outcome for that ticket. A failure means nothing was admitted and the
+ * activation is still leased. The caller never waits for the network here. */
+ocaml_temporal_core_status
+ocaml_temporal_core_v4_worker_submit_workflow_completion_json(
+    ocaml_temporal_core_runtime *runtime, const uint8_t *input,
+    size_t input_len, ocaml_temporal_core_result *output);
+
+/* Non-blocking take of every published workflow-completion outcome, as one
+ * JSON array (empty when none is ready). Collecting an outcome frees the
+ * worker completion-window credit its activation held. */
+ocaml_temporal_core_status
+ocaml_temporal_core_v4_worker_take_workflow_completions(
+    ocaml_temporal_core_runtime *runtime,
+    ocaml_temporal_core_result *output);
+
+/* Bounded wait for a workflow-completion outcome. Output is "ready" or
+ * "idle" (nothing in flight); a timeout is NOT_READY. The C binding must
+ * release the OCaml runtime lock while it waits. */
+ocaml_temporal_core_status
+ocaml_temporal_core_v4_worker_wait_workflow_completion(
+    ocaml_temporal_core_runtime *runtime,
+    ocaml_temporal_core_result *output);
+
 /* Reparse and reject the exact Rust-produced activation document when the
  * OCaml semantic decoder cannot accept it after lease handoff. */
 ocaml_temporal_core_status ocaml_temporal_core_v4_worker_reject_workflow_json(

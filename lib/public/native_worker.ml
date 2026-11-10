@@ -146,10 +146,37 @@ module Workflow_source = struct
     Native.perform supervisor Native.Try_poll_workflow
 
   (** Submits one workflow completion, already encoded once by the adapter,
-      through the supervisor mailbox. Only the encoded bytes are submitted; the
-      typed [completion] exists for test sources and is ignored here. *)
+      through the supervisor mailbox and waits for Temporal Core to accept
+      it. Only the encoded bytes are submitted; the typed [completion] exists
+      for test sources and is ignored here. The workflow lane uses
+      [submit_workflow] instead; only the activation watchdog, which must
+      report whether its replacement completion was acknowledged, still
+      occupies the supervisor until Core answers. *)
   let complete_workflow supervisor ~completion:_ encoded =
     Native.perform supervisor (Native.Complete_workflow encoded)
+
+  (** Admits one workflow completion without waiting for Temporal Core. The
+      supervisor handles only validation, conversion, and admission, so it is
+      free for the next activation, activity work, or a control message while
+      Core (and any RPC it makes) settles this one. *)
+  let submit_workflow supervisor ~completion:_ encoded =
+    Result.map
+      (fun ticket -> Workflow_adapter.Admitted ticket)
+      (Native.perform supervisor (Native.Submit_workflow_completion encoded))
+
+  (** Takes every published completion outcome without waiting. *)
+  let take_workflow_outcomes supervisor =
+    Native.perform supervisor Native.Take_workflow_completions
+
+  (** One bounded native wait for a completion outcome; the bridge's readiness
+      timeout is reported as [`Timed_out]. *)
+  let wait_workflow_outcome supervisor =
+    match Native.perform supervisor Native.Wait_workflow_completion with
+    | Ok `Ready -> Ok `Ready
+    | Ok `Idle -> Ok `Idle
+    | Error (Native.Backend { Bridge.status = Bridge.Not_ready; _ }) ->
+        Ok `Timed_out
+    | Error _ as error -> error
 
   (** Returns the stable classification used in adapter diagnostics. *)
   let error_code error = fst (native_error_view error)
@@ -244,7 +271,7 @@ module Activity_source = struct
   let exception_is_retryable _exception = false
 end
 
-module Workflow = Workflow_adapter.Make (Workflow_source)
+module Workflow = Workflow_adapter.Make_admitting (Workflow_source)
 (** Instantiates the workflow adapter with the production supervisor source. *)
 
 module Activity = Activity_adapter.Make (Activity_source)
@@ -465,6 +492,10 @@ let poll_workflow worker =
   else
     match Workflow.poll worker.workflows with
     | Ok Workflow_adapter.Not_ready -> Ok Not_ready
+    (* An admitted completion is progress for the lane: it executed an
+       activation and may take the next one while Core settles this one. The
+       matching [Completed] or [Rejected] is reported by a later poll. *)
+    | Ok (Workflow_adapter.Submitted _) -> Ok Progress
     | Ok (Workflow_adapter.Completed _) -> Ok Progress
     | Ok (Workflow_adapter.Rejected { error; lease_retired = true; _ }) ->
         report Logs.Warning ~operation:"workflow_task_rejected"
@@ -942,13 +973,26 @@ let release_native worker =
           Bounded_shutdown.Release_failed
             (public_native_error "worker shutdown" error))
 
-(** Maps a non-blocking workflow drain. A workflow drain failure is never
-    retried at shutdown: the adapter only resubmits a completion whose own
-    failure was classified retryable, and reports anything else unchanged. *)
+(** Maps a non-blocking workflow drain. A failed completion is never retried
+    at shutdown: the adapter only resubmits a completion whose own failure
+    was classified retryable, and reports anything else unchanged. The one
+    retryable drain error is a completion still in flight, whose drain only
+    waits for its outcome and never resubmits it. *)
 let drain_workflow worker () =
   match Workflow.try_drain worker.workflows with
   | None -> Bounded_shutdown.Busy
   | Some (Ok ()) -> Bounded_shutdown.Drained
+  | Some (Error ({ code; _ } as error))
+    when String.equal code Workflow_adapter.completion_in_flight_code ->
+      (* Admitted completions are still awaiting Temporal Core. Their outcome
+         may yet arrive, so the drain is retried until the lanes deadline;
+         past it the error reports their outcome as unknown, distinct from a
+         completion Core is known to have rejected. *)
+      Bounded_shutdown.Drain_failed
+        {
+          error = public_adapter_error "workflow completion drain" error;
+          retryable = true;
+        }
   | Some (Error error) ->
       Bounded_shutdown.Drain_failed
         {

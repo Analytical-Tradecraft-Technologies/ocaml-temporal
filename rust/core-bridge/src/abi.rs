@@ -5,8 +5,8 @@ use crate::replay_bridge::{ReplayWorker, ReplayWorkerError};
 /// SDK-side metrics recorder handle; see [`ocaml_temporal_core_v4_shared_runtime_metric_meter`].
 pub use crate::telemetry::MetricMeter;
 use crate::worker_bridge::{
-    BoundedFinalize, PollLaneError, PollLanes, ReadinessWait, ShutdownDrainError,
-    WORKER_FINALIZE_TIMEOUT, WORKER_SHUTDOWN_DRAIN_TIMEOUT, WorkerBridgeError,
+    BoundedFinalize, PollLaneError, PollLanes, READINESS_WAIT_TIMEOUT, ReadinessWait,
+    ShutdownDrainError, WORKER_FINALIZE_TIMEOUT, WORKER_SHUTDOWN_DRAIN_TIMEOUT, WorkerBridgeError,
     public_poll_lane_error_message, public_worker_error_message,
 };
 use crate::{activity_protocol, client_protocol, diagnostics, telemetry, workflow_protocol};
@@ -2924,6 +2924,80 @@ impl Runtime {
         Ok(Vec::new())
     }
 
+    /// Strictly validates one leased workflow completion and admits it
+    /// without awaiting Core, returning its ticket as decimal ASCII.
+    ///
+    /// Validation and Core conversion are identical to
+    /// [`Self::complete_workflow`], and run exactly once. Every failure
+    /// returned here happens before anything is spawned or sent: the lease,
+    /// its completion-window credit, and the semantic handoff below are all
+    /// unchanged, so the caller knows the completion was definitively not
+    /// admitted. On success the semantic handoff is removed at once, because
+    /// the converted value now belongs to the completion task and Core may
+    /// publish the run's next activation before OCaml collects this outcome;
+    /// the ledger lease was retired by admission for the same reason. The
+    /// owner Domain never waits for Core or the network on this path.
+    fn submit_workflow_completion(&mut self, input: &[u8]) -> Operation {
+        let text = decode_semantic_input(input)?;
+        let semantic = workflow_protocol::decode_completion(text).map_err(protocol_failure)?;
+        let activation = self
+            .workflow_activations
+            .get(&semantic.run_id)
+            .ok_or_else(|| Failure {
+                status: STATUS_PROTOCOL,
+                message: "workflow completion does not match a leased activation".to_owned(),
+            })?;
+        let worker_namespace = self.worker_namespace.as_deref().ok_or_else(|| Failure {
+            status: STATUS_INVALID_STATE,
+            message: "Temporal workflow worker namespace is not available".to_owned(),
+        })?;
+        let completion = workflow_protocol::completion_to_core_for_activation_with_namespace(
+            activation,
+            &semantic,
+            worker_namespace,
+        )
+        .map_err(core_conversion_failure)?;
+        let handle = self
+            .core
+            .as_ref()
+            .ok_or_else(runtime_closed)?
+            .tokio_handle()
+            .clone();
+        let worker = self.worker.as_mut().ok_or_else(worker_not_running)?;
+        let ticket = worker
+            .submit_workflow_completion(&handle, completion)
+            .map_err(worker_bridge_failure)?;
+        self.workflow_activations.remove(&semantic.run_id);
+        Ok(ticket.to_string().into_bytes())
+    }
+
+    /// Takes every published workflow-completion outcome without waiting, as
+    /// a JSON array (empty when none is ready); see
+    /// [`crate::workflow_completions::encode_outcomes`].
+    fn take_workflow_completions(&self) -> Operation {
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
+        Ok(crate::workflow_completions::encode_outcomes(
+            &worker.take_workflow_completions(),
+        ))
+    }
+
+    /// Waits, for at most the readiness bound, until a workflow-completion
+    /// outcome is ready. Returns `ready` when one is, `idle` at once when no
+    /// completion is in flight, and `STATUS_NOT_READY` on timeout. The C stub
+    /// releases the OCaml runtime lock; shutdown uses this to drain admitted
+    /// completions after the poll lanes have closed.
+    fn wait_workflow_completion(&self) -> Operation {
+        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
+        match worker.wait_workflow_completion(READINESS_WAIT_TIMEOUT) {
+            crate::workflow_completions::CompletionWait::Ready => Ok(b"ready".to_vec()),
+            crate::workflow_completions::CompletionWait::Idle => Ok(b"idle".to_vec()),
+            crate::workflow_completions::CompletionWait::TimedOut => Err(Failure {
+                status: STATUS_NOT_READY,
+                message: "no Temporal workflow completion outcome is ready; retry".to_owned(),
+            }),
+        }
+    }
+
     /// Revalidates and retires the exact workflow activation whose OCaml
     /// semantic decode failed after Rust handed off its lease.
     ///
@@ -3439,6 +3513,11 @@ fn drop_runtime_graph(
         // debt Core keeps outstanding (issue #769). A timeout leaves the
         // worker unfinalizable, which the match below handles.
         let _ = handle.block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT));
+        // An admitted workflow completion that outlived the bounded drain is
+        // still awaiting Core and holds a worker reference. Abort it and wait
+        // for the abort, so no task outlives the graph; its outcome is
+        // unknown and its lease was already retired at admission.
+        handle.block_on(worker.abort_completion_tasks());
         // A poll that was already inside Core can return after the first drain
         // and publish a new ready task before its lane exits.  The joins above
         // establish that no producer remains; a final pass therefore closes
@@ -5895,6 +5974,65 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_complete_workflow_json(
             runtime.complete_workflow(input)
         })
     }
+}
+
+/// Validate one workflow completion JSON document and admit it without
+/// awaiting Core.
+///
+/// On success the output holds the completion's ticket as decimal ASCII; the
+/// outcome is collected later with
+/// [`ocaml_temporal_core_v4_worker_take_workflow_completions`]. A failure
+/// means nothing was admitted and the lease is unchanged.
+///
+/// # Safety
+///
+/// The runtime and output contracts match the workflow poll operation. A
+/// nonzero input length requires that many readable bytes for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_submit_workflow_completion_json(
+    runtime: *mut Runtime,
+    input: *const u8,
+    input_len: usize,
+    output: *mut Result,
+) -> Status {
+    unsafe {
+        invoke_runtime_document(output, runtime, input, input_len, |runtime, input| {
+            runtime.submit_workflow_completion(input)
+        })
+    }
+}
+
+/// Take every ready workflow-completion outcome without waiting, as one JSON
+/// array document (empty when none is ready).
+///
+/// # Safety
+///
+/// `runtime` must be a live exclusively owned runtime handle and `output` must
+/// satisfy the standard initialized-result contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_take_workflow_completions(
+    runtime: *mut Runtime,
+    output: *mut Result,
+) -> Status {
+    unsafe { invoke(output, || runtime_ref(runtime)?.take_workflow_completions()) }
+}
+
+/// Wait for a workflow-completion outcome for at most the readiness bound.
+///
+/// The caller must release the OCaml runtime lock around this operation. The
+/// output is `ready` or `idle` (nothing in flight); a timeout is
+/// `STATUS_NOT_READY`.
+///
+/// # Safety
+///
+/// `runtime` must be a live exclusively owned runtime handle and `output` must
+/// satisfy the standard initialized-result contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_worker_wait_workflow_completion(
+    runtime: *mut Runtime,
+    output: *mut Result,
+) -> Status {
+    unsafe { invoke(output, || runtime_ref(runtime)?.wait_workflow_completion()) }
 }
 
 /// Reject one Rust-produced workflow activation that OCaml could not decode.

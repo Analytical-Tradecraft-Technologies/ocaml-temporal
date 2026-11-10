@@ -590,7 +590,7 @@ qualification of the full FFI.
 
 ### Private OCaml worker operations
 
-`Temporal_core_bridge.Native_bridge` exposes nine private wrappers over the
+`Temporal_core_bridge.Native_bridge` exposes private wrappers over the
 poll, readiness, completion, and rejection symbols. They are used by the
 native worker adapter and are not part of the public workflow-authoring API:
 
@@ -598,7 +598,10 @@ native worker adapter and are not part of the public workflow-authoring API:
 | --- | --- | --- |
 | `worker_try_poll_workflow` | Drain one already-ready workflow activation without waiting | semantic workflow JSON bytes |
 | `worker_wait_workflow` | Wait for workflow readiness without consuming a task | `unit` wake signal |
-| `worker_complete_workflow_json` | Validate and complete one leased workflow activation | `unit` |
+| `worker_complete_workflow_json` | Validate and complete one leased workflow activation, waiting for Core | `unit` |
+| `worker_submit_workflow_completion_json` | Validate one leased workflow completion and admit it without waiting for Core | decimal ticket bytes |
+| `worker_take_workflow_completions` | Take every published outcome of admitted workflow completions without waiting | `{"outcomes":[...]}` JSON bytes |
+| `worker_wait_workflow_completion` | Wait for an admitted completion's outcome without consuming it | `` `Ready `` or `` `Idle `` (nothing in flight) |
 | `worker_reject_workflow_json` | Retire the lease when OCaml cannot decode the exact Rust-produced activation document | `unit` |
 | `worker_try_poll_activity` | Drain one already-ready remote or local activity task without waiting | semantic activity JSON bytes |
 | `worker_wait_activity` | Wait for activity readiness without consuming a task | `unit` wake signal |
@@ -645,14 +648,17 @@ operations. It exposes a typed GADT rather than raw JSON bytes:
 | --- | --- |
 | `Try_poll_workflow` | `Workflow_protocol.activation option`; `None` means the workflow lane was empty at that instant |
 | `Wait_workflow` | bounded native readiness wait; it does not consume an activation and releases the OCaml runtime lock |
-| `Complete_workflow encoded` | an `Encoded_workflow_completion.t` holding the canonical JSON from the worker adapter's single encoder pass; the supervisor copies those bytes into the native completion call without encoding or reparsing them, and Rust strictly decodes them |
+| `Complete_workflow encoded` | an `Encoded_workflow_completion.t` holding the canonical JSON from the worker adapter's single encoder pass; the supervisor copies those bytes into the native completion call without encoding or reparsing them, and Rust strictly decodes them. The owner Domain waits for Core; only the activation watchdog still uses it |
+| `Submit_workflow_completion encoded` | the same value, admitted without waiting for Core; returns the ticket. An `Error` means nothing was admitted and the lease is unchanged ([completion admission](native-worker-execution.md#completion-admission)) |
+| `Take_workflow_completions` | every published `Workflow_protocol.completion_outcome`, oldest first, without waiting; collecting one frees its window credit |
+| `Wait_workflow_completion` | bounded native wait for an outcome with the OCaml runtime lock released; `` `Idle `` when nothing is in flight |
 | `Try_poll_activity` | `Activity_protocol.task option`; `None` means the activity lane was empty at that instant |
 | `Wait_activity` | bounded native readiness wait; it does not consume an activity task and releases the OCaml runtime lock |
 | `Wait_any` | bounded native readiness wait that any queued workflow activation or activity task ends; it consumes nothing and releases the OCaml runtime lock |
 | `Record_activity_heartbeat encoded` | an `Encoded_activity_heartbeat.t` holding the canonical JSON from the activity adapter's single encoder pass, which validated the token and details; the supervisor copies those bytes into the native call without encoding them again (#1001), and Rust records them for the outstanding activity lease without retiring it. The acknowledgement carries no cancellation flags, which arrive later on the activity poll lane. `Record_async_activity_heartbeat` takes the same value; the worker's throttled `Rpc_async_activity_heartbeat` client call instead takes an `Encoded_async_activity_heartbeat.t`, which adds the attempt's heartbeat timeout, and returns the activity state of the token's latest send (#1025) |
 | `Complete_activity encoded` | an `Encoded_activity_completion.t` holding the canonical JSON from the activity adapter's single encoder pass, which validated the opaque token and result; the supervisor copies those bytes into the native completion call without encoding them again, and Rust strictly decodes them. `Complete_async_activity` takes the same value |
 
-All eight operations enter the same bounded mailbox as client and worker
+All of these operations enter the same bounded mailbox as client and worker
 lifecycle changes. A poll, completion, worker shutdown, and runtime shutdown
 therefore cannot race native graph state. The pure protocol conversion module
 is visible only from the private supervisor library so both serialization
@@ -670,6 +676,19 @@ send and its wake notification one linearizable operation and prevents a
 notification-before-wait or send/receive reordering race. Shutdown closes both
 signals before asking Core to wake its polls, while in-flight poll results may
 still be queued and are always drained before the terminal state is reported.
+
+Admitted workflow completions add a third producer of the combined wake. The
+worker's completion window (Core's workflow-task slots plus its cached-run
+count) is reserved when an activation is handed to OCaml and released when
+OCaml collects the completion's outcome; a workflow poll with no free credit
+returns `Not_ready` without dequeuing. A completion task publishes its outcome
+under the window's own leaf mutex, releases it, and then notifies the combined
+wake. `worker_wait_any` reads the window after both lane mutexes, counts a
+queued activation as work only while a credit is free, and counts a published
+outcome as work, so a full window neither spins the owner nor sleeps through
+the outcome that frees it. Completion tasks hold the Core worker; worker
+shutdown joins them before finalizing Core, and runtime disposal aborts and
+joins the ones its bounded drain could not wait out.
 
 These wrappers deliberately return the same owned-response shape as lifecycle
 operations. The OCaml `decode` helper copies success or diagnostic bytes and

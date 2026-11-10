@@ -15,7 +15,18 @@ try_poll_workflow : supervisor -> (activation option, error) result
 complete_workflow :
   supervisor -> completion:completion -> Encoded_workflow_completion.t ->
   (unit, error) result
+submit_workflow :
+  supervisor -> completion:completion -> Encoded_workflow_completion.t ->
+  (submission, error) result          (* Acknowledged | Admitted of ticket *)
+take_workflow_outcomes : supervisor -> (completion_outcome list, error) result
+wait_workflow_outcome : supervisor -> ([`Ready | `Idle | `Timed_out], error) result
 ```
+
+The last three form the `ADMITTING_SUPERVISOR` signature used by
+`Make_admitting`; see [completion admission](#completion-admission). `Make`
+keeps the synchronous contract for replay and test sources by wrapping a
+`SUPERVISOR` in `Synchronous`, whose `submit_workflow` calls
+`complete_workflow` and answers `Acknowledged`.
 
 `complete_workflow` receives the canonical bytes from the completion's single
 encoder pass (`Encoded_workflow_completion.t`, which only that encoder can
@@ -108,17 +119,118 @@ The adapter owns only OCaml values:
   completion it was encoded from. A retry resubmits those bytes unchanged, so
   later mutation of a workflow-owned payload buffer cannot alter what is
   sent; the typed value is kept only to pass to the source read-only;
+- a map from admitted ticket to run ID, and a queue of results settled while
+  collecting outcomes, reported one per `poll`;
 - one mutex that serializes polling, execution, and completion submission.
 
 No native pointer, Rust future, or continuation is stored in the maps. The
 pending completion map owns those immutable completion bytes until the
-supervisor confirms acknowledgement and then releases them with the ordinary OCaml value
+supervisor confirms acknowledgement (for an admitted completion, until its
+outcome is collected) and then releases them with the ordinary OCaml value
 lifetime. The Rust ledger remains the authority for the native lease until
-Core accepts or rejects that completion. The mutex protects OCaml scheduler
+the completion is admitted; from then on the bridge task that owns the
+admitted completion is responsible for it until it publishes an outcome, and
+it restores the lease if Core rejects the completion. The mutex protects OCaml scheduler
 state in addition to the supervisor's own owner-Domain serialization, so two
 ordinary producer Domains cannot execute the same run concurrently. Workflow
 fibers must not call the adapter directly because supervisor operations may
 block their producer Domain.
+
+## Completion admission
+
+Temporal Core's `complete_workflow_activation` may wait for the network: it
+reports the workflow task to the server and can fetch more history before it
+returns, and Core documents that completions should run concurrently. The
+live worker used to await it through `Complete_workflow`, so the sole
+supervisor was occupied until that RPC finished. Every other run's
+activation, the activity lane, and lifecycle messages queued behind one slow
+completion. The live workflow lane now splits a completion into admission
+and outcome delivery.
+
+**Admission.** `Submit_workflow_completion` validates the canonical bytes,
+converts them to Core's completion once, retires the run's ledger lease, and
+moves the converted completion to one Tokio task. It returns a ticket without
+waiting for Core. The semantic activation retained at hand-off is removed at
+the same point, because Core may publish the run's next activation before
+OCaml collects this outcome. An `Error` from admission is definitive: nothing
+was spawned or sent, and the lease is unchanged. The adapter keeps the exact
+bytes in its pending entry, marked with the ticket, and `poll` reports
+`Submitted`; the lane immediately polls again.
+
+**Outcome delivery.** The Tokio task owns the Core worker reference, the task
+ledger, and an outcome guard. It publishes exactly one outcome for its ticket:
+`completed` when Core's call returned successfully, `rejected` when Core
+rejected it (the bridge then restores the ledger lease, as the synchronous
+path did), and `panicked` or `aborted` when the task ended without Core's
+answer. The guard publishes from its `Drop` so a panic or an abort cannot
+strand the ticket. Publication wakes the combined readiness wait. Each `poll`
+first reports one result settled earlier, then takes every published outcome
+with the non-blocking `Take_workflow_completions` and settles it: an
+acknowledgement runs the ordinary bookkeeping (registry removal, completion
+observer, `Completed` or `Rejected`), and anything else records a fail-closed
+refusal on the entry, exactly like a failed synchronous completion (#843). An
+admitted completion is never submitted again. Core accepting a completion is
+not the same as observing its history event; the adapter claims only the
+former.
+
+**Window.** One credit covers one activation from the moment Rust hands it to
+OCaml until OCaml has collected its completion's outcome. The window is the
+worker's Core workflow-task slots plus its cached-workflow count (evictions
+and queries hold no slot), capped at 65,536. The workflow poll checks for a
+credit *before* it dequeues, so OCaml can always submit a completion for every
+lease it holds and published outcomes can never exceed the window. With no
+credit, the poll returns `Not_ready` without dequeuing, while Core keeps
+polling (its own slots bound what it buffers). `Wait_any` then ignores queued
+activations that have no credit and wakes on a published outcome instead, so a
+full window neither spins the workflow lane nor holds the supervisor away from
+the activity lane. The poll still reports a fatal lane error while the window
+is full.
+
+**Tickets and order.** A ticket is the lease generation Rust assigned when it
+handed the activation to OCaml; every delivery gets a fresh one. The adapter
+accepts an outcome only if it holds that ticket for the same run and the
+run's pending entry still carries it, so a late or duplicate outcome cannot
+settle a newer activation of the run. Core may publish a run's next
+activation before OCaml collected the outcome of its previous completion. The
+lane then waits (in bounded native waits) for that one outcome before running
+any workflow code for the new activation, which keeps per-run order and lets
+a failed outcome stop the worker first. Other runs never wait for an outcome.
+
+**Shutdown.** `drain` collects outcomes and waits once per pass (100 ms). If
+admitted completions are still awaiting Core it returns
+`completion_in_flight`, which bounded shutdown retries until the lanes
+deadline; past the deadline the error reports their outcome as unknown,
+distinct from a completion Core is known to have rejected. Rust's worker
+shutdown also joins every completion task before it finalizes Core, waking
+its drain loop as each finishes so a lease restored after a rejection is
+retired. Runtime disposal aborts and joins tasks that outlive its bounded
+drain; an aborted completion's lease stays retired, because Core may already
+have consumed it, so it is never completed twice. `discard` drops the
+adapter's tickets and bytes without any native call.
+
+**Paths that still occupy the supervisor until Core answers.**
+
+- The activation watchdog's replacement completion uses the synchronous
+  `Complete_workflow`, because it must report whether the task failure was
+  acknowledged.
+- Rejections: an activation OCaml could not decode (`reject_polled_workflow`),
+  one Rust could not convert or encode inside `Try_poll_workflow`, and a
+  lease hand-off failure all fail the task with `block_on`, followed for the
+  first two by the existing 100 ms redelivery backoff. They are rare and
+  occur only on malformed or unsupported input.
+- Replay keeps its bounded synchronous completions.
+- Worker shutdown and runtime disposal, as before.
+
+**Diagnostics.** At `Debug` on the lifecycle source, the adapter emits one
+record per phase, keyed by run ID, with a monotonic `duration_ms`:
+`workflow_activation_executed` (workflow and encoder time),
+`workflow_completion_admission` (the supervisor round trip),
+`workflow_completion_core_await` (Core and its RPC, measured in Rust),
+`workflow_completion_queued` (outcome wait before collection, measured in
+Rust), `workflow_completion_settled` (admission to collection), and
+`workflow_completion_outcomes_collected` (one take, with the number of
+outcomes in `command_count`). They carry no payload, task token, or failure
+text, and are read only outside workflow code.
 
 ## Worker configuration validation
 
@@ -171,8 +283,10 @@ already been accepted.
 7. The encoded bytes are stored in an adapter-owned pending record before
    they are submitted through the same supervisor. The supervisor copies them
    into the C call without encoding the completion again; Rust checks the
-   leased run ID against its ledger and retires that lease only after Core
-   accepts it. A failure completion or eviction acknowledgement built by the
+   leased run ID against its ledger, retires the lease, and admits the
+   completion without waiting for Core (see
+   [completion admission](#completion-admission)); the adapter settles the
+   pending record when it collects the outcome. A failure completion or eviction acknowledgement built by the
    adapter is encoded once by the adapter in the same way. If the encoder
    rejects such a completion, nothing is submitted and the entry fails closed
    with `completion_failed`, as a non-retryable supervisor rejection does. The run entry is removed
@@ -579,6 +693,25 @@ verify:
 - duplicate and remote-only registration rejection before worker publication;
 - rejection of empty, NUL-containing, oversized, and non-UTF-8 worker queues
   before worker publication.
+
+`test/runtime/test_native_worker_completion_admission.ml` drives
+`Make_admitting` with a fake source whose outcomes the test releases. It
+checks that an admitted completion does not delay another run's activation,
+that a full window stops delivery without dequeuing and resumes after one
+outcome is collected, that a run's next activation waits for its previous
+outcome, that a stale ticket cannot settle an admitted completion, that
+failures before admission and unknown or rejected outcomes after it fail
+closed without resubmission, that drain reports a completion in flight and
+then settles it, that discard releases an admitted completion without a
+source call, and that a synchronous source is unchanged.
+`rust/core-bridge/tests/workflow_completion_overlap.rs` holds one run's real
+`RespondWorkflowTaskCompleted` behind a latch in a gRPC double: the same
+runtime admits that completion, delivers and settles another run's, and
+serves an unrelated operation before the latch opens (the synchronous call
+fails this test), and worker shutdown joins the held completion before
+finalizing. `rust/core-bridge/tests/workflow_completion_window.rs` covers the
+credit accounting, ticket generations, and exactly-once publication when a
+task panics or is aborted.
 
 `test/runtime/test_native_worker_lifecycle.ml` is a separate focused regression
 file for the shutdown-sensitive path. It rejects the same completion twice:
