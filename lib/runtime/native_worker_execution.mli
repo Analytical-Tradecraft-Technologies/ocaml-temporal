@@ -71,9 +71,66 @@ module type SUPERVISOR = sig
   val exception_is_retryable : exn -> bool
 end
 
+(** How a source took one submitted completion. [Acknowledged] means the
+    source retired the lease before returning, as a synchronous
+    [complete_workflow] does. [Admitted ticket] means the source took
+    ownership of the exact bytes without waiting for Temporal Core and will
+    publish one outcome for [ticket]; until that outcome is collected the
+    adapter treats the completion's fate as unknown. *)
+type submission = Acknowledged | Admitted of int
+
+(** Result of one bounded wait for an admitted completion's outcome.
+    [`Idle] means the source has nothing in flight. *)
+type outcome_wait = [ `Ready | `Idle | `Timed_out ]
+
+(** A source that can admit a completion without waiting for Temporal Core,
+    so the workflow lane can execute other runs' activations while Core (and
+    any RPC it makes) settles the completion.
+
+    Contract: [submit_workflow] returning [Error] means nothing was admitted
+    and the lease is unchanged; the adapter applies the same retry
+    classification as for [complete_workflow]. [Ok (Admitted ticket)] moves
+    the completion to the source, which must publish exactly one outcome for
+    [ticket] through [take_workflow_outcomes], including when its own task
+    fails. Tickets must be unique among admitted completions. The adapter
+    never resubmits an admitted completion: an outcome other than
+    [Completion_accepted] is recorded as a fail-closed error. The synchronous
+    [complete_workflow] remains for the watchdog, which must know whether its
+    replacement completion was acknowledged before reporting it. *)
+module type ADMITTING_SUPERVISOR = sig
+  include SUPERVISOR
+
+  (** Admits or acknowledges one completion, as the canonical bytes from its
+      single encoder pass; see the contract above. *)
+  val submit_workflow :
+    t ->
+    completion:Temporal_protocol.Workflow_protocol.completion ->
+    Temporal_protocol.Encoded_workflow_completion.t ->
+    (submission, error) result
+
+  (** Takes every published outcome without waiting, oldest first. *)
+  val take_workflow_outcomes :
+    t ->
+    (Temporal_protocol.Workflow_protocol.completion_outcome list, error) result
+
+  (** Waits a bounded time until an outcome is published. *)
+  val wait_workflow_outcome : t -> (outcome_wait, error) result
+end
+
+(** Adapts a synchronous source: [submit_workflow] calls [complete_workflow]
+    and answers [Acknowledged], no outcome is ever published, and the wait
+    answers [`Idle]. *)
+module Synchronous (Source : SUPERVISOR) :
+  ADMITTING_SUPERVISOR with type t = Source.t and type error = Source.error
+
 (** Stable diagnostic exposed by this private worker loop. It is safe to log
     and intentionally excludes payload bytes and native handles. *)
 type error_view = { code : string; path : string; message : string }
+
+(** Code of a [drain] error that found admitted completions still awaiting
+    Temporal Core. It is the only drain error a caller may retry: the
+    completions are owned by the source and may still be acknowledged. *)
+val completion_in_flight_code : string
 
 type activation_info = {
   run_id : string;
@@ -181,12 +238,20 @@ val update_handler_name : update_handler -> string
 (** Returns all payloads carried by an update activation. *)
 val update_input : update -> Temporal_base.Codec.payload list
 
-(** One worker-loop outcome. [Rejected] means a valid lease was completed with
-    a non-retryable bridge failure, so the caller can log the typed rejection
-    and continue polling. A supervisor error remains a [result] error because
-    the lease could not be proven retired. *)
+(** One worker-loop outcome. [Submitted] means an activation was executed and
+    its completion admitted by the source, which has not reported Core's
+    result yet; a later [poll] reports the matching [Completed] or [Rejected]
+    once the outcome is collected. [Rejected] means a valid lease was
+    completed with a non-retryable bridge failure, so the caller can log the
+    typed rejection and continue polling. A supervisor error remains a
+    [result] error because the lease could not be proven retired. *)
 type outcome =
   | Not_ready
+  | Submitted of {
+      run_id : string;
+      command_count : int;
+      terminal : bool;
+    }
   | Completed of {
       run_id : string;
       command_count : int;
@@ -198,7 +263,7 @@ type outcome =
       lease_retired : bool;
     }
 
-module Make (Supervisor : SUPERVISOR) : sig
+module Make_admitting (Supervisor : ADMITTING_SUPERVISOR) : sig
   (** A private owner-confined registry of running workflow executions. Calls
       to [poll] are serialized by an internal mutex so callers may safely
       invoke it from multiple ordinary Domains; workflow fibers must not call
@@ -229,7 +294,13 @@ module Make (Supervisor : SUPERVISOR) : sig
     (t, error_view) result
 
   (** Polls at most one activation, applies it to the deterministic execution
-      selected by its run ID, and submits exactly one completion. Empty native
+      selected by its run ID, and submits exactly one completion. Each call
+      first reports one result settled by an earlier collection, then
+      collects published outcomes without waiting; an admitted completion
+      therefore never blocks another run's activation. If the polled
+      activation's run still has an admitted completion without an outcome,
+      [poll] waits (in bounded source waits) for that one outcome before
+      running workflow code, preserving per-run order. Empty native
       lanes return [Ok Not_ready]. Unknown run IDs and invalid initialization
       inputs are converted to typed non-retryable workflow failures and
       reported as [Ok (Rejected _)] after their lease is retired. Child-start
@@ -237,7 +308,10 @@ module Make (Supervisor : SUPERVISOR) : sig
       Core without allowing a completed child to remain leased. *)
   val poll : t -> (outcome, error_view) result
 
-  (** Retries completions whose native acknowledgement previously failed with
+  (** Collects every admitted completion's outcome, waiting at most one
+      bounded source wait per pass; a wait that ends with completions still
+      in flight returns an error with code {!completion_in_flight_code}.
+      Then retries completions whose native acknowledgement previously failed with
       an explicitly retryable classification. The adapter mutex remains held
       while this operation runs, so no new activation can overtake an older
       lease. [Ok ()] proves that the pending map is empty. [Error _] leaves the
@@ -303,7 +377,16 @@ module Make (Supervisor : SUPERVISOR) : sig
       one whose lease the watchdog already released while its code still
       runs. A lock-free read, safe from any thread. *)
   val activation_in_flight : t -> bool
+
+  (** Lock-free count of completions admitted by the source whose outcome
+      has not been collected. *)
+  val admitted_completions : t -> int
 end
+
+(** The adapter over a synchronous source, whose completions are all
+    acknowledged before [poll] returns. *)
+module Make (Supervisor : SUPERVISOR) :
+  module type of Make_admitting (Synchronous (Supervisor))
 
 (** Wraps a public workflow definition in the private existential registration
     used by [Make]. Remote definitions are accepted by this constructor so the

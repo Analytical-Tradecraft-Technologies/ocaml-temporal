@@ -583,7 +583,10 @@ let drain (source : Source.t) runner =
           (replay_error
              (Printf.sprintf "replay completion failed (%s): %s" error.code
                 error.message))
-    | Ok (Adapter.Completed _) -> loop 0
+    (* Replay uses the synchronous adapter ([Adapter.Make]), whose source
+       acknowledges every completion before [poll] returns, so nothing is
+       ever admitted; the arm is progress for exhaustiveness only. *)
+    | Ok (Adapter.Completed _ | Adapter.Submitted _) -> loop 0
     | Ok Adapter.Not_ready -> (
         match Supervisor.perform source.native Supervisor.Finalize_replay with
         | Ok () -> Ok ()

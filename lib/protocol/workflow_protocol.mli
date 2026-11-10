@@ -557,6 +557,37 @@ val validate_retry_policy : retry_policy -> (unit, error) result
 (** Validates a programmatically constructed retry policy before a command
     translator exposes it as a semantic protocol value. *)
 
+(** How Temporal Core settled one workflow completion that the native bridge
+    admitted without waiting for it. [Completion_accepted] means Core's
+    completion call returned successfully, which is not the same as observing
+    the resulting history event. [Completion_rejected] means Core rejected it
+    and the bridge restored the activation's lease. [Completion_panicked] and
+    [Completion_aborted] mean the bridge task ended without Core's answer, so
+    Core may or may not have consumed the completion. *)
+type completion_result =
+  | Completion_accepted
+  | Completion_rejected
+  | Completion_panicked
+  | Completion_aborted
+
+type completion_outcome = {
+  ticket : int;
+      (** The ticket returned when the completion was admitted. *)
+  run_id : string;  (** The completion's run, for correlation. *)
+  result : completion_result;
+  core_await_us : int;
+      (** Monotonic microseconds the bridge spent awaiting Core. *)
+  queued_us : int;
+      (** Monotonic microseconds the outcome waited before collection. *)
+}
+(** One published outcome of an admitted workflow completion. *)
+
+val decode_completion_outcomes :
+  string -> (completion_outcome list, error) result
+(** Strictly decodes the bridge's
+    [{"outcomes":[{"ticket","run_id","result","core_await_us","queued_us"}]}]
+    document. *)
+
 (** Private codec building blocks shared by the closed semantic protocol
     adapters. They are exposed only from the internal protocol library so each
     adapter applies identical payload, failure, numeric, and time rules. *)

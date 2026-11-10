@@ -161,6 +161,8 @@ let deliver worker wire =
   | Ok (Worker.Completed _), Some completion -> completion.commands
   | Ok (Worker.Completed _), None -> failwith "adapter completed without a source call"
   | Ok Worker.Not_ready, _ -> failwith "adapter did not lease the activation"
+  | Ok (Worker.Submitted _), _ ->
+      failwith "synchronous benchmark source admitted a completion"
   | Ok (Worker.Rejected { error; _ }), _ ->
       failwith ("adapter rejected a benchmark activation: " ^ error.message)
   | Error error, _ -> failwith error.message

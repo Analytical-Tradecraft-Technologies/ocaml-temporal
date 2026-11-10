@@ -12,6 +12,7 @@
   test_native_worker_loop
   test_native_worker_policy
   test_native_worker_lifecycle
+  test_native_worker_completion_admission
   test_native_worker_shutdown
   test_native_worker_bounded_shutdown
   test_native_worker_execution

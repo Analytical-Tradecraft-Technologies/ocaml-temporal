@@ -365,6 +365,8 @@ let expect_completed ~terminal = function
         (Printf.sprintf "run %s emitted %d commands with terminal flag %b instead of %b"
            run_id command_count actual terminal)
   | Adapter.Not_ready -> failwith "poll unexpectedly reported Not_ready"
+  | Adapter.Submitted _ ->
+      failwith "the synchronous fake source unexpectedly admitted a completion"
   | Adapter.Rejected { error; _ } ->
       failwith
         (Printf.sprintf "poll unexpectedly rejected activation: %s at %s (%s)"

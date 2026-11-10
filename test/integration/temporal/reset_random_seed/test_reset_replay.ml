@@ -111,7 +111,8 @@ let () =
         match Replay.poll registry with
         | Error error -> failwith error.message
         | Ok (Worker.Rejected _) -> failwith "OCaml rejected a reset activation"
-        | Ok (Worker.Completed _) -> drain ()
+        (* The synchronous replay source never admits a completion. *)
+        | Ok (Worker.Completed _ | Worker.Submitted _) -> drain ()
         | Ok Worker.Not_ready ->
             (match Native.perform native Native.Finalize_replay with
              | Ok () -> ()

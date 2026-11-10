@@ -438,6 +438,20 @@ and bridge, read the [documentation guide](../README.md) first.
   `complete_workflow_activation`, so an identical resubmission could at best
   fail again and, after a lost acknowledgement, could complete a later
   activation of the same run.
+- A live workflow completion is admitted to the bridge without waiting for
+  Core (see [completion admission](native-worker-execution.md#completion-admission)).
+  Admission retires the run's ledger lease and moves the converted completion
+  to one Tokio task, which publishes exactly one outcome under the lease
+  generation (ticket) Rust assigned at hand-off, also when the task panics or
+  is aborted. OCaml keeps the exact bytes until it collects that outcome, and
+  accepts it only for the ticket it holds for the same run, so a late outcome
+  cannot settle a newer activation of the run. An admitted completion is never
+  resubmitted: a rejected or unknown outcome fails closed like a failed
+  synchronous completion. A run's next activation is executed only after the
+  previous outcome is settled; other runs never wait for an outcome. One
+  window credit covers each activation from hand-off to outcome collection,
+  and the credit is reserved before delivery, so OCaml can always complete
+  every lease it holds and the outcome queue stays bounded.
 - Namespace-bound async heartbeats and async complete/fail/cancel do not
   consume that Core completion lease, so they do not fail closed. An
   uncertain RPC `Connection` keeps the public handle and adapter async lease

@@ -621,7 +621,31 @@ module Native : sig
             single encoder pass. The value can only be built by
             [Encoded_workflow_completion.encode], so it is already validated;
             the supervisor copies it into the C call without encoding it
-            again (issue #846). *)
+            again (issue #846). The owner Domain waits until Temporal Core
+            answers, including any RPC Core makes, so the workflow lane uses
+            [Submit_workflow_completion]; only the activation watchdog, which
+            must know whether its replacement completion was acknowledged,
+            still uses this operation. *)
+    | Submit_workflow_completion :
+        Temporal_protocol.Encoded_workflow_completion.t -> int operation
+        (** Admits one workflow completion, as the canonical bytes from its
+            single encoder pass, without waiting for Temporal Core and
+            returns its ticket. The bridge validates and converts the bytes
+            and moves the completion to a Rust task; the owner Domain never
+            waits for Core or the network. [Error] means the completion was
+            definitively not admitted and its lease is unchanged. The outcome
+            is collected with [Take_workflow_completions]. *)
+    | Take_workflow_completions :
+        Temporal_protocol.Workflow_protocol.completion_outcome list operation
+        (** Takes every published outcome of admitted workflow completions
+            without waiting, oldest first. Collecting an outcome frees the
+            completion-window credit its activation held. *)
+    | Wait_workflow_completion : [ `Ready | `Idle ] operation
+        (** Waits, under the bounded runtime-lock-free contract of
+            [Wait_workflow], until an admitted completion's outcome is ready.
+            [`Idle] means none is in flight; a timeout is the bridge's
+            [Not_ready] error. Shutdown uses it to drain admitted completions
+            after the poll lanes have closed. *)
     | Try_poll_activity :
         Temporal_protocol.Activity_protocol.task option operation
         (** Takes and validates one already-ready remote activity task. [None]
