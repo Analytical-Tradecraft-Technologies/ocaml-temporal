@@ -122,6 +122,61 @@ leaked native handle or socket.
   external system deduplicate on that key atomically. Do not use the attempt
   number as the key.
 
+## Choosing an idempotency key and its scope
+
+At-least-once delivery means a side effect may be attempted again after it
+already happened. The key decides which attempts the external system treats
+as *the same operation*, so its scope must match the business meaning of
+"once" (#504).
+
+| Key built from | Same key for | Different key for | Use when |
+| --- | --- | --- | --- |
+| Workflow run ID + activity ID (`Activity.Info.workflow`, `Activity.Info.activity_id`) | Every retry of one scheduled activity, including retries on another worker after a crash | A workflow retry or continue-as-new (each has a new run ID), and every other activity in the run | "Once per scheduled activity of this run" |
+| Workflow ID + a business sequence carried in the input | Every attempt of every run of that workflow that uses the same sequence value | A different sequence value | "Once per business step", across workflow retries and continue-as-new |
+| A business key from the request (order ID, payment ID) | Every attempt, run and workflow that carries it | Anything else | "Once per real-world operation", even across workflows |
+
+- **Workflow retries and continue-as-new start a new run.** Activity IDs that
+  the SDK assigns are deterministic per run, so a retried or continued run
+  schedules activity `"1"` again under a new run ID. A key of run ID plus
+  activity ID therefore repeats the side effect in the new run. If a step
+  must happen once across runs, carry its key in the workflow input and
+  continue-as-new arguments, and pass it to the activity.
+- **The workflow ID alone is never enough.** A closed run's workflow ID can be
+  reused (`id_reuse_policy`), and one run schedules many activities.
+- **Never derive the key from the payload.** Two distinct operations with
+  identical inputs, such as two equal transfers in one run, must get distinct
+  keys. They do with run ID plus activity ID, because each scheduled activity
+  has its own ID. A hash of the input would merge them, and the second one
+  would be wrongly suppressed. Likewise, the attempt number distinguishes
+  retries of the *same* operation and must not be part of a deduplication
+  key.
+
+### When the external system cannot deduplicate atomically
+
+Exactly-once is achievable only when the system that performs the side effect
+can record "key K is done" in the same atomic step as the effect. That is, it
+offers an idempotency-key API, a unique constraint written in the same
+transaction, or a conditional write. Without such a facility:
+
+- **Check-then-act is not safe.** An attempt can perform the effect and die
+  before acknowledging it. A retry that first asks "was K done?" can race a
+  still-running abandoned attempt, which keeps running after the worker's
+  grace period. The result is at-least-once, not exactly-once.
+- **Prefer an effect that is naturally idempotent.** Use a set-to-value write
+  rather than an increment, or an upsert keyed by K.
+- **Otherwise reconcile.** Record the intent with K before the effect, look K
+  up in the external system on every attempt, and finish or compensate
+  according to what it reports. Accept that a window remains in which a human
+  or a reconciliation job may have to resolve a duplicate.
+- **Heartbeat details are progress hints, not a ledger.** They are recorded
+  only when a heartbeat reaches the server, so the last recorded detail can
+  predate the side effect.
+
+The runnable [cooperative cancellation example](../../examples/README.md#cancel-activities-cooperatively)
+uses an in-memory reservation ledger with idempotent operations, keyed by
+workflow ID, run ID and activity ID. It also shows a new run that reuses the
+workflow ID doing its own work.
+
 ## Running
 
 CI runs the suite against the Compose Temporal/PostgreSQL stack through
@@ -148,6 +203,10 @@ The following parts of #504 are not covered by this suite:
 - The worked side-effecting activity example with an external store that
   provides an atomic idempotency contract, and the failure-after-commit
   redelivery test across a worker restart. This is also left for later.
+- A test showing that two distinct operations with identical payloads get
+  distinct keys and are both performed. The key scope and the limits without
+  atomic deduplication are documented in
+  [Choosing an idempotency key and its scope](#choosing-an-idempotency-key-and-its-scope).
 
 CI artifact retention (#490) is closed: the live job uploads this suite's log
 from `_build/live-regressions/` in its `live-regressions-*` artifact, kept for
