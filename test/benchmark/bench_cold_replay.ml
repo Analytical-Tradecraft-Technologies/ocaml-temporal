@@ -164,7 +164,8 @@ let drain ~native ~registry =
     | Error error -> failwith error.message
     | Ok (Worker.Rejected _) ->
         failwith "OCaml rejected a cold replay activation"
-    | Ok (Worker.Completed _) -> loop ()
+    (* The synchronous replay source never admits a completion. *)
+    | Ok (Worker.Completed _ | Worker.Submitted _) -> loop ()
     | Ok Worker.Not_ready -> (
         match Native.perform native Native.Finalize_replay with
         | Ok () -> ()

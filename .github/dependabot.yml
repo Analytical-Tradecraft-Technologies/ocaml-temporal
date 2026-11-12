@@ -22,6 +22,91 @@ updates:
       - temporalio-common
       - temporalio-sdk-core
       - temporalio-protos
+    # Each group below is one upstream project whose crates are released
+    # together, so a release otherwise arrives as several PRs that each
+    # need a merge-queue run. Unrelated crates (rustls, hyper, serde_json,
+    # ...) keep their own PRs. Names are listed explicitly where another
+    # publisher could reuse the prefix (futures-retry is not rust-lang's).
+    tonic:
+      patterns:
+      - tonic
+      - tonic-*
+    prost:
+      patterns:
+      - prost
+      - prost-build
+      - prost-derive
+      - prost-types
+    tokio:
+      patterns:
+      - tokio
+      - tokio-macros
+    futures:
+      patterns:
+      - futures
+      - futures-channel
+      - futures-core
+      - futures-executor
+      - futures-io
+      - futures-macro
+      - futures-sink
+      - futures-task
+      - futures-util
+    tracing:
+      patterns:
+      - tracing
+      - tracing-attributes
+      - tracing-core
+      - tracing-serde
+      - tracing-subscriber
+    opentelemetry:
+      patterns:
+      - opentelemetry
+      - opentelemetry-http
+      - opentelemetry-otlp
+      - opentelemetry-proto
+      - opentelemetry_sdk
+    windows:
+      patterns:
+      - windows
+      - windows-*
+      - windows_*
+    wasm-bindgen:
+      patterns:
+      - wasm-bindgen
+      - wasm-bindgen-*
+      - js-sys
+      - web-sys
+    cc:
+      patterns:
+      - cc
+      - find-msvc-tools
+    icu4x:
+      patterns:
+      - icu_*
+      - zerovec
+      - zerovec-derive
+      - yoke
+      - yoke-derive
+      - zerofrom
+      - zerofrom-derive
+      - tinystr
+      - writeable
+      - litemap
+      - potential_utf
+    serde:
+      patterns:
+      - serde
+      - serde_core
+      - serde_derive
+    zerocopy:
+      patterns:
+      - zerocopy
+      - zerocopy-derive
+    bon:
+      patterns:
+      - bon
+      - bon-macros
   target-branch: master
   open-pull-requests-limit: 10
 - package-ecosystem: docker
@@ -124,3 +209,14 @@ updates:
     timezone: Australia/Sydney
   cooldown:
     default-days: 3
+  groups:
+    # upload-artifact and download-artifact are maintained together and
+    # usually move the same day; actions/cache/restore and actions/cache/save
+    # are two entry points of one action.
+    artifact-actions:
+      patterns:
+      - actions/upload-artifact
+      - actions/download-artifact
+    cache-actions:
+      patterns:
+      - actions/cache*

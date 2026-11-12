@@ -3465,6 +3465,66 @@ let encode_completion value =
       let* _ = completion_from_json json in
       Ok output
 
+(** How Temporal Core settled one admitted workflow completion. *)
+type completion_result =
+  | Completion_accepted
+  | Completion_rejected
+  | Completion_panicked
+  | Completion_aborted
+
+type completion_outcome = {
+  ticket : int;
+  run_id : string;
+  result : completion_result;
+  core_await_us : int;
+  queued_us : int;
+}
+
+(** Reads a non-negative JSON integer that fits a native OCaml [int]. Tickets
+    stay below 2{^62} on the Rust side and durations are microseconds, so a
+    wider value is a protocol defect rather than data to clamp. *)
+let nonnegative_int path value =
+  let* value = int64 path value in
+  if Int64.compare value 0L < 0 || Int64.compare value (Int64.of_int max_int) > 0
+  then Error (invalid path "integer is outside the non-negative native range")
+  else Ok (Int64.to_int value)
+
+(** Decodes one closed outcome object. *)
+let completion_outcome_from_json path json =
+  let* entries =
+    exact_object path
+      [ "ticket"; "run_id"; "result"; "core_await_us"; "queued_us" ]
+      json
+  in
+  let* ticket = field path "ticket" entries in
+  let* ticket = nonnegative_int (path ^ ".ticket") ticket in
+  let* run_id = field path "run_id" entries in
+  let* run_id = identifier (path ^ ".run_id") run_id in
+  let* result = field path "result" entries in
+  let* result =
+    match result with
+    | `String "completed" -> Ok Completion_accepted
+    | `String "rejected" -> Ok Completion_rejected
+    | `String "panicked" -> Ok Completion_panicked
+    | `String "aborted" -> Ok Completion_aborted
+    | _ -> Error (invalid (path ^ ".result") "unknown completion result")
+  in
+  let* core_await_us = field path "core_await_us" entries in
+  let* core_await_us = nonnegative_int (path ^ ".core_await_us") core_await_us in
+  let* queued_us = field path "queued_us" entries in
+  let* queued_us = nonnegative_int (path ^ ".queued_us") queued_us in
+  Ok { ticket; run_id; result; core_await_us; queued_us }
+
+(** Strictly decodes the outcome document published by the native bridge's
+    workflow-completion queue. *)
+let decode_completion_outcomes input =
+  match Control.decode_payload_object input with
+  | Error error -> Error (of_control_error_at_source error)
+  | Ok json ->
+      let* entries = exact_object "$" [ "outcomes" ] json in
+      let* outcomes = field "$" "outcomes" entries in
+      list "$.outcomes" completion_outcome_from_json outcomes
+
 (** Private aliases make the canonical semantic codecs reusable without
     copying validation logic into each protocol adapter. *)
 module Internal = struct

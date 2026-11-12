@@ -502,7 +502,7 @@ if [ "$(grep -Fc '  temporal-integration:' "$workflow")" -ne 1 ]; then
 fi
 # The shared diagnostic wrapper keeps the same seven live controllers in the
 # Makefile so PR/nightly evidence uses one invocation path.
-master_smoke=$(sed -n '/^  temporal-integration:/,/^  verify:/p' "$workflow")
+master_smoke=$(sed -n '/^  temporal-integration:/,/^  temporal-integration-result:/p' "$workflow")
 require_master_smoke_text() {
   needle=$1
   if ! printf '%s\n' "$master_smoke" | grep -F -- "$needle" >/dev/null; then
@@ -511,8 +511,82 @@ require_master_smoke_text() {
   fi
 }
 require_master_smoke_text 'make test-temporal-live-ci'
-require_master_smoke_text 'name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
-require_master_smoke_text 'timeout-minutes: 103'
+require_master_smoke_text 'timeout-minutes: 91'
+require_master_smoke_text 'TEMPORAL_LIVE_CI_SHARD: ${{ matrix.shard }}'
+require_master_smoke_text 'fail-fast: false'
+# The live controllers run as parallel shards. The matrix must list exactly
+# the Makefile's LIVE_CI_SHARDS, and every line of test-temporal-live-ci must
+# be tagged with one of them: an untagged line would run in every shard, and
+# a shard missing from the matrix would never run in CI.
+workflow_shards=$(printf '%s\n' "$master_smoke" \
+  | sed -n 's/^        shard: \[\(.*\)\]$/\1/p' | tr -d ' ' | tr ',' '\n' | LC_ALL=C sort)
+make_shards=$(sed -n 's/^LIVE_CI_SHARDS := //p' "$makefile" | tr -d '\r' | tr ' ' '\n' \
+  | sed '/^$/d' | LC_ALL=C sort)
+if [ -z "$make_shards" ] || [ "$workflow_shards" != "$make_shards" ]; then
+  echo "temporal-integration shards ($(printf '%s' "$workflow_shards" | tr '\n' ' ')) must equal LIVE_CI_SHARDS ($(printf '%s' "$make_shards" | tr '\n' ' '))" >&2
+  exit 1
+fi
+live_ci_recipe=$(tr -d '\r' <"$makefile" | awk '
+  /^test-temporal-live-ci:/ { active = 1; next }
+  active && /^[^\t]/ { exit }
+  active { print }')
+untagged=$(printf '%s\n' "$live_ci_recipe" | grep -v '^	$(call live_ci_shard,[a-z]*) ' || true)
+if [ -z "$live_ci_recipe" ] || [ -n "$untagged" ]; then
+  echo "every test-temporal-live-ci line must start with \$(call live_ci_shard,<shard>):" >&2
+  printf '%s\n' "$untagged" >&2
+  exit 1
+fi
+for shard in $make_shards; do
+  printf '%s\n' "$live_ci_recipe" | grep -F "\$(call live_ci_shard,$shard) " >/dev/null || {
+    echo "live CI shard $shard has no controllers" >&2
+    exit 1
+  }
+done
+# Expanding the recipe per shard (with $(MAKE) renamed so `make -n` does not
+# run the recursive lines) must run each line in exactly one shard, and every
+# line when no shard is selected. The macro stops Make on a tag outside
+# LIVE_CI_SHARDS, which leaves the unsharded count at zero below.
+make_copy=$(mktemp)
+sed 's/\$(MAKE)/$(LIVE_SUBMAKE)/g' "$makefile" >"$make_copy"
+expand_live_ci() {
+  make --no-print-directory -n -f "$make_copy" -C "$root" test-temporal-live-ci \
+    LIVE_SUBMAKE=submake TEMPORAL_LIVE_CI_SHARD="$1" 2>/dev/null
+}
+all_lines=$(expand_live_ci '' | grep -c 'submake test-temporal-' || true)
+selected=0
+for shard in $make_shards; do
+  count=$(expand_live_ci "$shard" | grep -v '^:' | grep -c 'submake test-temporal-' || true)
+  selected=$((selected + count))
+done
+if expand_live_ci bogus >/dev/null 2>&1; then
+  rm -f "$make_copy"
+  echo "an unknown TEMPORAL_LIVE_CI_SHARD must stop Make" >&2
+  exit 1
+fi
+rm -f "$make_copy"
+if [ "$all_lines" -eq 0 ]; then
+  echo "test-temporal-live-ci does not expand (an unknown shard tag?); run make -n test-temporal-live-ci" >&2
+  exit 1
+fi
+if [ "$selected" -ne "$all_lines" ]; then
+  echo "shards run $selected live CI lines, but the unsharded recipe runs $all_lines" >&2
+  exit 1
+fi
+# A matrix reports one check per shard, so a separate job reports the exact
+# name the master ruleset requires, runs even when a shard fails (required
+# checks must fail, not skip) and passes only when every shard passed.
+smoke_result=$(sed -n '/^  temporal-integration-result:/,/^  verify:/p' "$workflow")
+for needle in \
+  'if: ${{ !cancelled() && needs.changes.outputs.code == '"'"'true'"'"' }}' \
+  'needs: [changes, temporal-integration]' \
+  'name: Temporal/PostgreSQL integration smoke (OCaml 5.5)' \
+  'SHARDS_RESULT: ${{ needs.temporal-integration.result }}' \
+  'run: test "$SHARDS_RESULT" = success'; do
+  printf '%s\n' "$smoke_result" | grep -F -- "$needle" >/dev/null || {
+    echo "temporal-integration-result job is missing: $needle" >&2
+    exit 1
+  }
+done
 # Every step carries its own timeout and the job timeout covers their sum, so
 # a hung scenario step times out on its own and the always() evidence uploads
 # after it still run before GitHub kills the job (#504, #519).

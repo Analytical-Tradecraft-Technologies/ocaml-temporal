@@ -309,11 +309,27 @@ The development image copies the Rust toolchain pinned by
 `rust/rust-toolchain.toml`, Cargo, Clippy, and
 rustfmt from the official multi-architecture Rust image below, and
 `Dockerfile.rust-ci` builds the shared Linux Rust producer from the same
-digest. Rust is dual-licensed Apache-2.0 OR MIT. Debian's `protobuf-compiler`
+digest. That file is the single Rust version pin: both images install its
+exact channel with rustup and remove any other toolchain, the native and
+producer workflows select it through `RUSTUP_TOOLCHAIN`, and the Makefile's
+`NATIVE_RUST_VERSION` reads it, all through `scripts/rust-version.sh`. The
+image therefore only supplies rustup and Debian 12, and a Rust bump edits one
+line. Rust is dual-licensed Apache-2.0 OR MIT. Debian's `protobuf-compiler`
 and `libprotobuf-dev` packages are installed as build-only tools required by
 Temporal Core's generated protobuf crates and standard Google protobuf
 definitions; Protocol Buffers is BSD-3-Clause. Neither tool is intended for
 the eventual minimal runtime image.
+
+Debian's `lld` package, LLVM's linker (Apache-2.0 WITH LLVM-exception), is
+also a build-only tool in the development image. Only
+`scripts/build-temporal-executables.sh` selects it, through
+`OCAMLPARAM=_,ccopt=-fuse-ld=lld`, to link the live-test executables, which
+each statically link the Rust bridge: the 44 CI smoke programs link in 65
+seconds instead of GNU ld's 98 on a standard runner. `make verify`, the
+installed-library consumer and the SDK's own Dune rules keep the platform's
+default linker, because lld resolves symbols across archives in any order and
+could hide a link-order mistake in the flags the SDK ships to applications;
+`test/smoke/test_build_jobs_contract.sh` enforces that boundary.
 
 The Cargo license policy script runs in a separate official Python image in
 the standalone GitHub Actions audit job, and the release preflight uses the
@@ -430,11 +446,21 @@ dependencies (security updates can still cover vulnerable lockfile entries).
 Temporal Core packages remain grouped, but Dependabot does not move a
 `rev =` pin of a Git dependency, so that group has never proposed a Core
 upgrade; the scheduled freshness check under
-[Temporal Core pin upgrades](#temporal-core-pin-upgrades) does that job. Cargo
+[Temporal Core pin upgrades](#temporal-core-pin-upgrades) does that job.
+Crates that one upstream project releases together are also grouped, so a
+release arrives as one PR and one merge-queue run instead of several: tonic,
+the core prost crates, tokio with tokio-macros, the futures crates, tracing,
+opentelemetry, windows-rs, wasm-bindgen with js-sys/web-sys, cc with
+find-msvc-tools, ICU4X (icu_*, zerovec, yoke, zerofrom, tinystr, writeable,
+litemap, potential_utf), serde with serde_core/serde_derive, zerocopy, and bon.
+Unrelated crates keep separate PRs. The GitHub Actions entry groups the
+upload/download artifact actions and the two actions/cache entry points. Cargo
 resolution continues to enforce
 upstream version requirements; this policy does not override those constraints.
 Docker, Docker Compose, Rust toolchains, and GitHub Actions have separate daily
-entries. Versions embedded in arbitrary scripts, Makefiles, and action inputs
+entries. Because every gate reads the Rust version from
+`rust/rust-toolchain.toml`, the rust-toolchain entry's PR is a complete Rust
+upgrade on its own; the `rust:` image entry only refreshes the base. Versions embedded in arbitrary scripts, Makefiles, and action inputs
 still require explicit maintenance. OCaml and OPAM are intentionally absent
 because GitHub Dependabot does not support that ecosystem; the locked OPAM
 closure and its per-compiler overrides continue to be reviewed and updated

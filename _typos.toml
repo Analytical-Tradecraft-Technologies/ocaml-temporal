@@ -6,3 +6,6 @@ Open_wronly = "Open_wronly"
 # `flate2` is the Rust gzip crate the test gRPC server double uses; the
 # dependency inventory and its contract test name it in prose and shell.
 flate = "flate"
+# `writeable` is an ICU4X crate; the Dependabot policy in
+# docs/dependencies.md names it among the grouped crates.
+writeable = "writeable"

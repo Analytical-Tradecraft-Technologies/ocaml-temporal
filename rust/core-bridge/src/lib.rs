@@ -17,6 +17,8 @@ pub mod sigpipe;
 mod telemetry;
 #[doc(hidden)]
 pub mod worker_bridge;
+#[doc(hidden)]
+pub mod workflow_completions;
 pub mod workflow_protocol;
 
 pub use abi::*;

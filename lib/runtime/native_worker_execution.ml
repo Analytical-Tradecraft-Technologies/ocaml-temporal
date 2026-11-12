@@ -48,8 +48,64 @@ module type SUPERVISOR = sig
   val exception_is_retryable : exn -> bool
 end
 
+(** How a source took one submitted completion. [Acknowledged]: the source
+    has already retired the lease, as a synchronous [complete_workflow] does.
+    [Admitted ticket]: the source accepted ownership of the exact bytes and
+    will publish one outcome for [ticket] through [take_workflow_outcomes];
+    until then the completion's fate is unknown to this adapter. *)
+type submission = Acknowledged | Admitted of int
+
+(** Result of a bounded wait for an admitted completion's outcome. *)
+type outcome_wait = [ `Ready | `Idle | `Timed_out ]
+
+(** A source that may admit completions without waiting for Temporal Core.
+    It extends [SUPERVISOR], whose [complete_workflow] stays synchronous: the
+    non-yielding-code watchdog needs to know whether its replacement
+    completion was acknowledged before it reports the abandonment. *)
+module type ADMITTING_SUPERVISOR = sig
+  include SUPERVISOR
+
+  (* Hands the exact bytes to the source. [Error] means nothing was admitted
+     and the lease is unchanged; [Ok (Admitted ticket)] transfers the
+     completion to the source until its outcome is taken. *)
+  val submit_workflow :
+    t -> completion:Protocol.completion -> Encoded_completion.t ->
+    (submission, error) result
+
+  (* Takes every published outcome without waiting, oldest first. *)
+  val take_workflow_outcomes :
+    t -> (Protocol.completion_outcome list, error) result
+
+  (* Waits a bounded time for an outcome. [`Idle] means none is in flight. *)
+  val wait_workflow_outcome : t -> (outcome_wait, error) result
+end
+
+(** Adapts a synchronous source: every completion is acknowledged before
+    [submit_workflow] returns, so no outcome is ever published. *)
+module Synchronous (Source : SUPERVISOR) :
+  ADMITTING_SUPERVISOR with type t = Source.t and type error = Source.error =
+struct
+  include Source
+
+  (** Delegates to the synchronous completion. *)
+  let submit_workflow source ~completion encoded =
+    Result.map (fun () -> Acknowledged)
+      (Source.complete_workflow source ~completion encoded)
+
+  (** A synchronous source never has an outcome to take. *)
+  let take_workflow_outcomes _ = Ok []
+
+  (** Nothing is ever in flight. *)
+  let wait_workflow_outcome _ = Ok `Idle
+end
+
 (** Stable diagnostics deliberately contain no payload bytes or native values. *)
 type error_view = { code : string; path : string; message : string }
+
+(** Error code of a drain that found admitted completions still awaiting
+    Temporal Core. Shutdown may drain again; any other drain error is
+    terminal. *)
+let completion_in_flight_code = "completion_in_flight"
 
 (** Replay metadata exposed only to the private worker diagnostic hook. Payloads,
     continuations, and native handles remain inside the execution boundary. *)
@@ -242,11 +298,25 @@ type pending_completion = {
   submission : (Native_execution.encoded_completion, error_view) result;
   result : pending_result;
   mutable retry_refusal : error_view option;
+  mutable admission : admission;
 }
+
+(** Whether the source currently owns a pending completion. [Admitted_as]
+    records the ticket the source returned and the monotonic admission time.
+    An admitted entry is never resubmitted: it leaves [pending] when its
+    outcome is taken, either as acknowledged or with [retry_refusal] set. *)
+and admission =
+  | Not_admitted
+  | Admitted_as of { ticket : int; admitted_ns : int64 }
 
 (** One worker-loop result. *)
 type outcome =
   | Not_ready
+  | Submitted of {
+      run_id : string;
+      command_count : int;
+      terminal : bool;
+    }
   | Completed of {
       run_id : string;
       command_count : int;
@@ -578,11 +648,41 @@ let find_definition definitions workflow_type =
         (make_error ~path:"$.jobs[0].workflow_type" "unknown_workflow_type"
            ("no executable workflow is registered for type " ^ workflow_type))
 
+(** Tickets of admitted completions, mapped to their run IDs. *)
+module Ticket_map = Map.Make (Int)
+
+(** Monotonic nanoseconds for diagnostic durations only; never read by
+    workflow code or used for a deterministic decision. *)
+let monotonic_ns () =
+  try Temporal_core_bridge.Native_bridge.monotonic_now_ns () with _ -> 0L
+
+(** Milliseconds between two [monotonic_ns] readings, never negative. *)
+let elapsed_ms ~since ~until =
+  Float.max 0. (Int64.to_float (Int64.sub until since) /. 1e6)
+
+(** Emits one [Debug] timing record keyed by run ID, building its tags only
+    when the lifecycle source is at [Debug], so a disabled log costs one level
+    check. Durations are monotonic and diagnostic only: completion admission,
+    queue dwell, Core await, and outcome collection are reported separately
+    so a slow worker can be attributed to the right phase. No payload, task
+    token, or failure text is included. *)
+let report_timing ~operation ?run_id ?command_count duration_ms =
+  match Logs.Src.level Observability.Source.lifecycle with
+  | Some Logs.Debug -> (
+      try
+        let tags =
+          Observability.tags ~operation ~duration_ms ?run_id ?command_count ()
+        in
+        Observability.report ~src:Observability.Source.lifecycle Logs.Debug
+          ~tags "native workflow completion timing"
+      with _ -> ())
+  | _ -> ()
+
 (** The functor implementation uses a concrete record containing the source
     module and source value. The public [t] stores that record behind the
     functor's abstract type, preserving both the source's abstract type and the
     invariant that all calls pass through the adapter mutex. *)
-module Make (Supervisor : SUPERVISOR) = struct
+module Make_admitting (Supervisor : ADMITTING_SUPERVISOR) = struct
   (** Mutable state owned by one adapter instance. [supervisor], [task_queue],
       [namespace], and [definitions] are immutable after construction; [runs] and
       [pending] are changed only while [mutex] is held, so workflow execution
@@ -632,6 +732,21 @@ module Make (Supervisor : SUPERVISOR) = struct
        worker stays unhealthy until the process is replaced, because the code
        that failed to yield may have left process state inconsistent. *)
     stuck : stuck_activation option Atomic.t;
+    (* Admitted completions by ticket, mapped to the run whose [pending]
+       entry owns them. An outcome is accepted only if its ticket is here and
+       names the same run, so a late or duplicate outcome can never settle a
+       newer activation of that run. Changed only while [mutex] is held. *)
+    mutable tickets : string Ticket_map.t;
+    (* The number of entries in [tickets], readable without [mutex] by the
+       shutdown probe. *)
+    admitted : int Atomic.t;
+    (* Outcomes settled while collecting, reported one per [poll] so the
+       caller still sees every [Completed] or [Rejected]. Bounded by the
+       source's completion window. Changed only while [mutex] is held. *)
+    settled : outcome Queue.t;
+    (* Monotonic start of the activation being processed, consumed by the
+       first submission of its completion to report execution time. *)
+    mutable activation_started_ns : int64 option;
   }
 
   (** The public worker handle is the mutex-confined state above. *)
@@ -661,6 +776,10 @@ module Make (Supervisor : SUPERVISOR) = struct
         in_flight = Atomic.make None;
         next_epoch = 0;
         stuck = Atomic.make None;
+        tickets = Ticket_map.empty;
+        admitted = Atomic.make 0;
+        settled = Queue.create ();
+        activation_started_ns = None;
       }
 
   (** Distinguishes source rejection from an uncertain raised acknowledgement.
@@ -670,6 +789,7 @@ module Make (Supervisor : SUPERVISOR) = struct
       which the retained completion is never resubmitted. *)
   type completion_attempt =
     | Accepted
+    | Admitted_by_supervisor of int
     | Rejected_by_supervisor of { error : error_view; retryable : bool }
     | Raised_by_supervisor of { exception_ : exn; retryable : bool }
 
@@ -691,6 +811,34 @@ module Make (Supervisor : SUPERVISOR) = struct
     try
       match Supervisor.complete_workflow supervisor ~completion encoded with
       | Ok () -> Accepted
+      | Error source_error ->
+          let source =
+            supervisor_error ~path:"$.completion"
+              ~error_code:Supervisor.error_code
+              ~error_message:Supervisor.error_message source_error
+          in
+          Rejected_by_supervisor
+            {
+              error =
+                make_error ~path:"$.completion" "completion_failed"
+                  (Printf.sprintf "supervisor rejected completion (%s): %s"
+                     source.code source.message);
+              retryable = source_error_is_retryable source_error;
+            }
+    with exception_ ->
+      Raised_by_supervisor
+        { exception_; retryable = completion_exception_is_retryable exception_ }
+
+  (** Submits one completion through the admitting operation. A source that
+      admits without acknowledging returns [Admitted_by_supervisor]; failures
+      are classified exactly as in [attempt_completion], and an [Error] from
+      the source means nothing was admitted. *)
+  let attempt_submission supervisor
+      ({ completion; encoded } : Native_execution.encoded_completion) =
+    try
+      match Supervisor.submit_workflow supervisor ~completion encoded with
+      | Ok Acknowledged -> Accepted
+      | Ok (Admitted ticket) -> Admitted_by_supervisor ticket
       | Error source_error ->
           let source =
             supervisor_error ~path:"$.completion"
@@ -788,6 +936,35 @@ module Make (Supervisor : SUPERVISOR) = struct
                lease_retired = true;
              })
 
+  (** Records that the source admitted [pending] under [ticket] without
+      acknowledging it yet. The entry stays in [pending] with its exact bytes,
+      so the run's next activation cannot be processed until the outcome is
+      taken, and the completion is never submitted again. Nothing is reported
+      as completed here: [poll] returns [Submitted], and the [Completed] or
+      [Rejected] result follows once the outcome is collected. A ticket that
+      is already held is a source defect; the entry then fails closed. *)
+  let admit_pending adapter pending ~ticket ~admitted_ns =
+    if Ticket_map.mem ticket adapter.tickets then begin
+      let error =
+        make_error ~path:"$.completion" "completion_failed"
+          "supervisor returned a ticket that is already admitted"
+      in
+      pending.retry_refusal <- Some error;
+      Error error
+    end
+    else begin
+      pending.admission <- Admitted_as { ticket; admitted_ns };
+      adapter.tickets <- Ticket_map.add ticket pending.run_id adapter.tickets;
+      Atomic.incr adapter.admitted;
+      let command_count, terminal =
+        match pending.result with
+        | Pending_completed { command_count; terminal; _ } ->
+            (command_count, terminal)
+        | Pending_rejected _ -> (0, false)
+      in
+      Ok (Submitted { run_id = pending.run_id; command_count; terminal })
+    end
+
   (** Attempts one retained completion. A rejected or raised native call leaves
       the same value in [pending]. A failure the source did not explicitly
       classify as retryable sets [retry_refusal]; from then on this function
@@ -812,8 +989,23 @@ module Make (Supervisor : SUPERVISOR) = struct
                the supervisor's own encode rejected it non-retryably. *)
             refuse_unless false error
         | Ok submission ->
-        match attempt_completion adapter.supervisor submission with
+        let started_ns = monotonic_ns () in
+        (match adapter.activation_started_ns with
+         | Some activation_ns ->
+             adapter.activation_started_ns <- None;
+             report_timing ~operation:"workflow_activation_executed"
+               ~run_id:pending.run_id
+               (elapsed_ms ~since:activation_ns ~until:started_ns)
+         | None -> ());
+        let attempt = attempt_submission adapter.supervisor submission in
+        let admitted_ns = monotonic_ns () in
+        report_timing ~operation:"workflow_completion_admission"
+          ~run_id:pending.run_id
+          (elapsed_ms ~since:started_ns ~until:admitted_ns);
+        match attempt with
         | Accepted -> accepted_pending adapter pending
+        | Admitted_by_supervisor ticket ->
+            admit_pending adapter pending ~ticket ~admitted_ns
         | Rejected_by_supervisor { error; retryable } ->
             refuse_unless retryable error
         | Raised_by_supervisor { exception_; retryable } ->
@@ -821,6 +1013,173 @@ module Make (Supervisor : SUPERVISOR) = struct
                it with a task failure or rerun workflow code after an
                uncertain acknowledgement. *)
             refuse_unless retryable (completion_exception_error exception_))
+
+  (** The diagnostic recorded for an admitted completion whose outcome was
+      not an acknowledgement. A Core rejection is a known result; a bridge
+      task that ended without Core's answer leaves the outcome unknown. Either
+      way the completion is never submitted again. *)
+  let outcome_failure (result : Protocol.completion_result) =
+    match result with
+    | Protocol.Completion_accepted -> None
+    | Protocol.Completion_rejected ->
+        Some
+          (make_error ~path:"$.completion" "completion_failed"
+             "Temporal Core rejected the admitted workflow completion")
+    | Protocol.Completion_panicked | Protocol.Completion_aborted ->
+        Some
+          (make_error ~path:"$.completion" "completion_outcome_unknown"
+             "the bridge task that owned the admitted workflow completion \
+              ended without Temporal Core's answer; whether Core consumed it \
+              is unknown")
+
+  (** Settles one published outcome. Only an outcome whose ticket this adapter
+      holds, for the same run, and whose pending entry still carries that
+      exact ticket is accepted; anything else is a source defect reported as
+      an error without touching any entry, so a stale outcome can never
+      settle a newer activation of the run. An acknowledgement runs the
+      ordinary [accepted_pending] bookkeeping (registry removal, completion
+      observer, log) and queues its result for [poll]; any other result
+      records a fail-closed refusal on the entry. *)
+  let settle_outcome adapter (outcome : Protocol.completion_outcome) =
+    let mismatch code message =
+      Error (make_error ~path:"$.completion_outcomes" code message)
+    in
+    match Ticket_map.find_opt outcome.ticket adapter.tickets with
+    | None ->
+        mismatch "unknown_completion_ticket"
+          "the source published an outcome for a ticket this worker does not hold"
+    | Some run_id -> (
+        match Run_map.find_opt run_id adapter.pending with
+        | Some
+            ({ admission = Admitted_as { ticket; admitted_ns }; _ } as pending)
+          when ticket = outcome.ticket && String.equal run_id outcome.run_id ->
+            adapter.tickets <- Ticket_map.remove ticket adapter.tickets;
+            Atomic.decr adapter.admitted;
+            pending.admission <- Not_admitted;
+            report_timing ~operation:"workflow_completion_core_await" ~run_id
+              (Float.of_int outcome.core_await_us /. 1e3);
+            report_timing ~operation:"workflow_completion_queued" ~run_id
+              (Float.of_int outcome.queued_us /. 1e3);
+            report_timing ~operation:"workflow_completion_settled" ~run_id
+              (elapsed_ms ~since:admitted_ns ~until:(monotonic_ns ()));
+            (match outcome_failure outcome.result with
+             | None ->
+                 let* settled = accepted_pending adapter pending in
+                 Queue.push settled adapter.settled;
+                 Ok ()
+             | Some error ->
+                 pending.retry_refusal <- Some error;
+                 Error error)
+        | Some _ | None ->
+            mismatch "mismatched_completion_ticket"
+              "a completion outcome does not match the admitted completion of its run")
+
+  (** Takes and settles every published outcome without waiting. Every
+      outcome is settled even after one fails, so acknowledged completions
+      are not lost; the first failure is returned. A source with nothing
+      admitted is not called. *)
+  let collect_outcomes adapter =
+    if Ticket_map.is_empty adapter.tickets then Ok ()
+    else
+      let started_ns = monotonic_ns () in
+      let taken =
+        try Ok (Supervisor.take_workflow_outcomes adapter.supervisor)
+        with exception_ ->
+          Error (exception_error ~path:"$.completion_outcomes" exception_)
+      in
+      let* taken = taken in
+      match taken with
+      | Error source_error ->
+          Error
+            (supervisor_error ~path:"$.completion_outcomes"
+               ~error_code:Supervisor.error_code
+               ~error_message:Supervisor.error_message source_error)
+      | Ok outcomes ->
+          if outcomes <> [] then
+            report_timing ~operation:"workflow_completion_outcomes_collected"
+              ~command_count:(List.length outcomes)
+              (elapsed_ms ~since:started_ns ~until:(monotonic_ns ()));
+          List.fold_left
+            (fun first outcome ->
+              let settled = settle_outcome adapter outcome in
+              match first with Error _ -> first | Ok () -> settled)
+            (Ok ()) outcomes
+
+  (** The diagnostic when the source reports nothing in flight while this
+      adapter still holds admitted tickets: the two ledgers disagree, so the
+      admitted completions' fate cannot be established. *)
+  let lost_outcome_error () =
+    make_error ~path:"$.completion_outcomes" "completion_outcome_unknown"
+      "the source reports no workflow completion in flight, but admitted \
+       completions have no outcome"
+
+  (** One bounded source wait for an outcome, then a collection. [Ok true]
+      when the wait timed out with completions still admitted. *)
+  let wait_and_collect adapter =
+    let waited =
+      try Ok (Supervisor.wait_workflow_outcome adapter.supervisor)
+      with exception_ ->
+        Error (exception_error ~path:"$.completion_outcomes" exception_)
+    in
+    let* waited = waited in
+    match waited with
+    | Error source_error ->
+        Error
+          (supervisor_error ~path:"$.completion_outcomes"
+             ~error_code:Supervisor.error_code
+             ~error_message:Supervisor.error_message source_error)
+    | Ok `Ready ->
+        let* () = collect_outcomes adapter in
+        Ok false
+    | Ok `Timed_out -> Ok true
+    | Ok `Idle ->
+        let* () = collect_outcomes adapter in
+        if Ticket_map.is_empty adapter.tickets then Ok false
+        else Error (lost_outcome_error ())
+
+  (** Whether [run_id] has a completion admitted and not yet settled. *)
+  let run_admitted adapter run_id =
+    match Run_map.find_opt run_id adapter.pending with
+    | Some { admission = Admitted_as _; _ } -> true
+    | Some { admission = Not_admitted; _ } | None -> false
+
+  (** Keeps per-run order when Core has published a run's next activation
+      before this adapter collected the outcome of that run's previous
+      completion. The new activation is not executed until that outcome is
+      settled: workflow code then sees the registry exactly as the
+      acknowledgement left it (for example, a run already removed after a
+      terminal completion), and a failed outcome stops the worker before any
+      later activation of the run runs. Core publishes the next activation
+      only after it has processed the completion, so the wait is normally
+      immediate; each wait is bounded and the loop ends when the source
+      publishes the outcome, which it always does, even for an aborted task.
+      Other runs are not delayed by completions that are merely in flight;
+      only this ordering case waits. *)
+  let rec await_run_outcome adapter run_id =
+    let* () = collect_outcomes adapter in
+    if not (run_admitted adapter run_id) then Ok ()
+    else
+      let* (_timed_out : bool) = wait_and_collect adapter in
+      await_run_outcome adapter run_id
+
+  (** The first pending completion the source does not currently own: one
+      whose submission failed and is either fail-closed or explicitly
+      retryable. Admitted entries are excluded; they wait for an outcome. *)
+  let first_retained adapter =
+    Run_map.to_seq adapter.pending
+    |> Seq.find_map (fun (_, pending) ->
+           match pending.admission with
+           | Not_admitted -> Some pending
+           | Admitted_as _ -> None)
+
+  (** The drain error while admitted completions still await Core. Shutdown
+      may drain again until its deadline; past it, the outcome is unknown. *)
+  let in_flight_error count =
+    make_error ~path:"$.completion" completion_in_flight_code
+      (Printf.sprintf
+         "%d admitted workflow completion(s) are still awaiting Temporal Core; \
+          their outcome is not yet known"
+         count)
 
   (** Returns query IDs only when an activation consists solely of workflow
       queries. Query-only activations are read-only leases: adapter-level
@@ -984,6 +1343,7 @@ module Make (Supervisor : SUPERVISOR) = struct
               replaying = activation.is_replaying;
             };
         retry_refusal = None;
+        admission = Not_admitted;
       }
     in
     enqueue_pending adapter pending
@@ -1049,6 +1409,7 @@ module Make (Supervisor : SUPERVISOR) = struct
               activation_info;
             };
         retry_refusal = None;
+        admission = Not_admitted;
       }
     in
     enqueue_pending adapter pending
@@ -1078,6 +1439,7 @@ module Make (Supervisor : SUPERVISOR) = struct
               activation_info;
             };
         retry_refusal = None;
+        admission = Not_admitted;
       }
     in
     enqueue_pending adapter pending
@@ -1251,8 +1613,11 @@ module Make (Supervisor : SUPERVISOR) = struct
       }
     in
     Atomic.set adapter.in_flight (Some flight);
+    adapter.activation_started_ns <- Some (monotonic_ns ());
     Fun.protect
-      ~finally:(fun () -> Atomic.set adapter.in_flight None)
+      ~finally:(fun () ->
+        adapter.activation_started_ns <- None;
+        Atomic.set adapter.in_flight None)
       (fun () -> process_one adapter activation)
 
   (** Returns the epoch of the activation currently running workflow code, or
@@ -1320,6 +1685,11 @@ module Make (Supervisor : SUPERVISOR) = struct
           | Ok submission -> (
               match attempt_completion adapter.supervisor submission with
               | Accepted -> Ok ()
+              | Admitted_by_supervisor _ ->
+                  (* [attempt_completion] is synchronous and never admits. *)
+                  Error
+                    (make_error ~path:"$.completion" "completion_failed"
+                       "synchronous completion returned an admission ticket")
               | Rejected_by_supervisor { error; _ } -> Error error
               | Raised_by_supervisor { exception_; _ } ->
                   Error (completion_exception_error exception_))
@@ -1343,23 +1713,34 @@ module Make (Supervisor : SUPERVISOR) = struct
   (** The first activation the watchdog abandoned, if any. *)
   let stuck adapter = Atomic.get adapter.stuck
 
-  (** Retries retained workflow completions while the adapter mutex is held.
-      Shutdown uses this operation before closing Rust so an explicitly
-      retryable transport failure never leaves a lease behind. A completion
+  (** Settles admitted completions and retries retained ones while the
+      adapter mutex is held. Shutdown uses this operation before closing Rust
+      so neither an admitted completion nor an explicitly retryable transport
+      failure leaves a lease behind. A completion
       whose earlier failure was not classified retryable is not resubmitted:
       [finish_pending] returns its recorded error, which the worker treats as a
       terminal drain failure before force-releasing the native graph. *)
   let drain_locked adapter : (unit, error_view) result =
-    (* [min_binding_opt] gives retries a stable order. The loop stops on the
-       first error, retaining that completion and every later one; a
-       fail-closed entry stops it without any native call. *)
+    (* Retained entries are retried in [Run_map] order, which is stable. The
+       loop stops on the first error, retaining that completion and every
+       later one; a fail-closed entry stops it without any native call.
+       Admitted completions are collected first and then awaited with one
+       bounded source wait per pass; a wait that times out returns
+       [completion_in_flight], which bounded shutdown may retry until its
+       deadline. *)
     let rec loop () =
-      match Run_map.min_binding_opt adapter.pending with
-      | None -> Ok ()
-      | Some (_, pending) -> (
+      let* () = collect_outcomes adapter in
+      match first_retained adapter with
+      | Some pending -> (
           match finish_pending adapter pending with
           | Ok _ -> loop ()
           | Error error -> Error error)
+      | None ->
+          if Ticket_map.is_empty adapter.tickets then Ok ()
+          else
+            let* timed_out = wait_and_collect adapter in
+            if timed_out then Error (in_flight_error (Atomic.get adapter.admitted))
+            else loop ()
     in
     loop ()
 
@@ -1382,7 +1763,10 @@ module Make (Supervisor : SUPERVISOR) = struct
         (try Execution.shutdown execution with _ -> ()))
       adapter.runs;
     adapter.runs <- Run_map.empty;
-    adapter.pending <- Run_map.empty
+    adapter.pending <- Run_map.empty;
+    adapter.tickets <- Ticket_map.empty;
+    Atomic.set adapter.admitted 0;
+    Queue.clear adapter.settled
 
   (** Takes the adapter mutex for [discard_locked]. *)
   let discard adapter =
@@ -1411,18 +1795,35 @@ module Make (Supervisor : SUPERVISOR) = struct
       claimed the activation's lease. *)
   let activation_in_flight adapter = Option.is_some (Atomic.get adapter.in_flight)
 
+  (** Lock-free count of completions the source admitted whose outcome this
+      adapter has not collected yet. *)
+  let admitted_completions adapter = Atomic.get adapter.admitted
+
   (** Serializes one poll/execute/complete transaction. A mutex is required in
       addition to supervisor serialization because the run map and scheduler
-      state are OCaml values owned by this adapter, not by Rust. A retained
-      completion blocks new activations: it is retried only when its failure
-      was explicitly retryable, and otherwise reported again unchanged. *)
+      state are OCaml values owned by this adapter, not by Rust. Admitted
+      completions never block other runs: each call reports one settled
+      result or collects published outcomes without waiting, and only a
+      polled activation whose own run still awaits an outcome waits for it.
+      A retained (unadmitted) completion blocks new activations: it is
+      retried only when its failure was explicitly retryable, and otherwise
+      reported again unchanged. *)
   let poll adapter =
     Mutex.lock adapter.mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock adapter.mutex)
       (fun () ->
-        match Run_map.min_binding_opt adapter.pending with
-        | Some (_, pending) -> finish_pending adapter pending
+        (* Report settled results first, one per call, then collect any new
+           outcomes, without waiting for completions still in flight. *)
+        match Queue.take_opt adapter.settled with
+        | Some outcome -> Ok outcome
+        | None ->
+        let* () = collect_outcomes adapter in
+        match Queue.take_opt adapter.settled with
+        | Some outcome -> Ok outcome
+        | None ->
+        match first_retained adapter with
+        | Some pending -> finish_pending adapter pending
         | None ->
             (* Convert exceptions from the source poll into a typed error
                before inspecting the result, so the mutex is always released
@@ -1442,8 +1843,13 @@ module Make (Supervisor : SUPERVISOR) = struct
                 report Logs.Debug ~operation:"workflow_poll_not_ready" ();
                 Ok Not_ready
             | Ok (Some activation) ->
+                let* () = await_run_outcome adapter activation.run_id in
                 process_tracked adapter activation)
 end
+
+(** The synchronous adapter: every completion is acknowledged before [poll]
+    returns, exactly as before completions could be admitted. *)
+module Make (Supervisor : SUPERVISOR) = Make_admitting (Synchronous (Supervisor))
 
 (** Exposes registration without exposing its existential constructor. *)
 let register ?(signal_handlers = []) ?(query_handlers = []) ?(update_handlers = [])

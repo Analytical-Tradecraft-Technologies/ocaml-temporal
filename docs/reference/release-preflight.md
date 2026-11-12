@@ -60,6 +60,13 @@ their lint targets use `@install` rather than Dune's all-executables default.
 One downstream smoke job verifies their commit, compiler, platform, file list,
 and SHA-256 digests, then runs all existing Temporal/PostgreSQL controllers.
 It does not copy Dune build state or compile worker/driver programs again.
+The executables travel as one tar compressed by the `zstd` command
+(`scripts/smoke-artifact.py`): multi-threaded, level 3, with a 1 GiB
+long-distance window that stores the Rust bridge every executable embeds about
+once. The 8.2 GB set packs to about 0.9 GB in under half a minute; the previous
+gzip-9 archive took 16 minutes and 1.9 GB, most of the producer job. Unpacking
+verifies each executable into a staging directory and moves them into place
+only after all match. Running `make test-ci-artifacts` locally needs `zstd`.
 Local smoke commands retain the normal source-build behavior.
 
 Rust bundles, compiled OCaml SDKs, smoke executables, and the audited Cargo SBOM are retained

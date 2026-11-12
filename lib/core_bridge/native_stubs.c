@@ -1254,6 +1254,30 @@ CAMLprim value ocaml_temporal_worker_complete_workflow_json(value runtime,
       runtime, input, ocaml_temporal_core_v4_worker_complete_workflow_json);
 }
 
+/* Copy a semantic workflow completion and admit it without waiting for Core.
+ * The returned ticket is decimal ASCII; Rust owns the completion from here
+ * and publishes its outcome to the take/wait operations below. */
+CAMLprim value ocaml_temporal_worker_submit_workflow_completion_json(
+    value runtime, value input) {
+  return invoke_runtime_json(
+      runtime, input,
+      ocaml_temporal_core_v4_worker_submit_workflow_completion_json);
+}
+
+/* Take every published workflow-completion outcome without waiting. */
+CAMLprim value ocaml_temporal_worker_take_workflow_completions(value runtime) {
+  return invoke_runtime(runtime,
+                        ocaml_temporal_core_v4_worker_take_workflow_completions);
+}
+
+/* Wait for a workflow-completion outcome with the OCaml runtime lock
+ * released. The Rust wait is bounded by the same readiness timeout as the
+ * lane waits, so the supervisor mailbox regains control promptly. */
+CAMLprim value ocaml_temporal_worker_wait_workflow_completion(value runtime) {
+  return invoke_runtime(runtime,
+                        ocaml_temporal_core_v4_worker_wait_workflow_completion);
+}
+
 /* Return the exact Rust-produced activation document when the OCaml decoder
  * cannot represent it. Rust reparses and matches the retained activation
  * before failing Core and retiring the one-shot lease. */

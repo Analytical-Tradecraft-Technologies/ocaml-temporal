@@ -310,6 +310,16 @@ external worker_wait_workflow_raw : runtime -> response
 external worker_complete_workflow_json_raw : runtime -> bytes -> response
   = "ocaml_temporal_worker_complete_workflow_json"
 
+external worker_submit_workflow_completion_json_raw :
+  runtime -> bytes -> response
+  = "ocaml_temporal_worker_submit_workflow_completion_json"
+
+external worker_take_workflow_completions_raw : runtime -> response
+  = "ocaml_temporal_worker_take_workflow_completions"
+
+external worker_wait_workflow_completion_raw : runtime -> response
+  = "ocaml_temporal_worker_wait_workflow_completion"
+
 external worker_reject_workflow_json_raw : runtime -> bytes -> response
   = "ocaml_temporal_worker_reject_workflow_json"
 
@@ -1161,6 +1171,30 @@ let worker_complete_workflow_json runtime input =
   bridge_call "worker_complete_workflow_json" (fun () ->
       Result.map (fun _ -> ())
         (decode (worker_complete_workflow_json_raw runtime input)))
+
+(** Validates one workflow completion and admits it without waiting for
+    Temporal Core, returning its decimal ticket bytes. An [Error] means the
+    completion was not admitted and its lease is unchanged. Input bytes are
+    copied by the C stub and never retained after this call. *)
+let worker_submit_workflow_completion_json runtime input =
+  bridge_call "worker_submit_workflow_completion_json" (fun () ->
+      decode (worker_submit_workflow_completion_json_raw runtime input))
+
+(** Takes every published workflow-completion outcome without waiting, as one
+    JSON array document. *)
+let worker_take_workflow_completions runtime =
+  bridge_call "worker_take_workflow_completions" (fun () ->
+      decode (worker_take_workflow_completions_raw runtime))
+
+(** Waits for a workflow-completion outcome under the bounded,
+    runtime-lock-free contract of [worker_wait_workflow]. Returns
+    [Ok `Ready], [Ok `Idle] when nothing is in flight, or the [Not_ready]
+    bridge error on timeout. *)
+let worker_wait_workflow_completion runtime =
+  bridge_call "worker_wait_workflow_completion" (fun () ->
+      Result.map
+        (fun bytes -> if Bytes.equal bytes (Bytes.of_string "idle") then `Idle else `Ready)
+        (decode (worker_wait_workflow_completion_raw runtime)))
 
 (** Returns an activation document produced by Rust when OCaml's semantic
     decoder cannot accept it. Rust reparses and compares the complete value

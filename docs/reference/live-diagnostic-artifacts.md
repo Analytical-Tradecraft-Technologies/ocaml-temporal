@@ -1,14 +1,17 @@
 # Live-test diagnostic artifacts
 
 The PR/merge-queue and master/nightly Temporal jobs run the same seven existing
-controllers through `make test-temporal-live-ci`. Each controller takes snapshots
+controllers through `make test-temporal-live-ci`, split across three parallel
+shards (`baseline`, `recovery` and `replay`; see `LIVE_CI_SHARDS` in the
+Makefile). Each controller takes snapshots
 before deleting worker generations, containers or coordination files. The outer
 wrapper retains partial console output and the original exit status. Upload and
-job-summary steps use `always()`. Every step of the job has its own timeout
-(40 minutes for this scenario step) and the 103-minute job timeout is at least
+job-summary steps use `always()`. Every step of a shard job has its own timeout
+(30 minutes for this scenario step) and the 91-minute job timeout is at least
 their sum, so a step that times out still leaves time for publication.
 
-Artifacts are named `live-diagnostics-<Actions run ID>-<attempt>` and retained for
+Each shard uploads its own bundle, named
+`live-diagnostics-<shard>-<Actions run ID>-<attempt>` and retained for
 seven days. The job summary links the immutable downloadable artifact and reports
 the process outcome and collection warnings separately. Upload failure is visible
 in its own step and summary; it does not replace the scenario's failure. The
@@ -20,7 +23,8 @@ snapshot is best-effort evidence, not a guarantee that a lost runner can be
 recovered.
 
 The fixed-bug regression suites that `make test-temporal-live-ci` runs first
-(`make test-temporal-live-regressions`) are not wrapped by these collectors.
+(`make test-temporal-live-regressions`, in the `baseline` shard) are not
+wrapped by these collectors.
 Their controller writes one `<suite>.log` per suite, and the official-SDK
 interoperability evidence under `sdk_interop/`, to `_build/live-regressions/`
 and also prints each log to the job output. A separate `always()` step uploads
@@ -106,7 +110,8 @@ put a production export in the live fixture or this artifact directory.
 ## Reconstructing a failure timeline
 
 1. Download the job-summary artifact link before its seven-day retention ends,
-   or run `gh run download <run-id> --name live-diagnostics-<run-id>-<attempt>`.
+   or run `gh run download <run-id> --name live-diagnostics-<shard>-<run-id>-<attempt>`
+   for the shard whose job failed.
 2. Read `result.json`, then the snapshot manifests in numeric order. Confirm the
    SDK/Core commits and service images, and inspect collection warnings before
    treating a missing event as a product failure.

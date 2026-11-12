@@ -286,10 +286,17 @@ if sed -n '/^  verify:/,/^  smoke-build:/p' "$pr_workflow" | grep -Fq 'build-smo
   echo "the verify matrix must not compile the smoke executables again" >&2
   exit 1
 fi
-pr_smoke=$(sed -n '/^  temporal-integration:/,/^  verify:/p' "$pr_workflow")
+pr_smoke=$(sed -n '/^  temporal-integration:/,/^  temporal-integration-result:/p' "$pr_workflow")
 printf '%s\n' "$pr_smoke" | grep -Fqx '    needs: [changes, verify, smoke-build]'
 printf '%s\n' "$pr_smoke" | grep -Fqx '          test "$SMOKE_BUILD_RESULT" = success'
-printf '%s\n' "$pr_smoke" | grep -Fqx '    name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
+printf '%s\n' "$pr_smoke" | grep -Fqx '      TEMPORAL_LIVE_CI_SHARD: ${{ matrix.shard }}'
+# The live controllers run as matrix shards; one job keeps the exact required
+# check name and fails unless every shard passed.
+pr_smoke_result=$(sed -n '/^  temporal-integration-result:/,/^  verify:/p' "$pr_workflow")
+printf '%s\n' "$pr_smoke_result" | grep -Fq 'if: ${{ !cancelled()'
+printf '%s\n' "$pr_smoke_result" | grep -Fqx '    needs: [changes, temporal-integration]'
+printf '%s\n' "$pr_smoke_result" | grep -Fqx '    name: Temporal/PostgreSQL integration smoke (OCaml 5.5)'
+printf '%s\n' "$pr_smoke_result" | grep -Fqx '        run: test "$SHARDS_RESULT" = success'
 printf '%s\n' "$pr_smoke" | grep -Fqx '      OCAML_VERSION: "5.5.1"'
 printf '%s\n' "$pr_smoke" | grep -Fqx '      TEMPORAL_PREBUILT_SMOKE: "1"'
 printf '%s\n' "$pr_smoke" | grep -Fqx '        run: make test-temporal-live-ci'

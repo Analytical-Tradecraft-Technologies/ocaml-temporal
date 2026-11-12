@@ -518,6 +518,25 @@ module Protocol_adapter = struct
     | Ok activation -> Ok activation
     | Error error -> workflow_error "workflow activation decoding" error
 
+  (** Strictly decodes the bridge's workflow-completion outcome document. *)
+  let decode_workflow_completion_outcomes input =
+    match Workflow.decode_completion_outcomes (Bytes.to_string input) with
+    | Ok outcomes -> Ok outcomes
+    | Error error -> workflow_error "workflow completion outcome decoding" error
+
+  (** Parses the decimal ticket returned by an admitted workflow completion.
+      Rust keeps tickets positive and below 2{^62}, so anything else is a
+      protocol defect. *)
+  let decode_workflow_completion_ticket input =
+    match int_of_string_opt (Bytes.to_string input) with
+    | Some ticket when ticket > 0 -> Ok ticket
+    | Some _ | None ->
+        Error
+          {
+            Bridge.status = Protocol;
+            message = "workflow completion admission returned an invalid ticket";
+          }
+
   (** Keeps the original protocol failure primary while recording a native
       rejection failure with its bounded structural status and constant
       diagnostic category. *)
@@ -1174,6 +1193,11 @@ module Native_backend = struct
     | Wait_workflow : unit operation
     | Complete_workflow :
         Temporal_protocol.Encoded_workflow_completion.t -> unit operation
+    | Submit_workflow_completion :
+        Temporal_protocol.Encoded_workflow_completion.t -> int operation
+    | Take_workflow_completions :
+        Temporal_protocol.Workflow_protocol.completion_outcome list operation
+    | Wait_workflow_completion : [ `Ready | `Idle ] operation
     | Try_poll_activity :
         Temporal_protocol.Activity_protocol.task option operation
     | Wait_activity : unit operation
@@ -1516,6 +1540,19 @@ module Native_backend = struct
            pass before entering the mailbox and are not encoded again. *)
         Bridge.worker_complete_workflow_json runtime
           (Temporal_protocol.Encoded_workflow_completion.to_bytes encoded)
+    | Submit_workflow_completion encoded ->
+        (* Admission only: Rust validates and converts the bytes, then hands
+           them to a Tokio task and returns a ticket without waiting for
+           Core, so the owner Domain is free for the next message at once. *)
+        Result.bind
+          (Bridge.worker_submit_workflow_completion_json runtime
+             (Temporal_protocol.Encoded_workflow_completion.to_bytes encoded))
+          Protocol_adapter.decode_workflow_completion_ticket
+    | Take_workflow_completions ->
+        Result.bind
+          (Bridge.worker_take_workflow_completions runtime)
+          Protocol_adapter.decode_workflow_completion_outcomes
+    | Wait_workflow_completion -> Bridge.worker_wait_workflow_completion runtime
     | Try_poll_activity ->
         Protocol_adapter.activity_poll_result
           ~reject:(Bridge.worker_reject_activity_json runtime)
@@ -1691,6 +1728,11 @@ module Native = struct
     | Wait_workflow : unit operation
     | Complete_workflow :
         Temporal_protocol.Encoded_workflow_completion.t -> unit operation
+    | Submit_workflow_completion :
+        Temporal_protocol.Encoded_workflow_completion.t -> int operation
+    | Take_workflow_completions :
+        Temporal_protocol.Workflow_protocol.completion_outcome list operation
+    | Wait_workflow_completion : [ `Ready | `Idle ] operation
     | Try_poll_activity :
         Temporal_protocol.Activity_protocol.task option operation
     | Wait_activity : unit operation
