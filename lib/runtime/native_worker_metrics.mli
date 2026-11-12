@@ -41,10 +41,11 @@ val disabled : t
     carries the same [namespace] and [task_queue] labels, so one that cannot
     be a label value (empty, over 256 bytes, or containing a control
     character) fails the first registration, before anything is registered.
-    Series are never unregistered, though, so a runtime's 1,024-series cap
-    can stop registration part-way once many namespace and task-queue pairs
-    exist, leaving the series already registered exported at zero
-    (#1212). *)
+    Registration is all or nothing (#1212): if the runtime's 1,024
+    live-series cap refuses a later series, the series this call already
+    registered are released before the error is returned, and nothing is
+    recorded until every series is registered, so a refused worker exports
+    no partial set. Call {!release} when the worker stops. *)
 val create :
   Temporal_core_bridge.Native_bridge.metric_meter ->
   namespace:string ->
@@ -53,6 +54,16 @@ val create :
 
 (** Whether recording reaches a meter. *)
 val enabled : t -> bool
+
+(** Gives back this worker's series registrations (#1212), so a runtime that
+    hosts many short-lived workers on distinct namespaces or task queues
+    does not exhaust its live-series cap. Idempotent and safe from any
+    thread; a no-op on {!disabled}. Recording afterwards still works: a
+    detached activity callback may record late, and the series keep their
+    last values in the Prometheus scrape, as Core's own per-worker series
+    do. Another worker on the same namespace and task queue keeps its own
+    registration of the shared series. *)
+val release : t -> unit
 
 (** Why the SDK refused an activity task (label [reason]). *)
 type refusal =

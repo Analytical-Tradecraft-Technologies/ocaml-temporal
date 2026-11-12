@@ -291,8 +291,73 @@ let check_cardinality text =
         failwith ("an execution identifier reached the scrape: " ^ identifier))
     [ workflow_id; run_id; activity_id; "never_registered" ]
 
+(** Registers filler series on [meter] until the live-series cap refuses
+    one, and returns the identifiers registered by this call. Each filler
+    has its own [index] label; [prefix] keeps calls apart. *)
+let fill_meter meter prefix =
+  let rec loop index ids =
+    match
+      Bridge.metric_register meter ~kind:Bridge.Counter ~name:"ocaml_test_filler"
+        ~description:"Test filler."
+        ~labels:[ ("index", Printf.sprintf "%s-%d" prefix index) ]
+    with
+    | Ok id -> loop (index + 1) (id :: ids)
+    | Error _ -> List.rev ids
+  in
+  loop 0 []
+
+(** Worker metrics are all or nothing and give their series back (#1212).
+    On a runtime whose 1,024 live-series cap has one free place, [create]
+    fails, releases what it registered (the free place is still free) and
+    exports nothing for its task queue. Once the fillers are released,
+    [create] succeeds, and {!Metrics.release} (idempotent) gives every
+    series back, so the fillers fit again; recording after the release is
+    still safe. *)
+let test_release_and_all_or_nothing () =
+  let metrics_config =
+    get (Temporal.Runtime.Metrics.prometheus ~bind_address:"127.0.0.1:0" ())
+  in
+  let runtime = get (Temporal.Runtime.create ~io_threads:1 ~metrics:metrics_config ()) in
+  let address = Option.get (Temporal.Runtime.metrics_address runtime) in
+  let meter =
+    match Temporal_sdk_kernel.Shared_runtime.metric_meter runtime with
+    | Some meter -> meter
+    | None -> failwith "an exporting runtime has no SDK metric meter"
+  in
+  let fillers = fill_meter meter "first" in
+  if List.length fillers <> 1024 then
+    failwith (Printf.sprintf "expected 1024 fillers, registered %d" (List.length fillers));
+  assert (Bridge.metric_release meter (List.hd fillers));
+  let namespace = "rollback-ns" and task_queue = "rollback-queue" in
+  (match Metrics.create meter ~namespace ~task_queue with
+  | Ok _ -> failwith "worker metrics registered past the live-series cap"
+  | Error _ -> ());
+  (* The one free place is still free: the refused worker kept nothing. *)
+  (match fill_meter meter "probe" with
+  | [ probe ] -> assert (Bridge.metric_release meter probe)
+  | probes ->
+      failwith (Printf.sprintf "expected one free place, found %d" (List.length probes)));
+  if contains (scrape address) task_queue then
+    failwith "a refused worker exported part of its series";
+  List.iter (fun id -> ignore (Bridge.metric_release meter id)) (List.tl fillers);
+  let metrics =
+    match Metrics.create meter ~namespace ~task_queue with
+    | Ok metrics -> metrics
+    | Error { Bridge.message; _ } -> failwith message
+  in
+  Metrics.release metrics;
+  Metrics.release metrics;
+  Metrics.activity_completion_retry metrics;
+  let refilled = fill_meter meter "first" in
+  if List.length refilled <> 1024 then
+    failwith
+      (Printf.sprintf "a released worker still holds %d places"
+         (1024 - List.length refilled));
+  get (Temporal.Runtime.shutdown runtime)
+
 let () =
   test_shutdown_classification ();
+  test_release_and_all_or_nothing ();
   let metrics_config =
     get
       (Temporal.Runtime.Metrics.prometheus ~bind_address:"127.0.0.1:0"

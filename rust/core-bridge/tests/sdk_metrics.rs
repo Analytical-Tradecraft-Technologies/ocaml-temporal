@@ -2,7 +2,7 @@
 //!
 //! The OCaml SDK records worker states that Core cannot see (activity-lane
 //! occupancy, refusals, completion retries, shutdown outcomes) through a
-//! metric meter obtained from a shared runtime. These tests drive the four
+//! metric meter obtained from a shared runtime. These tests drive the five
 //! meter exports only through the ABI and read the results back from the
 //! runtime's real Prometheus endpoint, proving that recorded values reach
 //! the same scrape as Core's own metrics, with Core's prefix and labels, and
@@ -17,8 +17,8 @@ use ocaml_temporal_core_bridge::{
     MetricMeter, Result as AbiResult, STATUS_CONFIGURATION, STATUS_INVALID_ARGUMENT, STATUS_OK,
     SharedRuntime, Status, ocaml_temporal_core_v4_metric_meter_free,
     ocaml_temporal_core_v4_metric_meter_record, ocaml_temporal_core_v4_metric_meter_register_json,
-    ocaml_temporal_core_v4_result_free, ocaml_temporal_core_v4_shared_runtime_free,
-    ocaml_temporal_core_v4_shared_runtime_metric_meter,
+    ocaml_temporal_core_v4_metric_meter_release, ocaml_temporal_core_v4_result_free,
+    ocaml_temporal_core_v4_shared_runtime_free, ocaml_temporal_core_v4_shared_runtime_metric_meter,
     ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json,
 };
 
@@ -134,6 +134,12 @@ fn register_ok(meter: *const MetricMeter, document: &str) -> u32 {
 fn record(meter: *const MetricMeter, id: u32, value: i64) -> Status {
     // SAFETY: The meter is null or live.
     unsafe { ocaml_temporal_core_v4_metric_meter_record(meter, id, value) }
+}
+
+/// Gives back one registration of a series and returns the status.
+fn release(meter: *const MetricMeter, id: u32) -> Status {
+    // SAFETY: The meter is null or live.
+    unsafe { ocaml_temporal_core_v4_metric_meter_release(meter, id) }
 }
 
 /// Fetches `/metrics` and returns the response body.
@@ -370,6 +376,62 @@ fn registration_and_recording_enforce_their_bounds() {
         r#"{"kind":"counter","name":"ocaml_cap","labels":[{"name":"index","value":"overflow"}]}"#,
     );
     assert_eq!(status, STATUS_CONFIGURATION, "{error}");
+
+    free_meter(&mut meter);
+    free_shared(&mut shared);
+}
+
+/// Released registrations give their series' place under the live-series
+/// cap back (#1212). A series stays live while any registration of it is
+/// unreleased; its last release frees a place; reactivating a released
+/// series reuses its identifier but needs a free place; an unknown
+/// identifier, a null meter or an extra release is refused and changes
+/// nothing; and a released series still records and stays in the scrape.
+#[test]
+fn released_series_stop_counting_toward_the_cap() {
+    let (mut shared, address) = exporting_runtime();
+    let (_status, mut meter) = meter_of(shared);
+    assert!(!meter.is_null());
+    let document = |index: &str| {
+        format!(
+            r#"{{"kind":"counter","name":"ocaml_release","labels":[{{"name":"index","value":"{index}"}}]}}"#
+        )
+    };
+    let ids: Vec<u32> = (0..1024)
+        .map(|index| register_ok(meter, &document(&index.to_string())))
+        .collect();
+    let (status, _, error) = register(meter, &document("next"));
+    assert_eq!(status, STATUS_CONFIGURATION, "{error}");
+
+    // A second registration of a live series needs no new place, and
+    // releasing one of the two keeps the series live.
+    assert_eq!(register_ok(meter, &document("0")), ids[0]);
+    assert_eq!(release(meter, ids[0]), STATUS_OK);
+    assert_eq!(register(meter, &document("next")).0, STATUS_CONFIGURATION);
+
+    // The last release frees a place for a new series.
+    assert_eq!(release(meter, ids[0]), STATUS_OK);
+    let next = register_ok(meter, &document("next"));
+    assert!(!ids.contains(&next));
+
+    // Refused releases change nothing.
+    assert_eq!(release(meter, ids[0]), STATUS_INVALID_ARGUMENT);
+    assert_eq!(release(meter, u32::MAX), STATUS_INVALID_ARGUMENT);
+    assert_eq!(release(meter, next + 1), STATUS_INVALID_ARGUMENT);
+    assert_eq!(release(ptr::null(), ids[1]), STATUS_INVALID_ARGUMENT);
+    assert_eq!(register(meter, &document("0")).0, STATUS_CONFIGURATION);
+
+    // Reactivating a released series reuses its identifier once a place
+    // is free.
+    assert_eq!(release(meter, ids[1]), STATUS_OK);
+    assert_eq!(register_ok(meter, &document("0")), ids[0]);
+
+    // A released series still records and stays exported.
+    assert_eq!(record(meter, ids[1], 5), STATUS_OK);
+    let text = scrape(address);
+    let line = sample(&text, "temporal_ocaml_release", &[r#"index="1""#])
+        .unwrap_or_else(|| panic!("released series missing:\n{text}"));
+    assert!((value(line) - 5.0).abs() < f64::EPSILON, "{line}");
 
     free_meter(&mut meter);
     free_shared(&mut shared);

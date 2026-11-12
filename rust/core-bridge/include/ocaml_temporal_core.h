@@ -607,6 +607,16 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_metric_meter_record(
     const ocaml_temporal_core_metric_meter *meter, uint32_t id, int64_t value);
 
 /*
+ * Give back one registration of series `id` (#1212). The series stops
+ * counting toward the per-runtime cap after its last release but keeps its
+ * identifier and last exported value. Allocates no result and never blocks
+ * on I/O. An unknown identifier or one with no unreleased registration
+ * returns OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_metric_meter_release(
+    const ocaml_temporal_core_metric_meter *meter, uint32_t id);
+
+/*
  * Release an SDK metrics recorder and clear the slot. Touches only memory,
  * so it is safe from a GC finalizer. Calling again with the now-null slot is
  * safe.

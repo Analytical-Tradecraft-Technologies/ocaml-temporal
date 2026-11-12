@@ -5225,6 +5225,35 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_record(
     catch_unwind(AssertUnwindSafe(|| meter.record(id, value))).unwrap_or(STATUS_PANIC)
 }
 
+/// Give back one registration of SDK metric series `id` (#1212).
+///
+/// A worker releases each series it registered when it shuts down, and
+/// `Native_worker_metrics.create` releases those it already registered when
+/// a later registration fails, so the per-runtime series cap counts only the
+/// series of running workers. The series keeps its identifier and its last
+/// exported value; registering it again reactivates it. Allocates no result
+/// and does no I/O; it takes the meter's write lock only briefly. A null
+/// handle, an unknown identifier, or a series with no unreleased
+/// registration returns `STATUS_INVALID_ARGUMENT` and changes nothing; a
+/// contained panic returns `STATUS_PANIC`.
+///
+/// # Safety
+///
+/// `meter` must be null or a live handle from
+/// [`ocaml_temporal_core_v4_shared_runtime_metric_meter`]; concurrent calls
+/// on one handle, from any thread, are permitted.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_release(
+    meter: *const MetricMeter,
+    id: u32,
+) -> Status {
+    // SAFETY: The caller promises a null or live handle.
+    let Some(meter) = (unsafe { meter.as_ref() }) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    catch_unwind(AssertUnwindSafe(|| meter.release(id))).unwrap_or(STATUS_PANIC)
+}
+
 /// Release an SDK metrics recorder and clear the caller's slot. Dropping it
 /// touches only memory (never Core or Tokio), so this is safe from a GC
 /// finalizer and on any thread. Calling again with the now-null slot is safe.
