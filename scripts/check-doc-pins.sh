@@ -12,8 +12,8 @@
 # A `pin:core` value must be a prefix of at least eight hex digits of the
 # `rev` of the Core crates in rust/Cargo.toml; a `pin:rust` value must equal
 # the channel in rust/rust-toolchain.toml. Every Markdown file under docs/ and
-# README.md is scanned, and each document in [required_core] or
-# [required_rust] must carry at least one marker of that kind, so deleting a
+# README.md is scanned, and each document listed in the required-marker loops
+# near the end must carry at least one marker of that kind, so deleting a
 # marker cannot silently disable the check.
 #
 # Usage: check-doc-pins.sh [source-root]
@@ -37,12 +37,12 @@ if [ -z "$rust" ]; then
   exit 2
 fi
 
-# Documents that state the current pin and must keep a marker for it.
-required_core="docs/reference/live-acceptance-coverage.md docs/reference/v1-support-policy.md docs/reference/core-bridge.md docs/dependencies.md"
-required_rust="docs/reference/live-acceptance-coverage.md"
-
 status=0
+# One document path per line. The loops below read it with `while read`, never
+# by unquoted word splitting, so a path with spaces or glob characters stays
+# one path.
 documents=$(cd "$root" && { find docs -name '*.md' -type f; echo README.md; } | LC_ALL=C sort)
+tab=$(printf '\t')
 
 # markers KIND FILE prints "LINE<TAB>VALUE" for each `VALUE`<!-- pin:KIND -->.
 markers() {
@@ -60,12 +60,11 @@ markers() {
     }' "$2"
 }
 
-for document in $documents; do
+while IFS= read -r document; do
   path="$root/$document"
   [ -f "$path" ] || continue
-  for entry in $(markers core "$path" | tr '\t' ':'); do
-    line=${entry%%:*}
-    value=${entry#*:}
+  while IFS="$tab" read -r line value; do
+    [ -n "$line" ] || continue
     case "$value" in
       ????????*) ;;
       *) echo "$document:$line: pin:core value '$value' is shorter than 8 hex digits" >&2; status=1; continue ;;
@@ -77,24 +76,35 @@ for document in $documents; do
       "$value"*) ;;
       *) echo "$document:$line: quotes Core pin $value but rust/Cargo.toml pins $core" >&2; status=1 ;;
     esac
-  done
-  for entry in $(markers rust "$path" | tr '\t' ':'); do
-    line=${entry%%:*}
-    value=${entry#*:}
+  done <<EOF
+$(markers core "$path")
+EOF
+  while IFS="$tab" read -r line value; do
+    [ -n "$line" ] || continue
     if [ "$value" != "$rust" ]; then
       echo "$document:$line: quotes Rust toolchain $value but rust/rust-toolchain.toml selects $rust" >&2
       status=1
     fi
-  done
-done
+  done <<EOF
+$(markers rust "$path")
+EOF
+done <<EOF
+$documents
+EOF
 
-for document in $required_core; do
+# Documents that state the current pin and must keep a marker for it.
+for document in \
+  docs/reference/live-acceptance-coverage.md \
+  docs/reference/v1-support-policy.md \
+  docs/reference/core-bridge.md \
+  docs/dependencies.md
+do
   if [ -z "$(markers core "$root/$document" 2>/dev/null)" ]; then
     echo "$document: no \`...\`<!-- pin:core --> marker for the current Core pin" >&2
     status=1
   fi
 done
-for document in $required_rust; do
+for document in docs/reference/live-acceptance-coverage.md; do
   if [ -z "$(markers rust "$root/$document" 2>/dev/null)" ]; then
     echo "$document: no \`...\`<!-- pin:rust --> marker for the current Rust toolchain" >&2
     status=1

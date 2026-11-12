@@ -41,10 +41,24 @@ fresh
 expect_status 0 checkout
 grep -q 'documentation pins: ok' "$work/out" || fail "checkout: no success line"
 
+# The current pin, read the same way as the checker, so the fixtures below
+# keep working after a consistent Core upgrade.
+core=$(sed -n 's/^temporalio-sdk-core = .*rev = "\([0-9a-f]*\)".*/\1/p' "$root/rust/Cargo.toml" | head -n 1)
+[ "${#core}" -eq 40 ] || fail "could not read the Core rev from rust/Cargo.toml"
+# other: a valid 40-hex revision that is guaranteed to differ from the pin.
+case "$core" in
+  0*) other=1111111111111111111111111111111111111111 ;;
+  *) other=0000000000000000000000000000000000000000 ;;
+esac
+short=$(printf '%s' "$core" | cut -c 1-7)
+upper=$(printf '%s' "$core" | cut -c 1-8 | tr 'a-f' 'A-F')
+stale=$(printf '%s' "$other" | cut -c 1-8)
+
 # A Core pin bump without a documentation re-audit is drift.
 fresh
-sed 's/rev = "8fe478ee[0-9a-f]*"/rev = "0123456789abcdef0123456789abcdef01234567"/' \
+sed "s/rev = \"[0-9a-f]\{40\}\"/rev = \"$other\"/" \
   "$root/rust/Cargo.toml" > "$work/tree/rust/Cargo.toml"
+grep -q "rev = \"$other\"" "$work/tree/rust/Cargo.toml" || fail "core bump: fixture did not change the rev"
 expect_status 1 'core bump' 'live-acceptance-coverage.md:.*quotes Core pin'
 
 # A toolchain bump is drift for the Rust marker.
@@ -66,7 +80,7 @@ expect_status 1 'missing marker' 'core-bridge.md: no'
 
 # A marked stale or malformed value anywhere under docs/ fails; unmarked
 # historical mentions do not.
-for value in 95e97686 8fe478e 8FE478EE; do
+for value in "$stale" "$short" "$upper"; do
   fresh
   printf '\nOld pin `%s`<!-- pin:core --> here.\n' "$value" >> "$work/tree/docs/progress.md"
   expect_status 1 "marked $value" 'docs/progress.md:'
