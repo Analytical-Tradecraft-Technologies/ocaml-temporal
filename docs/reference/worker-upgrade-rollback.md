@@ -2,9 +2,10 @@
 
 **Status: proposed operator procedure, not an accepted upgrade.** This is the
 rehearsal plan for [#508]. No authenticated old-to-new deployment, mixed-version
-routing, drain, or rollback has been demonstrated by this document. The proposed
-[MVP support policy in PR #557] defers cross-version history compatibility and
-worker routing; it is not effective until approved and merged. The successful
+routing, drain, or rollback has been demonstrated by this document. The
+[v1 support policy], merged in PR #557 and still awaiting the maintainer
+approval tracked by #489, defers cross-version history compatibility and
+worker routing. The successful
 [same-version restart] and [patch lifecycle] fixtures are useful prechecks, not
 an upgrade rehearsal. Keep #508 open until its recorded live acceptance is
 complete.
@@ -174,7 +175,7 @@ rollback as unqualified in the support policy and release notes.
 [#503]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/503
 [#504]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/504
 [#505]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/505
-[MVP support policy in PR #557]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/pull/557
+[v1 support policy]: v1-support-policy.md
 [same-version restart]: worker-restart-replay-acceptance.md
 [patch lifecycle]: workflow-patching.md
 [legacy build-ID or deployment-based options]: worker-versioning.md
