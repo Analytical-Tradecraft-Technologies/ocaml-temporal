@@ -45,10 +45,10 @@ opaque bytes and applications may choose another deterministic codec.
 
 ## What works now
 
-The audited source is [`beae10d0a58e`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/beae10d0a58e58fb8e076734cd38113d7a2b4466).
-Its [September 19 Build run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35469570419)
-passed the Linux/native build matrix and a separate Linux OCaml 5.5
-Temporal/PostgreSQL live job. The [live evidence reference](docs/reference/live-acceptance-coverage.md)
+The live evidence was last audited at master [`7963a9a68e3c`](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/7963a9a68e3c31c876a4c883b290064d40ff9ddc)
+(#1142). Its [November 10 Build run](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/42926120004)
+passed the Linux/native build matrix and the three sharded Linux OCaml 5.5
+Temporal/PostgreSQL live jobs. The [live evidence reference](docs/reference/live-acceptance-coverage.md)
 links the exact tests, controller commands, and limits; build success on other
 platforms does not establish live compatibility there.
 
@@ -198,10 +198,11 @@ worker-visible readiness before control operations, and checks exact-run termina
 outcomes. The timeout retry fixtures are serialized after the shorter heartbeat
 path so a busy callback lane cannot masquerade as a server timeout test.
 
-The [audited live job](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35469570419/job/105967951226)
-passed with Temporal Server 1.32.0 and PostgreSQL 18.6 on Linux OCaml 5.5.
-It also executed the separate restart, crash recovery, cache eviction, patching,
-parent/child restart, and child-failure-after-replay controllers. See the
+The audited live jobs passed with Temporal Server 1.32.2 and PostgreSQL 18.6 on
+Linux OCaml 5.5. Besides the baseline driver, they executed the restart, crash
+recovery, cache eviction, patching, parent/child restart,
+child-failure-after-replay, start-metadata, task-failure and shipped-example
+controllers and the 22 live regression suites. See the
 [live evidence reference](docs/reference/live-acceptance-coverage.md) for
 commit-pinned definitions and the exact assertion boundaries.
 
