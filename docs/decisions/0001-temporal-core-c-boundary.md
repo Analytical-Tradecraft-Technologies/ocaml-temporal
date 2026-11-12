@@ -36,6 +36,14 @@ project-owned Rust `staticlib`. The first implementation starts from commit
 `95e97686a079dcfe6c42e3254b2f3f5e3d97408f`; updates require the complete
 compatibility and replay suite plus an updated license inventory.
 
+The `95e97686` citations in this record are historical: they are the revision
+inspected when the decision was made. The bridge now links Core
+`8fe478ee179ed754614d230f39586f3edb57da71` (#824, PR #989), with the ABI
+unchanged. The
+[Core bridge reference](../reference/core-bridge.md#temporal-core-revision)
+records the current pin and its upgrade evidence, and `rust/Cargo.toml` is
+authoritative.
+
 The bridge exports a versioned C ABI containing opaque runtime/client/worker
 handles and owned byte-buffer results. Its worker operations are synchronous
 from C's point of view:
