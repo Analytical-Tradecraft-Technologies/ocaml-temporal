@@ -2337,7 +2337,10 @@ let native_client_describe (client : native_client) (request : describe_request)
 
 (** Describes one retained mock run, exact or current, from the ledger. The
     mock runs no workflow code, so it has no pending activities or children
-    and records no history: [history_length] is [0]. An unknown workflow or
+    and records no history: [history_length] is [0]. Memo and search
+    attributes are sorted by key, as the native description is, so code that
+    compares descriptions sees the same order on both backends. An unknown
+    workflow or
     mismatched run is the same typed [NotFound] error as for the other
     operations. *)
 let mock_client_describe (client : mock_client) (request : describe_request) =
@@ -2355,7 +2358,12 @@ let mock_client_describe (client : mock_client) (request : describe_request) =
             Error (mock_not_found "workflow run id does not match the started run")
         | None -> Error (mock_not_found "workflow execution was not started")
         | Some execution ->
-            let copy_fields = List.map (fun (key, value) -> (key, copy_payload value)) in
+            (* The ledger keeps the caller's start order; the description
+               contract is sorted by key, matching Rust's sorted maps. *)
+            let copy_fields fields =
+              List.map (fun (key, value) -> (key, copy_payload value)) fields
+              |> List.stable_sort (fun (left, _) (right, _) -> String.compare left right)
+            in
             Ok
               {
                 workflow_id = request.workflow_id;

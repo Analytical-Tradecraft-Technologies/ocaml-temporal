@@ -639,7 +639,7 @@ let test_client_fetch_history_validation () =
 (** [Client.describe] and [Client.count] (#1152) on the deterministic
     client: an open run reports its identity, type, queue, [`Running], a start
     time and no close time, and the memo and search attributes passed to
-    [start] unchanged; after [terminate] the same exact run is [`Terminated]
+    [start] sorted by key (they are passed out of order); after [terminate] the same exact run is [`Terminated]
     with a close time no earlier than its start; a current-run handle names
     the concrete run; an unknown workflow or run is [`Not_found]. [count]
     matches the rows of an empty listing and refuses a non-empty query like
@@ -655,8 +655,11 @@ let test_client_describe_and_count () =
   let payload data : Temporal.Payload.t =
     { metadata = [ ("encoding", "json/plain") ]; data = Bytes.of_string data }
   in
-  let memo = [ ("note", payload "\"memo\"") ] in
-  let search_attributes = [ ("Key", payload "\"value\"") ] in
+  let memo = [ ("note", payload "\"memo\""); ("author", payload "\"ada\"") ] in
+  let search_attributes =
+    [ ("Key", payload "\"value\""); ("AKey", payload "\"first\"") ]
+  in
+  let by_key = List.sort (fun (left, _) (right, _) -> String.compare left right) in
   let handle =
     unwrap
       (Temporal.Client.start client ~workflow:echo_workflow ~memo
@@ -672,8 +675,8 @@ let test_client_describe_and_count () =
   assert (described.task_queue = "unit-test");
   assert (described.status = `Running);
   assert (described.close_time = None);
-  assert (described.memo = memo);
-  assert (described.search_attributes = search_attributes);
+  assert (described.memo = by_key memo);
+  assert (described.search_attributes = by_key search_attributes);
   assert (described.pending_activities = [] && described.pending_children = []);
   assert (described.history_length = 0L);
   let current =
