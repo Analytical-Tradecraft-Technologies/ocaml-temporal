@@ -1009,6 +1009,11 @@ let test_rpc_timeout_protocol () =
               next_page_token = None;
               rpc_deadline;
             } );
+      ( "describe",
+        fun rpc_deadline -> Protocol.encode_describe_request { execution; rpc_deadline } );
+      ( "count",
+        fun rpc_deadline ->
+          Protocol.encode_count_request { namespace = "default"; query = ""; rpc_deadline } );
     ]
   in
   List.iter
@@ -1020,6 +1025,116 @@ let test_rpc_timeout_protocol () =
       check_error_path label "$.rpc_timeout_ms"
         (encode (deadline (Int64.succ Protocol.max_rpc_timeout_ms))))
     encoders
+
+(** Describe and count documents (#1152): requests carry the run selector or
+    query and the optional budget; a describe answer is decoded strictly,
+    must name the requested execution, and maps every status and pending
+    activity state the Rust encoder can write, including [unknown_<n>]; a
+    count is a non-negative 64-bit integer. *)
+let test_describe_count_protocol () =
+  let request : Protocol.describe_request =
+    { execution = { execution with run_id = "" }; rpc_deadline = None }
+  in
+  let encoded = unwrap (Protocol.encode_describe_request request) in
+  require_fragment "describe run selector" {|"run_id":""|} encoded;
+  check_error_path "describe workflow" "$.workflow_id"
+    (Protocol.encode_describe_request
+       { request with execution = { execution with workflow_id = "" } });
+  (* [base64] is the payload data already in canonical padded base64. *)
+  let payload_json base64 =
+    Printf.sprintf
+      {|{"metadata":{"encoding":{"encoding":"base64","data":"anNvbi9wbGFpbg=="}},"data":{"encoding":"base64","data":%S}}|}
+      base64
+  in
+  let document ?(run_id = "run-1") ?(status = "running") ?(close_time = "null")
+      ?(history_length = "7") ?(memo = "[]") ?(state = "started")
+      ?(attempt = "3") ?(extra = "") () =
+    Printf.sprintf
+      {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":%S},"workflow_type":"Fixture","task_queue":"queue","status":%S,"start_time":{"seconds":1700000000,"nanoseconds":5},"close_time":%s,"history_length":%s,"memo":%s,"search_attributes":[],"pending_activities":[{"activity_id":"1","activity_type":"charge","state":%S,"attempt":%s}],"pending_children":[{"workflow_id":"child","run_id":null,"workflow_type":"Child"}]%s}|}
+      run_id status close_time history_length memo state attempt extra
+  in
+  let memo =
+    Printf.sprintf {|[{"key":"a","value":%s},{"key":"b","value":%s}]|}
+      (payload_json "MQ==") (payload_json "Mg==")
+  in
+  let described =
+    unwrap
+      (Protocol.decode_describe_response ~request
+         (document ~memo ~close_time:{|{"seconds":1700000060,"nanoseconds":0}|}
+            ~history_length:"9007199254740993" ()))
+  in
+  assert (described.execution.run_id = "run-1");
+  assert (described.status = `Running);
+  assert (described.start_time = { Workflow.seconds = 1_700_000_000L; nanoseconds = 5 });
+  assert (
+    described.close_time = Some { Workflow.seconds = 1_700_000_060L; nanoseconds = 0 });
+  assert (described.history_length = 9_007_199_254_740_993L);
+  assert (List.map (fun (field : Protocol.metadata_field) -> field.key) described.memo = [ "a"; "b" ]);
+  (match described.pending_activities with
+  | [ { activity_id = "1"; activity_type = "charge"; state = `Started; attempt = 3 } ] -> ()
+  | _ -> failwith "pending activity changed shape");
+  (match described.pending_children with
+  | [ { workflow_id = "child"; run_id = None; workflow_type = "Child" } ] -> ()
+  | _ -> failwith "pending child changed shape");
+  List.iter
+    (fun (state, expected) ->
+      match unwrap (Protocol.decode_describe_response ~request (document ~state ())) with
+      | { pending_activities = [ activity ]; _ } -> assert (activity.state = expected)
+      | _ -> failwith "pending activity state changed shape")
+    [
+      ("scheduled", `Scheduled);
+      ("started", `Started);
+      ("cancel_requested", `Cancel_requested);
+      ("paused", `Paused);
+      ("pause_requested", `Pause_requested);
+      ("unknown_0", `Unknown 0);
+      ("unknown_6", `Unknown 6);
+      ("unknown_-1", `Unknown (-1));
+    ];
+  assert (
+    (unwrap (Protocol.decode_describe_response ~request (document ~status:"unknown_9" ())))
+      .status
+    = `Unknown 9);
+  (* An exact request must be answered for its own run. *)
+  let exact = { request with execution } in
+  ignore (unwrap (Protocol.decode_describe_response ~request:exact (document ())));
+  check_error_path "other run" "$.execution"
+    (Protocol.decode_describe_response ~request:exact (document ~run_id:"run-2" ()));
+  check_error_path "unspecified status" "$.status"
+    (Protocol.decode_describe_response ~request (document ~status:"unspecified" ()));
+  check_error_path "named state as unknown" "$.pending_activities[0].state"
+    (Protocol.decode_describe_response ~request (document ~state:"unknown_2" ()));
+  check_error_path "negative history" "$.history_length"
+    (Protocol.decode_describe_response ~request (document ~history_length:"-1" ()));
+  check_error_path "negative attempt" "$.pending_activities[0].attempt"
+    (Protocol.decode_describe_response ~request (document ~attempt:"-1" ()));
+  check_error_path "duplicate memo key" "$.memo[1].key"
+    (Protocol.decode_describe_response ~request
+       (document
+          ~memo:
+            (Printf.sprintf {|[{"key":"a","value":%s},{"key":"a","value":%s}]|}
+               (payload_json "MQ==") (payload_json "Mg=="))
+          ()));
+  require_error
+    (Protocol.decode_describe_response ~request (document ~extra:{|,"extra":1|} ()));
+  let count_request : Protocol.count_request =
+    { namespace = "default"; query = "WorkflowType = 'x'"; rpc_deadline = None }
+  in
+  require_fragment "count query" "WorkflowType" (unwrap (Protocol.encode_count_request count_request));
+  check_error_path "count query" "$.query"
+    (Protocol.encode_count_request { count_request with query = "a\000" });
+  assert (unwrap (Protocol.decode_count_response {|{"count":42}|}) = 42L);
+  assert (
+    unwrap (Protocol.decode_count_response {|{"count":9223372036854775807}|})
+    = Int64.max_int);
+  List.iter
+    (fun malformed -> require_error (Protocol.decode_count_response malformed))
+    [
+      {|{"count":-1}|};
+      {|{"count":9223372036854775808}|};
+      {|{"count":"1"}|};
+      {|{"count":1,"groups":[]}|};
+    ]
 
 (** Runs one protocol test with a stable CI-visible name. *)
 let run name test =
@@ -1042,6 +1157,7 @@ let () =
   run "client signal protocol" test_signal_protocol;
   run "client query protocol" test_query_protocol;
   run "client visibility protocol" test_visibility_protocol;
+  run "client describe and count protocol" test_describe_count_protocol;
   run "client asynchronous starts" test_async_start_protocol;
   run "client id conflict policy" test_id_conflict_policy_protocol;
   run "client start execution policies" test_start_execution_policy_protocol;

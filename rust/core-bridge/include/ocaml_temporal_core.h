@@ -287,7 +287,14 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_wait_workflow_json(
  * (default 30 s, #1210). The bridge follows every page and
  * its success value is binary, not JSON: one serialized
  * temporal.api.history.v1.History message of at most the payload safety
- * limit, the form Temporal.Replay.History.of_protobuf accepts. */
+ * limit, the form Temporal.Replay.History.of_protobuf accepts.
+ * DESCRIBE and COUNT have no synchronous symbol either (#1152). DESCRIBE's
+ * document is {"namespace","workflow_id","run_id"} (an empty run ID selects
+ * the current run) with optional "rpc_timeout_ms" (default 10 s); its
+ * success value is the reduced describe document of
+ * docs/schemas/bridge/client-describe-response.schema.json. COUNT's document
+ * is {"namespace","query"} with optional "rpc_timeout_ms" (default 10 s); its
+ * success value is {"count":<n>}. */
 enum {
   OCAML_TEMPORAL_CORE_CLIENT_CALL_START = 1,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_WAIT = 2,
@@ -301,7 +308,9 @@ enum {
   OCAML_TEMPORAL_CORE_CLIENT_CALL_VISIBILITY = 10,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_COMPLETION = 11,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_HEARTBEAT = 12,
-  OCAML_TEMPORAL_CORE_CLIENT_CALL_HISTORY = 13
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_HISTORY = 13,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_DESCRIBE = 14,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_COUNT = 15
 };
 
 /* Submit one client RPC without waiting for Temporal (#807). Only the

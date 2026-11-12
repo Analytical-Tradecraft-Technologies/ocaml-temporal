@@ -193,6 +193,50 @@ type visibility_page = {
   next_page_token : string option;
 }
 
+(** One run to describe (#1152); see the interface. *)
+type describe_request = {
+  workflow_id : string;
+  run_id : string;
+  rpc_deadline : Client_protocol.rpc_deadline option;
+}
+
+(** One activity a described run has scheduled and not yet resolved. *)
+type pending_activity = {
+  activity_id : string;
+  activity_type : string;
+  state : Client_protocol.pending_activity_state;
+  attempt : int;
+}
+
+(** One child workflow a described run has initiated and not yet seen close. *)
+type pending_child = {
+  workflow_id : string;
+  run_id : string option;
+  workflow_type : string;
+}
+
+(** The description of one run; see the interface. *)
+type description = {
+  workflow_id : string;
+  run_id : string;
+  workflow_type : string;
+  task_queue : string;
+  status : Client_protocol.visibility_status;
+  start_time : Time.t;
+  close_time : Time.t option;
+  history_length : int64;
+  memo : (string * Payload.t) list;
+  search_attributes : (string * Payload.t) list;
+  pending_activities : pending_activity list;
+  pending_children : pending_child list;
+}
+
+(** One visibility count (#1152); see the interface. *)
+type count_request = {
+  query : string;
+  rpc_deadline : Client_protocol.rpc_deadline option;
+}
+
 (** Exact-run workflow update request retained by the private backend. *)
 type update_request = {
   workflow_id : string;
@@ -320,6 +364,16 @@ type mock_execution = {
   workflow_type : string;
   task_queue : string;
   input : Payload.t;
+  (* Copies of the memo and search attributes the run was started with,
+     which [describe] returns (#1152); a reset successor inherits them, as
+     Temporal's reset does. *)
+  memo : (string * Payload.t) list;
+  search_attributes : (string * Payload.t) list;
+  (* Host wall-clock instants of the run's start and of the first transition
+     out of [Mock_pending]. The mock runs no workflow code, so these are
+     test-ledger times, never replay inputs. *)
+  start_time : Time.t;
+  mutable close_time : Time.t option;
   mutable terminal : mock_terminal;
   signal_requests : (string, mock_signal) Hashtbl.t;
 }
@@ -383,6 +437,23 @@ let mock_services_mutex = Mutex.create ()
     introduce if a caller used that separator in a URL or namespace. *)
 let mock_services : ((string * string), mock_service) Hashtbl.t =
   Hashtbl.create 8
+
+(** Reads the host wall clock as a [Time.t] for the mock ledger's start and
+    close times. Only the client-side mock calls it, never workflow code. *)
+let mock_now () =
+  let now = Unix.gettimeofday () in
+  let seconds = Float.floor now in
+  let nanoseconds = Int.min 999_999_999 (int_of_float ((now -. seconds) *. 1e9)) in
+  match Time.of_unix ~seconds:(Int64.of_float seconds) ~nanoseconds with
+  | Ok time -> time
+  | Error _ -> invalid_arg "mock_now: fraction outside 0..999999999"
+
+(** Moves a mock run to [terminal], recording its close time the first time
+    it leaves [Mock_pending]. Must be called with the service mutex held. *)
+let mock_close (execution : mock_execution) terminal =
+  execution.terminal <- terminal;
+  if Option.is_none execution.close_time then
+    execution.close_time <- Some (mock_now ())
 
 (** Native client state retained by the private backend.
 
@@ -1347,6 +1418,11 @@ let mock_start_new_run service (request : start_request) =
       workflow_type = request.workflow_name;
       task_queue = request.task_queue;
       input = mock_workflow_input request.input;
+      memo = List.map (fun (key, value) -> (key, copy_payload value)) request.memo;
+      search_attributes =
+        List.map (fun (key, value) -> (key, copy_payload value)) request.search_attributes;
+      start_time = mock_now ();
+      close_time = None;
       terminal = Mock_pending;
       signal_requests = Hashtbl.create 8;
     }
@@ -1446,7 +1522,7 @@ let mock_client_start (client : mock_client) (request : start_request) =
                     started = false;
                   }
             | Some existing, `Terminate_existing ->
-                existing.terminal <- Mock_terminated;
+                mock_close existing Mock_terminated;
                 mock_start_new_run service request))
 
 
@@ -1530,7 +1606,7 @@ let mock_client_wait (client : mock_client) (request : wait_request) =
                 (* The first wait linearizes the synthetic execution into its
                    completed terminal state before returning the copied
                    payload. *)
-                execution.terminal <- Mock_completed;
+                mock_close execution Mock_completed;
                 Ok (Completed { payload = copy_payload execution.input; successor = None })
             | Mock_completed ->
                 Ok (Completed { payload = copy_payload execution.input; successor = None })
@@ -1582,16 +1658,16 @@ let mock_set_wait_outcome_for_test client (request : wait_request) outcome =
             | Some execution -> (
                 match outcome with
                 | Failed { error; successor } ->
-                    execution.terminal <- Mock_failed { error; successor };
+                    mock_close execution (Mock_failed { error; successor });
                     Ok ()
                 | Timed_out { error; successor } ->
-                    execution.terminal <- Mock_timed_out { error; successor };
+                    mock_close execution (Mock_timed_out { error; successor });
                     Ok ()
                 | Completed { successor = Some successor; _ } ->
-                    execution.terminal <- Mock_completed_with_successor successor;
+                    mock_close execution (Mock_completed_with_successor successor);
                     Ok ()
                 | Continued_as_new successor ->
-                    execution.terminal <- Mock_continued_as_new successor;
+                    mock_close execution (Mock_continued_as_new successor);
                     Ok ()
                 | Completed { successor = None; _ } | Cancelled _ | Terminated _ ->
                     Error
@@ -1766,7 +1842,7 @@ let mock_client_cancel (client : mock_client) (request : cancel_request) =
             Error (mock_not_found "workflow run id does not match the started run")
         | Some execution ->
             (match execution.terminal with
-            | Mock_pending -> execution.terminal <- Mock_cancelled
+            | Mock_pending -> mock_close execution Mock_cancelled
             | Mock_completed | Mock_completed_with_successor _
             | Mock_continued_as_new _ | Mock_cancelled | Mock_terminated
             | Mock_failed _ | Mock_timed_out _ ->
@@ -1831,7 +1907,7 @@ let mock_client_reset (client : mock_client) (request : reset_request) =
         | Some execution ->
             (match Hashtbl.find_opt service.executions request.workflow_id with
             | Some current when current.terminal = Mock_pending ->
-                current.terminal <- Mock_terminated
+                mock_close current Mock_terminated
             | Some _ | None -> ());
             service.next_run <- service.next_run + 1;
             let run_id = Printf.sprintf "mock-run-%d" service.next_run in
@@ -1841,6 +1917,14 @@ let mock_client_reset (client : mock_client) (request : reset_request) =
                 workflow_type = execution.workflow_type;
                 task_queue = execution.task_queue;
                 input = copy_payload execution.input;
+                memo =
+                  List.map (fun (key, value) -> (key, copy_payload value)) execution.memo;
+                search_attributes =
+                  List.map
+                    (fun (key, value) -> (key, copy_payload value))
+                    execution.search_attributes;
+                start_time = mock_now ();
+                close_time = None;
                 terminal = Mock_pending;
                 signal_requests = Hashtbl.create 8;
               }
@@ -1876,7 +1960,7 @@ let mock_client_terminate (client : mock_client) (request : terminate_request) =
             Error (mock_not_found "workflow run id does not match the started run")
         | Some execution ->
             (match execution.terminal with
-            | Mock_pending -> execution.terminal <- Mock_terminated
+            | Mock_pending -> mock_close execution Mock_terminated
             | Mock_completed | Mock_completed_with_successor _
             | Mock_continued_as_new _ | Mock_cancelled | Mock_terminated
             | Mock_failed _ | Mock_timed_out _ ->
@@ -2014,6 +2098,17 @@ let native_client_list_visibility (client : native_client)
             next_page_token = page.next_page_token;
           }
 
+(** The execution status Temporal visibility and describe report for a mock
+    run in [terminal]. *)
+let mock_status : mock_terminal -> Client_protocol.visibility_status = function
+  | Mock_pending -> `Running
+  | Mock_completed | Mock_completed_with_successor _ -> `Completed
+  | Mock_continued_as_new _ -> `Continued_as_new
+  | Mock_cancelled -> `Canceled
+  | Mock_terminated -> `Terminated
+  | Mock_failed _ -> `Failed
+  | Mock_timed_out _ -> `Timed_out
+
 (** Lists every retained mock run in workflow-ID and run-ID order. A page token
     resumes after the last exact run returned, even when reset created another
     run with the same workflow ID. The mock accepts only an empty query;
@@ -2071,22 +2166,12 @@ let mock_client_list_visibility (client : mock_client)
             let executions : visibility_execution list =
               Hashtbl.to_seq service.history
               |> Seq.map (fun ((workflow_id, _run_id), (execution : mock_execution)) ->
-                     let status =
-                       match execution.terminal with
-                       | Mock_pending -> `Running
-                       | Mock_completed | Mock_completed_with_successor _ -> `Completed
-                       | Mock_continued_as_new _ -> `Continued_as_new
-                       | Mock_cancelled -> `Canceled
-                       | Mock_terminated -> `Terminated
-                       | Mock_failed _ -> `Failed
-                       | Mock_timed_out _ -> `Timed_out
-                     in
                      ({
                         workflow_id;
                         run_id = execution.run_id;
                         workflow_type = execution.workflow_type;
                         task_queue = execution.task_queue;
-                        status;
+                        status = mock_status execution.terminal;
                       }
                        : visibility_execution))
               |> List.of_seq
@@ -2171,6 +2256,164 @@ let client_fetch_history client request =
   | Mock_client _ ->
       Error (defect "the deterministic mock client does not record workflow histories")
   | Native_client client -> native_client_fetch_history client request
+
+(** Converts a protocol timestamp Rust already validated into a [Time.t]. *)
+let public_time (time : Workflow_protocol.timestamp) =
+  match Time.of_unix ~seconds:time.seconds ~nanoseconds:time.nanoseconds with
+  | Ok time -> Ok time
+  | Error _ -> Error (protocol_error "core_invalid")
+
+(** Converts Rust's sorted named payloads to the public association list. *)
+let public_fields (fields : Client_protocol.metadata_field list) =
+  List.map (fun ({ key; value } : Client_protocol.metadata_field) -> (key, public_payload value)) fields
+
+(** Describes one run as a submitted call (#1152). Rust reduces the
+    [DescribeWorkflowExecution] answer and OCaml checks that it names the
+    requested execution. A gRPC failure, such as [not_found] for an unknown
+    run, arrives as the closed [rpc] document with the [Connection] status,
+    as for visibility. *)
+let native_client_describe (client : native_client) (request : describe_request) :
+    (description, Error.t) result =
+  if Atomic.get client.closed then Error (bridge_error "client is shut down")
+  else
+    let request : Client_protocol.describe_request =
+      {
+        execution =
+          {
+            namespace = client.namespace;
+            workflow_id = request.workflow_id;
+            run_id = request.run_id;
+          };
+        rpc_deadline = request.rpc_deadline;
+      }
+    in
+    match Native.call client.supervisor (Native.Rpc_describe request) with
+    | Error Native.Closed -> Error (bridge_error "client is shut down")
+    | Error error -> Error (native_call_error ~namespace:client.namespace error)
+    | Ok described -> (
+        let times =
+          Result.bind (public_time described.start_time) (fun start_time ->
+              match described.close_time with
+              | None -> Ok (start_time, None)
+              | Some close_time ->
+                  Result.map (fun close_time -> (start_time, Some close_time))
+                    (public_time close_time))
+        in
+        match times with
+        | Error error -> Error error
+        | Ok (start_time, close_time) ->
+            Ok
+              {
+                workflow_id = described.execution.workflow_id;
+                run_id = described.execution.run_id;
+                workflow_type = described.workflow_type;
+                task_queue = described.task_queue;
+                status = described.status;
+                start_time;
+                close_time;
+                history_length = described.history_length;
+                memo = public_fields described.memo;
+                search_attributes = public_fields described.search_attributes;
+                pending_activities =
+                  List.map
+                    (fun (activity : Client_protocol.pending_activity) ->
+                      {
+                        activity_id = activity.activity_id;
+                        activity_type = activity.activity_type;
+                        state = activity.state;
+                        attempt = activity.attempt;
+                      })
+                    described.pending_activities;
+                pending_children =
+                  List.map
+                    (fun (child : Client_protocol.pending_child) : pending_child ->
+                      {
+                        workflow_id = child.workflow_id;
+                        run_id = child.run_id;
+                        workflow_type = child.workflow_type;
+                      })
+                    described.pending_children;
+              })
+
+(** Describes one retained mock run, exact or current, from the ledger. The
+    mock runs no workflow code, so it has no pending activities or children
+    and records no history: [history_length] is [0]. An unknown workflow or
+    mismatched run is the same typed [NotFound] error as for the other
+    operations. *)
+let mock_client_describe (client : mock_client) (request : describe_request) =
+  let service = client.service in
+  Mutex.lock service.mutex;
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock service.mutex)
+    (fun () ->
+      if client.closed then Error (bridge_error "client is shut down")
+      else
+        match
+          mock_find_run service ~workflow_id:request.workflow_id ~run_id:request.run_id
+        with
+        | None when Hashtbl.mem service.executions request.workflow_id ->
+            Error (mock_not_found "workflow run id does not match the started run")
+        | None -> Error (mock_not_found "workflow execution was not started")
+        | Some execution ->
+            let copy_fields = List.map (fun (key, value) -> (key, copy_payload value)) in
+            Ok
+              {
+                workflow_id = request.workflow_id;
+                run_id = execution.run_id;
+                workflow_type = execution.workflow_type;
+                task_queue = execution.task_queue;
+                status = mock_status execution.terminal;
+                start_time = execution.start_time;
+                close_time = execution.close_time;
+                history_length = 0L;
+                memo = copy_fields execution.memo;
+                search_attributes = copy_fields execution.search_attributes;
+                pending_activities = [];
+                pending_children = [];
+              })
+
+(** Describes one run through the selected private transport. *)
+let client_describe client request =
+  match client with
+  | Mock_client client -> mock_client_describe client request
+  | Native_client client -> native_client_describe client request
+
+(** Counts matching executions as a submitted call (#1152); failures are
+    classified as for visibility. *)
+let native_client_count (client : native_client) (request : count_request) =
+  if Atomic.get client.closed then Error (bridge_error "client is shut down")
+  else
+    let request : Client_protocol.count_request =
+      { namespace = client.namespace; query = request.query; rpc_deadline = request.rpc_deadline }
+    in
+    match Native.call client.supervisor (Native.Rpc_count request) with
+    | Error Native.Closed -> Error (bridge_error "client is shut down")
+    | Error error -> Error (native_call_error ~namespace:client.namespace error)
+    | Ok count -> Ok count
+
+(** Counts every retained mock run, the rows an empty visibility listing
+    returns. Like the mock's listing it accepts only an empty query. *)
+let mock_client_count (client : mock_client) (request : count_request) =
+  if String.length request.query > 65_536 then
+    Error (defect "visibility query exceeds the protocol safety limit")
+  else if String.contains request.query '\000' then
+    Error (defect "visibility query must not contain NUL")
+  else if not (String.equal request.query "") then
+    Error (defect "the deterministic mock only supports an empty visibility query")
+  else
+    let service = client.service in
+    Mutex.lock service.mutex;
+    Fun.protect
+      ~finally:(fun () -> Mutex.unlock service.mutex)
+      (fun () ->
+        if client.closed then Error (bridge_error "client is shut down")
+        else Ok (Int64.of_int (Hashtbl.length service.history)))
+
+(** Counts matching executions through the selected private transport. *)
+let client_count client request =
+  match client with
+  | Mock_client client -> mock_client_count client request
+  | Native_client client -> native_client_count client request
 
 (** Converts a public update request to the namespace-bound JSON protocol. *)
 let native_update_request client (request : update_request) :

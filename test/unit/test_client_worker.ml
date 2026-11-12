@@ -636,6 +636,95 @@ let test_client_fetch_history_validation () =
   expect_error_message_contains "bridge" "client is shut down"
     (Temporal.Client.fetch_history handle)
 
+(** [Client.describe] and [Client.count] (#1152) on the deterministic
+    client: an open run reports its identity, type, queue, [`Running], a start
+    time and no close time, and the memo and search attributes passed to
+    [start] unchanged; after [terminate] the same exact run is [`Terminated]
+    with a close time no earlier than its start; a current-run handle names
+    the concrete run; an unknown workflow or run is [`Not_found]. [count]
+    matches the rows of an empty listing and refuses a non-empty query like
+    the mock's listing. Invalid deadlines and queries are typed defects and
+    a shut-down client reports the closed-client error. The native path is
+    covered by the bridge test and the live regression. *)
+let test_client_describe_and_count () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://describe"
+         ~namespace:"unit-test" ())
+  in
+  let payload data : Temporal.Payload.t =
+    { metadata = [ ("encoding", "json/plain") ]; data = Bytes.of_string data }
+  in
+  let memo = [ ("note", payload "\"memo\"") ] in
+  let search_attributes = [ ("Key", payload "\"value\"") ] in
+  let handle =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow ~memo
+         ~search_attributes ~task_queue:"unit-test" ~id:"describe-a" ~input:"a"
+         ())
+  in
+  let run_id = Option.get (Temporal.Client.run_id handle) in
+  let described = unwrap (Temporal.Client.describe handle) in
+  assert (
+    described.execution
+    = { namespace = "unit-test"; workflow_id = "describe-a"; run_id });
+  assert (described.workflow_type = "unit.echo");
+  assert (described.task_queue = "unit-test");
+  assert (described.status = `Running);
+  assert (described.close_time = None);
+  assert (described.memo = memo);
+  assert (described.search_attributes = search_attributes);
+  assert (described.pending_activities = [] && described.pending_children = []);
+  assert (described.history_length = 0L);
+  let current =
+    unwrap
+      (Temporal.Client.get_handle client ~workflow:echo_workflow ~id:"describe-a" ())
+  in
+  assert ((unwrap (Temporal.Client.describe current)).execution.run_id = run_id);
+  unwrap (Temporal.Client.terminate handle);
+  let closed = unwrap (Temporal.Client.describe handle) in
+  assert (closed.status = `Terminated);
+  (match closed.close_time with
+  | Some close_time ->
+      assert (Temporal.Time.compare closed.start_time close_time <= 0)
+  | None -> failwith "a terminated mock run has no close time");
+  ignore
+    (unwrap
+       (Temporal.Client.start client ~workflow:echo_workflow
+          ~task_queue:"unit-test" ~id:"describe-b" ~input:"b" ()));
+  let listed = unwrap (Temporal.Client.list_visibility client ~query:"" ()) in
+  assert (
+    unwrap (Temporal.Client.count client ~query:"" ())
+    = Int64.of_int (List.length listed.executions));
+  assert (unwrap (Temporal.Client.count client ~query:"" ()) = 2L);
+  let not_found = function
+    | Error error -> assert (Temporal.Client.rpc_status error = Some `Not_found)
+    | Ok _ -> failwith "an unknown run was described"
+  in
+  not_found
+    (Temporal.Client.describe
+       (unwrap
+          (Temporal.Client.get_handle client ~workflow:echo_workflow
+             ~id:"describe-missing" ())));
+  not_found
+    (Temporal.Client.describe
+       (unwrap
+          (Temporal.Client.get_handle client ~workflow:echo_workflow
+             ~id:"describe-a" ~run_id:"other-run" ())));
+  expect_error "defect"
+    (Temporal.Client.describe ~rpc_timeout:(Temporal.Duration.of_ms 0L) handle);
+  expect_error "defect"
+    (Temporal.Client.count ~rpc_timeout:(Temporal.Duration.of_ms 0L) client
+       ~query:"" ());
+  expect_error "defect" (Temporal.Client.count client ~query:"a\000" ());
+  expect_error_message_contains "defect" "only supports an empty"
+    (Temporal.Client.count client ~query:"WorkflowType = 'x'" ());
+  unwrap (Temporal.Client.shutdown client);
+  expect_error_message_contains "bridge" "client is shut down"
+    (Temporal.Client.describe handle);
+  expect_error_message_contains "bridge" "client is shut down"
+    (Temporal.Client.count client ~query:"" ())
+
 (** A continuation identity can be turned back into a typed exact-run handle
     without starting a second execution. Using the mock ledger's existing run
     proves the returned handle retained the workflow's output codec: [wait]
@@ -1883,6 +1972,7 @@ let () =
   test_client_execution_policy_validation ();
   test_client_visibility_listing ();
   test_client_fetch_history_validation ();
+  test_client_describe_and_count ();
   test_follow_continued_as_new_handle ();
   test_follow_rejects_malformed_successor_identity ();
   test_follow_rejects_cross_namespace_execution ();

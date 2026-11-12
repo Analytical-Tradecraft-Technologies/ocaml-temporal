@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-describe-response.schema.json",
+  "title": "OCaml Temporal native client describe response",
+  "description": "Success value of the DESCRIBE client call selector (#1152): the reduced DescribeWorkflowExecution answer. Heartbeat details, failures, timing fields other than start and close, callbacks and Nexus operations are not carried. Runtime validators also reject duplicate keys, NUL bytes, duplicate metadata keys, and strings over the 65,536-byte safety limit.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "execution",
+    "workflow_type",
+    "task_queue",
+    "status",
+    "start_time",
+    "close_time",
+    "history_length",
+    "memo",
+    "search_attributes",
+    "pending_activities",
+    "pending_children"
+  ],
+  "properties": {
+    "execution": {"$ref": "client-execution-ref.schema.json", "description": "The described run as Temporal resolved it; run_id is always concrete."},
+    "workflow_type": {"$ref": "#/$defs/identifier"},
+    "task_queue": {"$ref": "#/$defs/identifier"},
+    "status": {
+      "type": "string",
+      "anyOf": [
+        {"enum": ["running", "completed", "failed", "canceled", "terminated", "continued_as_new", "timed_out", "paused"]},
+        {"$ref": "#/$defs/unknown_status"}
+      ]
+    },
+    "start_time": {"$ref": "#/$defs/timestamp"},
+    "close_time": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/timestamp"}], "description": "null while the run is open."},
+    "history_length": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+    "memo": {"$ref": "#/$defs/named_payloads"},
+    "search_attributes": {"$ref": "#/$defs/named_payloads", "description": "As the server reports them, including its type metadata entry."},
+    "pending_activities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["activity_id", "activity_type", "state", "attempt"],
+        "properties": {
+          "activity_id": {"$ref": "#/$defs/identifier"},
+          "activity_type": {"$ref": "#/$defs/identifier"},
+          "state": {
+            "type": "string",
+            "anyOf": [
+              {"enum": ["scheduled", "started", "cancel_requested", "paused", "pause_requested"]},
+              {
+                "description": "A PendingActivityState value this SDK does not name, including the unspecified 0, as its canonical decimal value outside 1..5 within the signed 32-bit range.",
+                "pattern": "^unknown_-?(0|[1-9][0-9]{0,9})$"
+              }
+            ]
+          },
+          "attempt": {"type": "integer", "minimum": 0, "maximum": 2147483647}
+        }
+      }
+    },
+    "pending_children": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["workflow_id", "run_id", "workflow_type"],
+        "properties": {
+          "workflow_id": {"$ref": "#/$defs/identifier"},
+          "run_id": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/identifier"}], "description": "null while the child's start is still being initiated."},
+          "workflow_type": {"$ref": "#/$defs/identifier"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
+    "unknown_status": {
+      "description": "A WorkflowExecutionStatus value this SDK does not name, as its canonical decimal value outside 0..8 within the signed 32-bit range (the same spelling as a visibility row's).",
+      "pattern": "^unknown_-?(0|[1-9][0-9]{0,9})$"
+    },
+    "timestamp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seconds", "nanoseconds"],
+      "properties": {
+        "seconds": {"type": "integer"},
+        "nanoseconds": {"type": "integer", "minimum": 0, "maximum": 999999999}
+      }
+    },
+    "named_payloads": {
+      "type": "array",
+      "description": "Named payloads sorted by key; keys are unique.",
+      "items": {"$ref": "metadata-field.schema.json"}
+    }
+  }
+}
