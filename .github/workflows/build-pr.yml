@@ -31,6 +31,7 @@ jobs:
       code: ${{ steps.changed-paths.outputs.code }}
       linux: ${{ steps.matrix.outputs.linux }}
       native: ${{ steps.matrix.outputs.native }}
+      next: ${{ steps.matrix.outputs.next }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -455,6 +456,46 @@ jobs:
           if-no-files-found: error
           retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
           compression-level: 0
+
+  # The next compiler series (#1164): `make verify` on Linux amd64 with the
+  # pinned trunk/alpha image of NEXT_SERIES from scripts/ci-matrix.py. It runs
+  # only in master builds and is non-blocking (continue-on-error), so it never
+  # gates a pull request, the merge queue or a release; a failure is an early
+  # warning to read before raising the `< 5.6` bound (release checklist). It
+  # publishes no artifact.
+  verify-next:
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' && inputs.tier == 'master' }}
+    needs: [changes, rust-amd64]
+    name: OCaml next ${{ matrix.label }} / ${{ matrix.runner }} (non-blocking)
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    timeout-minutes: 60
+    env:
+      TEMPORAL_RUST_BRIDGE_DIR: /workspace/_build/rust-bridge
+      RUST_BRIDGE_PROFILE: ${{ inputs.bridge-profile || 'ci' }}
+      TEMPORAL_RUST_BRIDGE_KEY: ${{ needs.rust-amd64.outputs.key }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.next) }}
+    steps:
+      - name: Require the successful Rust producer
+        env:
+          RUST_AMD64_RESULT: ${{ needs.rust-amd64.result }}
+        run: test "$RUST_AMD64_RESULT" = success
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Download the verified platform bridge
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: rust-bridge-linux-amd64
+          path: _build/rust-bridge
+      - name: Reclaim disposable GitHub-hosted runner disk
+        if: runner.environment == 'github-hosted'
+        run: sh scripts/reclaim-runner-disk.sh 40 --prune-docker
+      - name: Build, lint, and test on the next compiler series
+        env:
+          OCAML_VERSION: ${{ matrix.ocaml }}
+        run: make verify
 
   smoke-build:
     # The live smoke executables used to be compiled after `make verify` in
