@@ -200,6 +200,27 @@ type start_outcome =
   | Rejected of client_error
   | Unknown of { request_id : string; workflow_id : string }
 
+type signal_with_start_request = {
+  start : start_request;
+  signal_name : string;
+  signal_input : payload list;
+}
+
+type update_with_start_request = {
+  start : start_request;
+  update_id : string;
+  update_name : string;
+  update_input : payload list;
+}
+
+type update_with_start_outcome =
+  | Update_with_start_accepted of {
+      start : start_response;
+      update : (update_response, client_error) result;
+    }
+  | Update_with_start_rejected of client_error
+  | Update_with_start_unknown of { request_id : string; workflow_id : string }
+
 type error = { code : string; path : string; message : string }
 type error_view = { code : string; path : string; message : string }
 
@@ -426,7 +447,10 @@ let start_policy_members (value : start_request) =
     ((("id_reuse_policy", json_string reuse) :: execution)
     @ run @ task @ retry @ rpc)
 
-let encode_start_request (value : start_request) =
+(** Validates one start request and builds its closed JSON object without
+    serializing it, so signal-with-start and update-with-start (#1151) can
+    embed the identical document under ["start"]. *)
+let start_request_json (value : start_request) =
   let* () = validate_identifier "$.request_id" value.request_id in
   let* () = validate_identifier "$.namespace" value.namespace in
   let* () = validate_identifier "$.workflow_id" value.workflow_id in
@@ -459,8 +483,8 @@ let encode_start_request (value : start_request) =
     | Terminate_existing -> "terminate_existing"
   in
   let* policies = start_policy_members value in
-  encode_object
-      (`Assoc
+  Ok
+    (`Assoc
       ([
         ("request_id", json_string value.request_id);
         ("namespace", json_string value.namespace);
@@ -473,6 +497,10 @@ let encode_start_request (value : start_request) =
         ("id_conflict_policy", json_string id_conflict_policy);
       ]
       @ policies))
+
+let encode_start_request (value : start_request) =
+  let* json = start_request_json value in
+  encode_object json
 
 (** Serializes the opaque native capability used by asynchronous start polls.
     The request is retained in the OCaml value but is deliberately omitted
@@ -1402,3 +1430,193 @@ let decode_update_error input =
            "already_started is not a valid update error")
   | Query_failed _ -> reject_query_failed "update" error
   | (Rpc _ | Protocol _) -> Ok error
+
+(** Serializes one signal-with-start request (#1151): the start document
+    exactly as [encode_start_request] builds it, under ["start"], plus the
+    signal. Temporal rejects the [Fail] conflict policy for this RPC, so it
+    is rejected here before anything crosses the bridge. *)
+let encode_signal_with_start_request (value : signal_with_start_request) =
+  match value.start.id_conflict_policy with
+  | Fail ->
+      Error
+        (invalid ~path:"$.start.id_conflict_policy"
+           "signal-with-start does not accept the fail conflict policy")
+  | Use_existing | Terminate_existing ->
+      let* start = start_request_json value.start in
+      let* () = validate_identifier "$.signal_name" value.signal_name in
+      let* signal_input = payloads_json value.signal_input in
+      encode_object
+        (`Assoc
+          [
+            ("start", start);
+            ("signal_name", json_string value.signal_name);
+            ("signal_input", signal_input);
+          ])
+
+(** Serializes one update-with-start request (#1151): the start document
+    under ["start"], plus the update. The update never names a run: Temporal
+    resolves the run the start creates or attaches to. *)
+let encode_update_with_start_request (value : update_with_start_request) =
+  let* start = start_request_json value.start in
+  let* () = validate_identifier "$.update_id" value.update_id in
+  let* () = validate_identifier "$.update_name" value.update_name in
+  let* update_input = payloads_json value.update_input in
+  encode_object
+    (`Assoc
+      [
+        ("start", start);
+        ("update_id", json_string value.update_id);
+        ("update_name", json_string value.update_name);
+        ("update_input", update_input);
+      ])
+
+(** Rejects error kinds an update-with-start's update half cannot report:
+    an already-started conflict belongs to the start, and a query failure to
+    queries only. *)
+let validate_update_half_error = function
+  | Already_started _ ->
+      Error
+        (invalid ~path:"$.update.error.kind"
+           "already_started is not a valid update error")
+  | Query_failed _ as error -> reject_query_failed "update" error
+  | (Rpc _ | Protocol _) as error -> Ok error
+
+(** Decodes the update half of an accepted update-with-start: Temporal's
+    answer for the update, correlated with the requested update ID and
+    workflow (its run is the one Temporal resolved), or the error that ended
+    the wait for acceptance. *)
+let decode_update_half ~(request : update_with_start_request) json =
+  let path = "$.update" in
+  let* kind_json =
+    match json with
+    | `Assoc entries -> field path "kind" entries
+    | _ -> Error (invalid ~path "expected JSON object")
+  in
+  let* kind = string (path ^ ".kind") kind_json in
+  match kind with
+  | "response" ->
+      let* entries =
+        exact_object path [ "kind"; "update_id"; "execution"; "outcome" ] json
+      in
+      let* update_id_json = field path "update_id" entries in
+      let* update_id = identifier (path ^ ".update_id") update_id_json in
+      if not (String.equal update_id request.update_id) then
+        Error
+          (invalid ~path:(path ^ ".update_id")
+             "update response update ID does not match request")
+      else
+        let* execution_json = field path "execution" entries in
+        let* execution = decode_execution (path ^ ".execution") execution_json in
+        let* () =
+          validate_execution_matches (path ^ ".execution")
+            ~namespace:request.start.namespace
+            ~workflow_id:request.start.workflow_id execution
+        in
+        let* outcome = decode_optional_update_outcome path entries in
+        Ok (Ok ({ update_id; execution; outcome } : update_response))
+  | "error" ->
+      let* entries = exact_object path [ "kind"; "error" ] json in
+      let* error_json = field path "error" entries in
+      let* error_text =
+        try Ok (Yojson.Safe.to_string error_json)
+        with _ -> Error (invalid ~path "invalid update client error")
+      in
+      let* error = decode_client_error error_text in
+      let* error = validate_update_half_error error in
+      Ok (Error error)
+  | _ -> Error (invalid ~path:(path ^ ".kind") "unknown update-with-start update kind")
+
+(** Parses one update-with-start outcome (#1151) and correlates it with
+    [request]. A rejected or unknown outcome is exactly a start's and is
+    decoded by [decode_start_outcome]; an accepted one adds the update half
+    beside the start's execution and [started] flag. *)
+let decode_update_with_start_outcome ~(request : update_with_start_request) input =
+  let* json = decode_object input in
+  let path = "$" in
+  let* kind_json =
+    match json with
+    | `Assoc entries -> field path "kind" entries
+    | _ -> Error (invalid ~path "expected JSON object")
+  in
+  let* kind = string "$.kind" kind_json in
+  match kind with
+  | "accepted" ->
+      let* entries =
+        exact_object path [ "kind"; "execution"; "started"; "update" ] json
+      in
+      let* execution_json = field path "execution" entries in
+      let* execution = decode_execution "$.execution" execution_json in
+      let* () =
+        validate_execution_matches "$.execution"
+          ~namespace:request.start.namespace
+          ~workflow_id:request.start.workflow_id execution
+      in
+      let* started_json = field path "started" entries in
+      let* started = bool "$.started" started_json in
+      let* () = validate_started request.start started in
+      let* update_json = field path "update" entries in
+      let* update = decode_update_half ~request update_json in
+      Ok (Update_with_start_accepted { start = { execution; started }; update })
+  | "rejected" | "unknown" -> (
+      let* outcome = decode_start_outcome ~request:request.start input in
+      match outcome with
+      | Rejected error -> Ok (Update_with_start_rejected error)
+      | Unknown { request_id; workflow_id } ->
+          Ok (Update_with_start_unknown { request_id; workflow_id })
+      | Accepted _ ->
+          Error (invalid ~path:"$.kind" "update-with-start outcome kind changed"))
+  | _ -> Error (invalid ~path:"$.kind" "unknown update-with-start outcome kind")
+
+(** Serializes one update outcome in the closed form [decode_update_outcome]
+    accepts. *)
+let update_outcome_json path = function
+  | Update_completed { result } ->
+      let* result = payloads_json result in
+      Ok (`Assoc [ ("kind", json_string "completed"); ("result", result) ])
+  | Update_failed { failure } ->
+      let* failure =
+        Workflow.Internal.failure_json failure
+        |> Result.map_error (rebase_workflow_error (path ^ ".failure"))
+      in
+      Ok (`Assoc [ ("kind", json_string "failed"); ("failure", failure) ])
+
+(** Serializes one update-with-start outcome, symmetric with
+    [decode_update_with_start_outcome]; used by tests and by callers that
+    persist a terminal outcome, like [encode_start_outcome]. *)
+let encode_update_with_start_outcome = function
+  | Update_with_start_accepted { start = { execution; started }; update } ->
+      let* execution = encode_execution "$.execution" execution in
+      let* update =
+        match update with
+        | Ok ({ update_id; execution; outcome } : update_response) ->
+            let* () = validate_identifier "$.update.update_id" update_id in
+            let* execution = encode_execution "$.update.execution" execution in
+            let* outcome =
+              match outcome with
+              | None -> Ok `Null
+              | Some outcome -> update_outcome_json "$.update.outcome" outcome
+            in
+            Ok
+              (`Assoc
+                [
+                  ("kind", json_string "response");
+                  ("update_id", json_string update_id);
+                  ("execution", execution);
+                  ("outcome", outcome);
+                ])
+        | Error error ->
+            let* error = validate_update_half_error error in
+            let* error = encode_client_error_json "$.update.error" error in
+            Ok (`Assoc [ ("kind", json_string "error"); ("error", error) ])
+      in
+      encode_object
+        (`Assoc
+          [
+            ("kind", json_string "accepted");
+            ("execution", execution);
+            ("started", `Bool started);
+            ("update", update);
+          ])
+  | Update_with_start_rejected error -> encode_start_outcome (Rejected error)
+  | Update_with_start_unknown { request_id; workflow_id } ->
+      encode_start_outcome (Unknown { request_id; workflow_id })

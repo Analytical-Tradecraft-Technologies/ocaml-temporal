@@ -289,6 +289,43 @@ type start_outcome =
     cannot prove whether Temporal accepted the request; callers must reconcile
     using [request_id] rather than automatically retrying. *)
 
+type signal_with_start_request = {
+  start : start_request;
+  signal_name : string;
+  signal_input : payload list;
+}
+(** Signal-with-start request (#1151): [start] is sent unchanged as the
+    embedded start document, whose [request_id] deduplicates both the start
+    and the signal and whose [rpc_deadline] bounds the whole call (default
+    ten seconds). Its conflict policy must not be [Fail]. The terminal value
+    is the ordinary {!type-start_outcome}, decoded with
+    {!decode_start_outcome} against [start]. *)
+
+type update_with_start_request = {
+  start : start_request;
+  update_id : string;
+  update_name : string;
+  update_input : payload list;
+}
+(** Update-with-start request (#1151). The update never names a run: it
+    targets the run the start creates or attaches to. [start.rpc_deadline]
+    bounds the whole call, including re-issued attempts while the update is
+    only admitted (default thirty seconds). *)
+
+type update_with_start_outcome =
+  | Update_with_start_accepted of {
+      start : start_response;
+      update : (update_response, client_error) result;
+    }
+  | Update_with_start_rejected of client_error
+  | Update_with_start_unknown of { request_id : string; workflow_id : string }
+(** Terminal result of an update-with-start. [Update_with_start_accepted]
+    proves the start was applied and carries the update's admission response
+    (accepted, or already completed or rejected by a validator) or the error
+    that ended the wait for acceptance, which is never [Already_started] or
+    [Query_failed]. The other two cases mean exactly what [Rejected] and
+    [Unknown] mean for a start. *)
+
 type error
 (** Privacy-safe client-protocol validation failure. *)
 
@@ -424,3 +461,25 @@ val decode_query_error : string -> (client_error, error) result
 val decode_update_error : string -> (client_error, error) result
 (** Decodes an update admission or poll error, rejecting the start-only
     [already_started] and query-only [query_failed] categories. *)
+
+val encode_signal_with_start_request :
+  signal_with_start_request -> (string, error) result
+(** Validates and serializes one signal-with-start request (#1151), rejecting
+    the [Fail] conflict policy. *)
+
+val encode_update_with_start_request :
+  update_with_start_request -> (string, error) result
+(** Validates and serializes one update-with-start request (#1151). *)
+
+val decode_update_with_start_outcome :
+  request:update_with_start_request ->
+  string ->
+  (update_with_start_outcome, error) result
+(** Strictly decodes one update-with-start outcome and correlates the start's
+    execution, the update ID and workflow, and any rejection or unknown
+    identity with [request]. *)
+
+val encode_update_with_start_outcome :
+  update_with_start_outcome -> (string, error) result
+(** Validates and serializes one update-with-start outcome; the inverse of
+    {!decode_update_with_start_outcome}. *)

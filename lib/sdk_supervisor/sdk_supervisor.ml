@@ -1074,6 +1074,33 @@ module Protocol_adapter = struct
         | Ok response -> Ok (Ok response)
         | Error error -> client_error "client update poll response decoding" error)
     | Error native_error -> decode_client_update_failure native_error
+
+  (** Canonically serializes one signal-with-start request (#1151). Its
+      outcome is a start outcome, decoded by
+      [decode_client_submitted_start_outcome] against the embedded start. *)
+  let encode_client_signal_with_start_request request =
+    match Client.encode_signal_with_start_request request with
+    | Ok output -> Ok (Bytes.of_string output)
+    | Error error -> client_error "client signal-with-start request encoding" error
+
+  (** Canonically serializes one update-with-start request (#1151). *)
+  let encode_client_update_with_start_request request =
+    match Client.encode_update_with_start_request request with
+    | Ok output -> Ok (Bytes.of_string output)
+    | Error error -> client_error "client update-with-start request encoding" error
+
+  (** Decodes the terminal outcome of a submitted update-with-start (#1151),
+      correlated with [request]. As for a submitted start, any native failure
+      is preserved for the caller, which treats it as an uncertain start
+      because the request may have been sent. *)
+  let decode_client_update_with_start_outcome request = function
+    | Ok input -> (
+        match
+          Client.decode_update_with_start_outcome ~request (Bytes.to_string input)
+        with
+        | Ok outcome -> Ok outcome
+        | Error error -> client_error "client update-with-start outcome decoding" error)
+    | Error native_error -> Error native_error
 end
 
 (** The production backend owns one runtime-client-worker graph. Every
@@ -1127,6 +1154,11 @@ module Native_backend = struct
         (Client.poll_update_response, Client.client_error) result client_rpc
     | Rpc_visibility : Client.visibility_request -> Client.visibility_page client_rpc
     | Rpc_history : Client.history_request -> string client_rpc
+    | Rpc_signal_with_start :
+        Client.signal_with_start_request -> Client.start_outcome client_rpc
+    | Rpc_update_with_start :
+        Client.update_with_start_request ->
+        Client.update_with_start_outcome client_rpc
     | Rpc_async_activity_completion :
         Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
     | Rpc_async_activity_heartbeat :
@@ -1354,6 +1386,34 @@ module Native_backend = struct
           ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
           ~encode:Protocol_adapter.encode_client_history_request
           ~decode:Protocol_adapter.decode_client_history_result
+    | Rpc_signal_with_start request ->
+        (* The embedded start's deadline bounds the whole call (#1151); one
+           that expired in the mailbox is a definite rejection, as for a
+           start, because nothing was sent. *)
+        deadline request.start.rpc_deadline
+          ~expired:(fun () ->
+            Ok
+              (Client_call.Completed
+                 (Ok (Client.Rejected (Client.Rpc { code = "deadline_exceeded" })))))
+          ~live:(fun rpc_deadline ->
+            let request = { request with start = { request.start with rpc_deadline } } in
+            submit_encoded runtime Bridge.Call_signal_with_start
+              ~decode:
+                (Protocol_adapter.decode_client_submitted_start_outcome request.start)
+              (Protocol_adapter.encode_client_signal_with_start_request request))
+    | Rpc_update_with_start request ->
+        deadline request.start.rpc_deadline
+          ~expired:(fun () ->
+            Ok
+              (Client_call.Completed
+                 (Ok
+                    (Client.Update_with_start_rejected
+                       (Client.Rpc { code = "deadline_exceeded" })))))
+          ~live:(fun rpc_deadline ->
+            let request = { request with start = { request.start with rpc_deadline } } in
+            submit_encoded runtime Bridge.Call_update_with_start
+              ~decode:(Protocol_adapter.decode_client_update_with_start_outcome request)
+              (Protocol_adapter.encode_client_update_with_start_request request))
     | Rpc_async_activity_completion encoded ->
         (* The activity adapter already encoded the completion exactly once
            (issue #995); only the C call's owned copy is made here. *)
@@ -1663,6 +1723,11 @@ module Native = struct
         (Client.poll_update_response, Client.client_error) result client_rpc
     | Rpc_visibility : Client.visibility_request -> Client.visibility_page client_rpc
     | Rpc_history : Client.history_request -> string client_rpc
+    | Rpc_signal_with_start :
+        Client.signal_with_start_request -> Client.start_outcome client_rpc
+    | Rpc_update_with_start :
+        Client.update_with_start_request ->
+        Client.update_with_start_outcome client_rpc
     | Rpc_async_activity_completion :
         Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
     | Rpc_async_activity_heartbeat :

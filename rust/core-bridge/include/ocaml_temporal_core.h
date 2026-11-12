@@ -287,7 +287,16 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_wait_workflow_json(
  * (default 30 s, #1210). The bridge follows every page and
  * its success value is binary, not JSON: one serialized
  * temporal.api.history.v1.History message of at most the payload safety
- * limit, the form Temporal.Replay.History.of_protobuf accepts. */
+ * limit, the form Temporal.Replay.History.of_protobuf accepts.
+ * SIGNAL_WITH_START and UPDATE_WITH_START have no synchronous symbol either
+ * (#1151). Both embed the START document unchanged as "start", whose
+ * "rpc_timeout_ms" bounds the whole call. SIGNAL_WITH_START adds
+ * "signal_name" and "signal_input" (a payload array), rejects the "fail"
+ * conflict policy, and succeeds with START's accepted/rejected/unknown
+ * outcome document. UPDATE_WITH_START adds "update_id", "update_name" and
+ * "update_input" (default budget 30 s) and succeeds with the outcome
+ * document of docs/schemas/bridge/client-update-with-start-outcome.schema.json:
+ * START's outcome whose "accepted" form also carries the update result. */
 enum {
   OCAML_TEMPORAL_CORE_CLIENT_CALL_START = 1,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_WAIT = 2,
@@ -301,7 +310,9 @@ enum {
   OCAML_TEMPORAL_CORE_CLIENT_CALL_VISIBILITY = 10,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_COMPLETION = 11,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_HEARTBEAT = 12,
-  OCAML_TEMPORAL_CORE_CLIENT_CALL_HISTORY = 13
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_HISTORY = 13,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_SIGNAL_WITH_START = 16,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_UPDATE_WITH_START = 17
 };
 
 /* Submit one client RPC without waiting for Temporal (#807). Only the

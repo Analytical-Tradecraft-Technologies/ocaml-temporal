@@ -922,6 +922,40 @@ let test_submitted_client_calls () =
   (match Supervisor.call supervisor (Supervisor.Rpc_start (start None)) with
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
   | _ -> failwith "an unconnected submitted start was accepted");
+  (* Signal-with-start and update-with-start (#1151) carry their deadline in
+     the embedded start and treat an expired one as a start does. *)
+  let signal_with_start rpc_deadline : Client.signal_with_start_request =
+    {
+      start = { (start rpc_deadline) with id_conflict_policy = Client.Use_existing };
+      signal_name = "s";
+      signal_input = [];
+    }
+  in
+  (match
+     Supervisor.call supervisor
+       (Supervisor.Rpc_signal_with_start (signal_with_start (expired_deadline ())))
+   with
+  | Ok (Client.Rejected error) when error = deadline_exceeded -> ()
+  | _ -> failwith "an expired signal-with-start was not a definite rejection");
+  (match
+     Supervisor.call supervisor (Supervisor.Rpc_signal_with_start (signal_with_start None))
+   with
+  | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
+  | _ -> failwith "an unconnected signal-with-start was accepted");
+  let update_with_start rpc_deadline : Client.update_with_start_request =
+    { start = start rpc_deadline; update_id = "u"; update_name = "u"; update_input = [] }
+  in
+  (match
+     Supervisor.call supervisor
+       (Supervisor.Rpc_update_with_start (update_with_start (expired_deadline ())))
+   with
+  | Ok (Client.Update_with_start_rejected error) when error = deadline_exceeded -> ()
+  | _ -> failwith "an expired update-with-start was not a definite rejection");
+  (match
+     Supervisor.call supervisor (Supervisor.Rpc_update_with_start (update_with_start None))
+   with
+  | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
+  | _ -> failwith "an unconnected update-with-start was accepted");
   (match Supervisor.call supervisor (Supervisor.Rpc_wait execution) with
   | Error (Supervisor.Backend { Bridge.status = Invalid_state; _ }) -> ()
   | _ -> failwith "an unconnected submitted wait was accepted");

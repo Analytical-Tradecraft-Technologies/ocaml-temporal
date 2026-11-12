@@ -124,6 +124,19 @@ one budget. It is the one selector whose success value is binary rather than
 JSON: a single serialized `temporal.api.history.v1.History` message, at most
 the payload safety limit, built by appending each page's re-encoded history.
 
+The signal-with-start and update-with-start selectors (`SIGNAL_WITH_START`
+16 and `UPDATE_WITH_START` 17, #1151) are additive in the same way and have
+no synchronous symbol. Each embeds the start document under `start`
+([signal-with-start](../schemas/bridge/client-signal-with-start-request.schema.json),
+[update-with-start](../schemas/bridge/client-update-with-start-request.schema.json)).
+`SIGNAL_WITH_START` succeeds with the start's accepted/rejected/unknown
+outcome document; `UPDATE_WITH_START` succeeds with
+[the update-with-start outcome](../schemas/bridge/client-update-with-start-outcome.schema.json),
+whose accepted form adds the update result. Both hold a start slot and share
+the start's `request_id` deduplication while in flight, and their Rust task
+owns only a connection clone and the decoded request, like every other
+submitted call.
+
 The canonical header is
 `rust/core-bridge/include/ocaml_temporal_core.h`. Both Rust and C compile-time
 assertions protect the status width, every numeric status value, and field

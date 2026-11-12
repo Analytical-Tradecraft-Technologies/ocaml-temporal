@@ -238,6 +238,38 @@ type update_response = {
 (** Bounded completion poll response; [None] means still pending. *)
 type poll_update_response = { outcome : update_outcome option }
 
+(** One signal-with-start (#1151): [start] is applied when the workflow ID
+    has no open run, and the signal is delivered to the resulting run.
+    [start.id_conflict_policy] is [`Use_existing] or [`Terminate_existing];
+    [start.request_id] deduplicates both the start and the signal, and
+    [start.rpc_deadline] bounds the whole call. *)
+type signal_with_start_request = {
+  start : start_request;
+  signal_name : string;
+  signal_input : Payload.t list;
+      (** Encoded signal argument payloads, as for {!signal_request}. *)
+}
+
+(** One update-with-start (#1151): [start] is applied when needed and the
+    update is admitted on the run it creates or attaches to.
+    [start.rpc_deadline] bounds the whole call, including re-issued attempts
+    while the update is only admitted (default thirty seconds). *)
+type update_with_start_request = {
+  start : start_request;
+  update_id : string;
+  update_name : string;
+  update_input : Payload.t list;
+      (** Encoded update argument payloads, as for {!update_request}. *)
+}
+
+(** The applied start of an update-with-start and its update: the admission
+    response (whose outcome may already be a completion or a validator
+    rejection) or the typed error that ended the wait for acceptance. *)
+type update_with_start_response = {
+  start : start_response;
+  update : (update_response, Error.t) result;
+}
+
 (** Successor identity from an exact-run close event. The protocol already
     checks its namespace against the waited execution. *)
 type successor = { workflow_id : string; run_id : string }
@@ -505,6 +537,24 @@ val client_update : client -> update_request -> (update_response, Error.t) resul
 val client_poll_update :
   ?deadline_ns:int64 ->
   client -> update_request -> (poll_update_response, Error.t) result
+
+(** Signals a workflow, starting it first when its workflow ID has no open
+    run (#1151). Errors are classified exactly as for {!client_start},
+    including the uncertain-start error once a native call was submitted.
+    The deterministic mock applies the start and records the signal on the
+    resulting run in one critical section. *)
+val client_signal_with_start :
+  client -> signal_with_start_request -> (start_response, Error.t) result
+
+(** Starts a workflow when needed and admits one update on it (#1151). An
+    error means the start was not applied, or (for an uncertain-start error)
+    may have been; [Ok] means it was applied and carries the update result.
+    The deterministic mock applies the start and reports the update as the
+    same typed error {!client_update} returns there. *)
+val client_update_with_start :
+  client ->
+  update_with_start_request ->
+  (update_with_start_response, Error.t) result
 
 (** Closes a client backend. Native shutdown is serialized and terminal even
     when it returns an error; the public client caches that exact result so a

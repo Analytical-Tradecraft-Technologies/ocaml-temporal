@@ -42,6 +42,16 @@ use temporalio_common::protos::temporal::api::{
 
 use crate::{protocol, workflow_protocol};
 
+// Signal-with-start and update-with-start (#1151) live in a child module so
+// they can reuse this module's private start, update, and status helpers.
+mod with_start;
+pub(crate) use with_start::{
+    SignalWithStartRequest, UpdateWithStartOutcome, UpdateWithStartRequest,
+    decode_signal_with_start_request, decode_update_with_start_request,
+    encode_update_with_start_outcome, same_signal_with_start_request,
+    same_update_with_start_request, signal_with_start_workflow, update_with_start_workflow,
+};
+
 /// One exact execution identity carried by client responses.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1811,30 +1821,7 @@ pub(crate) async fn update_workflow_within(
     request: UpdateWorkflowRequest,
     budget: Duration,
 ) -> Result<UpdateWorkflowResponse, ClientOperationError> {
-    let input = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
-    let rpc_request = UpdateWorkflowExecutionRequest {
-        namespace: request.namespace.clone(),
-        workflow_execution: Some(WorkflowExecution {
-            workflow_id: request.workflow_id.clone(),
-            run_id: request.run_id.clone(),
-        }),
-        wait_policy: Some(WaitPolicy {
-            lifecycle_stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Accepted),
-        }),
-        request: Some(update::v1::Request {
-            meta: Some(update::v1::Meta {
-                update_id: request.update_id.clone(),
-                identity: connection.identity().to_owned(),
-            }),
-            input: Some(update::v1::Input {
-                name: request.update_name.clone(),
-                args: Some(input),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let rpc_request = update_execution_request(&request, connection.identity())?;
     let deadline_exceeded = || ClientOperationError::Rpc {
         code: "deadline_exceeded".to_owned(),
     };
@@ -1880,6 +1867,40 @@ pub(crate) async fn update_workflow_within(
         }
         tokio::time::sleep_until(pause_until).await;
     }
+}
+
+/// Builds Temporal's `UpdateWorkflowExecutionRequest` for one validated update
+/// request, waiting for the `Accepted` stage. `update_workflow` sends it
+/// directly; update-with-start (#1151) sends it as the second operation of an
+/// `ExecuteMultiOperation` with an empty run ID, as Temporal requires there.
+fn update_execution_request(
+    request: &UpdateWorkflowRequest,
+    identity: &str,
+) -> Result<UpdateWorkflowExecutionRequest, ClientOperationError> {
+    let input = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
+    Ok(UpdateWorkflowExecutionRequest {
+        namespace: request.namespace.clone(),
+        workflow_execution: Some(WorkflowExecution {
+            workflow_id: request.workflow_id.clone(),
+            run_id: request.run_id.clone(),
+        }),
+        wait_policy: Some(WaitPolicy {
+            lifecycle_stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Accepted),
+        }),
+        request: Some(update::v1::Request {
+            meta: Some(update::v1::Meta {
+                update_id: request.update_id.clone(),
+                identity: identity.to_owned(),
+            }),
+            input: Some(update::v1::Input {
+                name: request.update_name.clone(),
+                args: Some(input),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
 }
 
 /// Classifies the lifecycle stage of an update response that carried no
@@ -2099,6 +2120,31 @@ pub async fn start_workflow(
     connection: Connection,
     request: StartWorkflowRequest,
 ) -> Result<StartWorkflowResponse, ClientOperationError> {
+    let rpc_request = start_execution_request(&request, connection.identity())?;
+    let budget = rpc_budget(request.rpc_timeout_ms, START_RPC_TIMEOUT);
+    let started = tokio::time::Instant::now();
+    // Connection owns Core's retry policy; its underlying workflow service
+    // skips that policy and gives up on the first transient transport error.
+    let mut service = connection.clone();
+    let response = budgeted_rpc(
+        budget,
+        started,
+        service.start_workflow_execution(budgeted_request(rpc_request, budget)),
+        |status| map_start_status(&request.workflow_id, status),
+    )
+    .await?;
+    start_response_from_core(&request, response.run_id, response.started)
+}
+
+/// Builds Temporal's `StartWorkflowExecutionRequest` for one validated start
+/// request. `start_workflow` sends it directly; update-with-start (#1151)
+/// sends it as the first operation of an `ExecuteMultiOperation`, and
+/// signal-with-start copies its fields, so every start path applies the same
+/// policies, timeouts, metadata, and identity.
+fn start_execution_request(
+    request: &StartWorkflowRequest,
+    identity: &str,
+) -> Result<StartWorkflowExecutionRequest, ClientOperationError> {
     let payloads = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
     let memo = metadata_to_memo(&request.memo).map_err(ClientOperationError::Core)?;
     let search_attributes = metadata_to_search_attributes(&request.search_attributes)
@@ -2109,69 +2155,61 @@ pub async fn start_workflow(
         .map(workflow_protocol::retry_policy_to_core)
         .transpose()
         .map_err(ClientOperationError::Core)?;
-    let workflow_execution_timeout = optional_milliseconds_to_core(request.execution_timeout_ms)?;
-    let workflow_run_timeout = optional_milliseconds_to_core(request.run_timeout_ms)?;
-    let workflow_task_timeout = optional_milliseconds_to_core(request.task_timeout_ms)?;
-    let budget = rpc_budget(request.rpc_timeout_ms, START_RPC_TIMEOUT);
-    let started = tokio::time::Instant::now();
-    let workflow_id = request.workflow_id.clone();
-    // Connection owns Core's retry policy; its underlying workflow service
-    // skips that policy and gives up on the first transient transport error.
-    let mut service = connection.clone();
-    let response = budgeted_rpc(
-        budget,
-        started,
-        service.start_workflow_execution(budgeted_request(
-            StartWorkflowExecutionRequest {
-                namespace: request.namespace.clone(),
-                input: Some(payloads),
-                workflow_id: request.workflow_id,
-                workflow_type: Some(WorkflowType {
-                    name: request.workflow_type,
-                }),
-                task_queue: Some(TaskQueue {
-                    name: request.task_queue,
-                    kind: 0,
-                    normal_name: String::new(),
-                }),
-                memo,
-                search_attributes,
-                identity: connection.identity().to_owned(),
-                request_id: request.request_id,
-                // Always explicit: an UNSPECIFIED policy would defer to the
-                // server default, which the public API documents as `Fail`.
-                workflow_id_conflict_policy: request.id_conflict_policy.to_core(),
-                // Also always explicit, for the same reason (#499).
-                workflow_id_reuse_policy: request.id_reuse_policy.to_core(),
-                // Absent timeouts and retry policy keep Temporal's defaults.
-                workflow_execution_timeout,
-                workflow_run_timeout,
-                workflow_task_timeout,
-                retry_policy,
-                // Cron schedules and start delays are deliberately not sent:
-                // OCaml workers reject them (#499 keeps them deferred).
-                ..Default::default()
-            },
-            budget,
-        )),
-        |status| map_start_status(&workflow_id, status),
-    )
-    .await?;
+    Ok(StartWorkflowExecutionRequest {
+        namespace: request.namespace.clone(),
+        input: Some(payloads),
+        workflow_id: request.workflow_id.clone(),
+        workflow_type: Some(WorkflowType {
+            name: request.workflow_type.clone(),
+        }),
+        task_queue: Some(TaskQueue {
+            name: request.task_queue.clone(),
+            kind: 0,
+            normal_name: String::new(),
+        }),
+        memo,
+        search_attributes,
+        identity: identity.to_owned(),
+        request_id: request.request_id.clone(),
+        // Always explicit: an UNSPECIFIED policy would defer to the
+        // server default, which the public API documents as `Fail`.
+        workflow_id_conflict_policy: request.id_conflict_policy.to_core(),
+        // Also always explicit, for the same reason (#499).
+        workflow_id_reuse_policy: request.id_reuse_policy.to_core(),
+        // Absent timeouts and retry policy keep Temporal's defaults.
+        workflow_execution_timeout: optional_milliseconds_to_core(request.execution_timeout_ms)?,
+        workflow_run_timeout: optional_milliseconds_to_core(request.run_timeout_ms)?,
+        workflow_task_timeout: optional_milliseconds_to_core(request.task_timeout_ms)?,
+        retry_policy,
+        // Cron schedules and start delays are deliberately not sent:
+        // OCaml workers reject them (#499 keeps them deferred).
+        ..Default::default()
+    })
+}
 
-    // Only USE_EXISTING can succeed without creating a run. Servers that
-    // predate `started` leave it false, so the other policies (whose success
-    // proves this logical request created the run, possibly as a request-ID
-    // deduplicated retry) report a new run regardless of the field.
-    let started = response.started || request.id_conflict_policy != IdConflictPolicy::UseExisting;
-    let run_id = response.run_id;
+/// Converts the run ID and `started` flag of a successful start-like
+/// response (start, signal-with-start, or the start operation of
+/// update-with-start) into the closed response for `request`.
+///
+/// Only USE_EXISTING can succeed without creating a run. Servers that
+/// predate `started` leave it false, so the other policies (whose success
+/// proves this logical request created the run, possibly as a request-ID
+/// deduplicated retry) report a new run regardless of the field. An empty or
+/// invalid run ID is a Core conversion error.
+fn start_response_from_core(
+    request: &StartWorkflowRequest,
+    run_id: String,
+    started: bool,
+) -> Result<StartWorkflowResponse, ClientOperationError> {
+    let started = started || request.id_conflict_policy != IdConflictPolicy::UseExisting;
     if run_id.is_empty() {
         return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
             "Temporal start response omitted run ID",
         )));
     }
     let execution = ExecutionRef {
-        namespace: request.namespace,
-        workflow_id,
+        namespace: request.namespace.clone(),
+        workflow_id: request.workflow_id.clone(),
         run_id,
     };
     validate_execution(&execution, "$.execution").map_err(|_| {

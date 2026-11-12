@@ -260,6 +260,14 @@ enum ClientCallKind {
     /// `History` message rather than a JSON document; see
     /// [`client_protocol::fetch_history`].
     History,
+    /// Signal a workflow, starting it first when its workflow ID has no open
+    /// run (#1151). It has no synchronous symbol; its outcome is the closed
+    /// accepted/rejected/unknown start outcome of [`ClientCallKind::Start`].
+    SignalWithStart,
+    /// Start a workflow if needed and admit one update on it (#1151). It has
+    /// no synchronous symbol; see
+    /// [`client_protocol::update_with_start_workflow`].
+    UpdateWithStart,
 }
 
 impl TryFrom<u32> for ClientCallKind {
@@ -281,6 +289,8 @@ impl TryFrom<u32> for ClientCallKind {
             11 => Self::AsyncActivityCompletion,
             12 => Self::AsyncActivityHeartbeat,
             13 => Self::History,
+            16 => Self::SignalWithStart,
+            17 => Self::UpdateWithStart,
             _ => {
                 return Err(Failure {
                     status: STATUS_INVALID_ARGUMENT,
@@ -305,6 +315,8 @@ enum ClientRpc {
     PollUpdate(client_protocol::PollWorkflowUpdateRequest),
     Visibility(client_protocol::VisibilityRequest),
     History(client_protocol::HistoryRequest),
+    SignalWithStart(Arc<client_protocol::SignalWithStartRequest>),
+    UpdateWithStart(Arc<client_protocol::UpdateWithStartRequest>),
     /// A namespace-bound async activity completion, failure, or
     /// cancellation (#1025). `binding` is `None` straight after
     /// [`ClientRpc::decode`], which has no runtime;
@@ -420,6 +432,14 @@ impl ClientRpc {
             ClientCallKind::History => Self::History(
                 client_protocol::decode_history_request(text).map_err(protocol_failure)?,
             ),
+            ClientCallKind::SignalWithStart => Self::SignalWithStart(Arc::new(
+                client_protocol::decode_signal_with_start_request(text)
+                    .map_err(protocol_failure)?,
+            )),
+            ClientCallKind::UpdateWithStart => Self::UpdateWithStart(Arc::new(
+                client_protocol::decode_update_with_start_request(text)
+                    .map_err(protocol_failure)?,
+            )),
             ClientCallKind::AsyncActivityCompletion => Self::AsyncActivity {
                 request: AsyncActivityRequest::decode_completion(text)?,
                 binding: None,
@@ -523,6 +543,22 @@ impl ClientRpc {
                 client_protocol::fetch_history(connection, request)
                     .await
                     .map_err(client_operation_failure)
+            }),
+            Self::SignalWithStart(request) => Box::pin(async move {
+                let result = client_protocol::signal_with_start_workflow(
+                    connection,
+                    request.as_ref().clone(),
+                )
+                .await;
+                start_outcome_bytes(&request.start, Some(result))
+            }),
+            Self::UpdateWithStart(request) => Box::pin(async move {
+                let outcome = client_protocol::update_with_start_workflow(
+                    connection,
+                    request.as_ref().clone(),
+                )
+                .await;
+                update_with_start_outcome_bytes(&request.start, &outcome)
             }),
             Self::AsyncActivity { request, binding } => Box::pin(async move {
                 let binding = binding.ok_or_else(unbound_async_activity)?;
@@ -990,12 +1026,72 @@ fn start_outcome_bytes(
     }
 }
 
+/// Encodes the closed outcome of one update-with-start (#1151).
+///
+/// As for [`start_outcome_bytes`], an outcome that cannot be encoded is
+/// reported as `Unknown` built from the validated start request, which always
+/// encodes: the caller then reconciles with the same request and update IDs
+/// instead of losing an applied start to a protocol error.
+fn update_with_start_outcome_bytes(
+    start: &client_protocol::StartWorkflowRequest,
+    outcome: &client_protocol::UpdateWithStartOutcome,
+) -> Operation {
+    match client_protocol::encode_update_with_start_outcome(outcome) {
+        Ok(encoded) => Ok(encoded.into_bytes()),
+        Err(_) => encode_bytes(client_protocol::encode_update_with_start_outcome(
+            &client_protocol::UpdateWithStartOutcome::Unknown {
+                request_id: start.request_id.clone(),
+                workflow_id: start.workflow_id.clone(),
+            },
+        )),
+    }
+}
+
+/// One in-flight start-like call: a plain start or a start combined with a
+/// signal or an update (#1151). They share the start slots and their
+/// `request_id` deduplication: a pending request ID may only be reused for
+/// the same logical operation of the same kind.
+enum PendingStartCall {
+    Start(Arc<client_protocol::StartWorkflowRequest>),
+    SignalWithStart(Arc<client_protocol::SignalWithStartRequest>),
+    UpdateWithStart(Arc<client_protocol::UpdateWithStartRequest>),
+}
+
+impl PendingStartCall {
+    /// The start's Temporal request ID, which the start slots deduplicate on.
+    fn request_id(&self) -> &str {
+        match self {
+            Self::Start(request) => &request.request_id,
+            Self::SignalWithStart(request) => &request.start.request_id,
+            Self::UpdateWithStart(request) => &request.start.request_id,
+        }
+    }
+
+    /// Reports whether `other` is a retry of this logical operation: the same
+    /// kind with every field equal except the RPC timeout.
+    fn same_operation(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Start(left), Self::Start(right)) => {
+                client_protocol::same_start_request(left, right)
+            }
+            (Self::SignalWithStart(left), Self::SignalWithStart(right)) => {
+                client_protocol::same_signal_with_start_request(left, right)
+            }
+            (Self::UpdateWithStart(left), Self::UpdateWithStart(right)) => {
+                client_protocol::same_update_with_start_request(left, right)
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Capacity class of one in-flight submitted call. Starts and waits keep
 /// the limits documented for the public client; the class also carries the
 /// identity those limits deduplicate on.
 enum CallScope {
-    /// A start; calls with the same `request_id` share one start slot.
-    Start(Arc<client_protocol::StartWorkflowRequest>),
+    /// A start, signal-with-start, or update-with-start; calls with the same
+    /// `request_id` share one start slot.
+    Start(PendingStartCall),
     /// An exact-run or current-run wait; calls on the same run share a slot.
     Wait(client_protocol::WaitWorkflowRequest),
     /// Any other RPC, bounded by its own deadline.
@@ -1973,13 +2069,23 @@ impl Runtime {
                 call.scope = CallScope::Released;
             }
         }
-        let scope = match &rpc {
-            ClientRpc::Start(request) => {
+        let start_call = match &rpc {
+            ClientRpc::Start(request) => Some(PendingStartCall::Start(Arc::clone(request))),
+            ClientRpc::SignalWithStart(request) => {
+                Some(PendingStartCall::SignalWithStart(Arc::clone(request)))
+            }
+            ClientRpc::UpdateWithStart(request) => {
+                Some(PendingStartCall::UpdateWithStart(Arc::clone(request)))
+            }
+            _ => None,
+        };
+        let scope = match (start_call, &rpc) {
+            (Some(request), _) => {
                 let mut distinct = HashSet::new();
                 for call in self.pending_calls.values() {
                     if let CallScope::Start(pending) = &call.scope {
-                        if pending.request_id == request.request_id
-                            && !client_protocol::same_start_request(pending, request)
+                        if pending.request_id() == request.request_id()
+                            && !pending.same_operation(&request)
                         {
                             return Err(Failure {
                                 status: STATUS_PROTOCOL,
@@ -1988,11 +2094,11 @@ impl Runtime {
                                         .to_owned(),
                             });
                         }
-                        distinct.insert(pending.request_id.as_str());
+                        distinct.insert(pending.request_id());
                     }
                 }
                 if distinct.len() >= limits.pending_starts
-                    && !distinct.contains(request.request_id.as_str())
+                    && !distinct.contains(request.request_id())
                 {
                     return Err(Failure {
                         status: STATUS_RESOURCE_EXHAUSTED,
@@ -2002,9 +2108,9 @@ impl Runtime {
                         ),
                     });
                 }
-                CallScope::Start(Arc::clone(request))
+                CallScope::Start(request)
             }
-            ClientRpc::Wait(request) => {
+            (None, ClientRpc::Wait(request)) => {
                 let distinct = self
                     .pending_calls
                     .values()
@@ -2024,7 +2130,7 @@ impl Runtime {
                 }
                 CallScope::Wait(request.clone())
             }
-            _ => CallScope::Bounded,
+            (None, _) => CallScope::Bounded,
         };
         // Hard bound on retained task handles (Codex review on #1077). An
         // aborted task's handle is only reaped once Tokio has run its
