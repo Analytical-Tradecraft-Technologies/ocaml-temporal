@@ -18,6 +18,13 @@ result. Read the documents in this order when you are new to the repository:
 5. [Native Core bridge](reference/core-bridge.md) explains ownership and the
    OCaml/C/Rust boundary.
 
+To change the SDK, start with the [contributing guide](../CONTRIBUTING.md):
+it covers the build and test commands, the review rules, the dependency and
+AI-disclosure policies, and the pull-request and merge-queue flow. The
+[code of conduct](../CODE_OF_CONDUCT.md) applies in every project space. Both
+are drafts pending maintainer adoption (#1140); the security policy is
+tracked by #509.
+
 The remaining reference documents are useful when changing one subsystem:
 
 - [Native execution translation](reference/native-execution-translation.md)

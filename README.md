@@ -390,6 +390,8 @@ are excluded from log messages. See the [observability reference](docs/reference
 - [Release checklist and bad-release remediation](docs/reference/release-checklist.md)
 - [Dependency and license inventory](docs/dependencies.md)
 - [Verified progress](docs/progress.md)
+- [Contributing guide](CONTRIBUTING.md) and [code of conduct](CODE_OF_CONDUCT.md)
+  (drafts pending maintainer adoption, #1140)
 
 ## License
 

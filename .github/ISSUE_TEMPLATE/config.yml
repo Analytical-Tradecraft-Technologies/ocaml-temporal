@@ -1,0 +1,7 @@
+# Issue chooser configuration (#1140). Blank issues stay available for
+# anything the forms do not fit, such as questions and documentation fixes.
+blank_issues_enabled: true
+contact_links:
+  - name: Contributing guide
+    url: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/master/CONTRIBUTING.md
+    about: How to build, test and submit a change, and how to report a security problem privately.
