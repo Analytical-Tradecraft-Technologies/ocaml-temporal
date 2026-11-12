@@ -1448,7 +1448,10 @@ Eio, Lwt or any other I/O, as described in section 1.
 ### Client calls from Eio fibers
 
 Run each blocking client call in a system thread with
-`Eio_unix.run_in_systhread`. The fiber suspends while the thread waits, so
+`Eio_unix.run_in_systhread`. That includes `Client.create` and
+`Worker.create`: they connect to the server and wait for the handshake, which
+can take up to the connect timeout. Either create the handles before entering
+`Eio_main.run` or offload the constructors too, as below. The fiber suspends while the thread waits, so
 other fibers keep running. One client may be shared by any number of threads,
 and its calls proceed concurrently (see the concurrency section of
 `client.mli`). Concurrent fibers therefore each get their own thread and their
@@ -1470,12 +1473,16 @@ let greet_from_eio client name =
 let () =
   Eio_main.run @@ fun _env ->
   match
-    Temporal.Client.create ~target_url:"http://127.0.0.1:7233" ~namespace:"default" ()
+    Eio_unix.run_in_systhread ~label:"temporal-connect" (fun () ->
+        Temporal.Client.create ~target_url:"http://127.0.0.1:7233"
+          ~namespace:"default" ())
   with
   | Error error -> prerr_endline (Temporal.Error.message error)
   | Ok client ->
       Fun.protect
-        ~finally:(fun () -> ignore (Temporal.Client.shutdown client))
+        ~finally:(fun () ->
+          Eio_unix.run_in_systhread ~label:"temporal-shutdown" (fun () ->
+              ignore (Temporal.Client.shutdown client)))
         (fun () ->
           (* Three workflows start and complete concurrently with each other
              and with any other fiber of this program. *)
@@ -1525,10 +1532,13 @@ let () =
   Eio_main.run @@ fun env ->
   let stop, _resolve_stop = Eio.Promise.create () in
   match
-    Temporal.Worker.create ~target_url:"http://127.0.0.1:7233" ~namespace:"default"
-      ~task_queue:"greetings"
-      ~workflows:[ Temporal.Worker.workflow greet ]
-      ~activities:[] ()
+    (* [Worker.create] connects to the server, so it runs off the Eio
+       thread like any other blocking SDK call. *)
+    Eio_unix.run_in_systhread ~label:"temporal-connect" (fun () ->
+        Temporal.Worker.create ~target_url:"http://127.0.0.1:7233"
+          ~namespace:"default" ~task_queue:"greetings"
+          ~workflows:[ Temporal.Worker.workflow greet ]
+          ~activities:[] ())
   with
   | Error error -> prerr_endline (Temporal.Error.message error)
   | Ok worker ->
@@ -1572,7 +1582,8 @@ libraries. If a callback must use an Eio- or Lwt-only library:
 
 ### Lwt
 
-The same rules apply with Lwt's primitives. Make each client call through
+The same rules apply with Lwt's primitives. Make each client call, including
+`Client.create`, `Worker.create` and `Client.shutdown`, through
 `Lwt_preemptive.detach`, whose pool size bounds concurrent client calls. Run
 `Worker.run` and then `Worker.shutdown` on a `Thread.t` or a `Domain.t` of
 their own, and call `Worker.request_shutdown` when your application's stop
