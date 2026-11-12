@@ -21,6 +21,7 @@
 //! The stderr level is selected per runtime by [`CORE_LOG_ENV`]; see
 //! `docs/reference/observability.md` for the operator-facing contract.
 
+use crate::client_protocol;
 use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
@@ -517,7 +518,7 @@ pub(crate) fn describe_connect_error(error: &ClientConnectError) -> ConnectFailu
             };
             let mut detail = BoundedText::new(MAX_CONNECTION_DETAIL_BYTES);
             detail.push("GetSystemInfo returned ");
-            detail.push(grpc_code_name(status.code()));
+            detail.push(client_protocol::rpc_code(status.code()));
             let mut cause = code_cause;
             if let Some(source) = status.source() {
                 detail.push(": ");
@@ -704,29 +705,6 @@ pub fn classify_chain(error: &(dyn Error + 'static)) -> Option<ConnectionCause> 
         }
     }
     cause
-}
-
-/// Stable snake-case gRPC code name, independent of tonic's `Debug` text.
-fn grpc_code_name(code: Code) -> &'static str {
-    match code {
-        Code::Ok => "ok",
-        Code::Cancelled => "cancelled",
-        Code::Unknown => "unknown",
-        Code::InvalidArgument => "invalid_argument",
-        Code::DeadlineExceeded => "deadline_exceeded",
-        Code::NotFound => "not_found",
-        Code::AlreadyExists => "already_exists",
-        Code::PermissionDenied => "permission_denied",
-        Code::ResourceExhausted => "resource_exhausted",
-        Code::FailedPrecondition => "failed_precondition",
-        Code::Aborted => "aborted",
-        Code::OutOfRange => "out_of_range",
-        Code::Unimplemented => "unimplemented",
-        Code::Internal => "internal",
-        Code::Unavailable => "unavailable",
-        Code::DataLoss => "data_loss",
-        Code::Unauthenticated => "unauthenticated",
-    }
 }
 
 /// Append-only text buffer with a byte limit and control-character escaping.
