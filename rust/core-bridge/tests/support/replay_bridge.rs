@@ -1005,3 +1005,115 @@ fn replay_reject_of_eviction_acknowledges_it_empty() {
     drain_replay_evictions_until_shutdown(&mut worker, &handle);
     finalize_or_panic(worker, &handle);
 }
+
+/// Live-worker shutdown error branches (#1229), driven on the poll lanes of a
+/// client-free replay worker: [`PollLanes`] is the same type a live worker
+/// uses, so these branches behave identically there.
+///
+/// A drain that cannot join a lane within its bound returns
+/// [`ShutdownDrainError::TimedOut`] and marks the ledger as having lost a
+/// poll lease. Finalization must then refuse with
+/// [`WorkerBridgeError::LostPollLease`] and hand the lanes back instead of
+/// running Core's finalizer, which is what makes `shutdown_worker` keep the
+/// worker and report `STATUS_WORKER`. Dropping the refused lanes, the
+/// last-resort path `drop_runtime_graph` takes, and then the Core runtime
+/// must both return.
+#[test]
+fn shutdown_drain_timeout_loses_the_lease_and_refuses_finalization() {
+    use crate::worker_bridge::{BoundedFinalize, ShutdownDrainError};
+    run_within_deadline(
+        "shutdown_drain_timeout_loses_the_lease_and_refuses_finalization",
+        |progress| {
+            progress.enter("start replay worker");
+            let core = core_runtime();
+            let handle = core.tokio_handle().clone();
+            let worker = ReplayWorker::start(&core, replay_config())
+                .expect("replay worker should construct without a client");
+            let mut lanes = worker.lanes;
+            handle.block_on(lanes.install_stuck_workflow_lane_for_test());
+            {
+                let _runtime_guard = handle.enter();
+                lanes.initiate_shutdown();
+            }
+
+            progress.enter("bounded drain (times out)");
+            let bound = Duration::from_millis(200);
+            let started = std::time::Instant::now();
+            let drained = handle.block_on(lanes.drain_and_join_for_shutdown(bound));
+            let elapsed = started.elapsed();
+            assert!(
+                matches!(drained, Err(ShutdownDrainError::TimedOut)),
+                "a lane that never stops must time the drain out: {drained:?}"
+            );
+            assert!(
+                elapsed >= bound,
+                "the drain returned before its bound: {elapsed:?}"
+            );
+            assert!(
+                !lanes.can_finalize(),
+                "a timed-out drain must leave the ledger unfinalizable"
+            );
+
+            progress.enter("bounded finalize (refuses)");
+            let lanes = match handle.block_on(lanes.finalize_bounded(Duration::from_secs(5))) {
+                BoundedFinalize::Refused(lanes, WorkerBridgeError::LostPollLease) => lanes,
+                BoundedFinalize::Refused(_, error) => {
+                    panic!("finalization refused for the wrong reason: {error:?}")
+                }
+                BoundedFinalize::Finalized => {
+                    panic!("finalization must not run Core's finalizer after a lost lease")
+                }
+                BoundedFinalize::Panicked => panic!("finalization panicked"),
+                BoundedFinalize::Detached => panic!("a refusal must not wait for its bound"),
+            };
+
+            progress.enter("drop refused lanes");
+            drop(lanes);
+            progress.enter("drop Core runtime");
+            drop(core);
+        },
+    );
+}
+
+/// Positive control for the refusal above (#1229): once Core has shut the
+/// lanes down and they are joined, the same bounded finalization runs Core's
+/// finalizer to completion, so the refusal there is caused by the lost lease
+/// and not by the replay setup. The Detached and Panicked outcomes cannot be
+/// forced deterministically here (Core's replay finalizer finishes within
+/// microseconds and cannot be made to panic), so their mapping onto the
+/// `shutdown_worker` result is pinned by `worker_shutdown_outcomes` in the
+/// ABI tests.
+#[test]
+fn finalize_bounded_finalizes_cleanly_joined_lanes() {
+    use crate::worker_bridge::BoundedFinalize;
+    run_within_deadline(
+        "finalize_bounded_finalizes_cleanly_joined_lanes",
+        |progress| {
+            progress.enter("start replay worker");
+            let core = core_runtime();
+            let handle = core.tokio_handle().clone();
+            let mut worker = ReplayWorker::start(&core, replay_config())
+                .expect("replay worker should construct without a client");
+            // The lane is joined first, as `ReplayWorker::finalize` does, so the
+            // poll task no longer shares the worker.
+            worker.finish_input();
+            drain_replay_evictions_until_shutdown(&mut worker, &handle);
+            let mut lanes = worker.lanes;
+            lanes.mark_natural_shutdown();
+            handle
+                .block_on(lanes.join_replay_poll_lane())
+                .expect("the replay lane stops after Core's shutdown");
+
+            progress.enter("bounded finalize");
+            match handle.block_on(lanes.finalize_bounded(Duration::from_secs(10))) {
+                BoundedFinalize::Finalized => {}
+                BoundedFinalize::Refused(_, error) => panic!("finalization was refused: {error:?}"),
+                BoundedFinalize::Detached => panic!("finalization outlived its bound"),
+                BoundedFinalize::Panicked => panic!("the finalizer panicked"),
+            }
+
+            progress.enter("drop Core runtime");
+            drop(core);
+        },
+    );
+}

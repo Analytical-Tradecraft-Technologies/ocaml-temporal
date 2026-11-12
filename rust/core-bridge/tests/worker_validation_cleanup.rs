@@ -16,6 +16,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use ocaml_temporal_core_bridge::worker_bridge::UNVALIDATED_WORKER_RELEASE_TIMEOUT;
 use ocaml_temporal_core_bridge::{
     Buffer, Result as AbiResult, STATUS_OK, STATUS_WORKER,
     ocaml_temporal_core_v4_client_connect_json, ocaml_temporal_core_v4_client_disconnect,
@@ -46,6 +47,19 @@ const GRPC_UNIMPLEMENTED: &str = "12";
 /// current-thread Tokio runtime, so it never shares an executor with the
 /// bridge under test and simply ends with the test process.
 fn spawn_missing_namespace_server() -> SocketAddr {
+    spawn_server(false)
+}
+
+/// Like [`spawn_missing_namespace_server`], but `ShutdownWorker` requests
+/// are never answered: the double keeps each one open for as long as its
+/// connection lives, as a server that has stopped responding would (#1229).
+fn spawn_unresponsive_shutdown_server() -> SocketAddr {
+    spawn_server(true)
+}
+
+/// Starts the double; `hang_shutdown` selects whether `ShutdownWorker` is
+/// left unanswered.
+fn spawn_server(hang_shutdown: bool) -> SocketAddr {
     let (address_sender, address_receiver) = mpsc::channel();
     thread::Builder::new()
         .name("grpc-missing-namespace-double".to_owned())
@@ -65,7 +79,7 @@ fn spawn_missing_namespace_server() -> SocketAddr {
                     let Ok((socket, _)) = listener.accept().await else {
                         continue;
                     };
-                    tokio::spawn(serve_connection(socket));
+                    tokio::spawn(serve_connection(socket, hang_shutdown));
                 }
             });
         })
@@ -78,12 +92,19 @@ fn spawn_missing_namespace_server() -> SocketAddr {
 /// Serves one HTTP/2 connection until the client closes it.
 ///
 /// Request bodies are ignored: a trailers-only gRPC response is valid before
-/// the request stream ends, and dropping the receive half resets it.
-async fn serve_connection(socket: tokio::net::TcpStream) {
+/// the request stream ends, and dropping the receive half resets it. With
+/// `hang_shutdown`, each `ShutdownWorker` response handle is kept unanswered
+/// until the connection ends.
+async fn serve_connection(socket: tokio::net::TcpStream, hang_shutdown: bool) {
     let Ok(mut connection) = h2::server::handshake(socket).await else {
         return;
     };
+    let mut unanswered = Vec::new();
     while let Some(Ok((request, mut respond))) = connection.accept().await {
+        if hang_shutdown && request.uri().path().ends_with("/ShutdownWorker") {
+            unanswered.push((request, respond));
+            continue;
+        }
         let (code, message) = if request.uri().path().ends_with("/DescribeNamespace") {
             (GRPC_NOT_FOUND, "Namespace missing-namespace is not found.")
         } else {
@@ -228,6 +249,65 @@ fn failed_namespace_validation_releases_worker_without_hanging() {
     unsafe { ocaml_temporal_core_v4_client_disconnect(runtime, &mut result) };
     consume(result, STATUS_OK);
 
+    // SAFETY: Children are closed and the slot is exclusively owned.
+    assert_eq!(
+        unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },
+        STATUS_OK
+    );
+    assert!(runtime.is_null());
+}
+
+/// Releasing an unvalidated worker is bounded even when the server never
+/// answers Core's `ShutdownWorker` RPC (#1229): Core's finalizer waits for
+/// that RPC, so `release_unvalidated_worker` must stop waiting after
+/// [`UNVALIDATED_WORKER_RELEASE_TIMEOUT`] and `Worker.create` must still
+/// return the typed validation failure. The release task keeps the worker
+/// and finishes in the background; the runtime is then freed without
+/// waiting for the unanswered RPC.
+#[test]
+fn unvalidated_release_is_bounded_when_shutdown_rpc_never_answers() {
+    let address = spawn_unresponsive_shutdown_server();
+    let mut runtime = ptr::null_mut();
+    let mut result = AbiResult::default();
+    // SAFETY: Both output locations are writable and exclusively owned.
+    unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) };
+    consume(result, STATUS_OK);
+
+    let client = format!(r#"{{"target_url":"http://{address}","identity":"validation-test"}}"#);
+    let mut result = AbiResult::default();
+    // SAFETY: The runtime is live and exclusively owned; the input remains
+    // readable for the full blocking call.
+    unsafe {
+        ocaml_temporal_core_v4_client_connect_json(
+            runtime,
+            client.as_ptr(),
+            client.len(),
+            &mut result,
+        );
+    }
+    consume(result, STATUS_OK);
+
+    let started = std::time::Instant::now();
+    let (returned, message) =
+        start_worker_bounded(runtime, MISSING_NAMESPACE_WORKER, STATUS_WORKER);
+    runtime = returned;
+    let elapsed = started.elapsed();
+    assert_eq!(message, "Temporal workflow worker validation failed");
+    // The lower bound proves the unanswered RPC was really waited for (the
+    // bound, not Core, ended the wait); the upper bound is the contract.
+    assert!(
+        elapsed >= UNVALIDATED_WORKER_RELEASE_TIMEOUT,
+        "the release returned before its bound, so the hang was not exercised: {elapsed:?}"
+    );
+    assert!(
+        elapsed < UNVALIDATED_WORKER_RELEASE_TIMEOUT + Duration::from_secs(10),
+        "the release must stop waiting at its bound, took {elapsed:?}"
+    );
+
+    let mut result = AbiResult::default();
+    // SAFETY: The runtime is live and exclusively owned by this thread again.
+    unsafe { ocaml_temporal_core_v4_client_disconnect(runtime, &mut result) };
+    consume(result, STATUS_OK);
     // SAFETY: Children are closed and the slot is exclusively owned.
     assert_eq!(
         unsafe { ocaml_temporal_core_v4_runtime_free(&mut runtime) },

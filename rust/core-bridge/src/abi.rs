@@ -2634,7 +2634,7 @@ impl Runtime {
             .worker
             .take()
             .expect("drained worker remains owned until terminal finalization");
-        let result = match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+        let released = match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
             BoundedFinalize::Refused(worker, error) => {
                 // The bridge would not consume the worker (for example after a
                 // lost poll lease). Keep it owned by the graph so runtime close
@@ -2642,21 +2642,11 @@ impl Runtime {
                 self.worker = Some(*worker);
                 return Err(worker_bridge_failure(error));
             }
-            BoundedFinalize::Finalized if retirement.abandoned_leases == 0 => Ok(Vec::new()),
-            BoundedFinalize::Finalized => Err(Failure {
-                status: STATUS_OUTSTANDING_TASKS,
-                message: "Temporal worker shutdown force-completed tasks that were never completed by the worker".to_owned(),
-            }),
-            BoundedFinalize::Panicked => Err(Failure {
-                status: STATUS_WORKER,
-                message: "Temporal worker finalization failed".to_owned(),
-            }),
-            BoundedFinalize::Detached => Err(Failure {
-                status: STATUS_WORKER,
-                message: "Temporal worker finalization did not finish within the shutdown bound"
-                    .to_owned(),
-            }),
+            BoundedFinalize::Finalized => ReleasedFinalize::Finalized,
+            BoundedFinalize::Panicked => ReleasedFinalize::Panicked,
+            BoundedFinalize::Detached => ReleasedFinalize::Detached,
         };
+        let result = shutdown_release_result(released, retirement.abandoned_leases);
         // In every remaining outcome the graph no longer owns the worker: it
         // was finalized, released while unwinding, or is still being finalized
         // by a task that owns it.
@@ -3572,6 +3562,46 @@ fn poll_lane_failure(error: PollLaneError) -> Failure {
     Failure {
         status: STATUS_WORKER,
         message: public_poll_lane_error_message(&error).to_owned(),
+    }
+}
+
+/// A [`BoundedFinalize`] outcome after which the runtime graph no longer owns
+/// the worker: it was finalized, released while unwinding, or is still owned
+/// by a detached finalizer task. `Refused` is excluded because the graph
+/// keeps that worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReleasedFinalize {
+    /// Core's finalizer completed, including its unregistration.
+    Finalized,
+    /// Core's finalizer panicked; the worker was dropped while unwinding.
+    Panicked,
+    /// The finalizer outlived [`WORKER_FINALIZE_TIMEOUT`] and keeps running
+    /// in its own task (#1149).
+    Detached,
+}
+
+/// Maps the outcome of `shutdown_worker`'s bounded finalization onto the
+/// native result (#1229). A clean finalization succeeds unless the drain had
+/// to force-complete leases OCaml never completed, which is
+/// `STATUS_OUTSTANDING_TASKS` because language-side work was lost. A panicked
+/// or detached finalizer is `STATUS_WORKER` with a closed diagnostic. In
+/// every case the worker has left the graph.
+fn shutdown_release_result(outcome: ReleasedFinalize, abandoned_leases: usize) -> Operation {
+    match outcome {
+        ReleasedFinalize::Finalized if abandoned_leases == 0 => Ok(Vec::new()),
+        ReleasedFinalize::Finalized => Err(Failure {
+            status: STATUS_OUTSTANDING_TASKS,
+            message: "Temporal worker shutdown force-completed tasks that were never completed by the worker".to_owned(),
+        }),
+        ReleasedFinalize::Panicked => Err(Failure {
+            status: STATUS_WORKER,
+            message: "Temporal worker finalization failed".to_owned(),
+        }),
+        ReleasedFinalize::Detached => Err(Failure {
+            status: STATUS_WORKER,
+            message: "Temporal worker finalization did not finish within the shutdown bound"
+                .to_owned(),
+        }),
     }
 }
 
@@ -7059,6 +7089,10 @@ mod worker_task_types;
 #[cfg(test)]
 #[path = "../tests/support/worker_tuning.rs"]
 mod worker_tuning;
+
+#[cfg(test)]
+#[path = "../tests/support/worker_shutdown_outcomes.rs"]
+mod worker_shutdown_outcomes;
 
 /// SDK name reported to Temporal as the `client-name` RPC header and recorded
 /// in `WorkflowTaskCompleted.sdk_metadata`. Core would otherwise attribute

@@ -1342,6 +1342,27 @@ it drops an undrained worker only if finalization still fails. This preserves
 memory ownership and collector progress, while explicit supervisor shutdown
 remains the required graceful path.
 
+That last-resort drop has a known cost (#1229). Core has no `Drop` for its
+worker, and only `finalize_shutdown` calls `finalize_unregister`, so a
+dropped worker leaves its registration in the client's worker set. On a
+runtime of its own that registration goes away with the client. On a shared
+runtime it stays until the client is released, so each such drop leaks one
+small registration entry (with the heartbeat callback it holds) for the
+client's lifetime. It happens only after a drain timeout or a
+refused finalization, which both mean Core or the server misbehaved.
+
+The error branches are pinned by tests. In the replay bridge tests, a drain
+whose lane never stops times out at its bound, marks the lease lost, and
+makes finalization refuse with `LostPollLease`; dropping the refused lanes
+and the Core runtime still returns. The
+`worker_shutdown_outcomes` ABI tests pin what each outcome becomes in
+`shutdown_worker`: a drain timeout or lane failure is `WORKER`, a panicked
+or detached finalizer is `WORKER` with its closed message, and abandoned
+leases are `OUTSTANDING_TASKS`. `worker_validation_cleanup` shows that
+releasing an unvalidated worker stops waiting at
+`UNVALIDATED_WORKER_RELEASE_TIMEOUT` (10 s) when the server never answers
+`ShutdownWorker`.
+
 ### Runtime destruction
 
 Creating an SDK runtime starts its Tokio executor and a small Rust cleanup
