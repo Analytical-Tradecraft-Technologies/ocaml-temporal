@@ -74,6 +74,26 @@ let child =
     depend on server wording. *)
 let show_error error = "error:" ^ Error.kind error
 
+(** Renders a child error with its typed {!Error.val-origin} (#1143), so the
+    timeout case pins how the parent sees a child that its run timeout
+    ended, without depending on server wording. *)
+let show_error_origin error =
+  let origin =
+    match Error.origin error with
+    | Some (`Timeout `Start_to_close) -> "timeout:start_to_close"
+    | Some (`Timeout `Schedule_to_start) -> "timeout:schedule_to_start"
+    | Some (`Timeout `Schedule_to_close) -> "timeout:schedule_to_close"
+    | Some (`Timeout `Heartbeat) -> "timeout:heartbeat"
+    | Some (`Timeout `Unspecified) -> "timeout:unspecified"
+    | Some `Application -> "application"
+    | Some `Server -> "server"
+    | Some `Cancelled -> "cancelled"
+    | Some `Terminated -> "terminated"
+    | Some `Other -> "other"
+    | None -> "none"
+  in
+  show_error error ^ " origin=" ^ origin
+
 (** The parent. Its input is ["<mode>:<child id>"]:
     - ["report"] runs the child with all three timeouts and records the
       child's report;
@@ -107,7 +127,7 @@ let parent =
                 child "stall"
             with
             | Ok value -> Ok ("unexpected success:" ^ value)
-            | Error error -> Ok (show_error error))
+            | Error error -> Ok (show_error_origin error))
         | "reuse" ->
             let* _ = Child_workflow.execute ~id:child_id child "report" in
             let attempt policy =
@@ -241,9 +261,14 @@ let check_report context =
   ignore (check_parent context "report" "report" "exec=60000 run=30000 task=7000")
 
 (** A stalling child is ended by its run timeout: the parent sees a failed
-    child and an exact-run wait on the child reports [Timed_out]. *)
+    child whose origin is a start-to-close timeout (how Temporal reports a
+    child's run or execution timeout, see workflow-failures.md), and an
+    exact-run wait on the child reports [Timed_out]. *)
 let check_timeout context =
-  let child_id = check_parent context "timeout" "timeout" "error:child_workflow" in
+  let child_id =
+    check_parent context "timeout" "timeout"
+      "error:child_workflow origin=timeout:start_to_close"
+  in
   let child_handle = get (Client.get_handle context.client ~workflow:child ~id:child_id ()) in
   match Client.wait child_handle with
   | Ok (Client.Timed_out _) -> ()
