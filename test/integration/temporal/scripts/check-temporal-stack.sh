@@ -12,20 +12,9 @@ sleep_seconds=${TEMPORAL_HEALTH_SLEEP_SECONDS:-2}
 
 # Only frontend availability and the CLI connection deadline are transient.
 # Authentication, configuration, and other RPC failures must fail immediately.
-# The CLI's connection-deadline error is matched on its first line only:
-# current CLI releases append diagnostic lines after it (namespace, TLS, and
-# "Connection checks"), so an exact match on the whole text would treat a
-# transient startup deadline as fatal.
-is_transient_cli_error() {
-  case "$1" in
-    *"code = Unavailable"*|*"code = DeadlineExceeded"*) return 0 ;;
-  esac
-  first_line=$(printf '%s\n' "$1" | sed -n '1p')
-  case "$first_line" in
-    "Error: failed connecting to Temporal server at $address: context deadline exceeded") return 0 ;;
-  esac
-  return 1
-}
+# The classification is shared with the per-test admin CLI queries (#1285):
+# temporal-cli-retry.sh defines it and Compose mounts it next to this script.
+. "$(dirname "$0")/temporal-cli-retry.sh"
 
 # Every namespace probe shares one bounded wait and retains its last error.
 # The caller supplies the operation name and resets attempt for a new phase.
@@ -72,7 +61,7 @@ while true; do
           created=1
           continue
         fi
-        if is_transient_cli_error "$create_error"; then
+        if temporal_cli_transient_error "$create_error"; then
           retry_namespace_probe create "$create_error"
           continue
         fi
@@ -87,7 +76,7 @@ while true; do
       fi
       ;;
     *)
-      if ! is_transient_cli_error "$describe_error"; then
+      if ! temporal_cli_transient_error "$describe_error"; then
         printf '%s\n' "$describe_error" >&2
         exit 1
       fi ;;
@@ -107,7 +96,7 @@ while true; do
   case "$readiness_error" in
     *"Namespace $namespace is not found."*) ;;
     *)
-      if ! is_transient_cli_error "$readiness_error"; then
+      if ! temporal_cli_transient_error "$readiness_error"; then
         printf '%s\n' "$readiness_error" >&2
         exit 1
       fi ;;

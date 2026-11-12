@@ -55,6 +55,27 @@ The health gate verifies the primary and visibility `schema_version` tables,
 calls Temporal's gRPC cluster-health operation, and describes the
 `temporal-sdk-test` namespace. Namespace creation is idempotent.
 
+The health gate and the live tests share one rule for transient failures of the
+official `temporal` CLI (#753, #839, #1285), defined in
+`test/integration/temporal/scripts/temporal-cli-retry.sh`. Only a gRPC
+`Unavailable` or `DeadlineExceeded` status, or the CLI's own `failed connecting
+to Temporal server at ...: context deadline exceeded` primary error, counts as
+transient. The health gate waits through these during startup. After startup,
+one-shot read-only queries (`workflow describe`, `show` and `query`, and
+`search-attribute list`) go through `temporal_cli_read_only`. It makes up to
+`TEMPORAL_CLI_RETRY_ATTEMPTS` attempts (default 5), with
+`TEMPORAL_CLI_RETRY_SLEEP_SECONDS` between them (default 3), and writes only
+the final attempt's stdout. These callers use it: the start-metadata,
+workflow-patch, parent/child restart and child-failure replay controllers, the
+task-failure controller (`read_only_command`), and the identity and history
+captures in the worker-restart and cache-eviction targets. Assertion failures,
+`NotFound`, authentication and configuration errors fail on the first attempt.
+Mutating calls such as `workflow start` and `search-attribute create` are never
+retried, because an attempt that timed out may already have committed.
+`make test-temporal-cli-retry` and `make test-task-failure-command-logging`
+check this rule with a fake CLI. They also check that the shell and Python
+classifiers agree.
+
 `temporal-stop` removes the containers and network without being the acceptance
 teardown. The acceptance target always calls `temporal-clean` before and after
 its run, so no PostgreSQL volume or workflow history is preserved between

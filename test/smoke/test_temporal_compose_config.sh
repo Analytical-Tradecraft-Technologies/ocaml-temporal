@@ -647,6 +647,9 @@ require_absent "$root/scripts/check-temporal-stack.sh"
 require_absent "$root/scripts/setup-temporal-postgres.sh"
 test -x "$fixture/scripts/setup-temporal-postgres.sh"
 test -x "$fixture/scripts/check-temporal-stack.sh"
+# The stack check sources the shared CLI classifier from its own directory
+# inside the admin-tools container, so Compose must mount both files (#1285).
+require_source_text "$compose_file" './scripts/temporal-cli-retry.sh:/scripts/temporal-cli-retry.sh:ro'
 test -x "$fixture/scripts/validate-restart-replay-identity.sh"
 # Schema initialization is a live-test reliability boundary. Keep the
 # bounded retry and idempotent database handling visible to this fast contract
