@@ -1,44 +1,48 @@
 # Live acceptance coverage and evidence
 
-This reference records the evidence audited for issue #491 on 2026-09-20.
-The source baseline is [`beae10d0a58e`][baseline]. **Implemented**, **focused-tested**,
-**live-tested**, and **supported** are different claims. A source definition or
-Docker-free contract proves neither a successful live run nor production support.
-The package remains experimental; [#489][policy] tracks the v1 support decision.
+This reference records the live evidence re-audited for issue #1142 on
+2026-11-13 at master commit [`7963a9a68e3c`][baseline]. It replaces the #491
+audit of `beae10d0a58e` (2026-09-20), which qualified the earlier Core pin
+`95e97686` only. **Implemented**, **focused-tested**, **live-tested**, and
+**supported** are different claims. A source definition or Docker-free contract
+proves neither a successful live run nor production support. The package
+remains experimental; [#489][policy] tracks the v1 support decision. This is a
+master snapshot, not release-candidate qualification: the
+[support policy](v1-support-policy.md) still requires evidence for the exact
+candidate commit.
 
 ## Verified CI boundary
 
-The [September 19 Build run][build] completed successfully at the baseline
-commit. Its [Temporal/PostgreSQL integration job][live-job] ran every live
-controller listed below, including the baseline driver's final
-`two-binary driver assertions passed` marker. The final child-failure controller
-also completed successfully; it was not merely present in the workflow YAML.
-The [September 17 Build run][previous-build] at
-[`a4581f7c97e8`][previous-baseline] is the earlier successful evidence cited by
-issue #491 and also ran these seven controllers. Older PR runs document the
-first introduction of smaller slices and must not be called the current suite.
+The [November 10 Build run][build] (a push to `master`) completed successfully
+at the audited commit. Its three Temporal/PostgreSQL shards, [baseline][live-baseline],
+[recovery][live-recovery] and [replay][live-replay], and the required
+[integration result][live-result] that passes only when every shard did,
+each succeeded. Every controller in the tables below ran in one of those shard
+logs, and each one fails its job on any assertion failure. The baseline shard
+prints the driver's final `two-binary driver assertions passed` marker and a
+`live regression <suite>: ok` line for each of the 22 regression suites. The
+recovery shard prints `cache eviction driver assertions passed` and the
+start-metadata `acceptance passed` line; the replay shard runs the patch and
+parent/child controllers. A queued, cancelled or failed run is not evidence.
 
 | Evidence | Verified configuration | Limit |
 | --- | --- | --- |
-| Live server job | Linux `ubuntu-24.04`, OCaml 5.5, independent OCaml worker/client processes, plaintext Temporal Server 1.32.0 and PostgreSQL 18.6 in Compose | One server/compiler/platform/topology combination; no TLS/authentication, Temporal Cloud, upgrade, or production qualification |
+| Live server job | Linux `ubuntu-24.04`, OCaml 5.5, independent OCaml worker/client processes, plaintext Temporal Server 1.32.2 and PostgreSQL 18.6 in Compose | One server/compiler/platform/topology combination; no TLS/authentication, Temporal Cloud, upgrade, or production qualification |
 | Linux build/test matrix | OCaml 5.2, 5.3, 5.4, and 5.5 on amd64 and arm64 | Build, lint, focused tests, and source contracts; these are not additional live-server lanes |
 | Native build/test matrix | OCaml 5.5 on Windows x64 and macOS ARM64 | Native package/bridge/runtime validation, without the Compose server suite |
-| Pins | [Compose images][compose] include immutable image digests; [Cargo manifest][cargo] pins Temporal Core to `95e97686a079dcfe6c42e3254b2f3f5e3d97408f`; the [workflow][workflow] identifies the executed lanes | A successful snapshot does not qualify later image, Core, toolchain, or source changes |
+| Pins | [Compose images][compose] include immutable image digests; [Cargo manifest][cargo] pins Temporal Core to `8fe478ee179ed754614d230f39586f3edb57da71`<!-- pin:core --> (v1.1.0, #989); [`rust-toolchain.toml`][toolchain] selects Rust `1.99.1`<!-- pin:rust -->, which the Makefile, CI and Rust images read through `scripts/rust-version.sh`; the [workflow][workflow] identifies the executed lanes | A successful snapshot does not qualify later image, Core, toolchain, or source changes |
 
-The audited run therefore qualifies Core `95e97686` only. The Temporal Core
-v1.1.0 upgrade to `8fe478ee179ed754614d230f39586f3edb57da71` (#989) has
-separate live evidence: the [October 12 Build run][core-upgrade-build] at the
-upgrade commit [`acbda8dad9a3`][core-upgrade-commit] passed the same
-[Temporal/PostgreSQL integration job][core-upgrade-live-job], including the
-`two-binary driver assertions passed` marker. That run has not been re-audited
-controller by controller as this record was; it is evidence that the existing
-live suite passes on the new Core pin, not a replacement for this audit.
+`make check-doc-pins` (part of `make test-quality-contract`) fails when the Core
+pin or Rust toolchain quoted in this row, or marked in the other reference
+documents, differs from `rust/Cargo.toml` or `rust/rust-toolchain.toml`. A pin
+change therefore forces this record to be revisited. Re-audit it against a new
+successful run rather than only editing the quoted value.
 
-The workflow and Makefile must be read at the tested commit. In particular,
-the audited Rust toolchain file selects 1.98 while the native workflow/Makefile
-still request 1.94.1; the successful job is evidence for what actually ran, not
-proof of a uniform release toolchain. Resolve the declared toolchain matrix
-before claiming a supported release combination.
+The workflow and Makefile must be read at the tested commit. The earlier
+records remain historical evidence for their own commits: the #491 audit
+([September 19 run][previous-build] at [`beae10d0a58e`][previous-baseline])
+and the first run on Core v1.1.0 ([October 12 run][core-upgrade-build] at
+[`acbda8dad9a3`][core-upgrade-commit]).
 
 ## Live controllers
 
@@ -55,17 +59,13 @@ All live controllers use a real Temporal Server and own fixture cleanup.
 | `test-temporal-workflow-patching` | Separately compiled sources exercise marker-free to active, active to deprecated, and deprecated to removed patch calls; normalized history and marker assertions | [patch controller][patch-controller], [patch contract][patch-contract] |
 | `test-temporal-parent-child-restart` | Exact parent and child histories, linkage, nonterminal prefixes after removal, both generation-two replay observations, then successful completion | [parent/child controller][parent-controller], [parent/child contract][parent-contract] |
 | `test-temporal-parent-child-failure-replay` | Both runs replay before the child fails non-retryably; child and parent failure events retain exact linkage; parent returns `SMOKE:PARENT:CHILD:FAILURE_RECOVERED` | [failure controller][failure-controller], [failure contract][failure-contract], [definitions][definitions] |
+| `test-temporal-start-metadata-live` | Five exact active runs carry memo, search-attribute, combined, continued and official-CLI start metadata; workflow snapshots match before and after worker replacement. Three more runs on a one-slot-cache worker are each evicted with reason `cache_full` and replayed; snapshots, exact expirations and results match | [start metadata controller][metadata-controller], [start metadata](workflow-start-metadata.md) |
+| `test-temporal-task-failure-live` | Body, encoder and missing-registration defects leave exact runs with durable workflow-task failures; a corrected worker replays and completes them, and typed business failures keep their retryability flags | [task-failure controller][task-failure-controller], [workflow failures](workflow-failures.md) |
+| `test-temporal-examples-live` | The shipped example's split activity and workflow workers serve a valid name with the documented two-line result and fail a blank name with the typed business failure; both workers stop cleanly on `SIGTERM`; the cooperative cancellation example prints its exact documented report | [examples controller][examples-controller], [examples](../../examples/README.md) |
+| `test-temporal-live-regressions` | Each of the 22 regression executables in `LIVE_REGRESSION_EXECUTABLES` runs once, bounded, against a fresh stack: cooperative activity cancellation and the worker-shutdown signal (#494); abrupt worker death during a running activity, recovered on the server's heartbeat timeout (#519); bounded shutdown of a worker whose activity never heartbeats, with the attempt retried on a second worker (#495); child start options (#1135); client start policies and RPC deadlines (#499); client request IDs (#545); completed-workflow queries (#548); concurrent calls on one client (#807); `Client.fetch_history` replay (#1137); query and suspended-update recovery after sticky-cache eviction and worker replacement (#530); local activity retry cancellation (#567); detection, task failure and bounded shutdown of a worker whose workflow code stops yielding, with the run recovered on a corrected worker (#493); official-SDK interoperability (#517), where the pinned official Python SDK client and activity worker drive an OCaml workflow and both clients decode the same exact runs; split workflow/activity workers (#805, #1211); durable timer cancellation (#1134); transport interruption and uncertain outcomes (#504); update admission outcomes (#546); update callers when the run closes (#520); Prometheus worker metrics and log correlation (#500); worker resource and shutdown options under saturation (#498); per-workflow worker versioning (#1159); and workflow start info (#512). The run fails if any suite fails; a Docker-free contract requires every `test/integration/*/regression.exe` to be in the smoke artifact and run by CI (#795) | [regression runner][regressions-controller]; each suite's `README.md` or module comment under `test/integration/` |
 
-Three live controllers were added to the Build workflow after the audited
-baseline, so the successful runs above do not cover them. Their assertion
-boundaries are defined by their own references, and the
-[generated inventory](live-acceptance-inventory.md) tracks their membership:
-
-| Make target | Assertion boundary | Reference |
-| --- | --- | --- |
-| `test-temporal-start-metadata-live` | Five exact active runs carry memo, search-attribute, combined, continued and official-CLI start metadata; workflow snapshots match before and after worker replacement. Three more runs on a one-slot-cache worker are each evicted with reason `cache_full` and replayed; snapshots, exact expirations and results match | [start metadata](workflow-start-metadata.md) |
-| `test-temporal-task-failure-live` | Body, encoder and missing-registration defects leave exact runs with durable workflow-task failures; a corrected worker replays and completes them, and typed business failures keep their retryability flags | [workflow failures](workflow-failures.md) |
-| `test-temporal-live-regressions` | Each fixed-bug regression executable in `LIVE_REGRESSION_EXECUTABLES` runs once, bounded, against a fresh stack: cooperative activity cancellation and the worker-shutdown signal (#494), bounded shutdown of a worker whose activity never heartbeats, with the attempt retried on a second worker (#495), detection, task failure and bounded shutdown of a worker whose workflow code stops yielding, with the run recovered on a corrected worker (#493), client request IDs (#545), update admission outcomes (#546), completed-workflow queries (#548), local activity retry cancellation (#567), split workflow/activity workers (#805), query and suspended-update recovery after sticky-cache eviction and worker replacement (#530), and official-SDK interoperability (#517), where the pinned official Python SDK client and activity worker drive an OCaml workflow and both clients decode the same exact runs. The run fails if any suite fails; a Docker-free contract requires every `test/integration/*/regression.exe` to be in the smoke artifact and run by CI (#795) | Each suite's `README.md` or module comment under `test/integration/` |
+The [generated inventory](live-acceptance-inventory.md) tracks the membership of
+these targets.
 
 The [child-failure acceptance reference](child-failure-replay-acceptance.md)
 records the original PR #361 evidence. Its status is live-tested, not pending a
@@ -140,9 +140,9 @@ and retry policy alone, the documented at-least-once contract.
 
 For [issue #519](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/519),
 this matrix separates the existing live-tested restart and crash cases from
-the stronger cache-eviction assertion. The cache change is
-source and contract coverage until its revised controller passes a live run;
-the September baseline job above does not verify that new behavior. The
+the stronger cache-eviction assertion. The revised cache controller passed in
+the audited run's recovery shard, which prints `cache eviction driver
+assertions passed` and `cache eviction progress histories: ok`. The
 [Makefile](../../Makefile), [restart driver](../../test/integration/temporal/driver/restart_driver.ml),
 [cache driver](../../test/integration/temporal/driver/cache_eviction_driver.ml),
 and [workflow definitions](../../test/integration/temporal/common/smoke_definitions.ml)
@@ -152,7 +152,7 @@ are the current source for these assertions.
 | --- | --- | --- |
 | Graceful shutdown with pending work: `make test-temporal-worker-restart` | The controller records the exact run's initial server history with `TimerStarted` and no `TimerFired` before stopping generation one. `temporal-stop-worker` gives Compose 30 seconds and requires the worker's post-shutdown marker. A fresh generation-two container must replay that same run and complete with `SMOKE:AFTER-REPLAY:ATTEMPT:2`; process exit alone does not pass. | Exact initial/terminal histories, replay diagnostics, controller phases, and worker logs. This covers a parked timer, not a long-running OCaml activity callback or an orchestrator termination deadline. |
 | Forced removal with pending work: `make test-temporal-worker-crash-recovery` | The same pending-timer history precedes `SIGKILL`; generation one must exit 137 without a graceful-stop marker and be removed. A new container must replay the exact run and reach the same successful terminal result. | The same exact-run evidence plus crash mode and exit code in the controller. One kill/replacement cycle does not cover repeated churn or every in-flight command. |
-| Cache eviction followed by normal progress: `make test-temporal-worker-cache-eviction` | A parks on a replay-safe signal condition. Its initial activation completion is acknowledged before timer-backed B starts; the observer publishes A's exact `RemoveFromCache(CacheFull)` marker only after Core acknowledges removal. The driver then waits for B's initial activation acknowledgement, signals exact run A while B is outstanding, requires `SMOKE:CACHE:FIRST:RESUME` and terminal `WorkflowExecutionCompleted`, and cancels B only afterward. B's exact history must contain `TimerStarted`, `WorkflowExecutionCancelRequested`, and terminal `WorkflowExecutionCanceled`. | The [cache history validator](../../test/integration/temporal/scripts/validate-cache-eviction-progress.sh) checks the marker and payload-free histories for both run IDs; the driver log and worker logs retain fault phases. This is a one-slot, two-run case and remains **live-unverified for #519** until the revised command succeeds. A has no timer; B supplies the pending timer boundary. |
+| Cache eviction followed by normal progress: `make test-temporal-worker-cache-eviction` | A parks on a replay-safe signal condition. Its initial activation completion is acknowledged before timer-backed B starts; the observer publishes A's exact `RemoveFromCache(CacheFull)` marker only after Core acknowledges removal. The driver then waits for B's initial activation acknowledgement, signals exact run A while B is outstanding, requires `SMOKE:CACHE:FIRST:RESUME` and terminal `WorkflowExecutionCompleted`, and cancels B only afterward. B's exact history must contain `TimerStarted`, `WorkflowExecutionCancelRequested`, and terminal `WorkflowExecutionCanceled`. | The [cache history validator](../../test/integration/temporal/scripts/validate-cache-eviction-progress.sh) checks the marker and payload-free histories for both run IDs; the driver log and worker logs retain fault phases. This is a one-slot, two-run case, live-verified for #519 at the audited commit. A has no timer; B supplies the pending timer boundary. |
 
 For a reproducible run that retains filtered worker logs, available normalized
 exact-run histories, and failure phases under `_build/live-diagnostics/`, use the same
@@ -228,10 +228,11 @@ workflow code: the watchdog fails the stuck task within the deadline plus one
 tick, shutdown reports the abandoned activation within its bound, and
 Temporal's retry completes the same run on a corrected worker.
 
-Reset, bounded visibility listing, worker deployment routing, search-attribute
-upserts and priority metadata have implemented/focused-tested surfaces but no
-dedicated live qualification. Start memo/search attributes have the post-baseline
-start-metadata controller described above. The private replay feeder
+Reset, bounded visibility listing, search-attribute upserts and priority
+metadata have implemented/focused-tested surfaces but no dedicated live
+qualification. Worker deployment routing has the per-workflow
+`worker_versioning` regression (#1159), and start memo/search attributes have
+the start-metadata controller described above. The private replay feeder
 is not a public history replay tool. The seeded
 [history corpus](history-corpus.md) is replayed offline in every `dune runtest`;
 it is not live acceptance. Authentication configuration, running that corpus
@@ -258,8 +259,20 @@ outcomes here. A generated list cannot establish that an assertion executed;
 keep the successful CI link and source snapshot together. Failed or incomplete
 runs must not replace the successful evidence with a broader support claim.
 
+`make check-doc-pins` reads every Markdown file under `docs/` and `README.md`.
+A current-pin statement marks its quoted value with an invisible HTML comment
+naming `pin:core` or `pin:rust`, placed directly after the value's closing
+backtick (see `scripts/check-doc-pins.sh` for the exact form). Each
+marked Core value must be a prefix of at least eight hex digits of the `rev`
+in `rust/Cargo.toml`, and each Rust value must equal the channel in
+`rust/rust-toolchain.toml`. This record, the support policy, the Core bridge
+reference and the dependency inventory must each keep their marker. Historical
+mentions, such as upgrade notes and capture records, stay unmarked.
+`make test-doc-pins-contract` checks the checker against a fixture tree.
+
 ```sh
 make check-live-acceptance-inventory
+make check-doc-pins
 make test-quality-contract
 make test-unit
 make test-runtime
@@ -268,36 +281,43 @@ make verify
 # Run the applicable live controller from the table above separately.
 ```
 
-[baseline]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/beae10d0a58e58fb8e076734cd38113d7a2b4466
-[build]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35469570419
-[live-job]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35469570419/job/105967951226
+[baseline]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/7963a9a68e3c31c876a4c883b290064d40ff9ddc
+[build]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/42926120004
+[live-baseline]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/42926120004/job/130308705520
+[live-recovery]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/42926120004/job/130308705505
+[live-replay]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/42926120004/job/130308705515
+[live-result]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/42926120004/job/130313438378
 [core-upgrade-build]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/38186805228
 [core-upgrade-commit]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/acbda8dad9a356cb2cc3ba47f9c4adeb146a5bee
-[core-upgrade-live-job]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/38186805228/job/114616750679
-[previous-build]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35278812252
-[previous-baseline]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/a4581f7c97e83498d4910dadc3ad811389a80f82
+[previous-build]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/actions/runs/35469570419
+[previous-baseline]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/commit/beae10d0a58e58fb8e076734cd38113d7a2b4466
+[toolchain]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/rust/rust-toolchain.toml
+[metadata-controller]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/scripts/run-start-metadata-live.sh
+[task-failure-controller]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/scripts/run-task-failure-live.py
+[examples-controller]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/scripts/run-examples-live.sh
+[regressions-controller]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/scripts/run-live-regressions.sh
 [policy]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/489
-[compose]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/temporal/compose.yaml
-[cargo]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/rust/Cargo.toml
-[workflow]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/.github/workflows/build.yml
-[makefile]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/Makefile
-[driver]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/temporal/driver/smoke_driver.ml
-[definitions]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/temporal/common/smoke_definitions.ml
-[lifecycle]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/test_core_lifecycle.ml
-[restart-driver]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/temporal/driver/restart_driver.ml
-[restart-contract]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/temporal/scripts/test-restart-replay-contract.sh
-[crash-contract]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/smoke/test_temporal_worker_crash_recovery_contract.sh
-[eviction-driver]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/temporal/driver/cache_eviction_driver.ml
-[eviction-contract]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/smoke/test_temporal_worker_cache_eviction_contract.sh
-[patch-controller]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/temporal/scripts/run-patch-replay-live.sh
-[patch-contract]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/temporal/scripts/test-patch-replay-contract.sh
-[parent-controller]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/temporal/scripts/run-parent-child-restart-replay-live.sh
-[parent-contract]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/temporal/scripts/test-parent-child-restart-replay-contract.sh
-[failure-controller]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/temporal/scripts/run-child-failure-replay-live.sh
-[failure-contract]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/integration/temporal/scripts/test-child-failure-replay-contract.sh
-[scope-source]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/lib/public/scope.ml
-[activity-source]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/lib/public/activity.ml
-[child-source]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/lib/public/child_workflow.ml
-[scope-tests]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/runtime/test_scope.ml
-[activation-tests]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/beae10d0a58e58fb8e076734cd38113d7a2b4466/test/runtime/test_activation.ml
+[compose]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/compose.yaml
+[cargo]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/rust/Cargo.toml
+[workflow]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/.github/workflows/build-pr.yml
+[makefile]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/Makefile
+[driver]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/driver/smoke_driver.ml
+[definitions]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/common/smoke_definitions.ml
+[lifecycle]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/test_core_lifecycle.ml
+[restart-driver]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/driver/restart_driver.ml
+[restart-contract]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/scripts/test-restart-replay-contract.sh
+[crash-contract]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/smoke/test_temporal_worker_crash_recovery_contract.sh
+[eviction-driver]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/driver/cache_eviction_driver.ml
+[eviction-contract]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/smoke/test_temporal_worker_cache_eviction_contract.sh
+[patch-controller]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/scripts/run-patch-replay-live.sh
+[patch-contract]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/scripts/test-patch-replay-contract.sh
+[parent-controller]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/scripts/run-parent-child-restart-replay-live.sh
+[parent-contract]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/scripts/test-parent-child-restart-replay-contract.sh
+[failure-controller]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/scripts/run-child-failure-replay-live.sh
+[failure-contract]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/integration/temporal/scripts/test-child-failure-replay-contract.sh
+[scope-source]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/lib/public/scope.ml
+[activity-source]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/lib/public/activity.ml
+[child-source]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/lib/public/child_workflow.ml
+[scope-tests]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/runtime/test_scope.ml
+[activation-tests]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/7963a9a68e3c31c876a4c883b290064d40ff9ddc/test/runtime/test_activation.ml
 [issue-519]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/519

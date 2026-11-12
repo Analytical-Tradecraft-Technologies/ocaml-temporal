@@ -556,6 +556,16 @@ update-live-acceptance-inventory:
 test-live-acceptance-inventory-contract:
 	sh test/smoke/test_live_acceptance_inventory_contract.sh .
 
+# Reference documents that quote the current Temporal Core pin or Rust
+# toolchain must match rust/Cargo.toml and rust/rust-toolchain.toml (#1142).
+# test-quality-contract runs both; see docs/reference/live-acceptance-coverage.md.
+.PHONY: check-doc-pins test-doc-pins-contract
+check-doc-pins:
+	sh scripts/check-doc-pins.sh .
+
+test-doc-pins-contract:
+	sh test/smoke/test_doc_pins_contract.sh .
+
 # The license-policy fixtures (#1150) need `opam show`, so they run in the
 # Compose development image. The native macOS lane runs them with its own
 # OCaml toolchain; native Windows skips them because its opam cannot read the
@@ -570,6 +580,8 @@ test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inve
 	sh test/smoke/test_release_tag_contract.sh .
 	sh test/smoke/test_release_notes_contract.sh .
 	sh test/smoke/test_release_tag_commit_contract.sh .
+	sh scripts/check-doc-pins.sh .
+	sh test/smoke/test_doc_pins_contract.sh .
 	sh test/smoke/test_prebuilt_install_tag_contract.sh .
 	sh test/smoke/test_make_docker_commands.sh .
 	sh test/smoke/test_make_seed_validation.sh .
