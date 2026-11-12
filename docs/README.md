@@ -128,7 +128,9 @@ The remaining reference documents are useful when changing one subsystem:
   [workflow authoring API](design/workflow-authoring-api.md) and
   [JSON control protocol foundation](design/json-control-protocol-foundation.md)
   designs record earlier phase decisions; when a design and the source
-  disagree, the source, tests, and progress record win.
+  disagree, the source, tests, and progress record win. The
+  [Nexus contract](design/nexus.md) is a proposal under review (#532) for
+  the first Nexus caller and handler slice; Nexus is not implemented.
 
 ## How the pieces fit together
 
