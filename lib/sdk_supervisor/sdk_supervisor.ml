@@ -559,6 +559,7 @@ module Protocol_adapter = struct
       | Retryable -> "retryable"
       | Async_heartbeat_rejected -> "async_heartbeat_rejected"
       | Resource_exhausted -> "resource_exhausted"
+      | Detached -> "detached"
       | Unknown code -> Printf.sprintf "unknown(%d)" code
     in
     {
