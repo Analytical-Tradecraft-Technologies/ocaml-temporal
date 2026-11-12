@@ -35,6 +35,15 @@ admin() {
     --address temporal:7233 --namespace temporal-sdk-test "$@" </dev/null
 }
 
+# Read-only queries (show, describe, query, search-attribute list) retry a
+# bounded number of times on a transient CLI transport failure (#1285).
+# Workflow start and search-attribute create stay single-attempt: a timed-out
+# attempt may already have committed, and a repeat would then fail.
+. "$fixture/scripts/temporal-cli-retry.sh"
+admin_read() {
+  temporal_cli_read_only admin "$@"
+}
+
 # Both application roles use one prebuilt binary and no long-lived Dune lock.
 application() {
   docker run "$@" --network "${project}_temporal-network" \
@@ -61,7 +70,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 # Register the exact indexed type before Client.start creates any durable run.
-if ! admin operator search-attribute list -o json > "$evidence/search-attributes.json"; then
+if ! admin_read operator search-attribute list -o json > "$evidence/search-attributes.json"; then
   exit 1
 fi
 if ! grep -q 'MetadataKeyword' "$evidence/search-attributes.json"; then
@@ -83,18 +92,18 @@ admin workflow start --workflow-id "$official_id" --type metadata.roundtrip \
   -o json > "$evidence/official-start.json"
 official_run=$(jq -er '.runId' "$evidence/official-start.json")
 printf '%s\t%s\tvalue:value:deadline\n' "$official_id" "$official_run" >> "$evidence/runs.tsv"
-admin workflow query --workflow-id "$official_id" --run-id "$official_run" \
+admin_read workflow query --workflow-id "$official_id" --run-id "$official_run" \
   --name metadata -o json > "$evidence/official-query.json"
 
 # Keep the original continue-as-new history as well as each active successor.
 while IFS="$(printf '\t')" read -r id run _expected; do
-  admin workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.root.json"
+  admin_read workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.root.json"
 done < "$evidence/runs.tsv.roots"
 
 # Retain exact-run nonterminal histories before terminating generation one.
 while IFS="$(printf '\t')" read -r id run _expected; do
-  admin workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.initial.json"
-  admin workflow describe --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.describe.initial.json"
+  admin_read workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.initial.json"
+  admin_read workflow describe --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.describe.initial.json"
 done < "$evidence/runs.tsv"
 docker logs "$worker" > "$evidence/worker-one.log" 2>&1
 # Abrupt replacement deliberately discards the entire in-memory cache.
@@ -105,8 +114,8 @@ application --detach --name "$worker" > "$evidence/worker-two.container"
 mode=finish
 application --rm --name "$client" > "$evidence/finish.log" 2>&1
 while IFS="$(printf '\t')" read -r id run _expected; do
-  admin workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.terminal.json"
-  admin workflow describe --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.describe.terminal.json"
+  admin_read workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.terminal.json"
+  admin_read workflow describe --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.describe.terminal.json"
 done < "$evidence/runs.tsv"
 
 # Cache-full phase: a fresh worker with max_cached_workflows = 1 on its own
@@ -123,14 +132,14 @@ application --detach --name "$worker" > "$evidence/worker-cache.container"
 mode=cache-start
 application --rm --name "$client" > "$evidence/cache-start.log" 2>&1
 while IFS="$(printf '\t')" read -r id run _expected; do
-  admin workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.initial.json"
-  admin workflow describe --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.describe.initial.json"
+  admin_read workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.initial.json"
+  admin_read workflow describe --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.describe.initial.json"
 done < "$evidence/cache-runs.tsv"
 mode=cache-finish
 application --rm --name "$client" > "$evidence/cache-finish.log" 2>&1
 while IFS="$(printf '\t')" read -r id run _expected; do
-  admin workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.terminal.json"
-  admin workflow describe --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.describe.terminal.json"
+  admin_read workflow show --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.terminal.json"
+  admin_read workflow describe --workflow-id "$id" --run-id "$run" -o json > "$evidence/$id.describe.terminal.json"
 done < "$evidence/cache-runs.tsv"
 docker logs "$worker" > "$evidence/worker-cache.log" 2>&1
 sh "$fixture/scripts/verify-start-metadata-history.sh" "$evidence"

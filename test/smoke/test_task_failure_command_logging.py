@@ -86,3 +86,110 @@ class CommandLoggingTests(unittest.TestCase):
             CONTROLLER.command([sys.executable, "-c", "import sys; sys.exit(9)"])
         self.assertEqual(raised.exception.returncode, 9)
         self.assertIn("Could not retain command diagnostic", self.stderr.getvalue())
+
+
+DEADLINE = ("Error: failed connecting to Temporal server at temporal:7233: "
+            "context deadline exceeded")
+RETRY_LIBRARY = (Path(__file__).resolve().parents[1]
+                 / "integration/temporal/scripts/temporal-cli-retry.sh")
+# Stderr samples shared by the Python and shell classifiers (#1285): each
+# pairs the text with whether a read-only query may be retried after it.
+CLASSIFICATION_SAMPLES = (
+    ("rpc error: code = Unavailable desc = frontend restarting", True),
+    ("rpc error: code = DeadlineExceeded desc = frontend not ready", True),
+    (DEADLINE, True),
+    (DEADLINE + "\n  Connection checks for temporal:7233\n"
+     "    ? gRPC failure could not be diagnosed before its deadline", True),
+    (" Container ocaml-temporal-integration-temporal-admin-tools-run Creating\n"
+     + DEADLINE, True),
+    ("Error: authentication failed: invalid API key\n" + DEADLINE, False),
+    ("Error: workflow not found for ID: missing", False),
+    ("rpc error: code = NotFound desc = workflow execution not found", False),
+    ("rpc error: code = PermissionDenied desc = forbidden", False),
+    ("", False),
+)
+
+
+class ReadOnlyRetryTests(unittest.TestCase):
+    """Read-only admin queries retry only transport failures, a bounded number of times."""
+
+    def setUp(self):
+        """Isolate artifacts, CI stderr and the fake CLI's attempt counter."""
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.counter = Path(self.directory.name) / "attempts"
+        self.counter.write_text("0")
+        patcher = patch.object(CONTROLLER, "ARTIFACTS", Path(self.directory.name) / "artifacts")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.stderr = io.StringIO()
+        redirect = contextlib.redirect_stderr(self.stderr)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+        self.sleeps = []
+
+    def fake_cli(self, failures, message):
+        """Return argv that fails [failures] times with [message], then prints JSON."""
+        code = (
+            "import pathlib, sys\n"
+            f"counter = pathlib.Path({str(self.counter)!r})\n"
+            "count = int(counter.read_text()) + 1\n"
+            "counter.write_text(str(count))\n"
+            f"if count <= {failures}:\n"
+            "    print('partial')\n"
+            f"    print({message!r}, file=sys.stderr)\n"
+            "    sys.exit(1)\n"
+            "print('{\"ok\": true}')\n")
+        return [sys.executable, "-c", code]
+
+    def attempts(self):
+        """Number of times the fake CLI ran."""
+        return int(self.counter.read_text())
+
+    def test_transient_failure_is_retried_and_stdout_is_final(self):
+        """Only the successful attempt's stdout reaches the JSON parser."""
+        output = CONTROLLER.read_only_command(
+            self.fake_cli(2, DEADLINE), sleep=self.sleeps.append)
+        self.assertEqual(json.loads(output), {"ok": True})
+        self.assertEqual(self.attempts(), 3)
+        self.assertEqual(self.sleeps, [CONTROLLER.CLI_RETRY_SLEEP_SECONDS] * 2)
+        self.assertIn("attempt 2 of 5", self.stderr.getvalue())
+
+    def test_non_transport_failure_is_not_retried(self):
+        """NotFound and authentication errors fail on the first attempt."""
+        for message in ("rpc error: code = NotFound desc = missing",
+                        "Error: authentication failed: invalid API key\n" + DEADLINE):
+            self.counter.write_text("0")
+            with self.assertRaises(subprocess.CalledProcessError):
+                CONTROLLER.read_only_command(self.fake_cli(1, message), sleep=self.sleeps.append)
+            self.assertEqual(self.attempts(), 1)
+        self.assertEqual(self.sleeps, [])
+
+    def test_retries_are_bounded_and_each_failure_is_retained(self):
+        """A persistent transport failure re-raises after the last attempt."""
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            CONTROLLER.read_only_command(
+                self.fake_cli(99, "rpc error: code = Unavailable desc = down"),
+                sleep=self.sleeps.append)
+        self.assertEqual(raised.exception.returncode, 1)
+        self.assertEqual(self.attempts(), CONTROLLER.CLI_RETRY_ATTEMPTS)
+        self.assertEqual(len(self.sleeps), CONTROLLER.CLI_RETRY_ATTEMPTS - 1)
+        records = (CONTROLLER.ARTIFACTS / "command-failures.jsonl").read_text().splitlines()
+        self.assertEqual(len(records), CONTROLLER.CLI_RETRY_ATTEMPTS)
+
+    def test_timeout_is_not_retried(self):
+        """A hung CLI is bounded by the per-command timeout, not repeated."""
+        with self.assertRaises(subprocess.TimeoutExpired):
+            CONTROLLER.read_only_command([sys.executable, "-c", "import time; time.sleep(30)"],
+                                         timeout=1, sleep=self.sleeps.append)
+        self.assertEqual(self.sleeps, [])
+
+    def test_python_and_shell_classifiers_agree(self):
+        """Both live-test languages classify the same samples identically."""
+        for text, transient in CLASSIFICATION_SAMPLES:
+            with self.subTest(text=text):
+                self.assertEqual(CONTROLLER.transient_cli_error(text), transient)
+                shell = subprocess.run(
+                    ["sh", "-c", '. "$1"; temporal_cli_transient_error "$2"', "sh",
+                     str(RETRY_LIBRARY), text], check=False)
+                self.assertEqual(shell.returncode == 0, transient)
