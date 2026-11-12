@@ -36,7 +36,9 @@ type item = { sku : string; qty : int; unit_cents : int }
     [note] is an explicit [null] in the driver's input and [coupon] is absent,
     so both spellings of an optional field are decoded. [pricing_task_queue]
     names the official SDK worker that hosts the pricing activity; carrying it
-    in the input keeps the workflow deterministic. *)
+    in the input keeps the workflow deterministic. [pricing_timeout_ms],
+    absent except in the timeout case (#1143), sets the activity's
+    start-to-close timeout in milliseconds and limits it to one attempt. *)
 type order = {
   customer : string;
   items : item list;
@@ -44,6 +46,7 @@ type order = {
   coupon : string option;
   rush : bool;
   pricing_task_queue : string;
+  pricing_timeout_ms : int option;
 }
 
 (** Workflow-local state read by the [status] query and changed by the
@@ -87,13 +90,23 @@ let decode_all decode values =
 (** Encodes an order. Only the OCaml client's typed handle uses this direction;
     the official SDK client produces the workflow input. *)
 let order_to_json order =
-  `Assoc [
+  `Assoc ([
     ("customer", `String order.customer);
     ("items", `List (List.map item_to_json order.items));
     ("note", optional order.note);
     ("coupon", optional order.coupon);
     ("rush", `Bool order.rush);
     ("pricing_task_queue", `String order.pricing_task_queue) ]
+    @ (match order.pricing_timeout_ms with
+      | Some ms -> [ ("pricing_timeout_ms", `Int ms) ]
+      | None -> []))
+
+(** Decodes the optional positive [pricing_timeout_ms] field. *)
+let timeout_of_json fields =
+  match List.assoc_opt "pricing_timeout_ms" fields with
+  | None | Some `Null -> Ok None
+  | Some (`Int ms) when ms > 0 -> Ok (Some ms)
+  | Some _ -> shape "pricing_timeout_ms must be a positive integer or null"
 
 (** Decodes the order object; any other JSON value is incompatible input. *)
 let order_of_json = function
@@ -107,7 +120,8 @@ let order_of_json = function
           let* items = decode_all item_of_json items in
           let* note = optional_of_json "note" fields in
           let* coupon = optional_of_json "coupon" fields in
-          Ok { customer; items; note; coupon; rush; pricing_task_queue }
+          let* pricing_timeout_ms = timeout_of_json fields in
+          Ok { customer; items; note; coupon; rush; pricing_task_queue; pricing_timeout_ms }
       | _ -> shape "order requires customer, items, rush and pricing_task_queue")
   | _ -> shape "order must be a JSON object"
 
@@ -146,7 +160,10 @@ let approved () =
     becomes a deliberate terminal workflow failure of type ["PricingFailed"]
     that forwards the activity's raw detail payloads, so the official SDK
     client must decode details produced by its own worker after they crossed
-    the OCaml workflow in both directions. *)
+    the OCaml workflow in both directions. A pricing timeout (#1143) is
+    recognized by [Error.timeout_type] and becomes a ["PricingTimedOut"]
+    failure whose details are the timeout kind followed by the activity's
+    last heartbeat details. *)
 let workflow = Workflow.define ~name:"interop-order" ~input:order_codec ~output:Codec.json
   (fun order ->
     let* () =
@@ -160,10 +177,37 @@ let workflow = Workflow.define ~name:"interop-order" ~input:order_codec ~output:
         ("rush", `Bool order.rush);
         ("items", `List (List.map item_to_json order.items)) ]
     in
+    let* retry_policy, start_to_close =
+      match order.pricing_timeout_ms with
+      | None -> Ok (None, Duration.of_ms 30_000L)
+      | Some ms ->
+          let* policy =
+            Retry_policy.make ~initial_interval:(Duration.of_ms 1_000L)
+              ~backoff_coefficient:2.0 ~maximum_interval:(Duration.of_ms 10_000L)
+              ~maximum_attempts:1 ()
+          in
+          Ok (Some policy, Duration.of_ms (Int64.of_int ms))
+    in
     match
-      Activity.execute ~task_queue:order.pricing_task_queue
-        ~start_to_close_timeout:(Duration.of_ms 30_000L) price request
+      Activity.execute ~task_queue:order.pricing_task_queue ?retry_policy
+        ~start_to_close_timeout:start_to_close price request
     with
+    | Error error when Option.is_some (Error.timeout_type error) ->
+        (* Branch on the typed timeout kind, never on the message (#1143),
+           and return the heartbeat details apart from the failure details. *)
+        let kind =
+          match Error.timeout_type error with
+          | Some `Start_to_close -> "start_to_close"
+          | Some `Schedule_to_start -> "schedule_to_start"
+          | Some `Schedule_to_close -> "schedule_to_close"
+          | Some `Heartbeat -> "heartbeat"
+          | Some `Unspecified | None -> "unspecified"
+        in
+        let* detail = Codec.encode Codec.json (`Assoc [ ("timeout", `String kind) ]) in
+        Error (Error.make ~category:`Workflow ~non_retryable:true
+          ~error_type:"PricingTimedOut"
+          ~details:(detail :: Error.last_heartbeat_details error)
+          ~message:("pricing activity timed out: " ^ kind) ())
     | Error error ->
         let activity_type = Option.value (Error.error_type error) ~default:"<none>" in
         Error (Error.make ~category:`Workflow ~non_retryable:true
@@ -300,6 +344,24 @@ let verify_report address queue report =
         | _ -> failwith "OCaml client decoded different failure details")
     | _ -> failwith "OCaml client did not observe the failed interop run");
     Printf.printf "activity failure run: %s/%s\n" id run_id;
+    let timeout = member "activity_timeout" runs in
+    let handle, id, run_id = reported_handle client queue timeout in
+    (match get (Client.wait handle) with
+    | Client.Failed { error; _ } ->
+        let view = Error.view error in
+        if Error.error_type error <> Some "PricingTimedOut" || not view.non_retryable then
+          failwith ("OCaml client decoded a different timeout failure: " ^ Error.message error);
+        let decoded =
+          List.map (fun detail -> Yojson.Safe.sort (get (Codec.decode Codec.json detail)))
+            view.details
+        in
+        let expected =
+          [ `Assoc [ ("timeout", `String "start_to_close") ]; `Assoc [ ("progress", `Int 42) ] ]
+        in
+        if not (List.equal Yojson.Safe.equal decoded expected) then
+          failwith "OCaml client decoded different timeout failure details"
+    | _ -> failwith "OCaml client did not observe the timed-out interop run");
+    Printf.printf "activity timeout run: %s/%s\n" id run_id;
     let incompatible = member "incompatible_input" runs in
     let handle, id, run_id = reported_handle client queue incompatible in
     (match get (Client.wait handle) with

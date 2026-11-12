@@ -88,6 +88,13 @@ its error's origin (#1215). Its other
 virtual-deadline errors (an execute or result `?timeout`, a condition
 timeout) are created by the SDK, so their origin is `None`.
 
+The official-SDK interoperability regression (`test/integration/sdk_interop`)
+exercises this shape across SDKs. A pinned Python SDK activity heartbeats
+and then outlives a start-to-close timeout set by the OCaml workflow. The
+workflow recognizes the timeout through `Error.timeout_type` and reads the
+Python heartbeat through `Error.last_heartbeat_details`. The Python and
+OCaml clients both decode what it forwards.
+
 Neither the origin nor the heartbeat details are transmitted: an error that
 an activity or workflow returns is sent with only its category, message,
 retryability, details and type. Otherwise the cause chain is not preserved as

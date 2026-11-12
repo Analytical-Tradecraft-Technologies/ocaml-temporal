@@ -10,7 +10,9 @@ with its default data converter, to:
 * query, update (accepted, validator-rejected, wrongly encoded and wrongly
   shaped) and signal the OCaml workflow;
 * decode the OCaml result, a terminal failure whose type and details crossed
-  both SDKs, and the fail-closed outcome of an incompatible workflow input;
+  both SDKs, a server-side activity timeout that the OCaml workflow reports
+  by its typed timeout kind and heartbeat details, and the fail-closed
+  outcome of an incompatible workflow input;
 * read each exact run's durable history to assert payload encodings and the
   SDK identity that the OCaml worker recorded.
 
@@ -31,6 +33,7 @@ from pathlib import Path
 
 import temporalio
 from temporalio import activity
+from temporalio.api.enums.v1 import TimeoutType
 from temporalio.api.workflowservice.v1 import GetSystemInfoRequest
 from temporalio.client import (
     Client,
@@ -47,6 +50,14 @@ from temporalio.worker import Worker
 # the controller's container timeout bounds the driver as a whole.
 READY_TIMEOUT = 120.0
 STATE_TIMEOUT = 60.0
+
+# The timeout case (#1143): the OCaml workflow gives the pricing activity this
+# start-to-close timeout and a single attempt, and the SLOW activity sleeps far
+# longer after heartbeating HEARTBEAT, which must come back separately from
+# the failure details.
+TIMEOUT_MS = 3000
+SLOW_ACTIVITY_SECONDS = 30.0
+HEARTBEAT = {"progress": 42}
 
 # The signal document exercises every JSON value kind. 2**53 + 1 is not
 # representable as a double, so a float-based conversion in either SDK would
@@ -76,10 +87,16 @@ async def price(request: dict) -> dict:
 
     An item with SKU ``OUT-OF-STOCK`` raises a non-retryable application
     failure with a structured detail, which the OCaml workflow forwards in
-    its own terminal failure.
+    its own terminal failure. An item with SKU ``SLOW`` heartbeats
+    ``HEARTBEAT`` and then outlives the OCaml-chosen start-to-close timeout,
+    so the server times the attempt out (#1143); the sleep is cancelled when
+    the worker shuts down.
     """
     RECEIVED[activity.info().workflow_id] = request
     items = request["items"]
+    if any(item["sku"] == "SLOW" for item in items):
+        activity.heartbeat(HEARTBEAT)
+        await asyncio.sleep(SLOW_ACTIVITY_SECONDS)
     for item in items:
         if item["sku"] == "OUT-OF-STOCK":
             raise ApplicationError(
@@ -368,6 +385,78 @@ async def activity_failure_run(client: Client, ready: dict) -> dict:
     raise RuntimeError("interop expectation failed: failing order completed")
 
 
+async def activity_timeout_run(client: Client, ready: dict) -> dict:
+    """Requires a server-side timeout of an official-SDK activity to reach the
+    OCaml workflow as a typed start-to-close timeout (#1143).
+
+    The OCaml workflow branches on ``Error.timeout_type`` rather than on the
+    message and fails with type ``PricingTimedOut``. Its details are the
+    timeout kind followed by ``Error.last_heartbeat_details``, so the Python
+    client must decode the heartbeat its own activity recorded, kept apart from
+    the failure details. History must show the server's start-to-close timeout
+    of the single attempt.
+    """
+    queue = ready["workflow_task_queue"]
+    workflow_id = f"{queue}-activity-timeout"
+    order = {
+        "customer": "timeout",
+        "items": [{"sku": "SLOW", "qty": 1, "unit_cents": 100}],
+        "note": None,
+        "rush": False,
+        "pricing_task_queue": ready["pricing_task_queue"],
+        "pricing_timeout_ms": TIMEOUT_MS,
+    }
+    started = await client.start_workflow(
+        "interop-order",
+        order,
+        id=workflow_id,
+        task_queue=queue,
+        execution_timeout=timedelta(minutes=5),
+    )
+    handle = client.get_workflow_handle(workflow_id, run_id=started.result_run_id)
+    try:
+        await handle.result()
+    except WorkflowFailureError as error:
+        cause = error.cause
+        require(isinstance(cause, ApplicationError), f"timeout cause {cause!r}")
+        require(cause.type == "PricingTimedOut", f"timeout failure type {cause.type!r}")
+        require(cause.non_retryable, "timeout failure lost non_retryable")
+        require(
+            cause.details == ({"timeout": "start_to_close"}, HEARTBEAT),
+            f"timeout failure details {cause.details!r}",
+        )
+        events = (await handle.fetch_history()).events
+        timed_out = [
+            e.activity_task_timed_out_event_attributes
+            for e in events
+            if e.HasField("activity_task_timed_out_event_attributes")
+        ]
+        require(len(timed_out) == 1, f"{len(timed_out)} activity timeouts in history")
+        require(
+            timed_out[0].failure.timeout_failure_info.timeout_type
+            == TimeoutType.TIMEOUT_TYPE_START_TO_CLOSE,
+            f"history timeout {timed_out[0].failure.timeout_failure_info!r}",
+        )
+        require(
+            not any(
+                e.HasField("activity_task_completed_event_attributes")
+                or e.HasField("activity_task_failed_event_attributes")
+                for e in events
+            ),
+            "timed-out activity also completed or failed",
+        )
+        return {
+            "workflow_id": workflow_id,
+            "run_id": started.result_run_id,
+            "error_type": cause.type,
+            "details": list(cause.details),
+        }
+    except BaseException:
+        await terminate_quietly(handle)
+        raise
+    raise RuntimeError("interop expectation failed: timed-out order completed")
+
+
 async def incompatible_input_run(client: Client, ready: dict) -> dict:
     """Requires undecodable workflow input to fail the task and leave the run open.
 
@@ -454,6 +543,11 @@ async def main() -> None:
             f"activity failure run: {failure['workflow_id']}/{failure['run_id']}",
             flush=True,
         )
+        timeout = await activity_timeout_run(client, ready)
+        print(
+            f"activity timeout run: {timeout['workflow_id']}/{timeout['run_id']}",
+            flush=True,
+        )
     incompatible = await incompatible_input_run(client, ready)
     print(
         f"incompatible input run: {incompatible['workflow_id']}/{incompatible['run_id']}",
@@ -469,6 +563,7 @@ async def main() -> None:
             "runs": {
                 "success": success,
                 "activity_failure": failure,
+                "activity_timeout": timeout,
                 "incompatible_input": incompatible,
             },
         },
