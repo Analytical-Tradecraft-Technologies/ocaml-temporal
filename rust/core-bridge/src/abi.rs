@@ -30,6 +30,7 @@ use temporalio_client::{
 use temporalio_common::protos::coresdk::{
     ActivityHeartbeat as CoreActivityHeartbeat,
     activity_task::{self, ActivityTask as CoreActivityTask},
+    workflow_completion::WorkflowActivationCompletion,
 };
 use temporalio_common::protos::temporal::api::{
     common::v1 as api_common,
@@ -622,6 +623,40 @@ fn worker_not_running() -> Failure {
         status: STATUS_INVALID_STATE,
         message: "Temporal worker is not running".to_owned(),
     }
+}
+
+/// The failure for a replay operation when no replay worker is running in
+/// this runtime graph.
+fn replay_worker_not_running() -> Failure {
+    Failure {
+        status: STATUS_INVALID_STATE,
+        message: "Temporal replay worker is not running".to_owned(),
+    }
+}
+
+/// Returns the Tokio executor of a graph's Core runtime, or
+/// [`runtime_closed`] once the graph has released its Core reference.
+///
+/// It takes the `core` field rather than the whole [`Runtime`] so callers can
+/// keep disjoint borrows of the graph's other fields (for example a mutable
+/// worker) while they hold the returned handle. The handle is an owned
+/// reference to Core's executor; it never crosses the native boundary.
+fn core_tokio_handle(
+    core: &Option<Arc<SharedCore>>,
+) -> std::result::Result<tokio::runtime::Handle, Failure> {
+    Ok(core.as_ref().ok_or_else(runtime_closed)?.tokio_handle())
+}
+
+/// Returns the Tokio executor of a graph that currently owns a live worker.
+///
+/// A worker is always dropped before its graph's Core reference, so a caller
+/// that has just observed `Some` worker can rely on Core being present; a
+/// missing Core here is a violated internal invariant and panics (contained
+/// by the ABI entry point like every other bridge panic).
+fn live_worker_tokio_handle(core: &Option<Arc<SharedCore>>) -> tokio::runtime::Handle {
+    core.as_ref()
+        .expect("a live worker always has its parent runtime")
+        .tokio_handle()
 }
 
 /// The failure for an async activity request on a runtime that has never
@@ -1755,11 +1790,7 @@ impl Runtime {
             .as_ref()
             .cloned()
             .ok_or_else(client_not_connected)?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle();
+        let handle = core_tokio_handle(&self.core)?;
         // Capture validated request identities before the request is moved into
         // the Core start call so an unencodable server response can still report
         // an Unknown outcome rather than dropping an accepted start.
@@ -1849,11 +1880,7 @@ impl Runtime {
             .as_ref()
             .cloned()
             .ok_or_else(client_not_connected)?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle();
+        let handle = core_tokio_handle(&self.core)?;
         Ok((connection, handle))
     }
 
@@ -2143,11 +2170,7 @@ impl Runtime {
             .as_ref()
             .cloned()
             .ok_or_else(client_not_connected)?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle();
+        let handle = core_tokio_handle(&self.core)?;
 
         // A caller that retries a begin request with the same logical ID must
         // observe the existing ticket only when every validated request field
@@ -2350,11 +2373,7 @@ impl Runtime {
             .as_ref()
             .cloned()
             .ok_or_else(client_not_connected)?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle();
+        let handle = core_tokio_handle(&self.core)?;
         if !self.pending_waits.contains_key(&request) {
             if self.pending_waits.len() >= self.client_limits.pending_waits {
                 return Err(Failure {
@@ -2389,13 +2408,12 @@ impl Runtime {
         Ok(encoded.into_bytes())
     }
 
-    /// Constructs and validates one official Core worker for the configured
-    /// task types.
+    /// Rejects a worker start while either worker graph is present.
     ///
-    /// Validation performs the namespace RPC before the worker enters the
-    /// graph. Any construction or validation failure consumes the temporary
-    /// worker and leaves the connected client available for a corrected retry.
-    fn start_worker(&mut self, config: WorkerConfigInput) -> Operation {
+    /// A runtime admits at most one worker graph: a live and a replay worker
+    /// must never overlap or compete for Core shutdown, and a second start of
+    /// the same kind would orphan the first worker's leases.
+    fn ensure_no_worker_graph(&self) -> std::result::Result<(), Failure> {
         if self.worker.is_some() {
             return Err(Failure {
                 status: STATUS_INVALID_STATE,
@@ -2408,6 +2426,57 @@ impl Runtime {
                 message: "Temporal replay worker is already running".to_owned(),
             });
         }
+        Ok(())
+    }
+
+    /// Strictly decodes one semantic workflow completion and converts it to
+    /// Core's form against the activation leased for its run.
+    ///
+    /// This is the shared validation step of the live, admitted, and replay
+    /// completion paths. It only reads the semantic handoff map: the caller
+    /// removes the run's handoff after Core (or admission) accepts the
+    /// completion, so every failure here leaves the lease untouched. The two
+    /// messages distinguish the live and replay lanes for diagnostics:
+    /// `unmatched` (`STATUS_PROTOCOL`) when no activation is leased for the
+    /// run, and `namespace_missing` (`STATUS_INVALID_STATE`) when the worker
+    /// namespace Core needs for child-workflow commands is absent.
+    fn leased_workflow_completion(
+        &self,
+        input: &[u8],
+        unmatched: &'static str,
+        namespace_missing: &'static str,
+    ) -> std::result::Result<(workflow_protocol::Completion, WorkflowActivationCompletion), Failure>
+    {
+        let text = decode_semantic_input(input)?;
+        let semantic = workflow_protocol::decode_completion(text).map_err(protocol_failure)?;
+        let activation = self
+            .workflow_activations
+            .get(&semantic.run_id)
+            .ok_or_else(|| Failure {
+                status: STATUS_PROTOCOL,
+                message: unmatched.to_owned(),
+            })?;
+        let worker_namespace = self.worker_namespace.as_deref().ok_or_else(|| Failure {
+            status: STATUS_INVALID_STATE,
+            message: namespace_missing.to_owned(),
+        })?;
+        let completion = workflow_protocol::completion_to_core_for_activation_with_namespace(
+            activation,
+            &semantic,
+            worker_namespace,
+        )
+        .map_err(core_conversion_failure)?;
+        Ok((semantic, completion))
+    }
+
+    /// Constructs and validates one official Core worker for the configured
+    /// task types.
+    ///
+    /// Validation performs the namespace RPC before the worker enters the
+    /// graph. Any construction or validation failure consumes the temporary
+    /// worker and leaves the connected client available for a corrected retry.
+    fn start_worker(&mut self, config: WorkerConfigInput) -> Operation {
+        self.ensure_no_worker_graph()?;
         let client = self
             .client
             .as_ref()
@@ -2466,18 +2535,7 @@ impl Runtime {
     /// Temporal client connection. A runtime admits at most one worker graph:
     /// replay and live workers cannot overlap or compete for Core shutdown.
     fn start_replay_worker(&mut self, config: WorkerConfigInput) -> Operation {
-        if self.worker.is_some() {
-            return Err(Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal workflow worker is already running".to_owned(),
-            });
-        }
-        if self.replay_worker.is_some() {
-            return Err(Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal replay worker is already running".to_owned(),
-            });
-        }
+        self.ensure_no_worker_graph()?;
         let worker_namespace = config.namespace.clone();
         let worker_config = config.into_core()?;
         let core = self.core.as_ref().ok_or_else(runtime_closed)?;
@@ -2506,11 +2564,7 @@ impl Runtime {
         let Some(worker) = self.worker.as_mut() else {
             return Ok(Vec::new());
         };
-        let handle = self
-            .core
-            .as_ref()
-            .expect("a live worker always has its parent runtime")
-            .tokio_handle();
+        let handle = live_worker_tokio_handle(&self.core);
         // `initiate_shutdown` synchronously calls `tokio::spawn`.
         let _runtime_guard = handle.enter();
         worker.initiate_shutdown();
@@ -2546,11 +2600,7 @@ impl Runtime {
         let Some(worker) = self.worker.as_mut() else {
             return Ok(Vec::new());
         };
-        let handle = self
-            .core
-            .as_ref()
-            .expect("a live worker always has its parent runtime")
-            .tokio_handle();
+        let handle = live_worker_tokio_handle(&self.core);
         {
             // `initiate_shutdown` synchronously calls `tokio::spawn`; keep
             // the guard narrower than the subsequent blocking finalization.
@@ -2601,12 +2651,7 @@ impl Runtime {
 
     /// Takes one workflow activation from the Rust lane without waiting.
     fn try_poll_workflow(&mut self) -> Operation {
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle()
-            .clone();
+        let handle = core_tokio_handle(&self.core)?;
         let worker = self.worker.as_mut().ok_or_else(worker_not_running)?;
         let activation = worker
             .try_take_workflow(&handle)
@@ -2644,17 +2689,12 @@ impl Runtime {
     /// Takes one replay activation, applies the same strict semantic
     /// conversion as the live worker, and retains its lease until completion.
     fn try_poll_replay_workflow(&mut self) -> Operation {
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle()
-            .clone();
+        let handle = core_tokio_handle(&self.core)?;
         let activation = {
-            let worker = self.replay_worker.as_mut().ok_or_else(|| Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal replay worker is not running".to_owned(),
-            })?;
+            let worker = self
+                .replay_worker
+                .as_mut()
+                .ok_or_else(replay_worker_not_running)?;
             worker
                 .try_take_workflow(&handle)
                 .ok_or_else(not_ready)?
@@ -2697,27 +2737,20 @@ impl Runtime {
     /// commands when Core is quiet; callers retry after `STATUS_NOT_READY`.
     fn wait_workflow(&self) -> Operation {
         let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
-        match worker.wait_workflow() {
-            ReadinessWait::Ready => Ok(Vec::new()),
-            ReadinessWait::TimedOut => Err(Failure {
-                status: STATUS_NOT_READY,
-                message: "Temporal workflow readiness wait timed out; retry".to_owned(),
-            }),
-            ReadinessWait::Shutdown => Err(Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal workflow readiness wait ended during worker shutdown".to_owned(),
-            }),
-            ReadinessWait::Error(error) => Err(poll_lane_failure(error)),
-        }
+        live_readiness_outcome(
+            worker.wait_workflow(),
+            "Temporal workflow readiness wait timed out; retry",
+            "Temporal workflow readiness wait ended during worker shutdown",
+        )
     }
 
     /// Waits for replay activation readiness and records the terminal shutdown
     /// observation needed by the normal replay finalizer.
     fn wait_replay_workflow(&mut self) -> Operation {
-        let worker = self.replay_worker.as_mut().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal replay worker is not running".to_owned(),
-        })?;
+        let worker = self
+            .replay_worker
+            .as_mut()
+            .ok_or_else(replay_worker_not_running)?;
         match worker.wait_workflow() {
             ReadinessWait::Ready => Ok(Vec::new()),
             ReadinessWait::TimedOut => Err(Failure {
@@ -2732,16 +2765,11 @@ impl Runtime {
     /// Queues one strictly validated replay history in Core's bounded feeder.
     fn feed_replay_history_json(&mut self, input: &[u8]) -> Operation {
         let text = decode_semantic_input(input)?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle()
-            .clone();
-        let worker = self.replay_worker.as_mut().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal replay worker is not running".to_owned(),
-        })?;
+        let handle = core_tokio_handle(&self.core)?;
+        let worker = self
+            .replay_worker
+            .as_mut()
+            .ok_or_else(replay_worker_not_running)?;
         worker
             .feed_json(&handle, text)
             .map_err(replay_worker_failure)
@@ -2760,35 +2788,16 @@ impl Runtime {
     /// Completes one replay activation after strict semantic validation and
     /// removes its one-shot lease only after Core accepts the completion.
     fn complete_replay_workflow(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let semantic = workflow_protocol::decode_completion(text).map_err(protocol_failure)?;
-        let activation = self
-            .workflow_activations
-            .get(&semantic.run_id)
-            .ok_or_else(|| Failure {
-                status: STATUS_PROTOCOL,
-                message: "replay workflow completion does not match a leased activation".to_owned(),
-            })?;
-        let worker_namespace = self.worker_namespace.as_deref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal replay worker namespace is not available".to_owned(),
-        })?;
-        let completion = workflow_protocol::completion_to_core_for_activation_with_namespace(
-            activation,
-            &semantic,
-            worker_namespace,
-        )
-        .map_err(core_conversion_failure)?;
-        let handle = self
-            .core
+        let (semantic, completion) = self.leased_workflow_completion(
+            input,
+            "replay workflow completion does not match a leased activation",
+            "Temporal replay worker namespace is not available",
+        )?;
+        let handle = core_tokio_handle(&self.core)?;
+        let worker = self
+            .replay_worker
             .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle()
-            .clone();
-        let worker = self.replay_worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal replay worker is not running".to_owned(),
-        })?;
+            .ok_or_else(replay_worker_not_running)?;
         handle
             .block_on(worker.complete_workflow(completion))
             .map_err(replay_worker_failure)?;
@@ -2819,16 +2828,11 @@ impl Runtime {
         run_id: &str,
         reason: &'static str,
     ) -> std::result::Result<(), Failure> {
-        let handle = self
-            .core
+        let handle = core_tokio_handle(&self.core)?;
+        let worker = self
+            .replay_worker
             .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle()
-            .clone();
-        let worker = self.replay_worker.as_ref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal replay worker is not running".to_owned(),
-        })?;
+            .ok_or_else(replay_worker_not_running)?;
         handle
             .block_on(worker.reject_workflow_delivery(run_id, reason))
             .map_err(replay_worker_failure)
@@ -2836,16 +2840,11 @@ impl Runtime {
 
     /// Finalizes a naturally drained replay and retains it on every failure.
     fn finalize_replay(&mut self) -> Operation {
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle()
-            .clone();
-        let worker = self.replay_worker.take().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal replay worker is not running".to_owned(),
-        })?;
+        let handle = core_tokio_handle(&self.core)?;
+        let worker = self
+            .replay_worker
+            .take()
+            .ok_or_else(replay_worker_not_running)?;
         match handle.block_on(worker.finalize(&handle)) {
             Ok(()) => {
                 self.worker_namespace = None;
@@ -2866,12 +2865,7 @@ impl Runtime {
         if self.replay_worker.is_none() {
             return Ok(Vec::new());
         }
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle()
-            .clone();
+        let handle = core_tokio_handle(&self.core)?;
         let worker = self
             .replay_worker
             .take()
@@ -2892,31 +2886,13 @@ impl Runtime {
 
     /// Strictly validates and submits one leased workflow completion.
     fn complete_workflow(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let semantic = workflow_protocol::decode_completion(text).map_err(protocol_failure)?;
-        let activation = self
-            .workflow_activations
-            .get(&semantic.run_id)
-            .ok_or_else(|| Failure {
-                status: STATUS_PROTOCOL,
-                message: "workflow completion does not match a leased activation".to_owned(),
-            })?;
-        let worker_namespace = self.worker_namespace.as_deref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal workflow worker namespace is not available".to_owned(),
-        })?;
-        let completion = workflow_protocol::completion_to_core_for_activation_with_namespace(
-            activation,
-            &semantic,
-            worker_namespace,
-        )
-        .map_err(core_conversion_failure)?;
+        let (semantic, completion) = self.leased_workflow_completion(
+            input,
+            "workflow completion does not match a leased activation",
+            "Temporal workflow worker namespace is not available",
+        )?;
         let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
-        let handle = self
-            .core
-            .as_ref()
-            .expect("worker retains parent runtime")
-            .tokio_handle();
+        let handle = live_worker_tokio_handle(&self.core);
         handle
             .block_on(worker.complete_workflow(completion))
             .map_err(worker_bridge_failure)?;
@@ -2938,31 +2914,12 @@ impl Runtime {
     /// the ledger lease was retired by admission for the same reason. The
     /// owner Domain never waits for Core or the network on this path.
     fn submit_workflow_completion(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let semantic = workflow_protocol::decode_completion(text).map_err(protocol_failure)?;
-        let activation = self
-            .workflow_activations
-            .get(&semantic.run_id)
-            .ok_or_else(|| Failure {
-                status: STATUS_PROTOCOL,
-                message: "workflow completion does not match a leased activation".to_owned(),
-            })?;
-        let worker_namespace = self.worker_namespace.as_deref().ok_or_else(|| Failure {
-            status: STATUS_INVALID_STATE,
-            message: "Temporal workflow worker namespace is not available".to_owned(),
-        })?;
-        let completion = workflow_protocol::completion_to_core_for_activation_with_namespace(
-            activation,
-            &semantic,
-            worker_namespace,
-        )
-        .map_err(core_conversion_failure)?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle()
-            .clone();
+        let (semantic, completion) = self.leased_workflow_completion(
+            input,
+            "workflow completion does not match a leased activation",
+            "Temporal workflow worker namespace is not available",
+        )?;
+        let handle = core_tokio_handle(&self.core)?;
         let worker = self.worker.as_mut().ok_or_else(worker_not_running)?;
         let ticket = worker
             .submit_workflow_completion(&handle, completion)
@@ -3025,12 +2982,7 @@ impl Runtime {
 
     /// Takes one remote activity task from its independent lane without waiting.
     fn try_poll_activity(&mut self) -> Operation {
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle()
-            .clone();
+        let handle = core_tokio_handle(&self.core)?;
         let worker = self.worker.as_mut().ok_or_else(worker_not_running)?;
         let task = worker
             .try_take_activity(&handle)
@@ -3087,18 +3039,11 @@ impl Runtime {
     /// bounded duration so the owner supervisor can process shutdown messages.
     fn wait_activity(&self) -> Operation {
         let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
-        match worker.wait_activity() {
-            ReadinessWait::Ready => Ok(Vec::new()),
-            ReadinessWait::TimedOut => Err(Failure {
-                status: STATUS_NOT_READY,
-                message: "Temporal activity readiness wait timed out; retry".to_owned(),
-            }),
-            ReadinessWait::Shutdown => Err(Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal activity readiness wait ended during worker shutdown".to_owned(),
-            }),
-            ReadinessWait::Error(error) => Err(poll_lane_failure(error)),
-        }
+        live_readiness_outcome(
+            worker.wait_activity(),
+            "Temporal activity readiness wait timed out; retry",
+            "Temporal activity readiness wait ended during worker shutdown",
+        )
     }
 
     /// Waits for readiness on either live-worker lane without consuming a task.
@@ -3110,18 +3055,11 @@ impl Runtime {
     /// lane has closed without queued work.
     fn wait_any(&self) -> Operation {
         let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
-        match worker.wait_any() {
-            ReadinessWait::Ready => Ok(Vec::new()),
-            ReadinessWait::TimedOut => Err(Failure {
-                status: STATUS_NOT_READY,
-                message: "Temporal worker readiness wait timed out; retry".to_owned(),
-            }),
-            ReadinessWait::Shutdown => Err(Failure {
-                status: STATUS_INVALID_STATE,
-                message: "Temporal worker readiness wait ended during worker shutdown".to_owned(),
-            }),
-            ReadinessWait::Error(error) => Err(poll_lane_failure(error)),
-        }
+        live_readiness_outcome(
+            worker.wait_any(),
+            "Temporal worker readiness wait timed out; retry",
+            "Temporal worker readiness wait ended during worker shutdown",
+        )
     }
 
     /// Applies the fixed native backoff used only after an explicitly
@@ -3147,11 +3085,7 @@ impl Runtime {
         reason: &'static str,
     ) -> std::result::Result<(), Failure> {
         let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
-        let handle = self
-            .core
-            .as_ref()
-            .expect("worker retains parent runtime")
-            .tokio_handle();
+        let handle = live_worker_tokio_handle(&self.core);
         handle
             .block_on(worker.reject_workflow_delivery_with_reason(run_id, reason))
             .map_err(worker_bridge_failure)
@@ -3183,11 +3117,7 @@ impl Runtime {
         reason: &'static str,
     ) -> std::result::Result<(), Failure> {
         let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
-        let handle = self
-            .core
-            .as_ref()
-            .expect("worker retains parent runtime")
-            .tokio_handle();
+        let handle = live_worker_tokio_handle(&self.core);
         handle
             .block_on(worker.reject_activity_delivery(task_token, reason))
             .map_err(worker_bridge_failure)
@@ -3202,11 +3132,7 @@ impl Runtime {
         let completion =
             activity_protocol::completion_to_core(&semantic).map_err(core_conversion_failure)?;
         let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
-        let handle = self
-            .core
-            .as_ref()
-            .expect("worker retains parent runtime")
-            .tokio_handle();
+        let handle = live_worker_tokio_handle(&self.core);
         handle
             .block_on(worker.complete_activity(completion))
             .map_err(worker_bridge_failure)?;
@@ -3271,11 +3197,7 @@ impl Runtime {
     /// token from the heartbeat throttle like submitted ones.
     fn async_activity_blocking(&mut self, request: AsyncActivityRequest) -> Operation {
         let client = self.async_activity_client()?;
-        let handle = self
-            .core
-            .as_ref()
-            .ok_or_else(runtime_closed)?
-            .tokio_handle();
+        let handle = core_tokio_handle(&self.core)?;
         handle.block_on(request.send_evicting(client, &self.heartbeat_throttle))?;
         Ok(Vec::new())
     }
@@ -3642,6 +3564,32 @@ fn shutdown_drain_failure(error: ShutdownDrainError) -> Failure {
             status: STATUS_WORKER,
             message: "Temporal worker poll lanes did not stop within the shutdown bound".to_owned(),
         },
+    }
+}
+
+/// Maps one live-worker readiness wait onto the native status contract.
+///
+/// `Ready` succeeds with an empty result, a bounded timeout is the retryable
+/// `STATUS_NOT_READY` (`timed_out` names the lane), and a lane that closed
+/// during shutdown without queued work is `STATUS_INVALID_STATE`
+/// (`shut_down`). Replay readiness deliberately does not use this mapping:
+/// there, shutdown is the normal end of the history stream.
+fn live_readiness_outcome(
+    wait: ReadinessWait,
+    timed_out: &'static str,
+    shut_down: &'static str,
+) -> Operation {
+    match wait {
+        ReadinessWait::Ready => Ok(Vec::new()),
+        ReadinessWait::TimedOut => Err(Failure {
+            status: STATUS_NOT_READY,
+            message: timed_out.to_owned(),
+        }),
+        ReadinessWait::Shutdown => Err(Failure {
+            status: STATUS_INVALID_STATE,
+            message: shut_down.to_owned(),
+        }),
+        ReadinessWait::Error(error) => Err(poll_lane_failure(error)),
     }
 }
 
