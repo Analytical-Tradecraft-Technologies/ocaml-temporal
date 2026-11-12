@@ -188,7 +188,7 @@ is as of 2026-10-17; check each issue before relying on it.
 | Security reporting and maintenance | [#509] | Open. There is no `SECURITY.md` yet. |
 | Release pipeline rehearsal | [#510] | Open. The source-archive consumer build and signed provenance are automated; a maintainer's prerelease rehearsal is still required. |
 | v1 support and compatibility policy | [#489] | Open. |
-| Documentation reconciled with CI evidence | [#491] | Closed. |
+| Documentation reconciled with CI evidence | [#1142] (after [#491]) | Open. [Live acceptance coverage](live-acceptance-coverage.md) was re-audited at master `7963a9a68e3c` on 2026-11-13, and `make check-doc-pins` fails when a quoted Core pin or Rust toolchain differs from the tree. Re-audit it and [feature coverage](feature-coverage.md) at the candidate commit before sign-off. |
 | Test instrumentation removed from the production worker | [#502] | Closed. |
 
 ## Bad-release remediation
@@ -241,6 +241,7 @@ there should also be superseded rather than removed.
 
 [#489]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/489
 [#491]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/491
+[#1142]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/1142
 [#502]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/502
 [#506]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/506
 [#507]: https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/507

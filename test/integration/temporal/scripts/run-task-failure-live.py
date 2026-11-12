@@ -62,6 +62,50 @@ def command(args, timeout=120):
         raise
 
 
+CLI_RETRY_ATTEMPTS = 5
+CLI_RETRY_SLEEP_SECONDS = 3
+CLI_CONNECTION_DEADLINE = re.compile(
+    r"Error: failed connecting to Temporal server at .*: context deadline exceeded")
+
+
+def transient_cli_error(stderr):
+    """Mirror temporal_cli_transient_error in temporal-cli-retry.sh (#1285).
+
+    A gRPC Unavailable or DeadlineExceeded status anywhere in the text is
+    transient. The CLI's connection deadline counts only when it is the first
+    line that starts with "Error: ", because the CLI appends diagnostics after
+    its primary error and Compose can print progress lines before it. The
+    smoke tests check that both implementations agree on the same samples.
+    """
+    if "code = Unavailable" in stderr or "code = DeadlineExceeded" in stderr:
+        return True
+    primary = next((line for line in stderr.splitlines() if line.startswith("Error: ")), None)
+    return primary is not None and CLI_CONNECTION_DEADLINE.fullmatch(primary) is not None
+
+
+def read_only_command(args, timeout=120, sleep=time.sleep):
+    """Run a read-only admin CLI query, retrying transient transport failures.
+
+    Only workflow describe/show style queries may use this: a repeated attempt
+    must be harmless even when an earlier one reached the server. Each failed
+    attempt still goes through [command], so its diagnostic is retained; a
+    retry only adds one line to stderr. A non-transport failure, a timeout, or
+    the last of CLI_RETRY_ATTEMPTS attempts re-raises the original error.
+    """
+    for attempt in range(1, CLI_RETRY_ATTEMPTS + 1):
+        try:
+            return command(args, timeout)
+        except subprocess.CalledProcessError as error:
+            if (attempt == CLI_RETRY_ATTEMPTS
+                    or not transient_cli_error(diagnostic_text(error.stderr))):
+                raise
+            print(f"Transient Temporal CLI failure (attempt {attempt} of "
+                  f"{CLI_RETRY_ATTEMPTS}), retrying in {CLI_RETRY_SLEEP_SECONDS}s",
+                  file=sys.stderr, flush=True)
+            sleep(CLI_RETRY_SLEEP_SECONDS)
+    raise AssertionError("unreachable: the final attempt returns or raises")
+
+
 def save_json(name, value):
     """Retain readable immutable evidence under this invocation's directory."""
     (ARTIFACTS / name).write_text(json.dumps(value, indent=2) + "\n")
@@ -141,7 +185,7 @@ def stop_worker(generation, container):
 
 def describe(name, workflow_id, run_id, stage):
     """Bind the returned identity separately because raw histories can omit it."""
-    value = json.loads(command(COMPOSE + ["run", "--rm", "--no-deps", "temporal-admin-tools",
+    value = json.loads(read_only_command(COMPOSE + ["run", "--rm", "--no-deps", "temporal-admin-tools",
         "temporal", "workflow", "describe", "--workflow-id", workflow_id,
         "--run-id", run_id, "--namespace", "temporal-sdk-test", "--output", "json"]))
     save_json(f"{name}.{stage}.describe.json", value)
@@ -154,7 +198,7 @@ def describe(name, workflow_id, run_id, stage):
 
 def history(name, workflow_id, run_id, stage):
     """Retain unmodified payload-bearing JSON from this exact server run."""
-    value = json.loads(command(COMPOSE + ["run", "--rm", "--no-deps", "temporal-admin-tools",
+    value = json.loads(read_only_command(COMPOSE + ["run", "--rm", "--no-deps", "temporal-admin-tools",
         "temporal", "workflow", "show", "--workflow-id", workflow_id,
         "--run-id", run_id, "--namespace", "temporal-sdk-test", "--output", "json"]))
     save_json(f"{name}.{stage}.history.json", value)

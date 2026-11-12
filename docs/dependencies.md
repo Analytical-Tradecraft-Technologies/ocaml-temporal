@@ -381,7 +381,7 @@ before publication.
 ## Locked Cargo closure
 
 `rust/Cargo.lock` locks the project bridge and its dependencies
-rooted at Temporal Core commit `8fe478ee179ed754614d230f39586f3edb57da71`
+rooted at Temporal Core commit `8fe478ee179ed754614d230f39586f3edb57da71`<!-- pin:core -->
 (upstream release tags `v1.1.0` and `core-v0.10.0`).
 Some crates are locked at more than one version because different packages in
 the graph require incompatible releases. The client, common, and SDK-Core

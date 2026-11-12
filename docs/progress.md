@@ -6831,3 +6831,21 @@ check name and passes only when every shard did. A PR run with all three
 changes reached the required check in 41 minutes. `make test-temporal-config` checks that the matrix equals
 `LIVE_CI_SHARDS`, that every recipe line is tagged, and that the shards
 together run each line exactly once. See [quality gates](reference/quality-gates.md#merge-queue-time-budget).
+
+## 2026-11-13: Bounded retry for read-only admin CLI queries
+
+One-shot official CLI queries in the live tests no longer fail a whole job on
+a single transient gRPC connection deadline (#1285). The namespace-readiness
+classifier from #753 and #839 now lives in
+`test/integration/temporal/scripts/temporal-cli-retry.sh`, which the health
+gate sources inside admin-tools and which also defines
+`temporal_cli_read_only`. The start-metadata, patch, parent/child and
+child-failure replay controllers, the task-failure controller, and the
+worker-restart and cache-eviction identity/history captures route `workflow
+describe`, `show`, `query` and `search-attribute list` through it: up to five
+attempts on `Unavailable`, `DeadlineExceeded` or the CLI connection deadline,
+with only the final stdout written. Mutating calls stay single-attempt.
+`make test-temporal-cli-retry` (part of `test-quality-contract`) and the
+task-failure command tests cover retry, bound, pass-through of fatal errors and
+shell/Python classifier agreement. See the [local stack
+reference](reference/local-temporal-stack.md#operator-commands).

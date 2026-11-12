@@ -2287,6 +2287,46 @@ impl PollLanes {
             .await
     }
 
+    /// Hands one workflow completion to Core and awaits its reply as `wait`
+    /// selects.
+    ///
+    /// Returns `Some` with Core's own answer, which the caller turns into
+    /// ledger bookkeeping. With [`CompletionWait::ReplayBounded`] the await is
+    /// bounded by [`complete_workflow_unless_stranded`]: a timeout is
+    /// [`WorkerBridgeError::CoreWaitTimedOut`], and a completion stranded by a
+    /// terminated workflow stream is [`WorkerBridgeError::CompletionStranded`]
+    /// unless `stranded_is_success`, in which case the result is `None` and the
+    /// caller reports success without further bookkeeping. Callers pass
+    /// `true` only for an empty (eviction) acknowledgement, which Core itself
+    /// ignores once the stream has ended. Neither error path restores the
+    /// lease: Core may already have consumed the completion.
+    async fn send_workflow_completion(
+        &self,
+        completion: WorkflowActivationCompletion,
+        wait: CompletionWait,
+        stranded_is_success: bool,
+    ) -> Result<Option<Result<(), CompleteWfError>>, WorkerBridgeError> {
+        match wait {
+            CompletionWait::Unbounded => Ok(Some(
+                self.worker.complete_workflow_activation(completion).await,
+            )),
+            CompletionWait::ReplayBounded => {
+                match complete_workflow_unless_stranded(
+                    &self.worker,
+                    &self.workflow_signal,
+                    completion,
+                )
+                .await
+                {
+                    GuardedCompletion::Finished(result) => Ok(Some(result)),
+                    GuardedCompletion::Stranded if stranded_is_success => Ok(None),
+                    GuardedCompletion::Stranded => Err(WorkerBridgeError::CompletionStranded),
+                    GuardedCompletion::TimedOut => Err(WorkerBridgeError::CoreWaitTimedOut),
+                }
+            }
+        }
+    }
+
     /// Shared implementation of [`Self::complete_workflow`] and
     /// [`Self::complete_replay_workflow`]; `wait` selects how Core's reply
     /// is awaited.
@@ -2318,26 +2358,11 @@ impl PollLanes {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .probe_complete_completion(&run_id);
-        let core_result = match wait {
-            CompletionWait::Unbounded => self.worker.complete_workflow_activation(completion).await,
-            CompletionWait::ReplayBounded => {
-                match complete_workflow_unless_stranded(
-                    &self.worker,
-                    &self.workflow_signal,
-                    completion,
-                )
-                .await
-                {
-                    GuardedCompletion::Finished(result) => result,
-                    GuardedCompletion::Stranded if is_empty => return Ok(()),
-                    GuardedCompletion::Stranded => {
-                        return Err(WorkerBridgeError::CompletionStranded);
-                    }
-                    GuardedCompletion::TimedOut => {
-                        return Err(WorkerBridgeError::CoreWaitTimedOut);
-                    }
-                }
-            }
+        let Some(core_result) = self
+            .send_workflow_completion(completion, wait, is_empty)
+            .await?
+        else {
+            return Ok(());
         };
         match core_result {
             Ok(()) => {
@@ -2588,28 +2613,13 @@ impl PollLanes {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .probe_reject_completion(run_id);
-        let core_result = match wait {
-            CompletionWait::Unbounded => self.worker.complete_workflow_activation(completion).await,
-            CompletionWait::ReplayBounded => {
-                match complete_workflow_unless_stranded(
-                    &self.worker,
-                    &self.workflow_signal,
-                    completion,
-                )
-                .await
-                {
-                    GuardedCompletion::Finished(result) => result,
-                    // An eviction acknowledgement is empty; see
-                    // `complete_replay_workflow` for why that is success.
-                    GuardedCompletion::Stranded if eviction_only => return Ok(()),
-                    GuardedCompletion::Stranded => {
-                        return Err(WorkerBridgeError::CompletionStranded);
-                    }
-                    GuardedCompletion::TimedOut => {
-                        return Err(WorkerBridgeError::CoreWaitTimedOut);
-                    }
-                }
-            }
+        // An eviction acknowledgement is empty; see `complete_replay_workflow`
+        // for why a stranded one is success.
+        let Some(core_result) = self
+            .send_workflow_completion(completion, wait, eviction_only)
+            .await?
+        else {
+            return Ok(());
         };
         core_result.map_err(|error| WorkerBridgeError::CoreWorkflow(error.to_string()))
     }

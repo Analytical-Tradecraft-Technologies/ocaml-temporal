@@ -136,7 +136,7 @@ or error-handling defect. C11 and C++11 consumers get equivalent checks.
 ## Temporal Core revision
 
 The bridge links Temporal Core commit
-`8fe478ee179ed754614d230f39586f3edb57da71`, the commit of upstream release tags
+`8fe478ee179ed754614d230f39586f3edb57da71`<!-- pin:core -->, the commit of upstream release tags
 `v1.1.0` and `core-v0.10.0` (crates `temporalio-client`/`-common` 1.1.0 and
 `temporalio-sdk-core`/`-protos` 0.10.0). `TEMPORAL_CORE_REVISION` in
 `rust/core-bridge/src/lib.rs` records it; the weekly freshness check described

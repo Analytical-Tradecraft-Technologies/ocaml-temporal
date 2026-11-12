@@ -59,6 +59,10 @@ compose() {
       --project-name "$project" --profile temporal "$@"
 }
 
+# Defines temporal_cli_read_only, which retries the read-only describe/show
+# queries below on a transient CLI transport failure (#1285).
+. "$fixture/scripts/temporal-cli-retry.sh"
+
 # Counts only volumes created by this Compose project. The live gate starts
 # and ends at zero so no PostgreSQL history can satisfy a later run.
 project_volume_count() {
@@ -189,7 +193,7 @@ fetch_raw_history() {
   workflow_id=$1
   run_id=$2
   destination=$3
-  compose run --rm --no-deps temporal-admin-tools temporal workflow show \
+  temporal_cli_read_only compose run --rm --no-deps temporal-admin-tools temporal workflow show \
     --workflow-id "$workflow_id" --run-id "$run_id" \
     --namespace temporal-sdk-test --output json >"$destination" 2>/dev/null
 }
@@ -268,7 +272,7 @@ check_execution_identity() {
   workflow_id=$1
   run_id=$2
   destination=$3
-  compose run --rm --no-deps temporal-admin-tools temporal workflow describe \
+  temporal_cli_read_only compose run --rm --no-deps temporal-admin-tools temporal workflow describe \
     --workflow-id "$workflow_id" --run-id "$run_id" \
     --namespace temporal-sdk-test --output json >"$destination" 2>/dev/null
   sh "$identity_validator" --input "$destination" --workflow-id "$workflow_id" \

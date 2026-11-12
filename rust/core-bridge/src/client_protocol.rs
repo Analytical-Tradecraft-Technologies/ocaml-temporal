@@ -16,10 +16,12 @@ use std::time::Duration;
 use temporalio_client::grpc::WorkflowService;
 use temporalio_client::request_extensions::{NoRetryOnMatching, RetryConfigForCall};
 use temporalio_client::tonic::metadata::MetadataValue;
-use temporalio_client::tonic::{Code, IntoRequest, Request, Status};
+use temporalio_client::tonic::{Code, IntoRequest, Request, Response, Status};
 use temporalio_client::{Connection, RetryOptions};
 use temporalio_common::protos::temporal::api::{
-    common::v1::{Memo, Payloads, SearchAttributes, WorkflowExecution, WorkflowType},
+    common::v1::{
+        Memo, Payload as CorePayload, Payloads, SearchAttributes, WorkflowExecution, WorkflowType,
+    },
     enums::v1::{
         HistoryEventFilterType, UpdateWorkflowExecutionLifecycleStage, WorkflowIdConflictPolicy,
         WorkflowIdReusePolicy,
@@ -1304,6 +1306,36 @@ where
     }
 }
 
+/// Awaits one budgeted workflow-service call and maps both of its failure
+/// modes the way every budgeted client operation reports them.
+///
+/// `call` is the already-constructed RPC future (its request should carry the
+/// same `budget` through [`budgeted_request`]), and `started` is the instant
+/// the operation's budget began. The outer `budget` timeout is the hard bound
+/// on the owner's wait: when it fires the operation is the typed
+/// `deadline_exceeded` RPC error. A returned status is mapped by `map`
+/// through [`budget_status`], so a transport or server deadline that expires
+/// together with the budget is reported the same way (#499). On success the
+/// response message is returned without its gRPC metadata.
+async fn budgeted_rpc<T, M>(
+    budget: Duration,
+    started: tokio::time::Instant,
+    call: impl std::future::Future<Output = Result<Response<T>, Status>>,
+    map: M,
+) -> Result<T, ClientOperationError>
+where
+    M: FnOnce(Status) -> ClientOperationError,
+{
+    match tokio::time::timeout(budget, call).await {
+        Ok(result) => Ok(result
+            .map_err(budget_status(started, budget, map))?
+            .into_inner()),
+        Err(_) => Err(ClientOperationError::Rpc {
+            code: "deadline_exceeded".to_owned(),
+        }),
+    }
+}
+
 /// Reports whether a failed `TerminateWorkflowExecution` attempt must be
 /// returned instead of retried.
 ///
@@ -1377,8 +1409,9 @@ pub async fn list_visibility(
         })
         .transpose()?;
     let mut service = connection.clone();
-    let response = match tokio::time::timeout(
+    let response = budgeted_rpc(
         budget,
+        started,
         service.list_workflow_executions(budgeted_request(
             ListWorkflowExecutionsRequest {
                 namespace: request.namespace,
@@ -1388,18 +1421,9 @@ pub async fn list_visibility(
             },
             budget,
         )),
+        map_rpc_status,
     )
-    .await
-    {
-        Ok(result) => result
-            .map_err(budget_status(started, budget, map_rpc_status))?
-            .into_inner(),
-        Err(_) => {
-            return Err(ClientOperationError::Rpc {
-                code: "deadline_exceeded".to_owned(),
-            });
-        }
-    };
+    .await?;
     let mut executions = Vec::with_capacity(response.executions.len());
     for info in response.executions {
         let execution = info.execution.ok_or_else(|| {
@@ -1479,21 +1503,13 @@ pub async fn fetch_history(
             skip_archival: false,
         };
         let started = tokio::time::Instant::now();
-        let response = match tokio::time::timeout(
+        let response = budgeted_rpc(
             budget,
+            started,
             service.get_workflow_execution_history(budgeted_request(page, budget)),
+            map_rpc_status,
         )
-        .await
-        {
-            Ok(result) => result
-                .map_err(budget_status(started, budget, map_rpc_status))?
-                .into_inner(),
-            Err(_) => {
-                return Err(ClientOperationError::Rpc {
-                    code: "deadline_exceeded".to_owned(),
-                });
-            }
-        };
+        .await?;
         if let Some(history) = response.history
             && !history.events.is_empty()
         {
@@ -1547,21 +1563,13 @@ pub async fn cancel_workflow(
         reason: request.reason,
         ..Default::default()
     };
-    match tokio::time::timeout(
+    budgeted_rpc(
         budget,
+        started,
         service.request_cancel_workflow_execution(budgeted_request(request, budget)),
+        map_rpc_status,
     )
-    .await
-    {
-        Ok(result) => {
-            result.map_err(budget_status(started, budget, map_rpc_status))?;
-        }
-        Err(_) => {
-            return Err(ClientOperationError::Rpc {
-                code: "deadline_exceeded".to_owned(),
-            });
-        }
-    }
+    .await?;
     Ok(CancelWorkflowResponse { acknowledged: true })
 }
 
@@ -1578,8 +1586,9 @@ pub async fn reset_workflow(
     let mut service = connection.clone();
     let namespace = request.namespace.clone();
     let workflow_id = request.workflow_id.clone();
-    let response = match tokio::time::timeout(
+    let response = budgeted_rpc(
         budget,
+        started,
         service.reset_workflow_execution(budgeted_request(
             ResetWorkflowExecutionRequest {
                 namespace: request.namespace,
@@ -1595,18 +1604,9 @@ pub async fn reset_workflow(
             },
             budget,
         )),
+        map_rpc_status,
     )
-    .await
-    {
-        Ok(result) => result
-            .map_err(budget_status(started, budget, map_rpc_status))?
-            .into_inner(),
-        Err(_) => {
-            return Err(ClientOperationError::Rpc {
-                code: "deadline_exceeded".to_owned(),
-            });
-        }
-    };
+    .await?;
     if response.run_id.is_empty() {
         return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
             "Temporal reset response omitted run ID",
@@ -1703,21 +1703,13 @@ pub async fn signal_workflow(
         request_id: request.request_id,
         ..Default::default()
     };
-    match tokio::time::timeout(
+    budgeted_rpc(
         budget,
+        started,
         service.signal_workflow_execution(budgeted_request(request, budget)),
+        map_rpc_status,
     )
-    .await
-    {
-        Ok(result) => {
-            result.map_err(budget_status(started, budget, map_rpc_status))?;
-        }
-        Err(_) => {
-            return Err(ClientOperationError::Rpc {
-                code: "deadline_exceeded".to_owned(),
-            });
-        }
-    }
+    .await?;
     Ok(SignalWorkflowResponse { acknowledged: true })
 }
 
@@ -1756,21 +1748,13 @@ pub async fn query_workflow(
         // enum variant names that can change with protobuf regeneration.
         query_reject_condition: 1,
     };
-    let response = match tokio::time::timeout(
+    let response = budgeted_rpc(
         budget,
+        started,
         service.query_workflow(budgeted_request(request, budget)),
+        map_query_status,
     )
-    .await
-    {
-        Ok(result) => result
-            .map_err(budget_status(started, budget, map_query_status))?
-            .into_inner(),
-        Err(_) => {
-            return Err(ClientOperationError::Rpc {
-                code: "deadline_exceeded".to_owned(),
-            });
-        }
-    };
+    .await?;
     if response.query_rejected.is_some() {
         return Err(ClientOperationError::Rpc {
             code: "failed_precondition".to_owned(),
@@ -2134,8 +2118,9 @@ pub async fn start_workflow(
     // Connection owns Core's retry policy; its underlying workflow service
     // skips that policy and gives up on the first transient transport error.
     let mut service = connection.clone();
-    let response = match tokio::time::timeout(
+    let response = budgeted_rpc(
         budget,
+        started,
         service.start_workflow_execution(budgeted_request(
             StartWorkflowExecutionRequest {
                 namespace: request.namespace.clone(),
@@ -2169,19 +2154,9 @@ pub async fn start_workflow(
             },
             budget,
         )),
+        |status| map_start_status(&workflow_id, status),
     )
-    .await
-    {
-        Ok(result) => result.map_err(budget_status(started, budget, |status| {
-            map_start_status(&workflow_id, status)
-        }))?,
-        Err(_elapsed) => {
-            return Err(ClientOperationError::Rpc {
-                code: "deadline_exceeded".to_owned(),
-            });
-        }
-    }
-    .into_inner();
+    .await?;
 
     // Only USE_EXISTING can succeed without creating a run. Servers that
     // predate `started` leave it false, so the other policies (whose success
@@ -2390,15 +2365,7 @@ fn payloads_to_core(
 fn metadata_to_memo(
     fields: &[MetadataField],
 ) -> Result<Option<Memo>, workflow_protocol::CoreConversionError> {
-    if fields.is_empty() {
-        return Ok(None);
-    }
-    let mut values = HashMap::with_capacity(fields.len());
-    for field in fields {
-        let payload = workflow_protocol::payload_to_core(&field.value)?;
-        values.insert(field.key.clone(), payload);
-    }
-    Ok(Some(Memo { fields: values }))
+    Ok(metadata_payload_map(fields)?.map(|fields| Memo { fields }))
 }
 
 /// Converts named OCaml search attributes to Temporal's indexed-field map.
@@ -2407,6 +2374,20 @@ fn metadata_to_memo(
 fn metadata_to_search_attributes(
     fields: &[MetadataField],
 ) -> Result<Option<SearchAttributes>, workflow_protocol::CoreConversionError> {
+    Ok(metadata_payload_map(fields)?.map(|indexed_fields| SearchAttributes { indexed_fields }))
+}
+
+/// Converts named OCaml metadata to the key-to-payload map shared by memo and
+/// search attributes.
+///
+/// An empty list is `None`, so the request leaves the field unset rather than
+/// sending an empty map. Keys were already validated as unique by
+/// [`validate_metadata`]; each value is converted with the same payload
+/// validation as every other outgoing payload, and the first invalid one
+/// fails the whole conversion.
+fn metadata_payload_map(
+    fields: &[MetadataField],
+) -> Result<Option<HashMap<String, CorePayload>>, workflow_protocol::CoreConversionError> {
     if fields.is_empty() {
         return Ok(None);
     }
@@ -2415,9 +2396,7 @@ fn metadata_to_search_attributes(
         let payload = workflow_protocol::payload_to_core(&field.value)?;
         values.insert(field.key.clone(), payload);
     }
-    Ok(Some(SearchAttributes {
-        indexed_fields: values,
-    }))
+    Ok(Some(values))
 }
 
 /// Builds successor metadata only for a nonempty Core run ID.
@@ -2543,7 +2522,9 @@ fn map_rpc_status(status: Status) -> ClientOperationError {
 /// Tonic's `Debug` spelling is Rust-style (`AlreadyExists`) and lowercasing it
 /// would collapse word boundaries (`alreadyexists`).  An explicit table keeps
 /// the error ABI stable if tonic changes its formatting implementation.
-fn rpc_code(code: Code) -> &'static str {
+/// Connection diagnostics reuse this table so a status is spelled the same
+/// way in every bridge-generated message.
+pub(crate) fn rpc_code(code: Code) -> &'static str {
     match code {
         Code::Ok => "ok",
         Code::Cancelled => "cancelled",

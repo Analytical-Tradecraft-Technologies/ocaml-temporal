@@ -124,6 +124,8 @@ services:
       TEMPORAL_NAMESPACE: temporal-sdk-test
     volumes:
       - ./scripts/check-temporal-stack.sh:/scripts/check-temporal-stack.sh:ro
+      # Sourced by check-temporal-stack.sh for its transient-error classifier.
+      - ./scripts/temporal-cli-retry.sh:/scripts/temporal-cli-retry.sh:ro
     networks:
       - temporal-network
 

@@ -2171,38 +2171,40 @@ fn validate_inbound_retry_policy(value: &RetryPolicy, path: &str) -> Result<(), 
 
 /// Strictly decodes one workflow activation.
 pub fn decode_activation(input: &str) -> Result<Activation, ProtocolError> {
-    let activation: Activation = protocol::semantic_from_value(
-        protocol::decode_payload_object(input)?,
+    protocol::decode_validated_semantic(
+        input,
         "invalid workflow activation semantics",
-    )?;
-    validate_activation(&activation)?;
-    Ok(activation)
+        validate_activation,
+    )
 }
 
 /// Validates, normalizes, and reparses one outgoing workflow activation.
 pub fn encode_activation(value: &Activation) -> Result<String, ProtocolError> {
-    validate_activation(value)?;
-    let output = protocol::encode_semantic(value, "could not encode workflow activation")?;
-    decode_activation(&output)?;
-    Ok(output)
+    protocol::encode_validated_semantic(
+        value,
+        validate_activation,
+        "could not encode workflow activation",
+        decode_activation,
+    )
 }
 
 /// Strictly decodes one successful workflow completion.
 pub fn decode_completion(input: &str) -> Result<Completion, ProtocolError> {
-    let completion: Completion = protocol::semantic_from_value(
-        protocol::decode_payload_object(input)?,
+    protocol::decode_validated_semantic(
+        input,
         "invalid workflow completion semantics",
-    )?;
-    validate_completion(&completion)?;
-    Ok(completion)
+        validate_completion,
+    )
 }
 
 /// Validates, normalizes, and reparses one outgoing workflow completion.
 pub fn encode_completion(value: &Completion) -> Result<String, ProtocolError> {
-    validate_completion(value)?;
-    let output = protocol::encode_semantic(value, "could not encode workflow completion")?;
-    decode_completion(&output)?;
-    Ok(output)
+    protocol::encode_validated_semantic(
+        value,
+        validate_completion,
+        "could not encode workflow completion",
+        decode_completion,
+    )
 }
 
 /// Why an official Core protobuf could not be represented losslessly.

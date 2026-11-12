@@ -166,10 +166,11 @@ opaque bytes with encoding metadata.
 
 ## Current status at a glance
 
-The [feature reference](reference/feature-coverage.md) and
-[live evidence matrix](reference/live-acceptance-coverage.md) record the audit at
-`beae10d0a58e`, including the successful September 19 CI job and exact source
-links. Keep current support wording aligned with the v1 policy decision.
+The [live evidence matrix](reference/live-acceptance-coverage.md) records the
+#1142 re-audit at master `7963a9a68e3c`, with the successful November 10 CI run
+and exact source links. The [feature reference](reference/feature-coverage.md)
+still names its September audit of `beae10d0a58e`; its re-audit is tracked by
+#1142. Keep current support wording aligned with the v1 policy decision.
 
 | Layer | Evidence | Important limit |
 | --- | --- | --- |

@@ -261,36 +261,12 @@ pub fn encode(envelope: &Envelope) -> Result<String, ProtocolError> {
 /// The caller must still enforce a closed semantic shape before using the
 /// returned value to change workflow or Core state.
 pub fn decode_object(input: &str) -> Result<JsonValue, ProtocolError> {
-    let value = parse_strict(input)?;
-    if matches!(value, JsonValue::Object(_)) {
-        Ok(value)
-    } else {
-        Err(ProtocolError::invalid(
-            "$",
-            "operation body must be a JSON object",
-        ))
-    }
+    decode_object_with_string_limit(input, MAX_STRING_BYTES)
 }
 
 /// Validates, normalizes, and independently reparses an outgoing object.
 pub fn encode_object(value: &JsonValue) -> Result<String, ProtocolError> {
-    if !matches!(value, JsonValue::Object(_)) {
-        return Err(ProtocolError::invalid(
-            "$",
-            "operation body must be a JSON object",
-        ));
-    }
-    let mut nodes = 0;
-    validate_tree(value, 1, &mut nodes, MAX_STRING_BYTES)?;
-    let output = render_json(value)?;
-    let reparsed = decode_object(&output)?;
-    if render_json(&reparsed)? != output {
-        return Err(ProtocolError::invalid(
-            "$",
-            "outgoing object did not round trip",
-        ));
-    }
-    Ok(output)
+    encode_object_with_string_limit(value, MAX_STRING_BYTES)
 }
 
 /// Decodes a semantic object while allowing maximum-size encoded payload data.
@@ -298,7 +274,25 @@ pub fn encode_object(value: &JsonValue) -> Result<String, ProtocolError> {
 /// Semantic callers must immediately validate a closed shape and apply
 /// [`MAX_STRING_BYTES`] to every string except canonical base64 payload data.
 pub fn decode_payload_object(input: &str) -> Result<JsonValue, ProtocolError> {
-    let value = parse_strict_with_string_limit(input, MAX_PAYLOAD_BASE64_BYTES)?;
+    decode_object_with_string_limit(input, MAX_PAYLOAD_BASE64_BYTES)
+}
+
+/// Normalizes and reparses a semantically validated object with payload data.
+pub fn encode_payload_object(value: &JsonValue) -> Result<String, ProtocolError> {
+    encode_object_with_string_limit(value, MAX_PAYLOAD_BASE64_BYTES)
+}
+
+/// Strictly parses one document whose root must be a JSON object.
+///
+/// `string_limit` is the decoded byte cap applied to every string. It is
+/// [`MAX_STRING_BYTES`] for ordinary operation bodies and
+/// [`MAX_PAYLOAD_BASE64_BYTES`] only for semantic documents that carry
+/// payload data; every other bound (depth, node count, duplicates) is shared.
+fn decode_object_with_string_limit(
+    input: &str,
+    string_limit: usize,
+) -> Result<JsonValue, ProtocolError> {
+    let value = parse_strict_with_string_limit(input, string_limit)?;
     if matches!(value, JsonValue::Object(_)) {
         Ok(value)
     } else {
@@ -309,8 +303,16 @@ pub fn decode_payload_object(input: &str) -> Result<JsonValue, ProtocolError> {
     }
 }
 
-/// Normalizes and reparses a semantically validated object with payload data.
-pub fn encode_payload_object(value: &JsonValue) -> Result<String, ProtocolError> {
+/// Validates, renders, and independently reparses one outgoing object.
+///
+/// The rendered text is reparsed with the same `string_limit` and rendered
+/// again; it is returned only when both renderings are byte-identical, so an
+/// outgoing document is never one the strict decoder on the other side of the
+/// native boundary would read differently.
+fn encode_object_with_string_limit(
+    value: &JsonValue,
+    string_limit: usize,
+) -> Result<String, ProtocolError> {
     if !matches!(value, JsonValue::Object(_)) {
         return Err(ProtocolError::invalid(
             "$",
@@ -318,9 +320,9 @@ pub fn encode_payload_object(value: &JsonValue) -> Result<String, ProtocolError>
         ));
     }
     let mut nodes = 0;
-    validate_tree(value, 1, &mut nodes, MAX_PAYLOAD_BASE64_BYTES)?;
+    validate_tree(value, 1, &mut nodes, string_limit)?;
     let output = render_json(value)?;
-    let reparsed = decode_payload_object(&output)?;
+    let reparsed = decode_object_with_string_limit(&output, string_limit)?;
     if render_json(&reparsed)? != output {
         return Err(ProtocolError::invalid(
             "$",
@@ -352,6 +354,42 @@ pub(crate) fn encode_semantic<T: serde::Serialize>(
 ) -> Result<String, ProtocolError> {
     let json = serde_json::to_value(value).map_err(|_| ProtocolError::invalid("$", unencodable))?;
     encode_payload_object(&from_serde(json)?)
+}
+
+/// Strictly decodes one typed semantic document and applies its validator.
+///
+/// This is the shared inbound contract for the semantic activity and workflow
+/// documents: the strict payload-object parser runs first, then Serde maps the
+/// closed shape (reporting `invalid` at path `$`), and finally `validate`
+/// enforces the document's semantic bounds. A value is returned only after all
+/// three succeed.
+pub(crate) fn decode_validated_semantic<T: serde::de::DeserializeOwned>(
+    input: &str,
+    invalid: &'static str,
+    validate: impl FnOnce(&T) -> Result<(), ProtocolError>,
+) -> Result<T, ProtocolError> {
+    let document: T = semantic_from_value(decode_payload_object(input)?, invalid)?;
+    validate(&document)?;
+    Ok(document)
+}
+
+/// Validates, encodes, and reparses one outgoing typed semantic document.
+///
+/// This is the shared outbound contract for the semantic activity and
+/// workflow documents: `validate` runs before anything is rendered, the
+/// document is encoded through [`encode_semantic`] (reporting `unencodable`
+/// at path `$`), and the rendered text must be accepted by `decode`, the
+/// document's own strict decoder, before it may cross the native boundary.
+pub(crate) fn encode_validated_semantic<T: serde::Serialize>(
+    value: &T,
+    validate: impl FnOnce(&T) -> Result<(), ProtocolError>,
+    unencodable: &'static str,
+    decode: impl FnOnce(&str) -> Result<T, ProtocolError>,
+) -> Result<String, ProtocolError> {
+    validate(value)?;
+    let output = encode_semantic(value, unencodable)?;
+    decode(&output)?;
+    Ok(output)
 }
 
 /// Converts the duplicate-aware protocol tree into Serde's value tree.

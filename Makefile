@@ -556,13 +556,23 @@ update-live-acceptance-inventory:
 test-live-acceptance-inventory-contract:
 	sh test/smoke/test_live_acceptance_inventory_contract.sh .
 
+# Reference documents that quote the current Temporal Core pin or Rust
+# toolchain must match rust/Cargo.toml and rust/rust-toolchain.toml (#1142).
+# test-quality-contract runs both; see docs/reference/live-acceptance-coverage.md.
+.PHONY: check-doc-pins test-doc-pins-contract
+check-doc-pins:
+	sh scripts/check-doc-pins.sh .
+
+test-doc-pins-contract:
+	sh test/smoke/test_doc_pins_contract.sh .
+
 # The license-policy fixtures (#1150) need `opam show`, so they run in the
 # Compose development image. The native macOS lane runs them with its own
 # OCaml toolchain; native Windows skips them because its opam cannot read the
 # MSYS temporary fixture paths, and the policy itself is platform-independent.
 LICENSE_POLICY_TEST ?= $(COMPOSE_RUN) sh test/smoke/test_license_policy.sh .
 
-test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness test-temporal-live-regressions-contract
+test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inventory-contract test-temporal-namespace-readiness test-temporal-cli-retry test-temporal-live-regressions-contract
 	sh test/smoke/test_quality_contract.sh .
 	$(LICENSE_POLICY_TEST)
 	sh test/smoke/test_build_jobs_contract.sh .
@@ -570,6 +580,8 @@ test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inve
 	sh test/smoke/test_release_tag_contract.sh .
 	sh test/smoke/test_release_notes_contract.sh .
 	sh test/smoke/test_release_tag_commit_contract.sh .
+	sh scripts/check-doc-pins.sh .
+	sh test/smoke/test_doc_pins_contract.sh .
 	sh test/smoke/test_prebuilt_install_tag_contract.sh .
 	sh test/smoke/test_make_docker_commands.sh .
 	sh test/smoke/test_make_seed_validation.sh .
@@ -929,8 +941,11 @@ test-temporal-parent-child-failure-replay-live: test-temporal-config
 		SMOKE_PARENT_CHILD_RESTART_TIMEOUT_SECONDS="$(SMOKE_PARENT_CHILD_RESTART_TIMEOUT_SECONDS)" \
 		sh test/integration/temporal/scripts/run-child-failure-replay-live.sh
 
+# Each one-shot describe/show retries a transient CLI transport failure through
+# temporal_cli_read_only (#1285); the 60-second timeout bounds every attempt.
 test-temporal-worker-cache-eviction-live: test-temporal-config
 	@set -eu; \
+	. test/integration/temporal/scripts/temporal-cli-retry.sh; \
 	workflow_a=two-binary-cache-eviction-a; \
 	workflow_b=two-binary-cache-eviction-b; \
 	history_a="$(SMOKE_CACHE_EVICTION_HISTORY_A)"; \
@@ -964,7 +979,7 @@ test-temporal-worker-cache-eviction-live: test-temporal-config
 	capture_history() { \
 		workflow_id=$$1; run_id=$$2; destination=$$3; \
 		valid_run_id "$$run_id" || return 1; \
-		if ! timeout --signal=TERM --kill-after=5s 60s env $(TEMPORAL_COMPOSE) run --rm --no-deps temporal-admin-tools \
+		if ! temporal_cli_read_only timeout --signal=TERM --kill-after=5s 60s env $(TEMPORAL_COMPOSE) run --rm --no-deps temporal-admin-tools \
 			temporal workflow describe --workflow-id "$$workflow_id" --run-id "$$run_id" \
 			--namespace temporal-sdk-test --output json >"$$describe_file" 2>/dev/null; then \
 			rm -f "$$describe_file"; return 1; \
@@ -974,7 +989,7 @@ test-temporal-worker-cache-eviction-live: test-temporal-config
 			rm -f "$$describe_file"; return 1; \
 		fi; \
 		rm -f "$$describe_file"; \
-		if ! timeout --signal=TERM --kill-after=5s 60s env $(TEMPORAL_COMPOSE) run --rm --no-deps temporal-admin-tools \
+		if ! temporal_cli_read_only timeout --signal=TERM --kill-after=5s 60s env $(TEMPORAL_COMPOSE) run --rm --no-deps temporal-admin-tools \
 			temporal workflow show --workflow-id "$$workflow_id" --run-id "$$run_id" \
 			--namespace temporal-sdk-test --output json >"$$raw_history" 2>/dev/null; then \
 			rm -f "$$raw_history"; return 1; \
@@ -1039,8 +1054,11 @@ test-temporal-worker-cache-eviction-live: test-temporal-config
 	sh "$$validator" "$$marker" "$$history_a" "$$history_b" "$$run_b"; \
 	sh test/integration/temporal/scripts/collect-live-diagnostics.sh validated || echo 'live diagnostic snapshot failed' >&2
 
+# The one-shot identity describe retries a transient CLI transport failure
+# (#1285); the history polls below already retry every failure while waiting.
 test-temporal-worker-restart-live: test-temporal-config
 	@set -eu; \
+	. test/integration/temporal/scripts/temporal-cli-retry.sh; \
 	replacement_mode=$${TEMPORAL_WORKER_RESTART_MODE:-graceful}; \
 	case "$$replacement_mode" in graceful|crash) ;; *) echo "unsupported TEMPORAL_WORKER_RESTART_MODE: $$replacement_mode" >&2; exit 2 ;; esac; \
 	workflow_id=two-binary-worker-restart-replay; \
@@ -1109,7 +1127,7 @@ test-temporal-worker-restart-live: test-temporal-config
 	[ -s "$$accepted_file" ] || { cat "$$driver_log"; echo "restart driver did not publish its run identity" >&2; exit 1; }; \
 	run_id=$$(sed -n 's/^run_id=//p' "$$accepted_file"); \
 	[ -n "$$run_id" ] || { echo "restart driver marker has no run ID" >&2; exit 1; }; \
-	if ! $(TEMPORAL_COMPOSE) run --rm --no-deps temporal-admin-tools \
+	if ! temporal_cli_read_only env $(TEMPORAL_COMPOSE) run --rm --no-deps temporal-admin-tools \
 		temporal workflow describe --workflow-id "$$workflow_id" --run-id "$$run_id" \
 		--namespace temporal-sdk-test --output json >"$$describe_file" 2>/dev/null; then \
 		echo "restart workflow identity lookup failed" >&2; exit 1; \
@@ -1589,6 +1607,12 @@ test-task-failure-markers:
 .PHONY: test-temporal-namespace-readiness
 test-temporal-namespace-readiness:
 	sh test/smoke/test_temporal_namespace_readiness.sh .
+
+# Exercises the bounded retry of read-only admin CLI queries (#1285) with a
+# fake CLI, without a live server or Docker.
+.PHONY: test-temporal-cli-retry
+test-temporal-cli-retry:
+	sh test/smoke/test_temporal_cli_retry.sh .
 
 # Compile once in the selected Linux OCaml job; the live job only executes them.
 .PHONY: build-smoke-executables test-ci-artifacts
