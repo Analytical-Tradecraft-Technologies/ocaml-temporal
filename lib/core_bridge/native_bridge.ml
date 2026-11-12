@@ -1505,3 +1505,12 @@ let metric_register meter ~kind ~name ~description ~labels =
   | Error _ as error -> error
 
 let metric_record meter id value = metric_record_raw meter id value = 0
+
+(** Gives back one registration of a series (#1212); allocation-free and
+    keeps the runtime lock, like {!metric_record_raw}. Returns the bridge
+    status code. *)
+external metric_release_raw : metric_meter -> int -> int
+  = "ocaml_temporal_metric_meter_release"
+[@@noalloc]
+
+let metric_release meter id = metric_release_raw meter id = 0

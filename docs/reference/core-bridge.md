@@ -1026,9 +1026,11 @@ An older archive lacks the symbols, so a stale pairing fails at link time.
   `service_name` or a configured global tag; values 1 to 256 bytes without
   control characters; descriptions up to 512 bytes without control
   characters; one name keeps one kind and one description; at most 1,024
-  series per meter. A violation is `CONFIGURATION` with a message that names
-  the rule, never the rejected text, and `*id` is `UINT32_MAX`. An identical
-  registration returns the first identifier, so two workers on one task queue
+  live series per meter (series with an unreleased registration). A
+  violation is `CONFIGURATION` with a message that names the rule, never the
+  rejected text, and `*id` is `UINT32_MAX`; a refused registration changes no
+  reference count. An identical registration returns the first identifier
+  and counts one more registration of it, so two workers on one task queue
   share their series. Each series is bound to its label set once here.
 - `ocaml_temporal_core_v4_metric_meter_record(meter, id, value)` is the hot
   path: no result, no allocation once the series has been recorded into, only
@@ -1037,6 +1039,16 @@ An older archive lacks the symbols, so a stale pairing fails at link time.
   histogram reads microseconds and Core exports it in milliseconds, or in
   seconds with `durations_as_seconds`. An unknown identifier or a negative
   unsigned value is `INVALID_ARGUMENT`; a panic is contained as `PANIC`.
+- `ocaml_temporal_core_v4_metric_meter_release(meter, id)` gives back one
+  registration (#1212). After the last one the series no longer counts
+  toward the live cap, but it keeps its identifier, still accepts records,
+  and stays in the scrape at its last value: Core's registry has no removal.
+  Registering it again reuses the identifier and needs a free place. It
+  allocates nothing and takes the write lock briefly. An unknown identifier
+  or a series with no unreleased registration is `INVALID_ARGUMENT`; a panic
+  is contained as `PANIC`. `Native_worker_metrics` releases every series of
+  a worker when the worker shuts down, and those it registered when a later
+  registration of the same worker fails.
 - `ocaml_temporal_core_v4_metric_meter_free(&meter)` clears the slot and drops
   the meter. It touches only memory, never Core or Tokio, so the OCaml
   custom-block finalizer calls it directly.

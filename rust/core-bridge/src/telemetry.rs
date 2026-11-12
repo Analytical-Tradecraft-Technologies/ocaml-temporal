@@ -475,12 +475,20 @@ async fn reject_busy(mut client: TcpStream, _permit: OwnedSemaphorePermit) {
 /// - otherwise the reserve is released, the relay connects and forwards the
 ///   head, and refills the reserve only once Core's first response bytes
 ///   arrive (or [`FIRST_RESPONSE_TIMEOUT`] passes), before relaying the rest.
-async fn relay_scrape(
-    mut client: TcpStream,
-    shared: Arc<RelayShared>,
-    _permit: OwnedSemaphorePermit,
-) {
+///
+/// Every step, including the wait for the reserve behind other relays and
+/// the connect to Core, runs under the one [`RELAY_MAX_LIFETIME`] deadline
+/// (#1212), so the permit is always back within that bound. Ending at the
+/// deadline drops both streams, which closes them. If it interrupts a relay
+/// that had released the reserve, the next relay's `refill` restores it.
+async fn relay_scrape(client: TcpStream, shared: Arc<RelayShared>, _permit: OwnedSemaphorePermit) {
     let deadline = Instant::now() + RELAY_MAX_LIFETIME;
+    let _ = tokio::time::timeout_at(deadline, relay_scrape_until(client, shared, deadline)).await;
+}
+
+/// Body of [`relay_scrape`]; the caller bounds the whole of it by
+/// `deadline`, which is also passed in for the final relay phase.
+async fn relay_scrape_until(mut client: TcpStream, shared: Arc<RelayShared>, deadline: Instant) {
     let head = match read_request_head(&mut client).await {
         RequestHead::Complete(head) => head,
         RequestHead::Empty => return,
@@ -873,9 +881,12 @@ pub(crate) fn start_metrics(
     }))
 }
 
-/// Most series one [`MetricMeter`] registers. The SDK registers a fixed set
-/// per worker (a few dozen), so the bound only stops a defect from growing
-/// the registry, and with it every scrape, without limit.
+/// Most *live* series one [`MetricMeter`] holds: series with at least one
+/// registration that has not been released. The SDK registers a fixed set per
+/// worker (a few dozen) and releases it when the worker shuts down (#1212),
+/// so the bound counts the workers running at once, not every namespace and
+/// task-queue pair a long-lived runtime has ever seen. It only stops a defect
+/// from growing the registry, and with it every scrape, without limit.
 pub(crate) const MAX_SDK_INSTRUMENTS: usize = 1024;
 
 /// Most labels one SDK series carries, besides Core's `service_name` and the
@@ -944,10 +955,21 @@ enum Instrument {
 }
 
 /// Registration state behind [`MetricMeter`]'s lock.
+///
+/// Invariants: `instruments` and `references` have the same length, and
+/// `live` is the number of entries of `references` that are non-zero. An
+/// identifier is never reused for another series and its instrument stays
+/// bound after its last release, so a late recording through a released
+/// identifier is harmless.
 #[derive(Default)]
 struct InstrumentRegistry {
     /// Bound series, indexed by the identifier returned to the caller.
     instruments: Vec<Instrument>,
+    /// Unreleased registrations of each series, by identifier (#1212).
+    references: Vec<u32>,
+    /// Series with at least one unreleased registration; bounded by
+    /// [`MAX_SDK_INSTRUMENTS`].
+    live: usize,
     /// Canonical registration key (kind, name and labels) to identifier, so
     /// registering the same series twice returns the same identifier.
     ids: HashMap<String, u32>,
@@ -1020,8 +1042,12 @@ impl MetricMeter {
 
     /// Registers one series from a strict JSON document and returns its
     /// identifier. Registering an identical series again returns the first
-    /// identifier. Every validation failure is a configuration error whose
-    /// message names only the violated rule, never the rejected text.
+    /// identifier and adds one reference to it, which a later
+    /// [`MetricMeter::release`] gives back. Every validation failure is a
+    /// configuration error whose message names only the violated rule, never
+    /// the rejected text. Only a series without unreleased references counts
+    /// toward [`MAX_SDK_INSTRUMENTS`] when it is (re)activated, so a refused
+    /// registration never changes any reference count.
     pub(crate) fn register(&self, bytes: &[u8]) -> Result<u32, Failure> {
         let spec: InstrumentSpec = serde_json::from_slice(bytes)
             .map_err(|_error| invalid("invalid SDK metric registration JSON".to_owned()))?;
@@ -1046,23 +1072,77 @@ impl MetricMeter {
                 "an SDK metric name must keep one kind and one description".to_owned(),
             ));
         }
-        if let Some(id) = registry.ids.get(&key) {
-            return Ok(*id);
+        let capacity_error = || {
+            invalid(format!(
+                "at most {MAX_SDK_INSTRUMENTS} SDK metric series may be registered at once"
+            ))
+        };
+        if let Some(&id) = registry.ids.get(&key) {
+            // Every stored identifier indexes `references` (see the
+            // registry invariants), and u32 always fits in usize here.
+            let index = usize::try_from(id)
+                .map_err(|_error| invalid("SDK metric identifier overflow".to_owned()))?;
+            let references = registry.references[index];
+            if references == 0 {
+                if registry.live >= MAX_SDK_INSTRUMENTS {
+                    return Err(capacity_error());
+                }
+                registry.live += 1;
+            }
+            registry.references[index] = references
+                .checked_add(1)
+                .ok_or_else(|| invalid("SDK metric reference count overflow".to_owned()))?;
+            return Ok(id);
         }
-        if registry.instruments.len() >= MAX_SDK_INSTRUMENTS {
-            return Err(invalid(format!(
-                "at most {MAX_SDK_INSTRUMENTS} SDK metric series may be registered"
-            )));
+        if registry.live >= MAX_SDK_INSTRUMENTS {
+            return Err(capacity_error());
         }
         let id = u32::try_from(registry.instruments.len())
-            .map_err(|_error| invalid("SDK metric identifier overflow".to_owned()))?;
+            .ok()
+            .filter(|id| *id != u32::MAX)
+            .ok_or_else(|| invalid("SDK metric identifier overflow".to_owned()))?;
         let instrument = self.bind(&spec);
         registry.instruments.push(instrument);
+        registry.references.push(1);
+        registry.live += 1;
         registry.ids.insert(key, id);
         registry
             .families
             .insert(spec.name, (spec.kind, spec.description));
         Ok(id)
+    }
+
+    /// Gives back one registration of series `id` (#1212).
+    ///
+    /// When the last registration is released the series stops counting
+    /// toward [`MAX_SDK_INSTRUMENTS`]. Its instrument stays bound, so a late
+    /// recording through `id` still succeeds, and Prometheus keeps exporting
+    /// the series at its last value: Core's registry has no removal, which
+    /// is also how Core's own per-task-queue series behave after their worker
+    /// stops. Registering the same series again reuses `id`. An unknown
+    /// identifier, or one with no unreleased registration, returns
+    /// `STATUS_INVALID_ARGUMENT` and changes nothing.
+    pub(crate) fn release(&self, id: u32) -> Status {
+        let mut registry = self
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(index) = usize::try_from(id)
+            .ok()
+            .filter(|index| *index < registry.references.len())
+        else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        match registry.references[index] {
+            0 => STATUS_INVALID_ARGUMENT,
+            references => {
+                registry.references[index] = references - 1;
+                if references == 1 {
+                    registry.live -= 1;
+                }
+                STATUS_OK
+            }
+        }
     }
 
     /// Applies the documented bounds to one registration.
