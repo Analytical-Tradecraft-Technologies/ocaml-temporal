@@ -152,7 +152,9 @@ failure with the exception text, never as an operation failure.
      service, operation, operation token, scheduled event ID), the inner
      cause chain, and `Error.origin` of `` `Cancelled `` or
      `` `Timeout `Schedule_to_close `` / `` `Start_to_close `` /
-     `` `Schedule_to_start `` as Core reports it.
+     `` `Schedule_to_start `` as Core reports it. `` `Start_to_close `` can
+     only occur for an asynchronous operation: Core ignores
+     `start_to_close_timeout` for synchronous ones.
 4. **Cancellation.** `cancel` (or cancelling the attached `scope`) emits
    `RequestCancelNexusOperation` at most once. Core's state machine applies
    the cancellation type. `Abandon` resolves at once without a server
@@ -242,8 +244,11 @@ These are explicitly not part of #533 or #534 and need their own issues:
 
 - **#533:**
   - live: an OCaml workflow calls `say_hello` (success and non-retryable
-    failure) and `slow_hello` with a short `start_to_close_timeout` (typed
-    timeout) on the Python handler;
+    failure) and `slow_hello` with a short `schedule_to_close_timeout`
+    (typed `` `Timeout `Schedule_to_close `` failure) on the Python handler.
+    `slow_hello` is synchronous, and at the pinned Core revision
+    `start_to_close_timeout` applies only to asynchronous operations, so a
+    start-to-close timeout test waits for an asynchronous fixture;
   - cancellation under each cancellation type;
   - a worker restart between start and resolution, replayed from history
     with the same result.
