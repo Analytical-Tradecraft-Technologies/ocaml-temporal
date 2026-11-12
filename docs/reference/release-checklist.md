@@ -99,6 +99,15 @@ limits) in the tracking issue for the release before pushing the tag.
       empty section, and a `TODO`, `TBD` or `FIXME` placeholder. The
       [v0.1.0-rc.1 notes](../releases/v0.1.0-rc.1.md) are the first example.
       Reviewers approve the notes with the version change.
+- [ ] Keep the OCaml upper bound (`< 5.6` in `dune-project` and both opam
+      files) unless the next series has been promoted (#1164). Raise it only
+      after that series' released compiler (not trunk or an alpha) is green
+      in the non-blocking `OCaml next` lane on Linux amd64 and in a local
+      `make verify OCAML_VERSION=<series>`. Promote it in the same PR: move
+      it into `COMPILERS` in `scripts/ci-matrix.py` (so it gates PRs and
+      releases), set `NEXT_SERIES` to the following series with its pinned
+      `docker/ocaml-<series>` image and Dependabot entry, and record the
+      evidence in the release notes.
 - [ ] Merge the PR through the merge queue, so the PR and merge-group checks
       (including `release-preflight.yml`) pass on it.
 
