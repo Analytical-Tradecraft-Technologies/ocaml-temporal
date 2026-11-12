@@ -1434,6 +1434,166 @@ running bytecode interpreter needs the shared stub library that is not
 installed. Native plugins (`.cmxs`) are also unsupported. The design reasons are recorded in the
 [Core bridge reference](../reference/core-bridge.md#supported-link-modes).
 
+## Use the SDK from Eio and Lwt applications
+
+The SDK has no Eio or Lwt dependency, and it does not need one. Every
+`Temporal.Client` call and `Temporal.Worker.run` blocks its calling *system
+thread*. It releases the OCaml runtime lock while it waits, but it never
+yields to a cooperative scheduler. Called directly on an Eio or Lwt fiber, it
+therefore stalls every other fiber on that scheduler until it returns. The
+rules below keep the scheduler responsive (#1141). Workflow code is a separate
+matter. It runs under the SDK's own deterministic scheduler and must never use
+Eio, Lwt or any other I/O, as described in section 1.
+
+### Client calls from Eio fibers
+
+Run each blocking client call in a system thread with
+`Eio_unix.run_in_systhread`. The fiber suspends while the thread waits, so
+other fibers keep running. One client may be shared by any number of threads,
+and its calls proceed concurrently (see the concurrency section of
+`client.mli`). Concurrent fibers therefore each get their own thread and their
+own in-flight call:
+
+```ocaml
+let greet_from_eio client name =
+  Eio_unix.run_in_systhread ~label:"temporal-client" (fun () ->
+      let ( let* ) = Result.bind in
+      let* handle =
+        Temporal.Client.start client ~workflow:greet ~task_queue:"greetings"
+          ~id:("greet-" ^ name) ~input:name ()
+      in
+      match Temporal.Client.wait ~timeout:(Temporal.Duration.of_seconds 30L) handle with
+      | Ok (Temporal.Client.Completed { output; _ }) -> Ok output
+      | Ok _ -> Error (Temporal.Error.defect ~message:"greet did not complete")
+      | Error error -> Error error)
+
+let () =
+  Eio_main.run @@ fun _env ->
+  match
+    Temporal.Client.create ~target_url:"http://127.0.0.1:7233" ~namespace:"default" ()
+  with
+  | Error error -> prerr_endline (Temporal.Error.message error)
+  | Ok client ->
+      Fun.protect
+        ~finally:(fun () -> ignore (Temporal.Client.shutdown client))
+        (fun () ->
+          (* Three workflows start and complete concurrently with each other
+             and with any other fiber of this program. *)
+          Eio.Fiber.List.map (greet_from_eio client) [ "Ada"; "Grace"; "Alan" ]
+          |> List.iter (function
+               | Ok greeting -> print_endline greeting
+               | Error error -> prerr_endline (Temporal.Error.message error)))
+```
+
+- **Bound waits with the SDK's own options.** Eio cannot interrupt a system
+  thread. `Eio.Time.with_timeout` or a cancelled switch around
+  `run_in_systhread` returns control to the fiber only after the blocking call
+  itself returns. Use `Client.wait ?timeout`, `?rpc_timeout` and the client's
+  `max_in_flight_calls` for the bounds that matter; an Eio timeout is no
+  substitute for them.
+- **Threads are cheap but not free.** `run_in_systhread` starts a new thread
+  whenever its pool is busy. A program that fans out thousands of concurrent
+  `wait`s should bound its own concurrency, for example with an
+  `Eio.Semaphore`, well below the client's `max_in_flight_calls`.
+- **Shut the client down outside the fibers that use it.** `Client.shutdown`
+  ends calls still in flight with the closed-client error. Calling it while
+  no fiber still needs the client avoids surprising those fibers.
+
+### Host a worker in an Eio program
+
+`Worker.run` holds its thread for the worker's whole life. Give it a Domain of
+its own with `Eio.Domain_manager.run`, and turn Eio cancellation into
+`Worker.request_shutdown`. That call is a single atomic write and is safe from
+any fiber, thread or Domain:
+
+```ocaml
+(* Runs [worker] on a new Domain until the calling fiber is cancelled, then
+   drains and releases it. Eio cannot interrupt [Worker.run] (it is not Eio
+   code), so a daemon fiber requests the stop instead. *)
+let serve_worker ~domain_mgr worker =
+  Eio.Switch.run @@ fun sw ->
+  Eio.Fiber.fork_daemon ~sw (fun () ->
+      Fun.protect
+        ~finally:(fun () -> Temporal.Worker.request_shutdown worker)
+        Eio.Fiber.await_cancel);
+  Eio.Domain_manager.run domain_mgr (fun () ->
+      let run_result = Temporal.Worker.run worker in
+      let shutdown_result = Temporal.Worker.shutdown worker in
+      Result.bind run_result (fun () -> shutdown_result))
+
+let () =
+  Eio_main.run @@ fun env ->
+  let stop, _resolve_stop = Eio.Promise.create () in
+  match
+    Temporal.Worker.create ~target_url:"http://127.0.0.1:7233" ~namespace:"default"
+      ~task_queue:"greetings"
+      ~workflows:[ Temporal.Worker.workflow greet ]
+      ~activities:[] ()
+  with
+  | Error error -> prerr_endline (Temporal.Error.message error)
+  | Ok worker ->
+      (* Resolving [stop] (for example from an admin endpoint) cancels the
+         worker fiber, which requests the stop; [Fiber.first] returns once
+         the worker Domain has shut the worker down. *)
+      Eio.Fiber.first
+        (fun () ->
+          match serve_worker ~domain_mgr:(Eio.Stdenv.domain_mgr env) worker with
+          | Ok () -> ()
+          | Error error -> prerr_endline (Temporal.Error.message error))
+        (fun () -> Eio.Promise.await stop)
+```
+
+When the calling fiber is cancelled, the daemon fiber is cancelled with it and
+requests the stop. `Worker.run` returns once each lane has finished its
+current task, or once the worker's grace period has elapsed for an activity
+callback, and the same Domain then runs the bounded `Worker.shutdown`.
+`Domain_manager.run` returns only after both have finished, so the worker
+never outlives the switch. For `SIGTERM`, keep the `Sys.signal` handler of
+[section 8](#8-register-a-worker) that calls `Worker.request_shutdown`. It
+works unchanged in an Eio program, because the handler does no I/O.
+
+### Activity callbacks that want Eio or Lwt I/O
+
+An activity callback runs on the worker's activity Domain (for a worker that
+registers activities), outside any Eio or Lwt scheduler. Ordinary blocking I/O
+there is fine, because it holds up neither workflow tasks nor your
+application's fibers. The callback may also use your own thread-safe client
+libraries. If a callback must use an Eio- or Lwt-only library:
+
+- do not start a fresh `Eio_main.run` or `Lwt_main.run` inside every callback.
+  Each one builds and tears down a whole event loop per attempt, and resources
+  such as connection pools cannot outlive it;
+- run one long-lived event loop on a Domain or system thread of your own.
+  Have the callback hand it a request and block on a `Mutex`/`Condition` or
+  similar result cell until the loop answers. While it waits, heartbeat
+  periodically and check `Activity.Context.cancellation` and
+  `Activity.Context.is_worker_shutting_down`, so cancellation and worker
+  shutdown still reach the attempt.
+
+### Lwt
+
+The same rules apply with Lwt's primitives. Make each client call through
+`Lwt_preemptive.detach`, whose pool size bounds concurrent client calls. Run
+`Worker.run` and then `Worker.shutdown` on a `Thread.t` or a `Domain.t` of
+their own, and call `Worker.request_shutdown` when your application's stop
+promise resolves. Never call either on the thread that runs `Lwt_main.run`.
+
+### Domain budget
+
+Every native client, replay runner and worker holds a supervisor Domain, and a
+worker that polls activities holds an activity Domain while `run` is active
+(see the Domain budget in `worker.mli`). Pools you create count against the
+same per-process limit:
+
+- each `Eio.Domain_manager.run` holds one Domain while its function runs, so
+  the worker hosted above costs one Domain more than the worker itself;
+- a Domainslib pool of *n* workers holds *n* Domains.
+
+`run_in_systhread`, `Lwt_preemptive` and plain `Thread.t` threads cost no
+Domain. A program with one client, one activity worker hosted as above and an
+eight-Domain Domainslib pool therefore uses 1 (main) + 1 (client) + 1
+(worker supervisor) + 1 (activity lane) + 1 (hosting Domain) + 8 = 13 Domains.
+
 ## Test workflows in-process
 
 `Temporal.Testing` is the supported way to unit-test workflow logic. It runs
