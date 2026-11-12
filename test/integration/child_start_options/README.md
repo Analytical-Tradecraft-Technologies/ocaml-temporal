@@ -17,9 +17,9 @@ that the options a parent passes to `Child_workflow` (#1135) reach Temporal:
   the start-child command carrying the options), and the report must be read
   back identically.
 - A child that never finishes, started with a 3 s run timeout, is ended by
-  Temporal. The parent observes a failed child (an `Error.kind` of
-  `child_workflow`; a typed timeout kind is #1143's subject), and an
-  exact-run `Client.wait` on the child reports `Timed_out`.
+  Temporal. The parent observes a failed child: an `Error.kind` of
+  `child_workflow` whose `Error.origin` is `` `Timeout `Start_to_close ``
+  (#1143). An exact-run `Client.wait` on the child reports `Timed_out`.
 - After a child completes, starting another child with the same workflow ID
   is refused under `` `Reject_duplicate `` (its `started` future fails) and
   allowed under `` `Allow_duplicate ``.
