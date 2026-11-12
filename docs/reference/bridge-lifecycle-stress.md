@@ -391,6 +391,30 @@ seed, round, rerun command, and each failing thread's call trace to
 `CONCURRENT_STRESS_OUTPUT_DIR`). Rust producer CI keeps that directory as a
 14-day artifact when a job fails.
 
+A crash in the OCaml multi-Domain stress kills the process before it can
+report anything. One SIGSEGV on OCaml 5.3.0 Linux amd64 (#1214) left only
+`Command got signal SEGV`. The test now prints its seed, budget and trace
+directory before the first native call. Each Domain also writes its own trace
+file under `concurrent-stress-trace/` in the Dune action's directory
+(`_build/default/test/bridge/`): `main.trace` and `domain-<n>.trace`. Before
+each operation, a Domain writes one flushed line:
+`seed=0x... round=R domain-N.trace round R domain N step S <operation> runtime=<slot> closed=<bool>`.
+The operations are the replay calls, cross-Domain and final closes, finalizer
+drops and each forced collection. The files are truncated at the start of
+every round, so after a crash they hold the crashing round: the last line of
+each file is the phase that Domain had entered. The seeded choices, but not
+the interleaving, can then be replayed with the printed seed.
+
+To capture cores, the Linux `verify` lanes and the scheduled stress set
+`kernel.core_pattern=core.%e.%p`. The kernel then writes a core into the
+crashing process's working directory instead of handing it to apport. When
+`make verify` fails, CI uploads the trace directory and any
+`_build/default/test/**/core.*` as `bridge-crash-<arch>-ocaml-<version>-<attempt>`
+for 14 days. When a core exists, it also uploads the bridge test executables
+it needs. The scheduled stress keeps the same files in its failure artifact.
+A manual dispatch of `stress.yml` takes an `ocaml_version` input, so the
+stresses can be looped on 5.3.0 or another supported compiler.
+
 ### Findings
 
 Long concurrent runs occasionally record one panic inside Temporal Core:
