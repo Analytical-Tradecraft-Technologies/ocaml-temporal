@@ -1672,6 +1672,7 @@ impl Runtime {
             config.max_in_flight_calls,
         )?;
 
+        let resolution_authority = name_resolution_authority(&target);
         let options = connection_options(
             target,
             config.identity,
@@ -1684,24 +1685,42 @@ impl Runtime {
         // otherwise hold `Client.create` for that full interval (#824). The
         // whole handshake is therefore bounded by `CLIENT_CONNECT_TIMEOUT`
         // and reported as the same typed connection failure.
-        let connection = core
-            .tokio_handle()
-            .block_on(async {
-                tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, Connection::connect(options)).await
-            })
-            .map_err(|_elapsed| Failure {
-                status: STATUS_CONNECTION,
-                message: diagnostics::connection_failure_message(
-                    diagnostics::ConnectionCause::Timeout,
-                    CLIENT_CONNECT_TIMEOUT_DETAIL,
-                ),
-            })?
-            .map_err(|error| {
+        let connection = core.tokio_handle().block_on(async {
+            // One deadline covers both phases, so the bridge's own lookup
+            // does not extend the documented bound.
+            let deadline = tokio::time::Instant::now() + CLIENT_CONNECT_TIMEOUT;
+            // A resolver that does not answer would otherwise expire the
+            // handshake bound inside Core and read as `cause=timeout`; the
+            // bridge resolves first so it is reported as `cause=dns` (#833).
+            // `lookup_host` runs `getaddrinfo` on Core's blocking pool, whose
+            // threads keep SIGPIPE blocked (#1041) in case the resolver falls
+            // back to TCP.
+            if let Some(authority) = resolution_authority {
+                diagnostics::bounded_name_resolution(
+                    tokio::net::lookup_host(authority),
+                    deadline,
+                    CLIENT_NAME_RESOLUTION_TIMEOUT_DETAIL,
+                )
+                .await
+                .map_err(|message| Failure {
+                    status: STATUS_CONNECTION,
+                    message,
+                })?;
+            }
+            match tokio::time::timeout_at(deadline, Connection::connect(options)).await {
+                Ok(Ok(connection)) => Ok(connection),
+                Err(_elapsed) => Err(Failure {
+                    status: STATUS_CONNECTION,
+                    message: diagnostics::connection_failure_message(
+                        diagnostics::ConnectionCause::Timeout,
+                        CLIENT_CONNECT_TIMEOUT_DETAIL,
+                    ),
+                }),
                 // Core's error text can contain server-provided gRPC status
                 // messages or configured header values. Only a closed cause
                 // plus bounded, sanitized local transport detail crosses into
                 // OCaml (#833); see `diagnostics::describe_connect_error`.
-                match diagnostics::describe_connect_error(&error) {
+                Ok(Err(error)) => Err(match diagnostics::describe_connect_error(&error) {
                     diagnostics::ConnectFailure::Configuration => Failure {
                         status: STATUS_CONFIGURATION,
                         message: "Temporal Core rejected the client connection options".to_owned(),
@@ -1710,8 +1729,9 @@ impl Runtime {
                         status: STATUS_CONNECTION,
                         message: diagnostics::connection_failure_message(cause, &detail),
                     },
-                }
-            })?;
+                }),
+            }
+        })?;
         self.client_limits = limits;
         self.client = Some(connection);
         Ok(Vec::new())
@@ -7102,15 +7122,33 @@ const SDK_NAME: &str = "temporal-ocaml";
 /// preflight gate rejects a release whose metadata disagrees with it.
 const SDK_VERSION: &str = "0.1.0-rc.1";
 
-/// Upper bound on establishing a client connection: transport connect, TLS,
-/// and Core's initial `GetSystemInfo` together. Healthy local and WAN
-/// handshakes finish well inside it; it only cuts short an endpoint that
-/// accepts and then stays silent, which Core would wait on for 30 s.
+/// Upper bound on establishing a client connection: the bridge's name lookup,
+/// transport connect, TLS, and Core's initial `GetSystemInfo` together, all
+/// measured against one deadline. Healthy local and WAN handshakes finish
+/// well inside it; it only cuts short an endpoint that accepts and then stays
+/// silent, which Core would wait on for 30 s, or a resolver that does not
+/// answer.
 const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Fixed, server-independent detail reported when [`CLIENT_CONNECT_TIMEOUT`]
-/// expires.
+/// expires after the name lookup has finished.
 const CLIENT_CONNECT_TIMEOUT_DETAIL: &str = "connection handshake did not complete within 10 s";
+
+/// Fixed detail reported with `cause=dns` when the bridge's name lookup has
+/// not finished within [`CLIENT_CONNECT_TIMEOUT`]. The lookup is the first
+/// phase of the handshake, so its bound is the whole connect bound.
+const CLIENT_NAME_RESOLUTION_TIMEOUT_DETAIL: &str = "name resolution did not complete within 10 s";
+
+/// Returns the `host:port` the bridge resolves before connecting, or `None`
+/// for an IP-literal target, which needs no resolver. The port follows Core's
+/// own choice (the URL's port or scheme default, else 7233) so the lookup
+/// asks for the service Core will connect to. Core resolves the name again
+/// for its connection; this lookup only attributes resolver failures.
+fn name_resolution_authority(target: &temporalio_sdk_core::Url) -> Option<String> {
+    let host = target.domain()?;
+    let port = target.port_or_known_default().unwrap_or(7233);
+    Some(format!("{host}:{port}"))
+}
 
 /// Builds Core connection options with this SDK's identity rather than Core's
 /// `temporal-rust` default, so server metrics, histories, and the Web UI

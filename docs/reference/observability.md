@@ -331,6 +331,13 @@ included (`GetSystemInfo returned unauthenticated`); the server's status
 message is never copied. Core's own rejection of connection options (URI,
 headers, TLS settings) is a `configuration` error with a constant message.
 
+`dns` covers every way name resolution can fail. Before Core connects, the
+bridge resolves a host-name target itself, inside the same 10 s connect
+bound. A resolver error, an empty answer, or a resolver that has not answered
+within the bound (`name resolution did not complete within 10 s`) is therefore
+`dns`. `timeout` means the name resolved but the transport connect, TLS, or
+`GetSystemInfo` did not finish in time. IP-literal targets skip the lookup.
+
 ## Temporal Core logs
 
 Temporal Core, the Rust engine behind the native worker and client, emits its
@@ -619,7 +626,10 @@ test target.
 
 `rust/core-bridge/tests/connection_diagnostics.rs` connects to a closed
 loopback port and to an unresolvable `.invalid` host and checks the `refused`
-and `dns` causes, the transport detail, and the message bound. It also checks
+and `dns` causes, the transport detail, and the message bound. Because the
+host resolver decides how the `.invalid` lookup fails, the test also drives
+the bridge's bounded lookup with a lookup that never finishes, a resolver
+error, and an empty answer, and requires `dns` for each. It also checks
 cause classification, level parsing, the Core log filter, and that a Core
 record becomes one escaped, bounded line.
 `rust/core-bridge/tests/core_log_env.rs` checks that every accepted

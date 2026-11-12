@@ -1,15 +1,17 @@
 //! Connection-failure causes and Core log formatting (#833).
 //!
-//! The ABI tests connect to endpoints that fail locally (a closed loopback
-//! port and a reserved `.invalid` host name), so they need no Temporal Server.
-//! The remaining tests exercise the bounded formatting helpers directly.
+//! The ABI tests connect to endpoints that fail without a Temporal Server (a
+//! closed loopback port, local listeners, and a reserved `.invalid` host name
+//! that only the host's resolver can reject). The remaining tests exercise
+//! the bounded name lookup and formatting helpers directly.
 
 use std::collections::HashMap;
 use std::ptr;
 
 use ocaml_temporal_core_bridge::diagnostics::{
     ConnectionCause, CoreLogLevel, MAX_CONNECTION_DETAIL_BYTES, MAX_CORE_LOG_LINE_BYTES,
-    classify_chain, core_log_filter, format_core_log_line, parse_core_log_level,
+    NAME_RESOLUTION_EMPTY_DETAIL, bounded_name_resolution, classify_chain, core_log_filter,
+    format_core_log_line, parse_core_log_level,
 };
 use ocaml_temporal_core_bridge::{
     Result as AbiResult, STATUS_CONNECTION, STATUS_OK, ocaml_temporal_core_v4_client_connect_json,
@@ -94,12 +96,87 @@ fn refused_connection_reports_cause_and_transport_detail() {
 }
 
 /// A reserved, never-resolvable host name is reported as a DNS failure.
+///
+/// The host OS resolver decides how this fails. It normally answers
+/// "no such name" within milliseconds, but on GitHub's macOS runners it does
+/// not reject `.invalid` locally and once left the lookup unanswered for
+/// about 30 s, past the 10 s connect bound, which read as `cause=timeout`. The bridge now resolves before Core connects, so both
+/// outcomes must report `cause=dns`; `name_lookup_outcomes_report_dns_cause`
+/// covers the unanswered case deterministically.
 #[test]
 fn unresolvable_host_reports_dns_cause() {
     let (status, message) = connect_failure("http://ocaml-temporal-issue-833.invalid:7233");
     assert_eq!(status, STATUS_CONNECTION, "{message}");
     assert_bounded_connection_message(&message);
     assert!(message.contains("(cause=dns)"), "{message}");
+}
+
+/// Runs the bridge's bounded name lookup over `lookup` with a `limit` from
+/// now on a fresh current-thread runtime, returning the outcome and the time
+/// it took.
+fn bounded_lookup<A>(
+    lookup: impl std::future::Future<Output = std::io::Result<A>>,
+    limit: std::time::Duration,
+) -> (Result<(), String>, std::time::Duration)
+where
+    A: Iterator<Item = std::net::SocketAddr>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("test runtime");
+    let started = std::time::Instant::now();
+    let outcome = runtime.block_on(async {
+        let deadline = tokio::time::Instant::now() + limit;
+        bounded_name_resolution(lookup, deadline, "lookup bound reached").await
+    });
+    (outcome, started.elapsed())
+}
+
+/// Every resolver outcome other than an address is a DNS failure: a lookup
+/// still pending at the deadline (the macOS runner case), a resolver error,
+/// and an empty answer. A lookup that yields an address lets the connect
+/// continue.
+#[test]
+fn name_lookup_outcomes_report_dns_cause() {
+    let limit = std::time::Duration::from_millis(50);
+    let pending = std::future::pending::<std::io::Result<std::vec::IntoIter<_>>>();
+    let (outcome, elapsed) = bounded_lookup(pending, limit);
+    let message = outcome.expect_err("an unanswered lookup must fail");
+    assert_bounded_connection_message(&message);
+    assert_eq!(
+        message,
+        "Temporal client connection failed (cause=dns): lookup bound reached"
+    );
+    assert!(
+        elapsed >= limit && elapsed < std::time::Duration::from_secs(5),
+        "took {elapsed:?}"
+    );
+
+    let error = std::io::Error::other("failed to lookup address information: no such host");
+    let failed = std::future::ready(Err::<std::vec::IntoIter<_>, _>(error));
+    let message = bounded_lookup(failed, limit)
+        .0
+        .expect_err("a resolver error must fail");
+    assert_bounded_connection_message(&message);
+    assert_eq!(
+        message,
+        "Temporal client connection failed (cause=dns): \
+         failed to lookup address information: no such host"
+    );
+
+    let empty = std::future::ready(Ok(Vec::new().into_iter()));
+    let message = bounded_lookup(empty, limit)
+        .0
+        .expect_err("an empty answer must fail");
+    assert_eq!(
+        message,
+        format!("Temporal client connection failed (cause=dns): {NAME_RESOLUTION_EMPTY_DETAIL}")
+    );
+
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], 7233));
+    let answered = std::future::ready(Ok(vec![address].into_iter()));
+    assert_eq!(bounded_lookup(answered, limit).0, Ok(()));
 }
 
 /// A listener that accepts each TCP connection and closes it after `delay`,
