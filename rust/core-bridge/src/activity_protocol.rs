@@ -227,20 +227,17 @@ pub enum ActivityCompletionResult {
 
 /// Decodes and validates one strict activity-task document.
 pub fn decode_task(input: &str) -> Result<ActivityTask, ProtocolError> {
-    let task: ActivityTask = protocol::semantic_from_value(
-        protocol::decode_payload_object(input)?,
-        "invalid activity task semantics",
-    )?;
-    validate_task(&task)?;
-    Ok(task)
+    protocol::decode_validated_semantic(input, "invalid activity task semantics", validate_task)
 }
 
 /// Validates, normalizes, and reparses one outgoing activity task.
 pub fn encode_task(value: &ActivityTask) -> Result<String, ProtocolError> {
-    validate_task(value)?;
-    let output = protocol::encode_semantic(value, "could not encode activity task")?;
-    decode_task(&output)?;
-    Ok(output)
+    protocol::encode_validated_semantic(
+        value,
+        validate_task,
+        "could not encode activity task",
+        decode_task,
+    )
 }
 
 /// Decodes and validates one strict activity-completion document.
@@ -288,46 +285,50 @@ fn reject_null_completed_payload(value: &protocol::JsonValue) -> Result<(), Prot
 
 /// Validates, normalizes, and reparses one outgoing activity completion.
 pub fn encode_completion(value: &ActivityCompletion) -> Result<String, ProtocolError> {
-    validate_completion(value)?;
-    let output = protocol::encode_semantic(value, "could not encode activity completion")?;
-    decode_completion(&output)?;
-    Ok(output)
+    protocol::encode_validated_semantic(
+        value,
+        validate_completion,
+        "could not encode activity completion",
+        decode_completion,
+    )
 }
 
 /// Decodes and validates one strict activity-heartbeat document.
 pub fn decode_heartbeat(input: &str) -> Result<ActivityHeartbeat, ProtocolError> {
-    let heartbeat: ActivityHeartbeat = protocol::semantic_from_value(
-        protocol::decode_payload_object(input)?,
+    protocol::decode_validated_semantic(
+        input,
         "invalid activity heartbeat semantics",
-    )?;
-    validate_heartbeat(&heartbeat)?;
-    Ok(heartbeat)
+        validate_heartbeat,
+    )
 }
 
 /// Validates, normalizes, and reparses one outgoing activity heartbeat.
 pub fn encode_heartbeat(value: &ActivityHeartbeat) -> Result<String, ProtocolError> {
-    validate_heartbeat(value)?;
-    let output = protocol::encode_semantic(value, "could not encode activity heartbeat")?;
-    decode_heartbeat(&output)?;
-    Ok(output)
+    protocol::encode_validated_semantic(
+        value,
+        validate_heartbeat,
+        "could not encode activity heartbeat",
+        decode_heartbeat,
+    )
 }
 
 /// Decodes and validates one strict async-activity heartbeat document.
 pub fn decode_async_heartbeat(input: &str) -> Result<AsyncActivityHeartbeat, ProtocolError> {
-    let heartbeat: AsyncActivityHeartbeat = protocol::semantic_from_value(
-        protocol::decode_payload_object(input)?,
+    protocol::decode_validated_semantic(
+        input,
         "invalid async activity heartbeat semantics",
-    )?;
-    validate_async_heartbeat(&heartbeat)?;
-    Ok(heartbeat)
+        validate_async_heartbeat,
+    )
 }
 
 /// Validates, normalizes, and reparses one outgoing async-activity heartbeat.
 pub fn encode_async_heartbeat(value: &AsyncActivityHeartbeat) -> Result<String, ProtocolError> {
-    validate_async_heartbeat(value)?;
-    let output = protocol::encode_semantic(value, "could not encode async activity heartbeat")?;
-    decode_async_heartbeat(&output)?;
-    Ok(output)
+    protocol::encode_validated_semantic(
+        value,
+        validate_async_heartbeat,
+        "could not encode async activity heartbeat",
+        decode_async_heartbeat,
+    )
 }
 
 /// Enforces the complete semantic contract for an activity task.
