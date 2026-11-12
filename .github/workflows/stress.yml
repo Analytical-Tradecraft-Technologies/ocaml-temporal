@@ -101,3 +101,14 @@ jobs:
             _build/default/test/**/core.*
           if-no-files-found: ignore
           retention-days: 30
+      - name: Retain the bridge test executables that dumped core
+        # A core is only readable with the exact binary that wrote it, and
+        # this workflow uploads nothing else that preserves the executables
+        # before the runner is discarded (#1214). Mirrors build-pr.yml.
+        if: failure() && hashFiles('_build/default/test/**/core.*') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bridge-stress-binaries-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/default/test/bridge/*.exe
+          if-no-files-found: ignore
+          retention-days: 30
