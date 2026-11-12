@@ -380,7 +380,7 @@ Worker startup reports SDK versions, embedded Core version, build ID, namespace,
 The project is designed for publication, not merely internal use:
 
 - Apache-2.0 licensing with source headers where required.
-- `README.md`, `CHANGES.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, and release instructions.
+- `README.md`, `CHANGES.md`, `CONTRIBUTING.md`, `SECURITY.md`, and release instructions.
 - Complete public `.mli` files with `odoc` comments and runnable examples.
 - Semantic versioning for the OCaml API and an explicit Core compatibility matrix.
 - CI for supported OCaml 5 releases on Linux and macOS, amd64 and arm64 where runners permit.

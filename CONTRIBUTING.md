@@ -7,11 +7,9 @@ in [`AGENTS.md`](AGENTS.md) (mirrored in `CLAUDE.md`); this guide summarizes
 them but does not replace them.
 
 > **Status: draft pending maintainer adoption (#1140).** The workflow below
-> describes how the repository already works. The
-> [code of conduct](CODE_OF_CONDUCT.md) and the security reporting route
-> (#509) take effect only once the maintainer adopts them.
+> describes how the repository already works. The security reporting route
+> (#509) takes effect only once the maintainer adopts it.
 
-By participating you agree to follow the [code of conduct](CODE_OF_CONDUCT.md).
 Do not report security vulnerabilities in public issues; see
 [Reporting a security problem](#reporting-a-security-problem).
 
