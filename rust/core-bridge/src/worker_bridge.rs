@@ -1279,6 +1279,15 @@ pub struct PollLanes {
     /// Set when a replay lane join hit its bound. Core never confirmed
     /// shutdown, so the worker must be leaked rather than finalized.
     replay_join_timed_out: bool,
+    /// Bound for the live drain in [`Self::drain_and_join_for_shutdown`],
+    /// as applied by `Worker.shutdown` and by runtime disposal. Always
+    /// [`WORKER_SHUTDOWN_DRAIN_TIMEOUT`] in production; tests shorten it so a
+    /// drain timeout runs end to end through the C ABI in milliseconds
+    /// (#1229).
+    shutdown_drain_bound: Duration,
+    /// Bound for [`Self::finalize_bounded`] on the same paths. Always
+    /// [`WORKER_FINALIZE_TIMEOUT`] in production; shortened only by tests.
+    finalize_bound: Duration,
 }
 
 /// Producer halves kept alive for disabled live-worker lanes; see
@@ -1407,7 +1416,23 @@ impl PollLanes {
             shutdown_started: false,
             replay_join_bound: REPLAY_CORE_WAIT_TIMEOUT,
             replay_join_timed_out: false,
+            shutdown_drain_bound: WORKER_SHUTDOWN_DRAIN_TIMEOUT,
+            finalize_bound: WORKER_FINALIZE_TIMEOUT,
         }
+    }
+
+    /// Bound the runtime graph passes to [`Self::drain_and_join_for_shutdown`]
+    /// when it shuts down or disposes this live worker.
+    /// [`WORKER_SHUTDOWN_DRAIN_TIMEOUT`] unless a test shortened it.
+    pub fn shutdown_drain_bound(&self) -> Duration {
+        self.shutdown_drain_bound
+    }
+
+    /// Bound the runtime graph passes to [`Self::finalize_bounded`] when it
+    /// shuts down or disposes this live worker. [`WORKER_FINALIZE_TIMEOUT`]
+    /// unless a test shortened it.
+    pub fn finalize_bound(&self) -> Duration {
+        self.finalize_bound
     }
 
     /// Reports whether a Core workflow poll loop was started for this worker.
@@ -2726,6 +2751,8 @@ impl PollLanes {
             shutdown_started,
             replay_join_bound,
             replay_join_timed_out,
+            shutdown_drain_bound,
+            finalize_bound,
         } = self;
         match Arc::try_unwrap(worker) {
             Ok(worker) => {
@@ -2748,6 +2775,8 @@ impl PollLanes {
                     shutdown_started,
                     replay_join_bound,
                     replay_join_timed_out,
+                    shutdown_drain_bound,
+                    finalize_bound,
                 },
                 WorkerBridgeError::WorkerStillShared,
             )),
@@ -2785,6 +2814,16 @@ impl PollLanes {
             let _ = workflow_lane.await;
         }
         self.workflow_lane = Some(tokio::spawn(std::future::pending::<()>()));
+    }
+
+    /// Shortens the live shutdown bounds that `shutdown_worker` and runtime
+    /// disposal read through [`Self::shutdown_drain_bound`] and
+    /// [`Self::finalize_bound`], so tests drive their timeout paths through
+    /// the real C ABI entry points in milliseconds (#1229).
+    #[cfg(test)]
+    pub(crate) fn set_shutdown_bounds_for_test(&mut self, drain: Duration, finalize: Duration) {
+        self.shutdown_drain_bound = drain;
+        self.finalize_bound = finalize;
     }
 
     /// Shortens the replay lane join bound so tests reach the timeout path in
