@@ -7060,3 +7060,27 @@ restoration and that an accepted update can then mutate and suspend. The
 guard covers SDK state only, not OCaml references, I/O, or foreign calls; the
 v1 policy keeps queries and updates Experimental pending the #489 decision
 and the live update qualification of #505.
+
+## 2026-11-14: Idempotent side effects across a worker restart
+
+The idempotent side-effect example (`examples/idempotency`, #504) posts each
+line of an order to a file-backed ledger under the business key
+`<order ID>/line-<N>`, carried in the activity input. The ledger's contract
+is atomic: a complete, synced record is published with a hard link that
+fails if the key's record exists, so the first request performs the posting
+and every later one gets the original record back as a duplicate, while a
+different posting under the same key is a conflict that fails the activity
+non-retryably. The self-checking example, run by
+`make test-temporal-examples-live`, shows two identical lines posted under
+two keys, a resubmitted order (a new run) answered entirely as duplicates,
+and a second order with identical lines posted under its own keys. The
+`activity_idempotency` live regression kills the worker with `SIGKILL` right
+after line 1's posting commits and before its completion; Temporal times the
+attempt out, a replacement process's attempt 2 is answered as a duplicate,
+and the run completes with one posting per line. Its artifacts (the ledger,
+`correlation.json`, `Client.describe` snapshots, history and worker logs)
+correlate every request with its workflow, run, activity, attempt and worker
+generation. `test/idempotency` tests the ledger contract (including
+concurrent requests from several Domains) and the same lost-completion
+redelivery under `Temporal.Testing`. Fault scenarios over TLS remain for
+#496.

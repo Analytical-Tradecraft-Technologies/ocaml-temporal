@@ -5,6 +5,9 @@ This document describes the deterministic transport fault harness for issue
 when the network to Temporal fails, and how a caller reconciles an operation
 that the server may have applied. The suite is
 [`test/integration/transport_interruption`](../../test/integration/transport_interruption/README.md).
+A second suite, `test/integration/activity_idempotency`, covers an external
+side effect redelivered across a worker restart; see
+[Idempotent side effects across a worker restart](#idempotent-side-effects-across-a-worker-restart).
 
 ## Harness
 
@@ -175,7 +178,71 @@ transaction, or a conditional write. Without such a facility:
 The runnable [cooperative cancellation example](../../examples/README.md#cancel-activities-cooperatively)
 uses an in-memory reservation ledger with idempotent operations, keyed by
 workflow ID, run ID and activity ID. It also shows a new run that reuses the
-workflow ID doing its own work.
+workflow ID doing its own work. The
+[idempotent side-effect example](../../examples/README.md#make-side-effects-idempotent)
+uses the business-key row of the table instead, against an external store with
+an atomic deduplication contract; the next section tests it across a worker
+restart.
+
+## Idempotent side effects across a worker restart
+
+The `activity_idempotency` live regression (#504) runs the idempotent
+side-effect example's own workflow and activity
+([`examples/idempotency`](../../examples/idempotency)). The activity posts
+each line of an order to a file-backed ledger under the key
+`<order ID>/line-<N>`, carried in its input. The ledger's contract is atomic:
+a complete, synced record is published under the key's name with a hard link,
+which fails if the name exists, so the first request for a key performs the
+posting and every later one is answered with the original record as a
+duplicate. The ledger directory is shared by every process, so it outlives a
+worker.
+
+The order has two lines with the same account and amount. The scenario:
+
+1. Generation 1 hosts the workflow and the activity. Line 1's first attempt
+   commits its posting and then sends `SIGKILL` to its own process, after the
+   durable effect and before the activity returns, so no completion can
+   reach Temporal. The driver requires that the process died of that signal
+   and that the ledger then holds only line 1's record, committed by attempt 1
+   of `post-line-1` in the exact run on generation 1.
+2. With no worker polling, Temporal times the lost attempt out (a five-second
+   start-to-close timeout) and schedules attempt 2. The driver waits until
+   `Client.describe` shows it.
+3. Generation 2, a new process, receives attempt 2. It sends the same key and
+   is answered as a duplicate, so it returns the original receipt without
+   posting again. Line 2 has an identical posting but its own key, so its
+   first attempt posts it.
+4. The run must complete with exactly both lines' receipts. The ledger must
+   hold exactly two records and its journal exactly three requests: line 1
+   committed by attempt 1 on generation 1, line 1 answered as a duplicate to
+   attempt 2 on generation 2, and line 2 committed by attempt 1 on
+   generation 2, all naming the exact workflow and run. The run's history
+   must hold two scheduled, started and completed activities and no activity
+   failure or timeout event; line 1's started event records attempt 2 on
+   generation 2 with a timeout as its last failure.
+
+The suite's evidence directory (`_build/live-regressions/activity_idempotency/`,
+uploaded in the `live-regressions-<run>-<attempt>` CI artifact) holds the
+ledger itself, `correlation.json` (the workflow, run, activity, attempt and
+worker generation of every record and request, and each generation's process
+ID), the `Client.describe` snapshots after the crash and after completion, the
+raw exact-run history and both workers' logs. The suite usually takes about
+20 seconds, most of it the attempt timeout and the dead worker's sticky-queue
+timeout.
+
+The same redelivery is tested without a server in `test/idempotency`, which
+runs the workflow under `Temporal.Testing` and fails line 1's first attempt
+after its commit. That directory also tests the ledger contract itself:
+concurrent requests for one key from several Domains commit once, a distinct
+key with an identical posting is posted, and a key reused for a different
+posting is a conflict that fails the activity non-retryably.
+
+The test proves exactly-once *effects* only because the ledger deduplicates
+atomically. Temporal still ran the activity twice for line 1, as its
+at-least-once contract allows; with an external system that cannot
+deduplicate, the limits in
+[the previous section](#when-the-external-system-cannot-deduplicate-atomically)
+apply.
 
 ## Running
 
@@ -196,17 +263,9 @@ make test-transport-interruption-live RUN='opam exec --' \
 
 ## Remaining #504 scope
 
-The following parts of #504 are not covered by this suite:
-
-- Faults on authenticated (TLS) connections. This depends on #496 and is
-  left for later.
-- The worked side-effecting activity example with an external store that
-  provides an atomic idempotency contract, and the failure-after-commit
-  redelivery test across a worker restart. This is also left for later.
-- A test showing that two distinct operations with identical payloads get
-  distinct keys and are both performed. The key scope and the limits without
-  atomic deduplication are documented in
-  [Choosing an idempotency key and its scope](#choosing-an-idempotency-key-and-its-scope).
+Faults on authenticated (TLS) connections are the part of #504 that neither
+this suite nor `activity_idempotency` covers. They depend on #496 and are
+left for later.
 
 CI artifact retention (#490) is closed: the live job uploads this suite's log
 from `_build/live-regressions/` in its `live-regressions-*` artifact, kept for
