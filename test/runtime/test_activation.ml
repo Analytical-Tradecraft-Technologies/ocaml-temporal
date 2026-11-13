@@ -2479,6 +2479,58 @@ let test_workflow_memo_upsert_misuse () =
   | [ Activation.Complete_workflow _ ] when !outcomes = [ true; true ] -> ()
   | _ -> failwith "an invalid memo key was not rejected"
 
+(** Verifies memo and search-attribute upserts (#1154) are rejected inside the
+    read-only callbacks, an update validator and a query handler, even for an
+    empty list, before any command is buffered or the current memo changes.
+    Validators are skipped on replay and query activations record no commands,
+    so a command buffered there would reach history only on the live path. *)
+let test_upserts_rejected_in_read_only_callbacks () =
+  let context =
+    Workflow_context_store.create ~randomness_seed:"271828" (Scheduler.create ())
+  in
+  let value = public_payload (payload "v") in
+  let rejected attempt =
+    match attempt () with () -> false | exception Invalid_argument _ -> true
+  in
+  let attempts () =
+    List.map rejected
+      [ (fun () -> Temporal.Workflow.upsert_memo [ ("k", value) ]);
+        (fun () -> Temporal.Workflow.upsert_memo []);
+        (fun () -> Temporal.Workflow.upsert_search_attributes [ ("K", value) ]);
+        (fun () -> Temporal.Workflow.upsert_search_attributes []) ]
+  in
+  if not (List.for_all Fun.id (Workflow_context_store.with_read_only_query context attempts))
+  then failwith "an upsert was accepted in a query handler";
+  let validator_outcomes = ref [] in
+  let definition =
+    Temporal.Update.define ~name:"read_only_upsert_validator"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+  in
+  let handler =
+    Temporal.Update.Handler.make
+      ~validator:(fun () ->
+        validator_outcomes := attempts ();
+        Ok ())
+      definition (fun () -> Ok ())
+  in
+  let unit_payload =
+    match Temporal.Codec.encode Temporal.Codec.unit () with
+    | Ok payload -> payload
+    | Error error -> failwith (Temporal.Error.message error)
+  in
+  (match
+     Workflow_context_store.with_context context (fun () ->
+         Temporal.Update.Handler.dispatch handler unit_payload)
+   with
+  | Ok _ -> ()
+  | Error error ->
+      failwith ("read-only upsert validator rejected the update: " ^ Temporal.Error.message error));
+  if !validator_outcomes = [] || not (List.for_all Fun.id !validator_outcomes) then
+    failwith "an upsert was accepted in an update validator";
+  match Workflow_context_store.take_commands context with
+  | [] -> ()
+  | _ :: _ -> failwith "a read-only callback buffered a durable command"
+
 (** Verifies public child routing and parent closure remain separate from
     explicit cancellation, and survive the native protocol translation. *)
 let test_child_routing_and_parent_close () =
@@ -2573,4 +2625,5 @@ let () =
   test_workflow_typed_search_attribute_upsert ();
   test_workflow_typed_search_attribute_misuse ();
   test_workflow_memo_upsert_and_continue_as_new ();
-  test_workflow_memo_upsert_misuse ()
+  test_workflow_memo_upsert_misuse ();
+  test_upserts_rejected_in_read_only_callbacks ()
