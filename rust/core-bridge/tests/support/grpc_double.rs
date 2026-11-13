@@ -32,6 +32,14 @@ pub(super) enum Reply {
     Message(Vec<u8>),
     /// No response: the stream stays open, like a server long poll.
     Hold,
+    /// A trailers-only gRPC failure with this numeric status code and
+    /// message, as a server or proxy sends when it rejects a request.
+    Error {
+        /// gRPC status code, for example 8 for `RESOURCE_EXHAUSTED`.
+        code: u32,
+        /// `grpc-message` text; it must be a valid HTTP header value.
+        message: &'static str,
+    },
 }
 
 /// Chooses the [`Reply`] for a request, given the gRPC method name (the last
@@ -127,6 +135,19 @@ async fn serve_connection(
             Reply::Message(message) => message,
             Reply::Hold => {
                 held.push(respond);
+                continue;
+            }
+            Reply::Error { code, message } => {
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/grpc")
+                    .header("grpc-status", code.to_string())
+                    .header("grpc-message", message)
+                    .body(())
+                    .expect("static gRPC error response");
+                // Trailers-only: the status travels in the headers and the
+                // stream ends with them.
+                let _ = respond.send_response(response, true);
                 continue;
             }
         };

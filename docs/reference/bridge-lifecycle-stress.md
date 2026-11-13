@@ -448,6 +448,43 @@ recurrence in their summary (`contained_upstream_panics`) and fail on a panic
 located in bridge code. It stays tracked here, not upstream, and needs
 re-evaluation after the next Core upgrade.
 
+## Live Core processing thread at shutdown (#1149)
+
+`rust/core-bridge/tests/support/real_processing_thread_detach.rs` is an
+in-crate lifecycle case. It runs in the ordinary `cargo test` in about a
+second and needs no server. It keeps Core's real workflow processing thread
+alive across worker shutdown and runtime release.
+
+**Setup.** A gRPC double hands a workflow worker one task, then fails every
+later workflow poll with the non-retryable "message larger than max" status.
+The workflow lane exits on that error. The run's activation, or the eviction
+that follows its failure, is never acknowledged.
+
+**What it checks.** Every lifecycle call goes through the C ABI. The test
+shortens the worker's drain bound, then checks two release paths:
+
+- a worker with its own runtime, released as `Worker.shutdown_with_report`
+  releases it;
+- a worker attached to a shared runtime, released as `Runtime.shutdown`
+  releases it.
+
+On both paths:
+
+- `worker_shutdown` returns `WORKER` at the drain bound and keeps the worker,
+  unfinalizable.
+- `runtime_free` returns `OK` well within its deadline and releases Core.
+- On the shared path, `shared_runtime_free`, which performs Core's final
+  drop, also returns `OK` and releases Core.
+
+**What it found.** A drain cannot succeed while the processing thread lives,
+because the workflow poll, and after it the local-activity lane, report
+`ShutDown` only once that thread's stream has ended. Core's finalizer
+therefore never runs, and so never joins the thread, while the thread is
+alive. Dropping Core does not wait for a plain OS thread. The `DETACHED` path
+of the bounded releases is covered by `runtime_release_bound.rs` with held
+blocking-pool work instead. See [Core bridge](core-bridge.md) for the
+production timings.
+
 ## What each tool observes
 
 | Component | Rust stress | Rust concurrent stress | Rust live concurrent stress | OCaml GC stress | OCaml multi-Domain stress | `test/bridge/test_abi.sh` |
