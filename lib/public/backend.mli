@@ -204,6 +204,58 @@ type visibility_page = {
   next_page_token : string option;
 }
 
+(** One run to describe (#1152): exact, or with an empty [run_id] the
+    workflow's current run. *)
+type describe_request = {
+  workflow_id : string;
+  run_id : string;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline fixed on the monotonic clock when the call began;
+          [None] keeps the ten-second default. The mock ignores it. *)
+}
+
+(** One activity a described run has scheduled and not yet resolved. *)
+type pending_activity = {
+  activity_id : string;
+  activity_type : string;
+  state : Temporal_sdk_kernel.Client_protocol.pending_activity_state;
+  attempt : int;
+}
+
+(** One child workflow a described run has initiated and not yet seen close;
+    [run_id] is [None] while its start is still being initiated. *)
+type pending_child = {
+  workflow_id : string;
+  run_id : string option;
+  workflow_type : string;
+}
+
+(** The description of one run. [run_id] is always the concrete run, also
+    for a current-run request. Memo and search attributes are copies, sorted
+    by key on the native path and in start order on the mock. *)
+type description = {
+  workflow_id : string;
+  run_id : string;
+  workflow_type : string;
+  task_queue : string;
+  status : Temporal_sdk_kernel.Client_protocol.visibility_status;
+  start_time : Time.t;
+  close_time : Time.t option;
+  history_length : int64;
+  memo : (string * Payload.t) list;
+  search_attributes : (string * Payload.t) list;
+  pending_activities : pending_activity list;
+  pending_children : pending_child list;
+}
+
+(** One visibility count (#1152); an empty query counts every execution. *)
+type count_request = {
+  query : string;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline fixed on the monotonic clock when the call began;
+          [None] keeps the ten-second default. The mock ignores it. *)
+}
+
 (** Request to admit one named workflow update on a run selector. *)
 type update_request = {
   workflow_id : string;
@@ -528,6 +580,16 @@ val client_list_visibility :
     [temporal.api.history.v1.History] message, for [Temporal.Replay]. The
     deterministic mock records no histories and returns a typed defect. *)
 val client_fetch_history : client -> history_request -> (string, Error.t) result
+
+(** Describes one run (#1152). An unknown workflow or run is an error whose
+    RPC status is [`Not_found] on every backend. The deterministic mock
+    reports its ledger: no pending work and a history length of [0]. *)
+val client_describe : client -> describe_request -> (description, Error.t) result
+
+(** Counts the executions a visibility query matches (#1152). The
+    deterministic mock accepts only an empty query and counts every retained
+    run, the rows an empty listing returns. *)
+val client_count : client -> count_request -> (int64, Error.t) result
 
 (** Admits one workflow update and returns its durable update handle data. *)
 val client_update : client -> update_request -> (update_response, Error.t) result

@@ -124,6 +124,19 @@ one budget. It is the one selector whose success value is binary rather than
 JSON: a single serialized `temporal.api.history.v1.History` message, at most
 the payload safety limit, built by appending each page's re-encoded history.
 
+The describe and count selectors (`DESCRIBE` 14 and `COUNT` 15, #1152) are
+additive in the same way and have no synchronous symbol either. `DESCRIBE`
+takes the run document of
+[`client-describe-request.schema.json`](../schemas/bridge/client-describe-request.schema.json)
+and succeeds with the reduced, closed document of
+[`client-describe-response.schema.json`](../schemas/bridge/client-describe-response.schema.json);
+`COUNT` takes
+[`client-count-request.schema.json`](../schemas/bridge/client-count-request.schema.json)
+and succeeds with
+[`client-count-response.schema.json`](../schemas/bridge/client-count-response.schema.json).
+Both are single bounded RPCs (10 s by default) whose Rust task owns only a
+connection clone and the decoded request, like every other submitted call.
+
 The signal-with-start and update-with-start selectors (`SIGNAL_WITH_START`
 16 and `UPDATE_WITH_START` 17, #1151) are additive in the same way and have
 no synchronous symbol. Each embeds the start document under `start`
@@ -1039,9 +1052,11 @@ An older archive lacks the symbols, so a stale pairing fails at link time.
   `service_name` or a configured global tag; values 1 to 256 bytes without
   control characters; descriptions up to 512 bytes without control
   characters; one name keeps one kind and one description; at most 1,024
-  series per meter. A violation is `CONFIGURATION` with a message that names
-  the rule, never the rejected text, and `*id` is `UINT32_MAX`. An identical
-  registration returns the first identifier, so two workers on one task queue
+  live series per meter (series with an unreleased registration). A
+  violation is `CONFIGURATION` with a message that names the rule, never the
+  rejected text, and `*id` is `UINT32_MAX`; a refused registration changes no
+  reference count. An identical registration returns the first identifier
+  and counts one more registration of it, so two workers on one task queue
   share their series. Each series is bound to its label set once here.
 - `ocaml_temporal_core_v4_metric_meter_record(meter, id, value)` is the hot
   path: no result, no allocation once the series has been recorded into, only
@@ -1050,6 +1065,16 @@ An older archive lacks the symbols, so a stale pairing fails at link time.
   histogram reads microseconds and Core exports it in milliseconds, or in
   seconds with `durations_as_seconds`. An unknown identifier or a negative
   unsigned value is `INVALID_ARGUMENT`; a panic is contained as `PANIC`.
+- `ocaml_temporal_core_v4_metric_meter_release(meter, id)` gives back one
+  registration (#1212). After the last one the series no longer counts
+  toward the live cap, but it keeps its identifier, still accepts records,
+  and stays in the scrape at its last value: Core's registry has no removal.
+  Registering it again reuses the identifier and needs a free place. It
+  allocates nothing and takes the write lock briefly. An unknown identifier
+  or a series with no unreleased registration is `INVALID_ARGUMENT`; a panic
+  is contained as `PANIC`. `Native_worker_metrics` releases every series of
+  a worker when the worker shuts down, and those it registered when a later
+  registration of the same worker fails.
 - `ocaml_temporal_core_v4_metric_meter_free(&meter)` clears the slot and drops
   the meter. It touches only memory, never Core or Tokio, so the OCaml
   custom-block finalizer calls it directly.
@@ -1354,6 +1379,27 @@ worker (issue #775);
 it drops an undrained worker only if finalization still fails. This preserves
 memory ownership and collector progress, while explicit supervisor shutdown
 remains the required graceful path.
+
+That last-resort drop has a known cost (#1229). Core has no `Drop` for its
+worker, and only `finalize_shutdown` calls `finalize_unregister`, so a
+dropped worker leaves its registration in the client's worker set. On a
+runtime of its own that registration goes away with the client. On a shared
+runtime it stays until the client is released, so each such drop leaks one
+small registration entry (with the heartbeat callback it holds) for the
+client's lifetime. It happens only after a drain timeout or a
+refused finalization, which both mean Core or the server misbehaved.
+
+The error branches are pinned by tests. In the replay bridge tests, a drain
+whose lane never stops times out at its bound, marks the lease lost, and
+makes finalization refuse with `LostPollLease`; dropping the refused lanes
+and the Core runtime still returns. The
+`worker_shutdown_outcomes` ABI tests pin what each outcome becomes in
+`shutdown_worker`: a drain timeout or lane failure is `WORKER`, a panicked
+or detached finalizer is `WORKER` with its closed message, and abandoned
+leases are `OUTSTANDING_TASKS`. `worker_validation_cleanup` shows that
+releasing an unvalidated worker stops waiting at
+`UNVALIDATED_WORKER_RELEASE_TIMEOUT` (10 s) when the server never answers
+`ShutdownWorker`.
 
 ### Runtime destruction
 

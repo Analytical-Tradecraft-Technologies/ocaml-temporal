@@ -264,6 +264,12 @@ the pin files, the Dependabot entries and the CI matrix stay in step.
 | `ocaml/opam:debian-12-ocaml-5.3` | `docker/ocaml-5.3/Dockerfile` |
 | `ocaml/opam:debian-12-ocaml-5.4` | `docker/ocaml-5.4/Dockerfile` |
 | `ocaml/opam:debian-12-ocaml-5.5` | `docker/ocaml-5.5/Dockerfile` |
+| `ocaml/opam:debian-12-ocaml-5.6` | `docker/ocaml-5.6/Dockerfile` (next-series readiness lane only, #1164) |
+
+The 5.6 image carries the compiler's trunk (`ocaml-variants.5.6.0+trunk`) or
+an alpha until 5.6.0 is released. Only the non-blocking `OCaml next` lane of
+master builds uses it; it is not a supported compiler and produces no
+artifact.
 
 Each index contains native `linux/amd64` and `linux/arm64` images. The image
 build recipes are MIT (`ocurrent/docker-base-images`); the OCaml and OPAM

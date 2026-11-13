@@ -31,6 +31,7 @@ use temporalio_common::protos::temporal::api::{
     taskqueue::v1::TaskQueue,
     update::{self, v1::WaitPolicy},
     workflowservice::v1::{
+        CountWorkflowExecutionsRequest, DescribeWorkflowExecutionRequest,
         GetWorkflowExecutionHistoryRequest, ListWorkflowExecutionsRequest,
         PollWorkflowExecutionUpdateRequest, QueryWorkflowRequest as QueryWorkflowExecutionRequest,
         RequestCancelWorkflowExecutionRequest, ResetWorkflowExecutionRequest,
@@ -631,6 +632,108 @@ pub struct HistoryRequest {
     pub rpc_timeout_ms: Option<u64>,
 }
 
+/// Request to describe one run (#1152): exact, or with an empty `run_id` the
+/// workflow's current run, which Temporal resolves when it handles the RPC.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DescribeRequest {
+    /// Namespace containing the execution.
+    pub namespace: String,
+    /// Stable workflow identifier.
+    pub workflow_id: String,
+    /// Run identifier, or empty to select the workflow's current run.
+    pub run_id: String,
+    /// Caller-selected total budget of this RPC in milliseconds, replacing
+    /// the ten-second default. Absent keeps the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_timeout_ms: Option<u64>,
+}
+
+/// One activity the described run has scheduled and not yet resolved.
+///
+/// Only the identity, state and attempt cross the boundary; heartbeat
+/// details, failures and timing stay in Rust, as for visibility rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingActivity {
+    /// Workflow-scoped activity identifier.
+    pub activity_id: String,
+    /// Registered activity type name.
+    pub activity_type: String,
+    /// Closed state name from [`pending_activity_state`].
+    pub state: String,
+    /// Current attempt, starting at 1; 0 only if the server omitted it.
+    pub attempt: u32,
+}
+
+/// One child workflow the described run has initiated and not yet seen close.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingChild {
+    /// The child's workflow identifier.
+    pub workflow_id: String,
+    /// The child's run, or `None` while its start is still being initiated.
+    pub run_id: Option<String>,
+    /// The child's registered workflow type.
+    pub workflow_type: String,
+}
+
+/// The reduced `DescribeWorkflowExecution` answer for one run (#1152).
+///
+/// It carries the run's identity as Temporal resolved it, its routing and
+/// status fields, its start and close times, history length, the memo and
+/// search attributes as named payloads sorted by key, and the pending
+/// activities and children in server order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DescribeResponse {
+    /// The described run; `run_id` is always concrete.
+    pub execution: ExecutionRef,
+    /// Registered workflow type.
+    pub workflow_type: String,
+    /// Task queue the run was started on.
+    pub task_queue: String,
+    /// Status name, in the visibility vocabulary of [`visibility_status`].
+    pub status: String,
+    /// When the run started.
+    pub start_time: workflow_protocol::Timestamp,
+    /// When the run closed, or `None` while it is open.
+    pub close_time: Option<workflow_protocol::Timestamp>,
+    /// Number of events in the run's history.
+    pub history_length: u64,
+    /// Memo payloads, sorted by key.
+    pub memo: Vec<MetadataField>,
+    /// Search-attribute payloads as the server reports them, sorted by key.
+    pub search_attributes: Vec<MetadataField>,
+    /// Activities scheduled and not yet resolved.
+    pub pending_activities: Vec<PendingActivity>,
+    /// Child workflows initiated and not yet closed.
+    pub pending_children: Vec<PendingChild>,
+}
+
+/// Request to count the executions a visibility query matches (#1152).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CountRequest {
+    /// Namespace queried by Temporal.
+    pub namespace: String,
+    /// Temporal visibility query expression; empty counts every execution.
+    pub query: String,
+    /// Caller-selected total budget of this RPC in milliseconds, replacing
+    /// the ten-second default. Absent keeps the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_timeout_ms: Option<u64>,
+}
+
+/// The number of executions a visibility query matched. For a `GROUP BY`
+/// query it is the total over every group.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CountResponse {
+    /// Matching executions.
+    pub count: u64,
+}
+
 /// Metadata for a successor run created by continued-as-new.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1108,6 +1211,40 @@ pub fn decode_history_request(input: &str) -> Result<HistoryRequest, protocol::P
     )
 }
 
+/// Strictly parses one describe request (#1152).
+pub fn decode_describe_request(input: &str) -> Result<DescribeRequest, protocol::ProtocolError> {
+    decode_request(
+        input,
+        protocol::decode_object,
+        "invalid describe request",
+        validate_describe_request,
+    )
+}
+
+/// Strictly parses one visibility count request (#1152).
+pub fn decode_count_request(input: &str) -> Result<CountRequest, protocol::ProtocolError> {
+    decode_request(
+        input,
+        protocol::decode_object,
+        "invalid count request",
+        validate_count_request,
+    )
+}
+
+/// Validates, encodes and reparses one describe answer before it crosses the
+/// ABI.
+pub fn encode_describe_response(
+    response: &DescribeResponse,
+) -> Result<String, protocol::ProtocolError> {
+    validate_describe_response(response)?;
+    encode_document(response)
+}
+
+/// Encodes and reparses one count answer before it crosses the ABI.
+pub fn encode_count_response(response: &CountResponse) -> Result<String, protocol::ProtocolError> {
+    encode_document(response)
+}
+
 /// Encodes and reparses a start response before ownership leaves Rust.
 pub fn encode_start_response(
     response: &StartWorkflowResponse,
@@ -1547,6 +1684,179 @@ pub async fn fetch_history(
 /// The default budget of one history page round trip when the caller gave
 /// no `rpc_timeout_ms` (#1210).
 const HISTORY_PAGE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The default total budget of one describe or count RPC when the caller gave
+/// no `rpc_timeout_ms`; the same as one visibility page's.
+const READ_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Describes one run through Temporal's official workflow service (#1152)
+/// and reduces the answer to [`DescribeResponse`].
+///
+/// The RPC is read-only, so Core may retry it within the budget like any
+/// other idempotent call. The answer must name the requested namespace and
+/// workflow ID and, for an exact request, the requested run; anything else,
+/// a missing execution record or start time, or an unspecified status is a
+/// malformed response (`core_invalid`). Memo and search-attribute payloads
+/// are converted with the same limits as every other inbound payload and
+/// sorted by key, so the document does not depend on protobuf map order.
+pub async fn describe_workflow(
+    connection: Connection,
+    request: DescribeRequest,
+) -> Result<DescribeResponse, ClientOperationError> {
+    let budget = rpc_budget(request.rpc_timeout_ms, READ_RPC_TIMEOUT);
+    let started = tokio::time::Instant::now();
+    let mut service = connection.clone();
+    let response = budgeted_rpc(
+        budget,
+        started,
+        service.describe_workflow_execution(budgeted_request(
+            DescribeWorkflowExecutionRequest {
+                namespace: request.namespace.clone(),
+                execution: Some(WorkflowExecution {
+                    workflow_id: request.workflow_id.clone(),
+                    run_id: request.run_id.clone(),
+                }),
+            },
+            budget,
+        )),
+        map_rpc_status,
+    )
+    .await?;
+    let malformed = |message| ClientOperationError::Core(workflow_protocol::invalid_core(message));
+    let info = response
+        .workflow_execution_info
+        .ok_or_else(|| malformed("describe response has no execution record"))?;
+    let execution = info
+        .execution
+        .ok_or_else(|| malformed("described execution has no identity"))?;
+    if execution.workflow_id != request.workflow_id
+        || execution.run_id.is_empty()
+        || (!request.run_id.is_empty() && execution.run_id != request.run_id)
+    {
+        return Err(malformed("Temporal described a different execution"));
+    }
+    let workflow_type = info
+        .r#type
+        .ok_or_else(|| malformed("described execution has no workflow type"))?
+        .name;
+    let start_time = info
+        .start_time
+        .as_ref()
+        .map(described_time)
+        .ok_or_else(|| malformed("described execution has no start time"))??;
+    let close_time = info.close_time.as_ref().map(described_time).transpose()?;
+    let history_length = u64::try_from(info.history_length)
+        .map_err(|_| malformed("described history length is negative"))?;
+    let memo = described_fields(info.memo.map(|memo| memo.fields))?;
+    let search_attributes =
+        described_fields(info.search_attributes.map(|search| search.indexed_fields))?;
+    let pending_activities = response
+        .pending_activities
+        .into_iter()
+        .map(|activity| PendingActivity {
+            activity_id: activity.activity_id,
+            activity_type: activity
+                .activity_type
+                .map(|activity_type| activity_type.name)
+                .unwrap_or_default(),
+            state: pending_activity_state(activity.state),
+            attempt: u32::try_from(activity.attempt).unwrap_or(0),
+        })
+        .collect();
+    let pending_children = response
+        .pending_children
+        .into_iter()
+        .map(|child| PendingChild {
+            workflow_id: child.workflow_id,
+            run_id: (!child.run_id.is_empty()).then_some(child.run_id),
+            workflow_type: child.workflow_type_name,
+        })
+        .collect();
+    Ok(DescribeResponse {
+        execution: ExecutionRef {
+            namespace: request.namespace,
+            workflow_id: execution.workflow_id,
+            run_id: execution.run_id,
+        },
+        workflow_type,
+        task_queue: info.task_queue,
+        status: visibility_status(info.status)?,
+        start_time,
+        close_time,
+        history_length,
+        memo,
+        search_attributes,
+        pending_activities,
+        pending_children,
+    })
+}
+
+/// Copies one described timestamp exactly, rejecting a fraction outside the
+/// protobuf range.
+fn described_time(
+    value: &prost_wkt_types::Timestamp,
+) -> Result<workflow_protocol::Timestamp, ClientOperationError> {
+    workflow_protocol::validate_time(value.seconds, value.nanos, false, "$").map_err(|_| {
+        ClientOperationError::Core(workflow_protocol::invalid_core(
+            "described timestamp is invalid",
+        ))
+    })?;
+    Ok(workflow_protocol::Timestamp {
+        seconds: value.seconds,
+        nanoseconds: value.nanos,
+    })
+}
+
+/// Converts one described memo or search-attribute map into named payloads
+/// sorted by key. An absent map is empty.
+fn described_fields(
+    fields: Option<HashMap<String, CorePayload>>,
+) -> Result<Vec<MetadataField>, ClientOperationError> {
+    let mut named = fields
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| {
+            Ok(MetadataField {
+                key,
+                value: workflow_protocol::payload_from_core(&value)
+                    .map_err(ClientOperationError::Core)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ClientOperationError>>()?;
+    named.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(named)
+}
+
+/// Counts the executions a visibility query matches through Temporal's
+/// official workflow service (#1152). For a `GROUP BY` query the server's
+/// `count` is already the total over every group, which is what is returned.
+pub async fn count_workflows(
+    connection: Connection,
+    request: CountRequest,
+) -> Result<CountResponse, ClientOperationError> {
+    let budget = rpc_budget(request.rpc_timeout_ms, READ_RPC_TIMEOUT);
+    let started = tokio::time::Instant::now();
+    let mut service = connection.clone();
+    let response = budgeted_rpc(
+        budget,
+        started,
+        service.count_workflow_executions(budgeted_request(
+            CountWorkflowExecutionsRequest {
+                namespace: request.namespace,
+                query: request.query,
+            },
+            budget,
+        )),
+        map_rpc_status,
+    )
+    .await?;
+    let count = u64::try_from(response.count).map_err(|_| {
+        ClientOperationError::Core(workflow_protocol::invalid_core(
+            "visibility count is negative",
+        ))
+    })?;
+    Ok(CountResponse { count })
+}
 
 /// Requests cancellation of one run (exact, or current for an empty run ID)
 /// through Temporal's official workflow service. The connection is cloned by
@@ -2864,12 +3174,7 @@ fn validate_update_outcome(value: &UpdateOutcome) -> Result<(), protocol::Protoc
 fn validate_visibility_request(value: &VisibilityRequest) -> Result<(), protocol::ProtocolError> {
     validate_rpc_timeout(value.rpc_timeout_ms)?;
     validate_identifier(&value.namespace, "$.namespace")?;
-    if value.query.len() > protocol::MAX_STRING_BYTES || value.query.contains('\0') {
-        return Err(protocol::ProtocolError::invalid(
-            "$.query",
-            "query exceeds the protocol string safety limit or contains NUL",
-        ));
-    }
+    validate_visibility_query(&value.query)?;
     if !(1..=1_000).contains(&value.page_size) {
         return Err(protocol::ProtocolError::invalid(
             "$.page_size",
@@ -2902,6 +3207,132 @@ fn validate_history_request(value: &HistoryRequest) -> Result<(), protocol::Prot
             "page_size must be between 1 and 1000",
         )),
         Some(_) | None => Ok(()),
+    }
+}
+
+/// Validates a describe request before any RPC occurs.
+fn validate_describe_request(value: &DescribeRequest) -> Result<(), protocol::ProtocolError> {
+    validate_rpc_timeout(value.rpc_timeout_ms)?;
+    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)
+}
+
+/// Validates a count request before any RPC occurs; the query follows the
+/// same rule as a visibility listing's.
+fn validate_count_request(value: &CountRequest) -> Result<(), protocol::ProtocolError> {
+    validate_rpc_timeout(value.rpc_timeout_ms)?;
+    validate_identifier(&value.namespace, "$.namespace")?;
+    validate_visibility_query(&value.query)
+}
+
+/// Bounds a visibility query by the protocol string limit and refuses NUL.
+/// An empty query is valid and matches every execution.
+fn validate_visibility_query(query: &str) -> Result<(), protocol::ProtocolError> {
+    if query.len() > protocol::MAX_STRING_BYTES || query.contains('\0') {
+        Err(protocol::ProtocolError::invalid(
+            "$.query",
+            "query exceeds the protocol string safety limit or contains NUL",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates a reduced describe answer: concrete identities, the closed
+/// status and pending-activity vocabularies, protobuf time ranges, and
+/// unique, valid metadata keys and payloads.
+fn validate_describe_response(value: &DescribeResponse) -> Result<(), protocol::ProtocolError> {
+    validate_execution(&value.execution, "$.execution")?;
+    validate_identifier(&value.workflow_type, "$.workflow_type")?;
+    validate_identifier(&value.task_queue, "$.task_queue")?;
+    if !is_visibility_status_name(&value.status) || value.status == "unspecified" {
+        return Err(protocol::ProtocolError::invalid(
+            "$.status",
+            "unknown execution status",
+        ));
+    }
+    workflow_protocol::validate_time(
+        value.start_time.seconds,
+        value.start_time.nanoseconds,
+        false,
+        "$.start_time",
+    )?;
+    if let Some(close_time) = &value.close_time {
+        workflow_protocol::validate_time(
+            close_time.seconds,
+            close_time.nanoseconds,
+            false,
+            "$.close_time",
+        )?;
+    }
+    if i64::try_from(value.history_length).is_err() {
+        return Err(protocol::ProtocolError::invalid(
+            "$.history_length",
+            "history length exceeds the signed 64-bit range",
+        ));
+    }
+    validate_metadata(&value.memo, "$.memo")?;
+    validate_metadata(&value.search_attributes, "$.search_attributes")?;
+    for (index, activity) in value.pending_activities.iter().enumerate() {
+        let path = format!("$.pending_activities[{index}]");
+        validate_identifier(&activity.activity_id, &format!("{path}.activity_id"))?;
+        validate_identifier(&activity.activity_type, &format!("{path}.activity_type"))?;
+        if !is_pending_activity_state_name(&activity.state) {
+            return Err(protocol::ProtocolError::invalid(
+                format!("{path}.state"),
+                "unknown pending activity state",
+            ));
+        }
+        if i32::try_from(activity.attempt).is_err() {
+            return Err(protocol::ProtocolError::invalid(
+                format!("{path}.attempt"),
+                "attempt exceeds the signed 32-bit range",
+            ));
+        }
+    }
+    for (index, child) in value.pending_children.iter().enumerate() {
+        let path = format!("$.pending_children[{index}]");
+        validate_identifier(&child.workflow_id, &format!("{path}.workflow_id"))?;
+        if let Some(run_id) = &child.run_id {
+            validate_identifier(run_id, &format!("{path}.run_id"))?;
+        }
+        validate_identifier(&child.workflow_type, &format!("{path}.workflow_type"))?;
+    }
+    Ok(())
+}
+
+/// Highest `PendingActivityState` wire value this bridge names.
+const MAX_KNOWN_PENDING_ACTIVITY_STATE: i32 = 5;
+
+/// Converts Temporal's numeric `PendingActivityState` into a stable name.
+///
+/// Known states map to fixed lowercase names; any other value, including the
+/// unspecified `0`, is `unknown_<n>` with the canonical decimal wire value,
+/// as for execution statuses (#1078), so a state a newer server adds never
+/// fails a whole describe.
+fn pending_activity_state(state: i32) -> String {
+    match state {
+        1 => "scheduled".to_owned(),
+        2 => "started".to_owned(),
+        3 => "cancel_requested".to_owned(),
+        4 => "paused".to_owned(),
+        5 => "pause_requested".to_owned(),
+        _ => format!("{UNKNOWN_STATUS_PREFIX}{state}"),
+    }
+}
+
+/// Returns whether `state` is a name [`pending_activity_state`] can produce:
+/// a fixed name, or `unknown_<n>` in canonical decimal for a value without
+/// one, so one wire value has exactly one spelling.
+fn is_pending_activity_state_name(state: &str) -> bool {
+    match state {
+        "scheduled" | "started" | "cancel_requested" | "paused" | "pause_requested" => true,
+        _ => state
+            .strip_prefix(UNKNOWN_STATUS_PREFIX)
+            .and_then(|digits| digits.parse::<i32>().ok().map(|value| (digits, value)))
+            .is_some_and(|(digits, value)| {
+                !(1..=MAX_KNOWN_PENDING_ACTIVITY_STATE).contains(&value)
+                    && value.to_string() == digits
+            }),
     }
 }
 

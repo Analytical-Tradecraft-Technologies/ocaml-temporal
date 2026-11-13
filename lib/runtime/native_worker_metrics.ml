@@ -2,10 +2,15 @@ module Bridge = Temporal_core_bridge.Native_bridge
 
 (** [ids.(i)] is the bridge identifier of the series at index [i] of
     {!series}. Both arrays are immutable after [create], so recording reads
-    them without synchronization. *)
+    them without synchronization. [released] makes {!release} give the
+    registrations back exactly once, whichever thread calls it first. *)
 type t =
   | Disabled
-  | Enabled of { meter : Bridge.metric_meter; ids : int array }
+  | Enabled of {
+      meter : Bridge.metric_meter;
+      ids : int array;
+      released : bool Atomic.t;
+    }
 
 let disabled = Disabled
 let enabled = function Disabled -> false | Enabled _ -> true
@@ -133,6 +138,14 @@ let metric_names =
   |> List.map (fun { name; _ } -> "temporal_" ^ name)
   |> List.sort_uniq String.compare
 
+(** Gives back the registrations of [ids.(0)] to [ids.(count - 1)]. A
+    refused release is ignored: it can only mean the meter was already freed
+    with its runtime, and metrics never change worker behavior. *)
+let release_ids meter ids count =
+  for index = 0 to count - 1 do
+    ignore (Bridge.metric_release meter ids.(index))
+  done
+
 let create meter ~namespace ~task_queue =
   let ids = Array.make (Array.length all_series) (-1) in
   let rec register index =
@@ -144,28 +157,46 @@ let create meter ~namespace ~task_queue =
         :: Option.to_list label
       in
       match Bridge.metric_register meter ~kind ~name ~description ~labels with
-      | Error _ as error -> error
+      | Error _ as error ->
+          (* All or nothing (#1212): give back what this worker registered,
+             so a refused worker holds no series against the cap. Nothing
+             has been recorded yet, so no partial set is exported. *)
+          release_ids meter ids index;
+          error
       | Ok id ->
           ids.(index) <- id;
-          (* Recording zero creates the series, so a counter or gauge is
-             exported (at 0) before its first event and a rate or absence
-             alert has a baseline. A histogram is left alone because a zero
-             would be a real observation. *)
-          (match kind with
-          | Counter | Up_down_counter -> ignore (Bridge.metric_record meter id 0)
-          | Gauge | Histogram | Duration_histogram -> ());
           register (index + 1)
   in
   match register 0 with
-  | Ok () -> Ok (Enabled { meter; ids })
   | Error _ as error -> error
+  | Ok () ->
+      (* Recording zero creates the series, so a counter or gauge is
+         exported (at 0) before its first event and a rate or absence alert
+         has a baseline. It happens only after every registration succeeded.
+         A histogram is left alone because a zero would be a real
+         observation. *)
+      Array.iteri
+        (fun index { kind; _ } ->
+          match kind with
+          | Bridge.Counter | Up_down_counter ->
+              ignore (Bridge.metric_record meter ids.(index) 0)
+          | Gauge | Histogram | Duration_histogram -> ())
+        all_series;
+      Ok (Enabled { meter; ids; released = Atomic.make false })
+
+let release = function
+  | Disabled -> ()
+  | Enabled { meter; ids; released } ->
+      if Atomic.compare_and_set released false true then
+        release_ids meter ids (Array.length ids)
 
 (** Adds [value] to the series at [index]. A refused recording is dropped:
     metrics never change worker behavior. *)
 let record metrics index value =
   match metrics with
   | Disabled -> ()
-  | Enabled { meter; ids } -> ignore (Bridge.metric_record meter ids.(index) value)
+  | Enabled { meter; ids; _ } ->
+      ignore (Bridge.metric_record meter ids.(index) value)
 
 let activity_callback_started metrics =
   record metrics admitted 1;

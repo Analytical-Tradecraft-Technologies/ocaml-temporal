@@ -288,6 +288,13 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_wait_workflow_json(
  * its success value is binary, not JSON: one serialized
  * temporal.api.history.v1.History message of at most the payload safety
  * limit, the form Temporal.Replay.History.of_protobuf accepts.
+ * DESCRIBE and COUNT have no synchronous symbol either (#1152). DESCRIBE's
+ * document is {"namespace","workflow_id","run_id"} (an empty run ID selects
+ * the current run) with optional "rpc_timeout_ms" (default 10 s); its
+ * success value is the reduced describe document of
+ * docs/schemas/bridge/client-describe-response.schema.json. COUNT's document
+ * is {"namespace","query"} with optional "rpc_timeout_ms" (default 10 s); its
+ * success value is {"count":<n>}.
  * SIGNAL_WITH_START and UPDATE_WITH_START have no synchronous symbol either
  * (#1151). Both embed the START document unchanged as "start", whose
  * "rpc_timeout_ms" bounds the whole call. SIGNAL_WITH_START adds
@@ -311,6 +318,8 @@ enum {
   OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_COMPLETION = 11,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_HEARTBEAT = 12,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_HISTORY = 13,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_DESCRIBE = 14,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_COUNT = 15,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_SIGNAL_WITH_START = 16,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_UPDATE_WITH_START = 17
 };
@@ -616,6 +625,16 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_metric_meter_register_json(
  */
 ocaml_temporal_core_status ocaml_temporal_core_v4_metric_meter_record(
     const ocaml_temporal_core_metric_meter *meter, uint32_t id, int64_t value);
+
+/*
+ * Give back one registration of series `id` (#1212). The series stops
+ * counting toward the per-runtime cap after its last release but keeps its
+ * identifier and last exported value. Allocates no result and never blocks
+ * on I/O. An unknown identifier or one with no unreleased registration
+ * returns OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT.
+ */
+ocaml_temporal_core_status ocaml_temporal_core_v4_metric_meter_release(
+    const ocaml_temporal_core_metric_meter *meter, uint32_t id);
 
 /*
  * Release an SDK metrics recorder and clear the slot. Touches only memory,

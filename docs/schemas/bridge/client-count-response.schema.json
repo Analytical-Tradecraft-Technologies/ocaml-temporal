@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-count-response.schema.json",
+  "title": "OCaml Temporal native client visibility count",
+  "description": "Success value of the COUNT client call selector (#1152). For a GROUP BY query, count is the server's total over every group; the groups are not returned.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["count"],
+  "properties": {
+    "count": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}
+  }
+}

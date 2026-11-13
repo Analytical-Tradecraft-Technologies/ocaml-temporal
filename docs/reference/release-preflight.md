@@ -216,7 +216,10 @@ The digest is reproducibility evidence for review, not a signed attestation.
 
 `temporal-sdk.opam` and `dune-project` bound OCaml to `>= 5.2 & < 5.6`,
 matching the CI-tested 5.2–5.5 series; raise the upper bound only together with
-the CI matrix. The opam `conf-rust-2024` dependency only proves edition 2024
+the CI matrix. Master builds also run a non-blocking `OCaml next` lane on the
+next series (`NEXT_SERIES` in `scripts/ci-matrix.py`, currently 5.6 trunk), and
+the [release checklist](release-checklist.md#1-prepare-the-version) states when
+that lane's result allows raising the bound (#1164). The opam `conf-rust-2024` dependency only proves edition 2024
 support (Rust 1.85), while the workspace `rust-version` in `rust/Cargo.toml` is
 newer. `scripts/build-rust-bridge.sh` therefore compares the compiler Cargo
 will use (`$RUSTC`, default `rustc`) against that `rust-version` before

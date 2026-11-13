@@ -320,7 +320,10 @@ val client_wait_workflow_json : runtime -> bytes -> (bytes, error) result
     the token's latest send. [Call_history] (#1137) has no synchronous
     operation: it takes a history request document, and its successful
     outcome is binary, one serialized [temporal.api.history.v1.History]
-    message holding every page of the run's history. [Call_signal_with_start]
+    message holding every page of the run's history. [Call_describe] and
+    [Call_count] (#1152) have no synchronous operation either: they take a
+    describe or count request document and succeed with the reduced describe
+    document or the [{"count":n}] document. [Call_signal_with_start]
     and [Call_update_with_start] (#1151) have no synchronous operation
     either: each takes a document embedding a start request under [start];
     the first succeeds with the start outcome document and the second with
@@ -339,6 +342,8 @@ type client_call_kind =
   | Call_async_activity_completion
   | Call_async_activity_heartbeat
   | Call_history
+  | Call_describe
+  | Call_count
   | Call_signal_with_start
   | Call_update_with_start
 
@@ -600,7 +605,9 @@ val shared_runtime_metric_meter :
     [temporal_] prefix and, like label names, match [[a-z_][a-z0-9_]*]. At
     most 8 labels, values of 1 to 256 bytes without control characters, a
     label may not repeat [le], [quantile], [service_name] or a global tag,
-    and one meter holds at most 1,024 series. Callers must keep label values
+    and one meter holds at most 1,024 live series: series with a
+    registration not yet given back with {!metric_release}. Each successful
+    call is one registration to release. Callers must keep label values
     bounded (task queue, namespace, closed enumerations); a rejected
     registration is a [Configuration] error. *)
 val metric_register :
@@ -618,3 +625,14 @@ val metric_register :
     negative value on an unsigned instrument. Allocation-free and safe from
     any Domain; it never blocks on I/O. *)
 val metric_record : metric_meter -> int -> int -> bool
+
+(** [metric_release meter id] gives back one {!metric_register} of series
+    [id] (#1212). Registering an identical series counts one more
+    registration of the same identifier; once every registration is
+    released, the series no longer counts toward the meter's 1,024-series
+    cap. It keeps its identifier, recording into it still succeeds, and
+    Prometheus keeps exporting its last value, as Core does for its own
+    series of a stopped worker. Returns [false], changing nothing, for an
+    unknown identifier or one with no unreleased registration.
+    Allocation-free, safe from any Domain, and never blocks on I/O. *)
+val metric_release : metric_meter -> int -> bool

@@ -988,6 +988,37 @@ module Protocol_adapter = struct
     | Ok history -> Ok (Bytes.to_string history)
     | Error native_error -> Error native_error
 
+  (** Canonically serializes one describe request (#1152). *)
+  let encode_client_describe_request request =
+    match Client.encode_describe_request request with
+    | Ok output -> Ok (Bytes.of_string output)
+    | Error error -> client_error "client describe request encoding" error
+
+  (** Strictly decodes one describe answer for [request], which must name the
+      requested execution, or passes the native failure through unchanged
+      for the public client to classify. *)
+  let decode_client_describe_result request = function
+    | Ok input -> (
+        match Client.decode_describe_response ~request (Bytes.to_string input) with
+        | Ok response -> Ok response
+        | Error error -> client_error "client describe response decoding" error)
+    | Error native_error -> Error native_error
+
+  (** Canonically serializes one visibility count request (#1152). *)
+  let encode_client_count_request request =
+    match Client.encode_count_request request with
+    | Ok output -> Ok (Bytes.of_string output)
+    | Error error -> client_error "client count request encoding" error
+
+  (** Strictly decodes one visibility count, or passes the native failure
+      through unchanged. *)
+  let decode_client_count_result = function
+    | Ok input -> (
+        match Client.decode_count_response (Bytes.to_string input) with
+        | Ok count -> Ok count
+        | Error error -> client_error "client count response decoding" error)
+    | Error native_error -> Error native_error
+
   (** Decodes a native query payload list or preserves a structured server
       failure as an inner typed client error. The public layer enforces the
       output codec's expected payload cardinality. *)
@@ -1154,6 +1185,8 @@ module Native_backend = struct
         (Client.poll_update_response, Client.client_error) result client_rpc
     | Rpc_visibility : Client.visibility_request -> Client.visibility_page client_rpc
     | Rpc_history : Client.history_request -> string client_rpc
+    | Rpc_describe : Client.describe_request -> Client.describe_response client_rpc
+    | Rpc_count : Client.count_request -> int64 client_rpc
     | Rpc_signal_with_start :
         Client.signal_with_start_request -> Client.start_outcome client_rpc
     | Rpc_update_with_start :
@@ -1386,6 +1419,16 @@ module Native_backend = struct
           ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
           ~encode:Protocol_adapter.encode_client_history_request
           ~decode:Protocol_adapter.decode_client_history_result
+    | Rpc_describe request ->
+        submit_bounded runtime Bridge.Call_describe request.rpc_deadline
+          ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
+          ~encode:Protocol_adapter.encode_client_describe_request
+          ~decode:(Protocol_adapter.decode_client_describe_result request)
+    | Rpc_count request ->
+        submit_bounded runtime Bridge.Call_count request.rpc_deadline
+          ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
+          ~encode:Protocol_adapter.encode_client_count_request
+          ~decode:Protocol_adapter.decode_client_count_result
     | Rpc_signal_with_start request ->
         (* The embedded start's deadline bounds the whole call (#1151); one
            that expired in the mailbox is a definite rejection, as for a
@@ -1723,6 +1766,8 @@ module Native = struct
         (Client.poll_update_response, Client.client_error) result client_rpc
     | Rpc_visibility : Client.visibility_request -> Client.visibility_page client_rpc
     | Rpc_history : Client.history_request -> string client_rpc
+    | Rpc_describe : Client.describe_request -> Client.describe_response client_rpc
+    | Rpc_count : Client.count_request -> int64 client_rpc
     | Rpc_signal_with_start :
         Client.signal_with_start_request -> Client.start_outcome client_rpc
     | Rpc_update_with_start :

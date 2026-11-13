@@ -395,6 +395,30 @@ module Native : sig
     (** Returns the binary [History] protobuf Rust assembled from every page,
         or passes the native failure through unchanged. *)
 
+    val encode_client_describe_request :
+      Temporal_protocol.Client_protocol.describe_request ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result
+    (** Canonically serializes one describe request (#1152). *)
+
+    val decode_client_describe_result :
+      Temporal_protocol.Client_protocol.describe_request ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result ->
+      (Temporal_protocol.Client_protocol.describe_response,
+       Temporal_core_bridge.Native_bridge.error) result
+    (** Strictly decodes one describe answer for the given request, or passes
+        the native failure through unchanged. *)
+
+    val encode_client_count_request :
+      Temporal_protocol.Client_protocol.count_request ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result
+    (** Canonically serializes one visibility count request (#1152). *)
+
+    val decode_client_count_result :
+      (bytes, Temporal_core_bridge.Native_bridge.error) result ->
+      (int64, Temporal_core_bridge.Native_bridge.error) result
+    (** Strictly decodes one visibility count, or passes the native failure
+        through unchanged. *)
+
     val encode_client_update_request :
       Temporal_protocol.Client_protocol.update_request ->
       (bytes, Temporal_core_bridge.Native_bridge.error) result
@@ -507,6 +531,13 @@ module Native : sig
         Temporal_protocol.Client_protocol.history_request -> string client_rpc
         (** Fetches one run's complete history as one binary
             [temporal.api.history.v1.History] message (#1137). *)
+    | Rpc_describe :
+        Temporal_protocol.Client_protocol.describe_request ->
+        Temporal_protocol.Client_protocol.describe_response client_rpc
+        (** Describes one run, exact or current (#1152). *)
+    | Rpc_count :
+        Temporal_protocol.Client_protocol.count_request -> int64 client_rpc
+        (** Counts the executions a visibility query matches (#1152). *)
     | Rpc_signal_with_start :
         Temporal_protocol.Client_protocol.signal_with_start_request ->
         Temporal_protocol.Client_protocol.start_outcome client_rpc

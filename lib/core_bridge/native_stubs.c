@@ -915,6 +915,19 @@ CAMLprim value ocaml_temporal_metric_meter_record(value meter, value id,
       *Metric_meter_slot(meter), (uint32_t)raw_id, (int64_t)Long_val(amount)));
 }
 
+/* Give back one registration of series [id] (#1212) and return the bridge
+ * status. Like recording, it allocates nothing and does no I/O (Rust takes
+ * the meter's write lock briefly), so the external is [@@noalloc] and keeps
+ * the runtime lock. An identifier outside the u32 range is refused here. */
+CAMLprim value ocaml_temporal_metric_meter_release(value meter, value id) {
+  intnat raw_id = Long_val(id);
+  if (raw_id < 0 || (uintnat)raw_id >= UINT32_MAX) {
+    return Val_int(OCAML_TEMPORAL_CORE_STATUS_INVALID_ARGUMENT);
+  }
+  return Val_int(ocaml_temporal_core_v4_metric_meter_release(
+      *Metric_meter_slot(meter), (uint32_t)raw_id));
+}
+
 /* Connect the official client using a strict JSON configuration while the
  * OCaml runtime lock is available to other Domains. */
 CAMLprim value ocaml_temporal_client_connect(value runtime, value input) {

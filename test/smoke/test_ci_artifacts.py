@@ -50,6 +50,21 @@ class MatrixTests(unittest.TestCase):
                 if tier == "release":
                     self.assertEqual({row["ocaml"] for row in native}, set(MATRIX.COMPILERS))
 
+    def test_next_series_lane_is_master_only(self):
+        """The next-compiler lane (#1164) runs only in master builds, on one
+        Linux amd64 runner, outside the supported compilers, from a pinned
+        image of its own."""
+        self.assertNotIn(MATRIX.NEXT_SERIES, {c.rsplit(".", 1)[0] for c in MATRIX.COMPILERS})
+        self.assertEqual(
+            MATRIX.matrices("master")["next"]["include"],
+            [{"ocaml": MATRIX.NEXT_SERIES, "label": MATRIX.NEXT_SERIES,
+              "runner": "ubuntu-24.04"}])
+        for tier in ("pr", "release"):
+            with self.subTest(tier=tier):
+                self.assertEqual(MATRIX.matrices(tier)["next"]["include"], [])
+        root = Path(__file__).resolve().parents[2]
+        self.assertTrue((root / "docker" / f"ocaml-{MATRIX.NEXT_SERIES}" / "Dockerfile").is_file())
+
     def test_unknown_tier_fails(self):
         """Typos must not silently select a cheap, incomplete release matrix."""
         with self.assertRaises(ValueError):

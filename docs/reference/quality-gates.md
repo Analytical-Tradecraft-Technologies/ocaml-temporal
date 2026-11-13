@@ -61,7 +61,7 @@ calls the same workflow with the `master` matrix tier.
 | Event | Linux OCaml matrix | Native OCaml matrix | Other build jobs |
 | --- | --- | --- | --- |
 | PR or merge group | amd64 5.2 and 5.5; arm64 5.5 | macOS ARM64 and Windows x64 on 5.5 | Four Rust producers, quality, standalone license audit, the live Temporal/PostgreSQL smoke on Linux amd64/5.5, and the sandboxed opam build from the source archive on Linux amd64 (`opam-source-sandbox-linux`, #1148) |
-| `master` push, schedule, or manual Build dispatch | amd64 and arm64 on 5.2, 5.3, 5.4, and 5.5 | macOS ARM64 and Windows x64 on 5.5 | The same Rust, quality, license, live smoke and Linux sandbox jobs, plus the macOS ARM64 sandboxed offline opam build (`opam-source-offline`) |
+| `master` push, schedule, or manual Build dispatch | amd64 and arm64 on 5.2, 5.3, 5.4, and 5.5, plus the non-blocking next-series lane (`verify-next`, amd64 on 5.6 trunk, #1164) | macOS ARM64 and Windows x64 on 5.5 | The same Rust, quality, license, live smoke and Linux sandbox jobs, plus the macOS ARM64 sandboxed offline opam build (`opam-source-offline`) |
 
 The required PR and merge-group graph runs even for documentation-only,
 fixture-only, or empty effective diffs. The `changes` job validates the
@@ -73,7 +73,11 @@ the group's base. The separate release metadata/SBOM workflow also runs for
 PRs and merge groups without compiling the SDK.
 
 The broader `master` matrix catches intermediate-compiler regressions outside
-the PR sample. These entries describe configured jobs, not evidence that a
+the PR sample. `verify-next` runs `make verify` with the pinned image of the
+next, not yet supported, compiler series (`NEXT_SERIES` in
+`scripts/ci-matrix.py`). It has `continue-on-error`, so a failure leaves the
+master run green and only warns that the next compiler or the locked OPAM
+closure needs work before the `< 5.6` bound can be raised. These entries describe configured jobs, not evidence that a
 particular Actions run completed.
 
 ## Rust artifact sharing

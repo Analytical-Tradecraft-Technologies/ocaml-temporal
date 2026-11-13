@@ -260,6 +260,12 @@ enum ClientCallKind {
     /// `History` message rather than a JSON document; see
     /// [`client_protocol::fetch_history`].
     History,
+    /// Describe one run (#1152). It has no synchronous symbol; see
+    /// [`client_protocol::describe_workflow`].
+    Describe,
+    /// Count the executions a visibility query matches (#1152). It has no
+    /// synchronous symbol; see [`client_protocol::count_workflows`].
+    Count,
     /// Signal a workflow, starting it first when its workflow ID has no open
     /// run (#1151). It has no synchronous symbol; its outcome is the closed
     /// accepted/rejected/unknown start outcome of [`ClientCallKind::Start`].
@@ -289,6 +295,8 @@ impl TryFrom<u32> for ClientCallKind {
             11 => Self::AsyncActivityCompletion,
             12 => Self::AsyncActivityHeartbeat,
             13 => Self::History,
+            14 => Self::Describe,
+            15 => Self::Count,
             16 => Self::SignalWithStart,
             17 => Self::UpdateWithStart,
             _ => {
@@ -315,6 +323,8 @@ enum ClientRpc {
     PollUpdate(client_protocol::PollWorkflowUpdateRequest),
     Visibility(client_protocol::VisibilityRequest),
     History(client_protocol::HistoryRequest),
+    Describe(client_protocol::DescribeRequest),
+    Count(client_protocol::CountRequest),
     SignalWithStart(Arc<client_protocol::SignalWithStartRequest>),
     UpdateWithStart(Arc<client_protocol::UpdateWithStartRequest>),
     /// A namespace-bound async activity completion, failure, or
@@ -432,6 +442,12 @@ impl ClientRpc {
             ClientCallKind::History => Self::History(
                 client_protocol::decode_history_request(text).map_err(protocol_failure)?,
             ),
+            ClientCallKind::Describe => Self::Describe(
+                client_protocol::decode_describe_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::Count => {
+                Self::Count(client_protocol::decode_count_request(text).map_err(protocol_failure)?)
+            }
             ClientCallKind::SignalWithStart => Self::SignalWithStart(Arc::new(
                 client_protocol::decode_signal_with_start_request(text)
                     .map_err(protocol_failure)?,
@@ -543,6 +559,18 @@ impl ClientRpc {
                 client_protocol::fetch_history(connection, request)
                     .await
                     .map_err(client_operation_failure)
+            }),
+            Self::Describe(request) => Box::pin(async move {
+                let response = client_protocol::describe_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_describe_response(&response))
+            }),
+            Self::Count(request) => Box::pin(async move {
+                let response = client_protocol::count_workflows(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_count_response(&response))
             }),
             Self::SignalWithStart(request) => Box::pin(async move {
                 let result = client_protocol::signal_with_start_workflow(
@@ -2740,7 +2768,7 @@ impl Runtime {
             .worker
             .take()
             .expect("drained worker remains owned until terminal finalization");
-        let result = match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+        let released = match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
             BoundedFinalize::Refused(worker, error) => {
                 // The bridge would not consume the worker (for example after a
                 // lost poll lease). Keep it owned by the graph so runtime close
@@ -2748,21 +2776,11 @@ impl Runtime {
                 self.worker = Some(*worker);
                 return Err(worker_bridge_failure(error));
             }
-            BoundedFinalize::Finalized if retirement.abandoned_leases == 0 => Ok(Vec::new()),
-            BoundedFinalize::Finalized => Err(Failure {
-                status: STATUS_OUTSTANDING_TASKS,
-                message: "Temporal worker shutdown force-completed tasks that were never completed by the worker".to_owned(),
-            }),
-            BoundedFinalize::Panicked => Err(Failure {
-                status: STATUS_WORKER,
-                message: "Temporal worker finalization failed".to_owned(),
-            }),
-            BoundedFinalize::Detached => Err(Failure {
-                status: STATUS_WORKER,
-                message: "Temporal worker finalization did not finish within the shutdown bound"
-                    .to_owned(),
-            }),
+            BoundedFinalize::Finalized => ReleasedFinalize::Finalized,
+            BoundedFinalize::Panicked => ReleasedFinalize::Panicked,
+            BoundedFinalize::Detached => ReleasedFinalize::Detached,
         };
+        let result = shutdown_release_result(released, retirement.abandoned_leases);
         // In every remaining outcome the graph no longer owns the worker: it
         // was finalized, released while unwinding, or is still being finalized
         // by a task that owns it.
@@ -3678,6 +3696,46 @@ fn poll_lane_failure(error: PollLaneError) -> Failure {
     Failure {
         status: STATUS_WORKER,
         message: public_poll_lane_error_message(&error).to_owned(),
+    }
+}
+
+/// A [`BoundedFinalize`] outcome after which the runtime graph no longer owns
+/// the worker: it was finalized, released while unwinding, or is still owned
+/// by a detached finalizer task. `Refused` is excluded because the graph
+/// keeps that worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReleasedFinalize {
+    /// Core's finalizer completed, including its unregistration.
+    Finalized,
+    /// Core's finalizer panicked; the worker was dropped while unwinding.
+    Panicked,
+    /// The finalizer outlived [`WORKER_FINALIZE_TIMEOUT`] and keeps running
+    /// in its own task (#1149).
+    Detached,
+}
+
+/// Maps the outcome of `shutdown_worker`'s bounded finalization onto the
+/// native result (#1229). A clean finalization succeeds unless the drain had
+/// to force-complete leases OCaml never completed, which is
+/// `STATUS_OUTSTANDING_TASKS` because language-side work was lost. A panicked
+/// or detached finalizer is `STATUS_WORKER` with a closed diagnostic. In
+/// every case the worker has left the graph.
+fn shutdown_release_result(outcome: ReleasedFinalize, abandoned_leases: usize) -> Operation {
+    match outcome {
+        ReleasedFinalize::Finalized if abandoned_leases == 0 => Ok(Vec::new()),
+        ReleasedFinalize::Finalized => Err(Failure {
+            status: STATUS_OUTSTANDING_TASKS,
+            message: "Temporal worker shutdown force-completed tasks that were never completed by the worker".to_owned(),
+        }),
+        ReleasedFinalize::Panicked => Err(Failure {
+            status: STATUS_WORKER,
+            message: "Temporal worker finalization failed".to_owned(),
+        }),
+        ReleasedFinalize::Detached => Err(Failure {
+            status: STATUS_WORKER,
+            message: "Temporal worker finalization did not finish within the shutdown bound"
+                .to_owned(),
+        }),
     }
 }
 
@@ -5329,6 +5387,35 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_record(
         return STATUS_INVALID_ARGUMENT;
     };
     catch_unwind(AssertUnwindSafe(|| meter.record(id, value))).unwrap_or(STATUS_PANIC)
+}
+
+/// Give back one registration of SDK metric series `id` (#1212).
+///
+/// A worker releases each series it registered when it shuts down, and
+/// `Native_worker_metrics.create` releases those it already registered when
+/// a later registration fails, so the per-runtime series cap counts only the
+/// series of running workers. The series keeps its identifier and its last
+/// exported value; registering it again reactivates it. Allocates no result
+/// and does no I/O; it takes the meter's write lock only briefly. A null
+/// handle, an unknown identifier, or a series with no unreleased
+/// registration returns `STATUS_INVALID_ARGUMENT` and changes nothing; a
+/// contained panic returns `STATUS_PANIC`.
+///
+/// # Safety
+///
+/// `meter` must be null or a live handle from
+/// [`ocaml_temporal_core_v4_shared_runtime_metric_meter`]; concurrent calls
+/// on one handle, from any thread, are permitted.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_release(
+    meter: *const MetricMeter,
+    id: u32,
+) -> Status {
+    // SAFETY: The caller promises a null or live handle.
+    let Some(meter) = (unsafe { meter.as_ref() }) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    catch_unwind(AssertUnwindSafe(|| meter.release(id))).unwrap_or(STATUS_PANIC)
 }
 
 /// Release an SDK metrics recorder and clear the caller's slot. Dropping it
@@ -7165,6 +7252,10 @@ mod worker_task_types;
 #[cfg(test)]
 #[path = "../tests/support/worker_tuning.rs"]
 mod worker_tuning;
+
+#[cfg(test)]
+#[path = "../tests/support/worker_shutdown_outcomes.rs"]
+mod worker_shutdown_outcomes;
 
 /// SDK name reported to Temporal as the `client-name` RPC header and recorded
 /// in `WorkflowTaskCompleted.sdk_metadata`. Core would otherwise attribute

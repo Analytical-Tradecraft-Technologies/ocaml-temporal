@@ -6849,3 +6849,53 @@ with only the final stdout written. Mutating calls stay single-attempt.
 task-failure command tests cover retry, bound, pass-through of fatal errors and
 shell/Python classifier agreement. See the [local stack
 reference](reference/local-temporal-stack.md#operator-commands).
+
+## 2026-11-13: SDK metric series released at worker shutdown
+
+The per-runtime cap of 1,024 SDK metric series counted every namespace and
+task-queue pair a runtime had ever seen, so a long-lived runtime hosting
+short-lived workers on distinct queues ran out after about 50 pairs, and the
+worker that hit the cap exported a partial set stuck at zero (#1212). The
+Rust registry now reference-counts registrations and the cap counts only
+live series; the new `ocaml_temporal_core_v4_metric_meter_release` gives one
+registration back, and `Native_worker_metrics.release` returns a worker's
+series when its bounded shutdown is reported. Registration is all or
+nothing: a refused worker releases what it registered and records nothing.
+A released series keeps its identifier and its last value in the scrape,
+because Core's Prometheus registry has no removal. The scrape relay now
+bounds its reserve wait and its connect to Core by the same
+`RELAY_MAX_LIFETIME` deadline as the rest of the relay. `tests/sdk_metrics.rs`
+and `test/runtime/test_native_worker_metrics.ml` cover release, reactivation,
+refusals and the all-or-nothing rollback against a real scrape. See
+[SDK metric registration limits](reference/observability.md#sdk-metric-registration-limits).
+
+## 2026-11-13: Describe one run and count executions
+
+`Client.describe` returns a snapshot of the run a handle addresses without
+waiting for it: identity, type, task queue, the visibility status vocabulary,
+start and close times, history length, memo, search attributes, and pending
+activities and child workflows. `Client.count` counts the executions a
+visibility query matches (#1152). Both are submitted calls on the new
+`DESCRIBE` (14) and `COUNT` (15) selectors. `tests/describe_count.rs` covers
+them against a gRPC double, and the `describe_count` live regression checks
+them against Temporal Server. See [describe and
+count](reference/client-protocol.md#describe-one-run-and-count-executions-1152).
+
+## 2026-11-13: Signal-with-start and update-with-start
+
+`Client.signal_with_start` and `Client.update_with_start` deliver a typed
+signal or update to a workflow, starting it first when its workflow ID has no
+open run, as one atomic Temporal operation each (#1151). Both take every
+`start` option. Signal-with-start offers only the `Use_existing` (default) and
+`Terminate_existing` conflict policies, because Temporal rejects `FAIL` for
+it. Update-with-start sends `ExecuteMultiOperation [StartWorkflow,
+UpdateWorkflow]` and returns the run handle beside the update's own
+`start_update`-shaped result, so a validator rejection still reports the run
+that was started. They use the new `SIGNAL_WITH_START` (16) and
+`UPDATE_WITH_START` (17) selectors, whose documents embed the start document
+unchanged and share the start slots and request-ID deduplication.
+`tests/with_start.rs` covers them against a gRPC double. The `with_start` live
+regression checks every exact run ID against Temporal Server, including a
+signal recorded before the run's first workflow task. A Python SDK
+counterpart in `sdk_interop` remains open. See [signal-with-start and
+update-with-start](reference/client-protocol.md#signal-with-start-and-update-with-start-1151).

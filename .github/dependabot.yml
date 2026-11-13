@@ -176,6 +176,19 @@ updates:
   - dependency-name: ocaml/opam
     versions:
     - '>= 5.6'
+# The next-compiler readiness lane (#1164, NEXT_SERIES in scripts/ci-matrix.py).
+- package-ecosystem: docker
+  directory: /docker/ocaml-5.6
+  schedule:
+    interval: cron
+    cronjob: 0 6 * * *
+    timezone: Australia/Sydney
+  cooldown:
+    default-days: 3
+  ignore:
+  - dependency-name: ocaml/opam
+    versions:
+    - '>= 5.7'
 - package-ecosystem: docker-compose
   directory: /test/integration/temporal
   schedule:
