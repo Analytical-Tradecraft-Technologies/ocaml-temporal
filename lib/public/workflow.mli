@@ -483,7 +483,9 @@ val upsert_memo : (string * Payload.t) list -> unit
     or an empty, malformed or repeated memo or search-attribute key) fails
     the current workflow task with a typed [Defect] before any command is
     emitted, exactly like an input encoding failure. Payload bytes are
-    copied.
+    copied. Calling it from a query handler or update validator raises
+    [Invalid_argument] before any setting is checked or input encoded, so
+    only that callback is rejected and the run is left untouched.
 
     The fiber ends through a private exception that cleanup code
     ([Fun.protect ~finally]) observes but must let through. Do not wrap the
