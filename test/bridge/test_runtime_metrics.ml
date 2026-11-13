@@ -5,7 +5,9 @@
     reject a busy address as a typed [`Bridge] error without leaking a
     runtime, survive scrapers that reset the connection mid-response, and
     close the endpoint once [Runtime.shutdown] has returned.
-    Invalid options are typed defects raised before any native work. *)
+    Invalid options are typed defects raised before any native work. An
+    OTLP runtime (#1161) listens on nothing and shuts down within its bound
+    without a reachable collector. *)
 open Temporal
 
 (** Unwraps a public result in fixture setup. *)
@@ -301,6 +303,64 @@ let test_invalid_options () =
       ("127.0.0.1:0", [ ("ok", "") ]);
     ]
 
+(** An OTLP runtime (#1161) listens on nothing, needs no reachable
+    collector to be created, and shuts down within the documented bound
+    even when its final export cannot be delivered. The collector address is
+    a loopback port with nothing listening. Exports themselves are covered
+    against collector doubles in [rust/core-bridge/tests/otlp_exporter.rs]
+    and against a live worker in the [worker_metrics] regression. *)
+let test_otlp_lifecycle () =
+  let closed_port =
+    let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+    Fun.protect
+      ~finally:(fun () -> Unix.close socket)
+      (fun () ->
+        Unix.bind socket (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+        match Unix.getsockname socket with
+        | Unix.ADDR_INET (_, port) -> port
+        | Unix.ADDR_UNIX _ -> failwith "loopback socket has no port")
+  in
+  List.iter
+    (fun protocol ->
+      let endpoint =
+        Printf.sprintf "http://127.0.0.1:%d%s" closed_port
+          (match protocol with `Grpc -> "" | `Http_protobuf -> "/v1/metrics")
+      in
+      let metrics =
+        get
+          (Runtime.Metrics.otlp ~endpoint ~protocol
+             ~headers:[ ("authorization", "Bearer test") ]
+             ~period:(Duration.of_ms 100L) ())
+      in
+      let runtime = get (Runtime.create ~io_threads:1 ~metrics ()) in
+      assert (Runtime.metrics_address runtime = None);
+      Unix.sleepf 0.3;
+      let started = Unix.gettimeofday () in
+      get (Runtime.shutdown runtime);
+      let elapsed = Unix.gettimeofday () -. started in
+      if elapsed > 16. then
+        failwith (Printf.sprintf "OTLP runtime shutdown took %.1f s" elapsed))
+    [ `Grpc; `Http_protobuf ];
+  (* Invalid OTLP options are typed defects that never echo a header. *)
+  List.iter
+    (fun result ->
+      match result with
+      | Ok _ -> failwith "accepted an invalid OTLP option"
+      | Error error ->
+          assert ((Error.view error).category = `Defect);
+          assert (not (contains (Error.message error) "s3cr3t")))
+    [
+      Runtime.Metrics.otlp ~endpoint:"localhost:4317" ();
+      Runtime.Metrics.otlp ~endpoint:"http://127.0.0.1:4317"
+        ~headers:[ ("Authorization", "s3cr3t") ]
+        ();
+      Runtime.Metrics.otlp ~endpoint:"http://127.0.0.1:4317"
+        ~headers:[ ("authorization", "s3cr3t\n") ]
+        ();
+      Runtime.Metrics.otlp ~endpoint:"http://127.0.0.1:4317"
+        ~period:(Duration.of_ms 50L) ();
+    ]
+
 (** The scrape helper's timeout is measured in seconds on every platform
     (#1072). A listener that never accepts completes the TCP handshake from
     its backlog but sends nothing, so a 1 s scrape must fail at the first
@@ -339,4 +399,5 @@ let () =
   test_aborted_scrapes_do_not_kill_the_process ();
   test_no_metrics_by_default ();
   test_invalid_options ();
+  test_otlp_lifecycle ();
   print_endline "runtime metrics: ok"

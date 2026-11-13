@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/master/docs/schemas/bridge/runtime-telemetry.schema.json",
+  "title": "OCaml Temporal Core bridge runtime telemetry document",
+  "description": "Private, strict document passed to ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json (#500, #1161), at most 256 KiB. An empty object configures no exporter; at most one exporter may be configured. Temporal_base.Metrics_config renders it and writes every member explicitly. Runtime validators enforce the byte-length bounds and grammars documented in docs/reference/core-bridge.md, which JSON Schema can express only approximately (lengths here are character-based). An otlp document carries header credentials and must never be logged.",
+  "type": "object",
+  "additionalProperties": false,
+  "maxProperties": 1,
+  "properties": {
+    "prometheus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bind_address"],
+      "properties": {
+        "bind_address": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "a.b.c.d:port with canonical decimal octets, or [ipv6]:port without a zone; port 0 to 65535 without leading zeros (0 selects an ephemeral port)."
+        },
+        "global_tags": { "$ref": "#/$defs/globalTags" },
+        "counters_total_suffix": { "type": "boolean", "default": false },
+        "unit_suffix": { "type": "boolean", "default": false },
+        "durations_as_seconds": { "type": "boolean", "default": false }
+      }
+    },
+    "otlp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpoint"],
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 2048,
+          "pattern": "^https?://[!-\"$-~]+$",
+          "description": "Lowercase http:// or https:// URL. Host: DNS name whose last label is not all digits, canonical dotted-quad IPv4, or bracketed IPv6 without a zone; optional port 1 to 65535 without leading zeros; no user information, fragment, or byte outside printable ASCII ! to ~. For http_protobuf it is the complete metrics URL; no path is appended."
+        },
+        "protocol": {
+          "enum": ["grpc", "http_protobuf"],
+          "default": "grpc"
+        },
+        "headers": {
+          "type": "array",
+          "maxItems": 16,
+          "description": "Request headers sent with every export; names unique. Values are credentials and never appear in a log or error message.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "value"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$",
+                "description": "Must not end in -bin, start with grpc-, or be connection, content-encoding, content-length, content-type, host, keep-alive, proxy-connection, te, trailer, transfer-encoding, upgrade, or user-agent."
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "pattern": "^[!-~]([ -~]*[!-~])?$"
+              }
+            }
+          }
+        },
+        "period_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 3600000,
+          "default": 1000
+        },
+        "temporality": {
+          "enum": ["cumulative", "delta"],
+          "default": "cumulative"
+        },
+        "global_tags": { "$ref": "#/$defs/globalTags" },
+        "durations_as_seconds": { "type": "boolean", "default": false }
+      }
+    }
+  },
+  "$defs": {
+    "globalTags": {
+      "type": "array",
+      "maxItems": 16,
+      "description": "Constant labels (Prometheus) or resource attributes (OTLP), in caller order; names unique.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "value"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+            "description": "Must not start with __ or be a label Temporal Core uses (activity_type, eager, failure_reason, le, namespace, operation, poller_type, quantile, service_name, status_code, task_queue, worker_type, workflow_type)."
+          },
+          "value": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "At most 256 UTF-8 bytes without control characters."
+          }
+        }
+      }
+    }
+  }
+}
