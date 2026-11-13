@@ -1252,7 +1252,10 @@ retry delivers it once), and an update is reported as the typed error
 [`with_start.rs`](../../rust/core-bridge/tests/with_start.rs) drive both
 selectors against a gRPC double; the
 [with-start live regression](../../test/integration/with_start/README.md)
-checks both against Temporal Server.
+checks both against Temporal Server, and the
+[official-SDK interoperability regression](../../test/integration/sdk_interop/README.md)
+checks both in each direction between the OCaml SDK and the official Python
+SDK.
 
 ## Structured failures
 
