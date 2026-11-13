@@ -22,20 +22,31 @@ environment variable to keep it apart from another local stack. CI runs it
 with the other suites through `make test-temporal-live-regressions`, which
 `make test-temporal-live-ci` invokes. Logs and evidence are written to
 `_build/live-regressions/sdk_interop.log` and
-`_build/live-regressions/sdk_interop/` (`ready.json`, `python-report.json` and
-`driver-exit`).
+`_build/live-regressions/sdk_interop/` (`ready.json`, `python-ready`,
+`ocaml-with-start.json`, `python-report.json` and `driver-exit`).
 
 ## Topology
 
 [`run-live-regressions.sh`](../temporal/scripts/run-live-regressions.sh)
 starts `regression.exe check` in the development image. That process spawns
-an OCaml worker for the `interop-order` workflow on a unique task queue and
-publishes the queue names in `ready.json`. The controller then runs the
-[Python driver](python/driver.py), which hosts the `interop-price` activity
-in an official-SDK worker on a second queue and drives the OCaml workflow
-with the official client. After the driver exits, the controller writes its
-status to `driver-exit`, and the OCaml process reopens every exact run the
-driver reported through the OCaml client. Both processes must succeed.
+an OCaml worker for the `interop-order` and `interop-entity` workflows on a
+unique task queue and publishes the queue names in `ready.json`. The
+controller then runs the [Python driver](python/driver.py), which hosts the
+`interop-price` activity and the `interop-py-entity` workflow in official-SDK
+workers on two more queues and drives the OCaml workflows with the official
+client. Once its workers poll, the driver publishes `python-ready`; the OCaml
+process then drives the Python entity with its own client while the driver
+runs its cases, and publishes those runs (or its failure) in
+`ocaml-with-start.json`, which the driver checks from its side before it
+exits. After the driver exits, the controller writes its status to
+`driver-exit`, and the OCaml process reopens every exact run the driver
+reported through the OCaml client. Both processes must succeed.
+
+The two entity workflows implement one protocol (#1151): a `deliver` signal
+and an `apply` update (whose validator rejects `"reject"` with type
+`Rejected`, non-retryable, and a JSON detail) append a string, and a
+no-argument `finish` signal completes the run with its label, the received
+items in order, its run ID and the implementing SDK.
 
 ## Tested combinations
 
@@ -50,7 +61,11 @@ driver reported through the OCaml client. Both processes must succeed.
 | Python activity failure to Python client through OCaml | `ApplicationError` type `OutOfStock`, non-retryable, with a JSON detail | The OCaml workflow sees `OutOfStock` and fails with type `PricingFailed`, forwarding the raw details; Python decodes type, non-retryability and the original detail |
 | Server timeout of a Python activity, seen by the OCaml workflow (#1143) | The Python activity heartbeats `{"progress": 42}` and outlives the 3 s start-to-close timeout the OCaml workflow set, with one attempt | History records the server's `START_TO_CLOSE` timeout and no completion or failure. The OCaml workflow branches on `Error.timeout_type` (not the message) and fails with type `PricingTimedOut`. Its details are `{"timeout": "start_to_close"}` followed by `Error.last_heartbeat_details`, so the Python client decodes the heartbeat its own activity recorded, kept apart from the failure details. The OCaml client decodes the same |
 | Incompatible workflow input | A JSON string instead of the order object | The OCaml worker fails the workflow task and the run stays `RUNNING` (fail-closed decoding); the driver terminates it |
-| OCaml client re-check | The four exact runs reported by Python | The OCaml client decodes the same completed result, the `PricingFailed` type and detail, the `PricingTimedOut` type with its timeout kind and heartbeat detail, and the termination |
+| Python client signal-with-start to OCaml workflow (#1151) | `start_workflow` with `start_signal` on an absent workflow, on its open run, with `TERMINATE_EXISTING`, and after the run closed | A new run whose history records the `json/plain` signal before the first workflow task starts; the open run is only signalled (same run ID); the replaced run is terminated after both signals; the closed workflow starts again. The OCaml results list exactly the delivered signals |
+| Python client update-with-start to OCaml workflow (#1151) | `execute_update_with_start_workflow` with `USE_EXISTING` on an absent workflow and its open run, an OCaml validator rejection on the open run and on an absent workflow, and `FAIL` on the open run | Results `1` and `2` from one run; the rejection is an `ApplicationError` of type `Rejected` with its detail while `workflow_handle()` still names the open or newly started run; `FAIL` raises `WorkflowAlreadyStartedError` naming the open run; only the two accepted updates enter history |
+| OCaml client signal-with-start to Python workflow (#1151) | `Client.signal_with_start` on an absent workflow, its open run, with `` `Terminate_existing ``, and after the run closed | `Client.started` and the exact run ID per case on the OCaml side; on the Python side, the OCaml-encoded `json/plain` start input and signals, each new run's signal recorded before its first workflow task, the replaced run terminated, and the same decoded results |
+| OCaml client update-with-start to Python workflow (#1151) | `Client.update_with_start` with `` `Use_existing `` on an absent workflow and its open run, a Python validator rejection on the open run and on an absent workflow, and `` `Fail `` on the open run | Update results `1` and `2`; the Python rejection's type, non-retryability and detail returned beside the open or newly started run; `Client.already_started` naming the open run; Python sees only the accepted updates in history and decodes the same results |
+| OCaml client re-check | The four exact runs reported by Python, and the five with-start runs of the OCaml entity | The OCaml client decodes the same completed result, the `PricingFailed` type and detail, the `PricingTimedOut` type with its timeout kind and heartbeat detail, the termination, and the with-start results Python decoded |
 
 The driver report records the Python SDK, CPython, OCaml SDK and Temporal
 Server versions, and every exact workflow and run ID.
