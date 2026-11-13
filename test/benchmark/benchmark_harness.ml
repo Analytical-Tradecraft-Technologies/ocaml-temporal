@@ -125,7 +125,10 @@ module Memory = struct
       baseline and the final allocator-capacity observation. *)
   let snapshot ~compact () =
     if compact then Gc.compact ();
-    let stat = Gc.stat () in
+    (* OCaml 5.6 deprecates [Gc.stat] in favour of [full_major] then
+       [quick_stat]; the alert is silenced here because the exact live-word
+       count must stay identical on every supported series (5.2-5.5 included). *)
+    let stat = (Gc.stat [@alert "-deprecated"]) () in
     let rss_bytes, peak_rss_bytes, rss_source = resident () in
     {
       heap_words = stat.heap_words;

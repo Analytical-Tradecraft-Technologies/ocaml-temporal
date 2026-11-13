@@ -44,11 +44,14 @@ let complete context =
   in
   internal (Context.resolve_activity context ~seq (Ok payload))
 
-(** Full collections eliminate dead callback environments before measurement. *)
+(** Full collections eliminate dead callback environments before measurement.
+    OCaml 5.6 deprecates [Gc.stat] in favour of [full_major] then
+    [quick_stat]; the alert is silenced here because the exact live-word
+    count must stay identical on every supported series (5.2-5.5 included). *)
 let live_words () =
   Gc.full_major ();
   Gc.full_major ();
-  (Gc.stat ()).live_words
+  ((Gc.stat [@alert "-deprecated"]) ()).live_words
 
 (** Compares a mapped path against same-owner small futures with no dependency
     on the source. Each batch retains more futures and checks that their values

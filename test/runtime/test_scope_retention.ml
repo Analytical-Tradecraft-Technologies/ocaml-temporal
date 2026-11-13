@@ -32,11 +32,14 @@ let facade future =
     ~outside_error:(fun () -> Temporal.Error.defect ~message:"outside test scheduler")
     ~callbacks_live:(fun () -> F.callbacks_live future) ~enqueue:(F.enqueue future)
 
-(** Measures retained OCaml words rather than RSS or cumulative allocation. *)
+(** Measures retained OCaml words rather than RSS or cumulative allocation.
+    OCaml 5.6 deprecates [Gc.stat] in favour of [full_major] then
+    [quick_stat]; the alert is silenced here because the exact live-word
+    count must stay identical on every supported series (5.2-5.5 included). *)
 let live_words () =
   Gc.full_major ();
   Gc.full_major ();
-  (Gc.stat ()).live_words
+  ((Gc.stat [@alert "-deprecated"]) ()).live_words
 
 (** Permits fixed test/runtime overhead, but rejects even a single retained
     list cell per operation across a 10,000-operation batch. *)
