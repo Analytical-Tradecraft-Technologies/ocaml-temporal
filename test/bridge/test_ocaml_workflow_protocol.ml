@@ -824,16 +824,58 @@ let test_continue_as_new_command () =
       commands =
         [
           Continue_as_new
-            { workflow_type = "counter"; input = [ input ] };
+            { workflow_type = "counter"; input = [ input ]; memo = [] };
         ];
     }
   in
   let encoded = unwrap (Protocol.encode_completion completion) in
   check_string "continue-as-new command"
-    {|{"commands":[{"input":[{"data":{"data":"","encoding":"base64"},"metadata":{"encoding":{"data":"YmluYXJ5L251bGw=","encoding":"base64"}}}],"kind":"continue_as_new","workflow_type":"counter"}],"run_id":"current-run"}|}
+    {|{"commands":[{"input":[{"data":{"data":"","encoding":"base64"},"metadata":{"encoding":{"data":"YmluYXJ5L251bGw=","encoding":"base64"}}}],"kind":"continue_as_new","memo":{},"workflow_type":"counter"}],"run_id":"current-run"}|}
     encoded;
   if unwrap (Protocol.decode_completion encoded) <> completion then
     failwith "continue-as-new command did not round-trip"
+
+(** Proves a memo upsert (#1154) and a continue-as-new memo use the exact
+    JSON shape the Rust decoder reads, round-trip, and reject a repeated
+    key; a continue-as-new document without its memo member is malformed
+    on this side, which always writes it. *)
+let test_memo_commands () =
+  let note : Protocol.payload =
+    { metadata = [ ("encoding", Bytes.of_string "json/plain") ]; data = Bytes.of_string "1" }
+  in
+  let completion memo_commands : Protocol.completion =
+    { run_id = "memo-run"; versioning_behavior = None; task_failure = None;
+      commands = memo_commands }
+  in
+  let value =
+    completion
+      [ Modify_workflow_properties { upserted_memo = [ ("note", note) ] };
+        Continue_as_new { workflow_type = "counter"; input = []; memo = [ ("note", note) ] } ]
+  in
+  let encoded = unwrap (Protocol.encode_completion value) in
+  let note_json =
+    {|{"data":{"data":"MQ==","encoding":"base64"},"metadata":{"encoding":{"data":"anNvbi9wbGFpbg==","encoding":"base64"}}}|}
+  in
+  check_string "memo commands"
+    (Printf.sprintf
+       {|{"commands":[{"kind":"modify_workflow_properties","upserted_memo":{"note":%s}},{"input":[],"kind":"continue_as_new","memo":{"note":%s},"workflow_type":"counter"}],"run_id":"memo-run"}|}
+       note_json note_json)
+    encoded;
+  if unwrap (Protocol.decode_completion encoded) <> value then
+    failwith "memo commands did not round-trip";
+  (match
+     Protocol.encode_completion
+       (completion
+          [ Modify_workflow_properties { upserted_memo = [ ("k", note); ("k", note) ] } ])
+   with
+  | Ok _ -> failwith "a repeated memo key was encoded"
+  | Error _ -> ());
+  match
+    Protocol.decode_completion
+      {|{"commands":[{"input":[],"kind":"continue_as_new","workflow_type":"counter"}],"run_id":"memo-run"}|}
+  with
+  | Ok _ -> failwith "a continue-as-new without its memo member was decoded"
+  | Error _ -> ()
 
 (** Proves closed nested objects, numeric bounds, canonical binary data, and
     workflow semantic invariants are rejected identically by both languages. *)
@@ -2011,6 +2053,7 @@ let () =
   run "all child cancellation policies" test_all_child_cancellation_policies;
   run "child cancellation validation" test_child_cancellation_validation;
   run "continue-as-new command" test_continue_as_new_command;
+  run "memo commands" test_memo_commands;
   run "malformed workflow documents" test_invalid_documents;
   run "strict JSON error paths" test_strict_json_error_paths;
   run "large nested payload" test_large_nested_payload;

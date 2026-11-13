@@ -1651,7 +1651,7 @@ let test_continue_as_new_terminal () =
   (* A [Codec.unit] successor input is sent as zero arguments (#819). *)
   expect "continue-as-new command"
     [ Activation.Continue_as_new
-        { workflow_type = "continuation_target"; input = [] } ]
+        { workflow_type = "continuation_target"; input = []; memo = [] } ]
     (Execution.activate execution [ Activation.Start_workflow ]);
   expect "continue-as-new activation is terminal" []
     (Execution.activate execution [ Activation.Start_workflow ]);
@@ -1685,7 +1685,7 @@ let test_codec_callback_preserves_terminal_control () =
   in
   let expected =
     [ Activation.Continue_as_new
-        { workflow_type = "codec_continuation_target"; input = [] } ]
+        { workflow_type = "codec_continuation_target"; input = []; memo = [] } ]
   in
   expect "activity codec callback terminal command" expected
     (Execution.activate (Execution.start source ()) [ Activation.Start_workflow ]);
@@ -2360,6 +2360,177 @@ let test_workflow_empty_search_attribute_upsert () =
       Activation.Complete_workflow _ ] -> ()
   | _ -> failwith "empty search-attribute upsert emitted a command"
 
+(** Verifies the typed search-attribute upsert (#1154) emits the same Core
+    command as the raw one, with each value's [json/plain] encoding and the
+    ["type"] metadata of its key, and an unset as the canonical
+    [binary/null] payload with no type entry. *)
+let test_workflow_typed_search_attribute_upsert () =
+  let status = Temporal.Search_attribute.keyword "status" in
+  let attempts = Temporal.Search_attribute.int64 "attempts" in
+  let retired = Temporal.Search_attribute.bool "retired" in
+  let workflow =
+    Temporal.Workflow.define ~name:"typed_search_attribute_upsert"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        Temporal.Workflow.upsert_typed_search_attributes
+          Temporal.Search_attribute.
+            [ set status "ready"; set attempts 3L; unset retired ];
+        Temporal.Workflow.upsert_typed_search_attributes [];
+        Ok ())
+  in
+  let execution = Execution.start workflow () in
+  let entry data kind =
+    { Temporal_base.Payload.metadata = [ ("encoding", "json/plain"); ("type", kind) ];
+      data = Bytes.of_string data }
+  in
+  expect "typed search-attribute upsert"
+    [ Activation.Upsert_search_attributes
+        { search_attributes =
+            [ ("status", entry "\"ready\"" "Keyword");
+              ("attempts", entry "3" "Int");
+              ("retired",
+               { Temporal_base.Payload.metadata = [ ("encoding", "binary/null") ];
+                 data = Bytes.empty }) ] };
+      Activation.Complete_workflow
+        { Temporal_base.Payload.metadata = [ ("encoding", "binary/null") ];
+          data = Bytes.empty } ]
+    (Execution.activate execution [ Activation.Start_workflow ])
+
+(** Verifies a typed update that cannot be encoded is a programmer error
+    raised before any command is buffered: a repeated name fails the
+    workflow task instead of emitting an upsert the server would reject. *)
+let test_workflow_typed_search_attribute_misuse () =
+  let status = Temporal.Search_attribute.keyword "status" in
+  let raised = ref false in
+  let workflow =
+    Temporal.Workflow.define ~name:"typed_search_attribute_misuse"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit (fun () ->
+        (try
+           Temporal.Workflow.upsert_typed_search_attributes
+             Temporal.Search_attribute.[ set status "a"; set status "b" ]
+         with Invalid_argument _ -> raised := true);
+        Ok ())
+  in
+  let execution = Execution.start workflow () in
+  match Execution.activate execution [ Activation.Start_workflow ] with
+  | [ Activation.Complete_workflow _ ] when !raised -> ()
+  | _ -> failwith "a repeated typed search attribute was not rejected"
+
+(** Verifies [upsert_memo] (#1154) emits one [ModifyWorkflowProperties]
+    command per non-empty call with copied payloads, skips an empty call,
+    and that a later continue-as-new carries the merged memo: the start
+    memo, with the upserted value added and the [binary/null] key removed,
+    so Core does not fall back to the start memo and drop the upsert. *)
+let test_workflow_memo_upsert_and_continue_as_new () =
+  let successor =
+    Temporal.Workflow.remote ~name:"memo_successor" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit
+  in
+  let null = { Temporal_base.Payload.metadata = [ ("encoding", "binary/null") ]; data = Bytes.empty } in
+  let note = Bytes.of_string "\"note\"" in
+  let workflow =
+    Temporal.Workflow.define ~name:"memo_upsert" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () ->
+        Temporal.Workflow.upsert_memo [];
+        Temporal.Workflow.upsert_memo
+          [ ("note", { Temporal.Payload.metadata = [ ("encoding", "json/plain") ]; data = note });
+            ("dropped", public_payload null) ];
+        (* Mutating the caller's buffer after the call must not change the
+           buffered command. *)
+        Bytes.set note 1 'X';
+        Temporal.Workflow.continue_as_new successor ())
+  in
+  let execution = Execution.start workflow () in
+  Execution.set_start_metadata execution
+    (Some
+       { Workflow_context_store.memo =
+           Some [ ("kept", payload "kept"); ("dropped", payload "old") ];
+         search_attributes = None;
+         execution_expiration_time = None });
+  expect "memo upsert and continue-as-new"
+    [ Activation.Modify_workflow_properties
+        { upserted_memo = [ ("note", payload "note"); ("dropped", null) ] };
+      Activation.Continue_as_new
+        { workflow_type = "memo_successor"; input = [];
+          memo = [ ("kept", payload "kept"); ("note", payload "note") ] } ]
+    (Execution.activate execution [ Activation.Start_workflow ])
+
+(** Verifies memo keys follow the search-attribute key rules: an empty or
+    repeated key raises [Invalid_argument] before a command is buffered, and
+    the call is rejected outside workflow execution. *)
+let test_workflow_memo_upsert_misuse () =
+  let value = public_payload (payload "v") in
+  let rejected values =
+    match Temporal.Workflow.upsert_memo values with
+    | () -> false
+    | exception Invalid_argument _ -> true
+  in
+  if not (rejected [ ("k", value) ]) then
+    failwith "upsert_memo outside a workflow was accepted";
+  let outcomes = ref [] in
+  let workflow =
+    Temporal.Workflow.define ~name:"memo_misuse" ~input:Temporal.Codec.unit
+      ~output:Temporal.Codec.unit (fun () ->
+        outcomes :=
+          [ rejected [ ("", value) ]; rejected [ ("k", value); ("k", value) ] ];
+        Ok ())
+  in
+  let execution = Execution.start workflow () in
+  match Execution.activate execution [ Activation.Start_workflow ] with
+  | [ Activation.Complete_workflow _ ] when !outcomes = [ true; true ] -> ()
+  | _ -> failwith "an invalid memo key was not rejected"
+
+(** Verifies memo and search-attribute upserts (#1154) are rejected inside the
+    read-only callbacks, an update validator and a query handler, even for an
+    empty list, before any command is buffered or the current memo changes.
+    Validators are skipped on replay and query activations record no commands,
+    so a command buffered there would reach history only on the live path. *)
+let test_upserts_rejected_in_read_only_callbacks () =
+  let context =
+    Workflow_context_store.create ~randomness_seed:"271828" (Scheduler.create ())
+  in
+  let value = public_payload (payload "v") in
+  let rejected attempt =
+    match attempt () with () -> false | exception Invalid_argument _ -> true
+  in
+  let attempts () =
+    List.map rejected
+      [ (fun () -> Temporal.Workflow.upsert_memo [ ("k", value) ]);
+        (fun () -> Temporal.Workflow.upsert_memo []);
+        (fun () -> Temporal.Workflow.upsert_search_attributes [ ("K", value) ]);
+        (fun () -> Temporal.Workflow.upsert_search_attributes []) ]
+  in
+  if not (List.for_all Fun.id (Workflow_context_store.with_read_only_query context attempts))
+  then failwith "an upsert was accepted in a query handler";
+  let validator_outcomes = ref [] in
+  let definition =
+    Temporal.Update.define ~name:"read_only_upsert_validator"
+      ~input:Temporal.Codec.unit ~output:Temporal.Codec.unit
+  in
+  let handler =
+    Temporal.Update.Handler.make
+      ~validator:(fun () ->
+        validator_outcomes := attempts ();
+        Ok ())
+      definition (fun () -> Ok ())
+  in
+  let unit_payload =
+    match Temporal.Codec.encode Temporal.Codec.unit () with
+    | Ok payload -> payload
+    | Error error -> failwith (Temporal.Error.message error)
+  in
+  (match
+     Workflow_context_store.with_context context (fun () ->
+         Temporal.Update.Handler.dispatch handler unit_payload)
+   with
+  | Ok _ -> ()
+  | Error error ->
+      failwith ("read-only upsert validator rejected the update: " ^ Temporal.Error.message error));
+  if !validator_outcomes = [] || not (List.for_all Fun.id !validator_outcomes) then
+    failwith "an upsert was accepted in an update validator";
+  match Workflow_context_store.take_commands context with
+  | [] -> ()
+  | _ :: _ -> failwith "a read-only callback buffered a durable command"
+
 (** Verifies public child routing and parent closure remain separate from
     explicit cancellation, and survive the native protocol translation. *)
 let test_child_routing_and_parent_close () =
@@ -2450,4 +2621,9 @@ let () =
   test_workflow_random_int_is_replay_stable ();
   test_update_validator_cannot_consume_workflow_randomness ();
   test_workflow_search_attribute_upsert ();
-  test_workflow_empty_search_attribute_upsert ()
+  test_workflow_empty_search_attribute_upsert ();
+  test_workflow_typed_search_attribute_upsert ();
+  test_workflow_typed_search_attribute_misuse ();
+  test_workflow_memo_upsert_and_continue_as_new ();
+  test_workflow_memo_upsert_misuse ();
+  test_upserts_rejected_in_read_only_callbacks ()

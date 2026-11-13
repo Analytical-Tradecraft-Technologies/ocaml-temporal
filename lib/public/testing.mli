@@ -62,8 +62,11 @@
     - Workflow cancellation and child cancellation follow the runtime's
       immediate cancellation path; child cancellation types are not
       distinguished.
-    - Asynchronous activities, Nexus operations, search-attribute visibility,
-      memos, and workflow ID reuse policies are not simulated. Child workflow
+    - Asynchronous activities, Nexus operations, visibility queries, and
+      workflow ID reuse policies are not simulated. A run's memo and search
+      attributes are kept and merged on upsert ({!memo},
+      {!search_attributes}), but nothing indexes them and a start cannot set
+      them. Child workflow
       execution, run, and task timeouts are validated and recorded in the
       start command but not enforced, so a child never times out.
     - Identifiers (workflow IDs, run IDs, update IDs) are deterministic
@@ -257,3 +260,21 @@ val workflow_id : ('input, 'output) handle -> string
 
 (** Returns the ID of the latest run, which changes after continue-as-new. *)
 val run_id : ('input, 'output) handle -> string
+
+(** Returns the latest run's memo (#1154), sorted by key: the memo the run
+    started with, merged with its {!Workflow.upsert_memo} calls as the server
+    merges them, so a [binary/null] value removes its key. A run started by
+    {!start} has an empty memo. A continue-as-new successor starts with its
+    predecessor's merged memo once the predecessor upserted one, and with the
+    predecessor's start memo otherwise, as a native worker does; a retry run
+    starts with the start memo. *)
+val memo : ('input, 'output) handle -> (string * Payload.t) list
+
+(** Returns the latest run's search attributes, sorted by key, after its
+    {!Workflow.upsert_search_attributes} and
+    {!Workflow.upsert_typed_search_attributes} calls; read typed values with
+    {!Search_attribute.decode}. A run started by {!start} has none, and a
+    continue-as-new successor inherits its predecessor's current values.
+    Only the stored values are simulated: there is no visibility store to
+    query, and names need not be registered. *)
+val search_attributes : ('input, 'output) handle -> (string * Payload.t) list

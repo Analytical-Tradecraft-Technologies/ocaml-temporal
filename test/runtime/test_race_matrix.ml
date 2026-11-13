@@ -173,6 +173,7 @@ let render = function
   | Activation.Set_patch_marker { patch_id; _ } ->
       Printf.sprintf "patch-marker(%s)" patch_id
   | Activation.Upsert_search_attributes _ -> "upsert-search-attributes"
+  | Activation.Modify_workflow_properties _ -> "modify-workflow-properties"
 
 (** Recognizes the commands that close the current run. *)
 let is_terminal = function

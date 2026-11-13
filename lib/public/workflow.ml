@@ -552,32 +552,38 @@ let deprecate_patch ~id =
   | Some context ->
       Temporal_sdk_kernel.Workflow_context_store.deprecate_patch context ~patch_id
 
-(** Validates one search-attribute key at the public boundary. Search
-    attributes are persisted in workflow history, so rejecting malformed keys
-    before buffering a command prevents a programmer error from becoming a
-    delayed worker failure. *)
-let validate_search_attribute_key key =
-  if String.equal key "" then invalid_arg "Temporal search-attribute key is empty";
+(** Validates one search-attribute or memo key at the public boundary;
+    [label] names the collection in the message. Both maps are persisted in
+    workflow history, so rejecting malformed keys before buffering a command
+    prevents a programmer error from becoming a delayed worker failure. *)
+let validate_metadata_key ~label key =
+  if String.equal key "" then invalid_arg (Printf.sprintf "Temporal %s key is empty" label);
   if String.contains key '\000' then
-    invalid_arg "Temporal search-attribute key contains a NUL byte";
+    invalid_arg (Printf.sprintf "Temporal %s key contains a NUL byte" label);
   if String.length key > max_name_bytes then
-    invalid_arg "Temporal search-attribute key exceeds 65536 bytes";
+    invalid_arg (Printf.sprintf "Temporal %s key exceeds 65536 bytes" label);
   if not (Temporal_base.Codec.valid_utf_8 key) then
-    invalid_arg "Temporal search-attribute key must be valid UTF-8"
+    invalid_arg (Printf.sprintf "Temporal %s key must be valid UTF-8" label)
+
+(** Validates every key of one upsert and rejects repeats, which the bridge's
+    payload map could not represent. [label] names the collection
+    (["search-attribute"] or ["memo"]) in the [Invalid_argument] message. *)
+let validate_metadata_keys ~label values =
+  let rec validate_keys seen = function
+    | [] -> ()
+    | (key, _) :: rest ->
+        validate_metadata_key ~label key;
+        if List.exists (String.equal key) seen then
+          invalid_arg (Printf.sprintf "Temporal %s keys must be unique" label)
+        else validate_keys (key :: seen) rest
+  in
+  validate_keys [] values
 
 (** Converts public payloads into private owned values and emits one Core
     search-attribute merge command. No network or nondeterministic operation
     occurs until the enclosing workflow activation is completed. *)
 let upsert_search_attributes values =
-  let rec validate_keys seen = function
-    | [] -> ()
-    | (key, _) :: rest ->
-        validate_search_attribute_key key;
-        if List.exists (String.equal key) seen then
-          invalid_arg "Temporal search-attribute keys must be unique"
-        else validate_keys (key :: seen) rest
-  in
-  validate_keys [] values;
+  validate_metadata_keys ~label:"search-attribute" values;
   match Temporal_sdk_kernel.Workflow_context_store.current () with
   | None ->
       invalid_arg
@@ -585,6 +591,31 @@ let upsert_search_attributes values =
   | Some context ->
       let values = List.map (fun (key, payload) -> (key, Payload_private.to_base payload)) values in
       Temporal_sdk_kernel.Workflow_context_store.upsert_search_attributes context values
+
+(** Encodes typed updates through the public {!Search_attribute} encoder and
+    merges the result with {!upsert_search_attributes}. An encoding error is
+    raised as [Invalid_argument] because every way to produce one (a bad or
+    repeated name, a non-UTF-8 string, a non-finite double, an out-of-range
+    datetime) is a defect in the calling workflow code, matching the raw
+    form's treatment of malformed keys. *)
+let upsert_typed_search_attributes updates =
+  match Search_attribute.encode updates with
+  | Ok values -> upsert_search_attributes values
+  | Error error ->
+      invalid_arg
+        ("Temporal.Workflow.upsert_typed_search_attributes: " ^ Error.message error)
+
+(** Validates memo keys, copies the payloads into private values, and buffers
+    one [ModifyWorkflowProperties] command; the runtime also folds the values
+    into the run's current memo so continue-as-new can carry it forward. *)
+let upsert_memo values =
+  validate_metadata_keys ~label:"memo" values;
+  match Temporal_sdk_kernel.Workflow_context_store.current () with
+  | None ->
+      invalid_arg "Temporal.Workflow.upsert_memo used outside a workflow execution"
+  | Some context ->
+      let values = List.map (fun (key, payload) -> (key, Payload_private.to_base payload)) values in
+      Temporal_sdk_kernel.Workflow_context_store.upsert_memo context values
 
 (** Makes a continue-as-new input encoder failure fail only the workflow task.
     The runtime treats a [Fail_workflow] as a task failure only for [Bridge],

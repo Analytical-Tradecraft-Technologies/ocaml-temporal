@@ -174,6 +174,12 @@ type t = {
      do not carry it, so the worker adapter supplies it at construction. *)
   namespace : string;
   mutable start_metadata : start_metadata option;
+  (* The run's memo after its own [upsert_memo] calls, or [None] before the
+     first one. It is derived only from the start snapshot and the run's
+     deterministic upserts, so replay rebuilds the same value, and
+     [continue_as_new] passes it to the successor because Core would
+     otherwise reuse the start memo and drop the upserts (#1154). *)
+  mutable current_memo : (string * Temporal_base.Payload.t) list option;
   (* Installed once from the initialization activation; strings are
      immutable copies owned by the protocol decoder, so they can be shared. *)
   mutable run_info : run_info option;
@@ -300,6 +306,7 @@ let create ?(task_queue = "default") ?(namespace = "default")
         task_queue;
         namespace;
         start_metadata = None;
+        current_memo = None;
         run_info = None;
         conditions = Condition_store.create scheduler;
         activation_timestamp = None;
@@ -664,6 +671,19 @@ let with_randomness_disabled context action =
   context.randomness_disabled <- true;
   Fun.protect action ~finally:(fun () -> context.randomness_disabled <- previous)
 
+(** Rejects a durable command from a read-only callback. [randomness_disabled]
+    is set for exactly the read-only extents: update validators, which run
+    only for live requests and are skipped on replay, and query handlers,
+    whose activations must not record commands. A command buffered there
+    would reach history on the live path only, so replay could not reproduce
+    it; the call is a programmer error, like use after the execution ended,
+    and is rejected before any state or command buffer changes. *)
+let reject_in_read_only_callback context ~what =
+  if context.randomness_disabled then
+    invalid_arg
+      ("Temporal workflow " ^ what
+     ^ " cannot be changed in a read-only update validator or query handler")
+
 (** Buffers a search-attribute merge without consulting wall-clock or process
     state. The payload list is copied at the public boundary before this
     command is retained by the execution context.
@@ -679,6 +699,7 @@ let upsert_search_attributes context search_attributes =
   if context.sealed then
     invalid_arg
       "Temporal workflow search attributes used after workflow execution ended";
+  reject_in_read_only_callback context ~what:"search attributes";
   match search_attributes with
   | [] -> ()
   | _ :: _ ->
@@ -692,6 +713,60 @@ let upsert_search_attributes context search_attributes =
       in
       context.commands_rev <-
         Activation.Upsert_search_attributes { search_attributes = copied }
+        :: context.commands_rev
+
+(** Reports whether [payload] is exactly the canonical [binary/null] value,
+    which Temporal Server treats as a removal when it merges a memo or
+    search-attribute upsert. The server compares the whole payload, so a
+    [binary/null] payload with extra metadata or data is an ordinary value. *)
+let is_removal (payload : Temporal_base.Payload.t) =
+  Bytes.length payload.data = 0
+  && (match payload.metadata with
+     | [ ("encoding", "binary/null") ] -> true
+     | _ -> false)
+
+(** Applies one memo or search-attribute upsert to [memo] as the server
+    does: a removal deletes its key, any other value replaces an existing key
+    in place or is appended. *)
+let merge_upsert memo upserted =
+  List.fold_left
+    (fun memo (key, payload) ->
+      if is_removal payload then List.filter (fun (name, _) -> not (String.equal name key)) memo
+      else if List.mem_assoc key memo then
+        List.map (fun ((name, _) as entry) -> if String.equal name key then (key, payload) else entry) memo
+      else memo @ [ (key, payload) ])
+    memo upserted
+
+(** Buffers one memo merge (#1154) and folds it into [current_memo], seeded
+    from the start snapshot on first use. Like a search-attribute upsert, an
+    empty list emits nothing, and the sealed check runs first so use after
+    the execution ended stays a programmer error. *)
+let upsert_memo context upserted =
+  if context.sealed then
+    invalid_arg "Temporal workflow memo used after workflow execution ended";
+  reject_in_read_only_callback context ~what:"memo";
+  match upserted with
+  | [] -> ()
+  | _ :: _ ->
+      let copied =
+        List.map
+          (fun (key, { Temporal_base.Payload.metadata; data }) ->
+            (snapshot_identifier key,
+             { Temporal_base.Payload.metadata = List.map Fun.id metadata;
+               data = Bytes.copy data }))
+          upserted
+      in
+      let current =
+        match context.current_memo with
+        | Some memo -> memo
+        | None -> (
+            match context.start_metadata with
+            | Some { memo = Some memo; _ } -> memo
+            | Some { memo = None; _ } | None -> [])
+      in
+      context.current_memo <- Some (merge_upsert current copied);
+      context.commands_rev <-
+        Activation.Modify_workflow_properties { upserted_memo = copied }
         :: context.commands_rev
 
 (** Makes [context] current on the calling thread while [action] runs, then
@@ -788,9 +863,13 @@ let terminate context command =
 
 (** Records the successor command before aborting the current scheduler. The
     command must be visible even though the terminal effect never resumes its
-    caller. *)
+    caller. After a memo upsert the successor receives the merged memo;
+    otherwise the memo is left empty so Core reuses the start memo. The
+    payloads are shared with [current_memo], which nothing mutates once the
+    run has ended. *)
 let continue_as_new context ~workflow_type ~input =
-  terminate context (Activation.Continue_as_new { workflow_type; input })
+  let memo = Option.value context.current_memo ~default:[] in
+  terminate context (Activation.Continue_as_new { workflow_type; input; memo })
 
 (** Builds an error indicating that Core and the OCaml runtime disagree about
     which operation sequence is pending or that a bridge lifecycle rule was

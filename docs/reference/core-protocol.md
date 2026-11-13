@@ -435,6 +435,32 @@ command. Rust validates the same limits before converting the map to Core's
 `UpsertWorkflowSearchAttributes` command. Core applies the map as one merge,
 and the new values become visible only after the workflow task is accepted;
 the bridge does not perform a visibility query itself.
+`Temporal.Workflow.upsert_typed_search_attributes` (#1154) emits the same
+command from typed `Temporal.Search_attribute` keys; its payloads carry an
+extra `type` metadata entry such as `Keyword`, which the bridge forwards
+unchanged.
+
+`Temporal.Workflow.upsert_memo` (#1154) merges values into the workflow memo
+with the same map shape:
+
+```json
+{
+  "kind": "modify_workflow_properties",
+  "upserted_memo": {
+    "note": {
+      "metadata": {"encoding": "json/plain"},
+      "data": "InJlYWR5Ig=="
+    }
+  }
+}
+```
+
+Rust converts it to Core's `ModifyWorkflowProperties` command, whose
+`upserted_memo` Core records as a `WorkflowPropertiesModified` event and
+matches on replay. A key whose value is exactly the canonical `binary/null`
+payload is removed by the server. As for search attributes, the OCaml API
+emits no command for an empty map, and both validators reject an empty,
+NUL-containing, or oversized key and an oversized payload.
 
 ### Continue-as-new
 
@@ -447,7 +473,8 @@ terminal command shape:
   "workflow_type": "counter",
   "input": [
     {"data":{"data":"","encoding":"base64"},"metadata":{}}
-  ]
+  ],
+  "memo": {}
 }
 ```
 
@@ -460,9 +487,16 @@ identifiers, malformed payloads, and a terminal command followed by another
 command.
 
 Rust converts this record to Core's
-`ContinueAsNewWorkflowExecution`. The current semantic protocol intentionally
-does not expose a task queue, timeout, memo, headers, search attributes,
-retry policy, or versioning controls for this command. The Rust reverse
+`ContinueAsNewWorkflowExecution`. `memo` is the successor's memo (#1154).
+The OCaml encoder always writes it and its decoder requires it; the Rust
+decoder treats an absent member as an empty map. An empty map is Core's
+"unset", which reuses the memo the current run started with, so the OCaml
+runtime fills it only after a `Workflow.upsert_memo`, with the start memo
+merged with every upsert: otherwise the upserted values would be lost.
+Core also gives the successor the run's current search attributes. The
+current semantic protocol intentionally does not expose a task queue,
+timeout, headers, search attributes, retry policy, or versioning controls
+for this command. The Rust reverse
 conversion accepts only Core's explicit defaults for those fields and returns
 `core_unsupported` for a non-default value, preventing silent loss of workflow
 semantics. The successor run is not followed by the bridge or by

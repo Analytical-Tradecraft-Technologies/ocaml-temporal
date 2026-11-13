@@ -243,7 +243,8 @@
           "properties": {
             "kind": {"const": "continue_as_new"},
             "workflow_type": {"$ref": "#/$defs/identifier"},
-            "input": {"type": "array", "maxItems": 201326592, "items": {"$ref": "#/$defs/payload"}}
+            "input": {"type": "array", "maxItems": 201326592, "items": {"$ref": "#/$defs/payload"}},
+            "memo": {"$ref": "#/$defs/payload_map", "description": "The successor's memo (#1154). OCaml always writes it; an empty map makes Core reuse the current run's start memo, and Rust reads an absent member as empty."}
           }
         },
         {
@@ -294,6 +295,15 @@
             "search_attributes": {"$ref": "#/$defs/payload_map"}
           },
           "description": "Merges encoded values into Temporal's indexed workflow search attributes. Keys are unique protocol identifiers and values are ordinary Temporal payloads."
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "upserted_memo"],
+          "properties": {
+            "kind": {"const": "modify_workflow_properties"},
+            "upserted_memo": {"$ref": "#/$defs/payload_map"}
+          },
+          "description": "Merges encoded values into the workflow memo through Core's ModifyWorkflowProperties command (#1154). A key whose value is exactly the canonical binary/null payload is removed by the server."
         },
         {
           "type": "object", "additionalProperties": false,

@@ -6899,3 +6899,23 @@ regression checks every exact run ID against Temporal Server, including a
 signal recorded before the run's first workflow task. A Python SDK
 counterpart in `sdk_interop` remains open. See [signal-with-start and
 update-with-start](reference/client-protocol.md#signal-with-start-and-update-with-start-1151).
+
+## 2026-11-13: Typed search attributes and memo upserts
+
+`Temporal.Search_attribute` pairs a registered search-attribute name with its
+indexed type (text, keyword, int64, double, bool, datetime, keyword list), so
+`encode` writes the `json/plain` payload and `type` metadata Temporal Server
+decodes and `decode` reads a value back from `Workflow.start_metadata` or
+`Client.describe` (#1154). `Workflow.upsert_typed_search_attributes` applies
+typed `set`/`unset` updates; the raw payload-list parameters are unchanged and
+remain the escape hatch. `Workflow.upsert_memo` emits Core's
+`ModifyWorkflowProperties` through a new `modify_workflow_properties` protocol
+command. Core reuses the start memo on continue-as-new, so the runtime tracks
+the merged memo and sends it in the continue-as-new command's new `memo`
+field after an upsert. `Temporal.Testing` merges both kinds of upsert and
+exposes `Testing.memo` and `Testing.search_attributes`. The
+`search_attributes` live regression finds a run by a visibility query on its
+typed keyword and int, decodes every type from `describe`, replays the
+recorded upserts, and checks the merged memo across continue-as-new. Child
+starts (#1135) and continue-as-new options (#1153) do not take memo or search
+attributes yet.

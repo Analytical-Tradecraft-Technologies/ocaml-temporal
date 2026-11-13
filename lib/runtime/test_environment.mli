@@ -124,6 +124,17 @@ val workflow_id : handle -> string
 (** Returns the ID of the chain's current (latest) run. *)
 val run_id : handle -> string
 
+(** Returns the current run's memo (#1154): the memo it started with, after
+    its [Workflow.upsert_memo] merges, sorted by key, with copied payloads.
+    A continue-as-new successor starts with its predecessor's merged memo
+    once that run upserted one, and with the predecessor's start memo
+    otherwise, as Core does. *)
+val memo : handle -> (string * Temporal_base.Codec.payload) list
+
+(** Returns the current run's search attributes after its upserts, sorted by
+    key, with copied payloads. A continue-as-new successor inherits them. *)
+val search_attributes : handle -> (string * Temporal_base.Codec.payload) list
+
 (** Runs the environment, skipping virtual time to the next pending timer or
     activity retry whenever every execution is blocked, until the chain
     closes. Returns the encoded output, or the workflow's failure,

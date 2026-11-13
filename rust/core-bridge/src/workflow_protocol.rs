@@ -881,11 +881,17 @@ pub enum CompletionCommand {
         failure: Failure,
     },
     /// Replaces the current run with a fresh run of the same workflow type.
-    /// The language layer currently supplies only the workflow type and input;
-    /// all other Core options remain explicit defaults until exposed safely.
+    /// The language layer supplies the workflow type, input, and memo; all
+    /// other Core options remain explicit defaults until exposed safely.
     ContinueAsNew {
         workflow_type: String,
         input: Vec<Payload>,
+        /// The successor's memo (#1154). Empty, the default when the member
+        /// is absent, lets Core reuse the memo the current run started with;
+        /// the OCaml runtime fills it after a memo upsert so the merged memo
+        /// survives continue-as-new.
+        #[serde(default)]
+        memo: BTreeMap<String, Payload>,
     },
     CancelWorkflow,
     /// Returns one query result to Core without scheduling workflow work.
@@ -914,6 +920,12 @@ pub enum CompletionCommand {
     /// Merges encoded values into Core's indexed workflow search attributes.
     UpsertSearchAttributes {
         search_attributes: BTreeMap<String, Payload>,
+    },
+    /// Merges encoded values into the workflow memo through Core's
+    /// `ModifyWorkflowProperties` command (#1154). The server removes a key
+    /// whose value is the canonical `binary/null` payload.
+    ModifyWorkflowProperties {
+        upserted_memo: BTreeMap<String, Payload>,
     },
 }
 
@@ -1931,8 +1943,13 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
             }
             CompletionCommand::RequestCancelActivity { .. }
             | CompletionCommand::RequestCancelLocalActivity { .. } => {}
-            CompletionCommand::ContinueAsNew { workflow_type, .. } => {
+            CompletionCommand::ContinueAsNew {
+                workflow_type,
+                memo,
+                ..
+            } => {
                 identifier(workflow_type, "$.commands.workflow_type")?;
+                validate_payload_map(memo, "$.commands.memo")?;
             }
             CompletionCommand::StartTimer {
                 start_to_fire_timeout,
@@ -1996,20 +2013,10 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                 }
             }
             CompletionCommand::UpsertSearchAttributes { search_attributes } => {
-                for (key, payload) in search_attributes {
-                    identifier(key, "$.commands.search_attributes")?;
-                    if payload.data.len() > MAX_PAYLOAD_BYTES
-                        || payload
-                            .metadata
-                            .values()
-                            .any(|value| value.len() > MAX_PAYLOAD_BYTES)
-                    {
-                        return Err(ProtocolError::invalid(
-                            "$.commands.search_attributes",
-                            "payload exceeds the byte limit",
-                        ));
-                    }
-                }
+                validate_payload_map(search_attributes, "$.commands.search_attributes")?;
+            }
+            CompletionCommand::ModifyWorkflowProperties { upserted_memo } => {
+                validate_payload_map(upserted_memo, "$.commands.upserted_memo")?;
             }
             _ => {}
         }
@@ -2403,6 +2410,54 @@ pub(crate) fn validate_payload_limits(value: &Payload) -> Result<(), CoreConvers
         ));
     }
     Ok(())
+}
+
+/// Checks an outbound memo or search-attribute map: every key must be a
+/// protocol identifier and every payload must fit the protocol byte limits.
+/// `path` locates the map in the diagnostic.
+fn validate_payload_map(
+    values: &BTreeMap<String, Payload>,
+    path: &str,
+) -> Result<(), ProtocolError> {
+    for (key, payload) in values {
+        identifier(key, path)?;
+        if payload.data.len() > MAX_PAYLOAD_BYTES
+            || payload
+                .metadata
+                .values()
+                .any(|value| value.len() > MAX_PAYLOAD_BYTES)
+        {
+            return Err(ProtocolError::invalid(
+                path,
+                "payload exceeds the byte limit",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Converts an outbound memo or search-attribute map into the map type of
+/// the Core command field that carries it.
+fn payload_map_to_core<M>(values: &BTreeMap<String, Payload>) -> Result<M, CoreConversionError>
+where
+    M: FromIterator<(String, api_common::Payload)>,
+{
+    values
+        .iter()
+        .map(|(key, payload)| Ok((key.clone(), payload_to_core(payload)?)))
+        .collect()
+}
+
+/// Converts the memo or search-attribute map of a Core command back to the
+/// semantic protocol, copying every payload. Keys are kept as Core holds
+/// them; the semantic validator checks them before any reuse.
+fn payload_map_from_core<'a>(
+    entries: impl IntoIterator<Item = (&'a String, &'a api_common::Payload)>,
+) -> Result<BTreeMap<String, Payload>, CoreConversionError> {
+    entries
+        .into_iter()
+        .map(|(key, payload)| Ok((key.clone(), payload_from_core(payload)?)))
+        .collect()
 }
 
 /// Builds a Core payload whose allocation ownership is transferred into protobuf values.
@@ -4025,12 +4080,15 @@ fn command_to_core(
         CompletionCommand::ContinueAsNew {
             workflow_type,
             input,
+            memo,
         } => {
             Variant::ContinueAsNewWorkflowExecution(core_commands::ContinueAsNewWorkflowExecution {
                 workflow_type: workflow_type.clone(),
                 arguments: payload_vec_to_core(input)?,
+                // An empty map is Core's "unset": it reuses the start memo.
+                memo: payload_map_to_core(memo)?,
                 // The semantic protocol intentionally exposes no task queue,
-                // timeout, memo, header, retry, or versioning controls yet.
+                // timeout, header, retry, or versioning controls yet.
                 ..Default::default()
             })
         }
@@ -4084,12 +4142,16 @@ fn command_to_core(
             deprecated: *deprecated,
         }),
         CompletionCommand::UpsertSearchAttributes { search_attributes } => {
-            let indexed_fields = search_attributes
-                .iter()
-                .map(|(key, payload)| Ok((key.clone(), payload_to_core(payload)?)))
-                .collect::<Result<_, CoreConversionError>>()?;
+            let indexed_fields = payload_map_to_core(search_attributes)?;
             Variant::UpsertWorkflowSearchAttributes(core_commands::UpsertWorkflowSearchAttributes {
                 search_attributes: Some(api_common::SearchAttributes { indexed_fields }),
+            })
+        }
+        CompletionCommand::ModifyWorkflowProperties { upserted_memo } => {
+            Variant::ModifyWorkflowProperties(core_commands::ModifyWorkflowProperties {
+                upserted_memo: Some(api_common::Memo {
+                    fields: payload_map_to_core(upserted_memo)?,
+                }),
             })
         }
     };
@@ -4348,7 +4410,6 @@ fn command_from_core(
             if !value.task_queue.is_empty()
                 || value.workflow_run_timeout.is_some()
                 || value.workflow_task_timeout.is_some()
-                || !value.memo.is_empty()
                 || !value.headers.is_empty()
                 || value.search_attributes.is_some()
                 || value.retry_policy.is_some()
@@ -4365,6 +4426,7 @@ fn command_from_core(
             Ok(CompletionCommand::ContinueAsNew {
                 workflow_type: value.workflow_type.clone(),
                 input: payload_vec_from_core(&value.arguments)?,
+                memo: payload_map_from_core(&value.memo)?,
             })
         }
         Variant::CancelWorkflowExecution(value) => {
@@ -4422,15 +4484,24 @@ fn command_from_core(
             deprecated: value.deprecated,
         }),
         Variant::UpsertWorkflowSearchAttributes(value) => {
-            let search_attributes = value
-                .search_attributes
-                .as_ref()
-                .ok_or_else(|| invalid_core("Core search-attribute command has no values"))?
-                .indexed_fields
-                .iter()
-                .map(|(key, payload)| Ok((key.clone(), payload_from_core(payload)?)))
-                .collect::<Result<_, CoreConversionError>>()?;
+            let search_attributes = payload_map_from_core(
+                &value
+                    .search_attributes
+                    .as_ref()
+                    .ok_or_else(|| invalid_core("Core search-attribute command has no values"))?
+                    .indexed_fields,
+            )?;
             Ok(CompletionCommand::UpsertSearchAttributes { search_attributes })
+        }
+        Variant::ModifyWorkflowProperties(value) => {
+            let upserted_memo = payload_map_from_core(
+                &value
+                    .upserted_memo
+                    .as_ref()
+                    .ok_or_else(|| invalid_core("Core modify-properties command has no memo"))?
+                    .fields,
+            )?;
+            Ok(CompletionCommand::ModifyWorkflowProperties { upserted_memo })
         }
         _ => Err(unsupported("Core workflow command kind is not supported")),
     }

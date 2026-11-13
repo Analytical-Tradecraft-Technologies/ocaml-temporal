@@ -230,6 +230,12 @@ type command =
   | Upsert_search_attributes of {
       search_attributes : (string * Temporal_base.Codec.payload) list;
     }
+  (** Merges encoded values into the workflow's memo through Core's
+      [ModifyWorkflowProperties] command (#1154); a [binary/null] value
+      removes its key. Core records the merge in history and replays it. *)
+  | Modify_workflow_properties of {
+      upserted_memo : (string * Temporal_base.Codec.payload) list;
+    }
   | Complete_workflow of Temporal_base.Codec.payload
   | Fail_workflow of Temporal_base.Error.t
   (** Ends this run and asks Temporal to start the same workflow type with a
@@ -238,5 +244,7 @@ type command =
       workflow_type : string;
       input : Temporal_base.Codec.payload list;
           (** Exact argument payloads, as for [Start_child_workflow]. *)
+      memo : (string * Temporal_base.Codec.payload) list;
+          (** The successor's memo; empty reuses the run's start memo. *)
     }
   | Cancel_workflow_execution

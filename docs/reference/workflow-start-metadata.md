@@ -13,7 +13,11 @@ match Option.bind metadata.memo (List.assoc_opt "note") with
 ```
 
 The snapshot describes this run's start event. Later
-`Workflow.upsert_search_attributes` commands do not change it. Every access
+`Workflow.upsert_search_attributes` and `Workflow.upsert_memo` commands do
+not change it; `Temporal.Search_attribute.decode` reads a typed search
+attribute from it (#1154). A continue-as-new successor starts with its
+predecessor's current search attributes and, once the predecessor upserted
+its memo, with the merged memo. Every access
 copies payload bodies; mutating returned bytes cannot change a later
 observation. Replay reconstructs the snapshot from history, and a successor
 run receives its own inherited metadata. `None` preserves an absent protobuf

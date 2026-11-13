@@ -474,9 +474,17 @@ type completion_command =
   | Set_patch_marker of { patch_id : string; deprecated : bool }
   (** Merges payload values into Temporal's indexed search-attribute map. *)
   | Upsert_search_attributes of { search_attributes : (string * payload) list }
+  (** Merges payload values into the workflow memo through Core's
+      [ModifyWorkflowProperties] command (#1154). Keys are unique protocol
+      identifiers; a [binary/null] value asks the server to remove its key. *)
+  | Modify_workflow_properties of { upserted_memo : (string * payload) list }
   | Complete_workflow of { result : payload option }
   | Fail_workflow of { failure : failure }
-  | Continue_as_new of { workflow_type : string; input : payload list }
+  | Continue_as_new of {
+      workflow_type : string;
+      input : payload list;
+      memo : (string * payload) list;
+    }
   | Cancel_workflow_execution
 
 type versioning_behavior = Versioning_pinned | Versioning_auto_upgrade
@@ -2981,7 +2989,7 @@ let completion_command path json =
       Ok (Request_cancel_external_workflow { seq; workflow_id; run_id; reason })
   | "continue_as_new" ->
       let* entries =
-        exact_object path [ "kind"; "workflow_type"; "input" ] json
+        exact_object path [ "kind"; "workflow_type"; "input"; "memo" ] json
       in
       let* workflow_type_json = field path "workflow_type" entries in
       let* workflow_type =
@@ -2989,7 +2997,9 @@ let completion_command path json =
       in
       let* input_json = field path "input" entries in
       let* input = list (path ^ ".input") payload input_json in
-      Ok (Continue_as_new { workflow_type; input })
+      let* memo_json = field path "memo" entries in
+      let* memo = payload_map (path ^ ".memo") memo_json in
+      Ok (Continue_as_new { workflow_type; input; memo })
   | "request_cancel_activity" ->
       let* entries = exact_object path [ "kind"; "seq" ] json in
       let* seq_json = field path "seq" entries in
@@ -3042,6 +3052,11 @@ let completion_command path json =
       let* values_json = field path "search_attributes" entries in
       let* search_attributes = payload_map (path ^ ".search_attributes") values_json in
       Ok (Upsert_search_attributes { search_attributes })
+  | "modify_workflow_properties" ->
+      let* entries = exact_object path [ "kind"; "upserted_memo" ] json in
+      let* values_json = field path "upserted_memo" entries in
+      let* upserted_memo = payload_map (path ^ ".upserted_memo") values_json in
+      Ok (Modify_workflow_properties { upserted_memo })
   | "complete_workflow" ->
       let* entries = exact_object path [ "kind"; "result" ] json in
       let* result_json = field path "result" entries in
@@ -3213,14 +3228,16 @@ let completion_command_json = function
             ("run_id", `String run_id);
             ("reason", `String reason);
           ])
-  | Continue_as_new { workflow_type; input } ->
+  | Continue_as_new { workflow_type; input; memo } ->
       let* input = payloads_json input in
+      let* memo = payload_map_json "$.commands.memo" memo in
       Ok
         (`Assoc
           [
             ("kind", `String "continue_as_new");
             ("workflow_type", `String workflow_type);
             ("input", input);
+            ("memo", memo);
           ])
   | Start_timer { seq; start_to_fire_timeout } ->
       Ok
@@ -3265,6 +3282,14 @@ let completion_command_json = function
         (`Assoc
           [ ("kind", `String "upsert_search_attributes");
             ("search_attributes", search_attributes) ])
+  | Modify_workflow_properties { upserted_memo } ->
+      let* upserted_memo =
+        payload_map_json "$.commands.upserted_memo" upserted_memo
+      in
+      Ok
+        (`Assoc
+          [ ("kind", `String "modify_workflow_properties");
+            ("upserted_memo", upserted_memo) ])
   | Complete_workflow { result } ->
       let* result = match result with None -> Ok `Null | Some value -> payload_json value in
       Ok (`Assoc [ ("kind", `String "complete_workflow"); ("result", result) ])

@@ -151,7 +151,7 @@ let test_teardown kind ending ~queued ~finished =
     | Fail -> [ Activation.Fail_workflow (base_error (application_error ())) ]
     | Cancel -> [ Activation.Cancel_workflow_execution ]
     | Continue ->
-        [ Activation.Continue_as_new { workflow_type = "successor"; input = [] } ]
+        [ Activation.Continue_as_new { workflow_type = "successor"; input = []; memo = [] } ]
     | Evict | Shutdown -> []
   in
   expect "teardown preserves terminal command" expected commands;
@@ -316,7 +316,7 @@ let test_catch_all_around_continue_as_new ~returns_error =
       [ Activation.Fire_timer { seq = 1L }; Activation.Fire_timer { seq = 2L } ]
   in
   expect "catch-all keeps continue-as-new"
-    [ Activation.Continue_as_new { workflow_type = "successor"; input = [] } ]
+    [ Activation.Continue_as_new { workflow_type = "successor"; input = []; memo = [] } ]
     commands;
   expect "catch-all result is not a task failure" None
     (Execution.task_failure execution);
@@ -368,7 +368,7 @@ let test_raising_finally_around_terminal shape =
   let first = Execution.activate execution [ Activation.Start_workflow ] in
   let commands, expected =
     let continued =
-      [ Activation.Continue_as_new { workflow_type = "successor"; input = [] } ]
+      [ Activation.Continue_as_new { workflow_type = "successor"; input = []; memo = [] } ]
     in
     match shape with
     | Continue_root -> (first, continued)

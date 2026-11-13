@@ -840,6 +840,23 @@ let protocol_failure path (error : Temporal_base.Error.t) =
         info = failure_info;
       }
 
+(** Converts a search-attribute or memo map to protocol payloads, in order,
+    after checking every key with the strict identifier rule and rejecting a
+    repeated key, which the protocol's JSON object could not represent.
+    [path] locates the map in diagnostics and [label] names it. *)
+let protocol_payload_map ~path ~label values =
+  let rec convert seen reversed = function
+    | [] -> Ok (List.rev reversed)
+    | (key, payload) :: rest ->
+        let* () = validate_identifier path key in
+        if List.mem key seen then
+          Error (invalid path (label ^ " keys must be unique"))
+        else
+          let* payload = protocol_payload path payload in
+          convert (key :: seen) ((key, payload) :: reversed) rest
+  in
+  convert [] [] values
+
 (** Converts one command without fabricating fields. Activity commands already
     carry all Core-required identifiers, arguments, timeout policies, and
     cancellation options; the final semantic encoder below performs a second
@@ -1230,27 +1247,17 @@ let command_to_protocol command =
       let* () = validate_identifier "$.command.patch_id" patch_id in
       Ok (Protocol.Set_patch_marker { patch_id; deprecated })
   | Activation.Upsert_search_attributes { search_attributes } ->
-      let rec validate_keys seen = function
-        | [] -> Ok ()
-        | (key, payload) :: rest ->
-            let* () = validate_identifier "$.command.search_attributes" key in
-            if List.mem key seen then
-              Error
-                (invalid "$.command.search_attributes"
-                   "search-attribute keys must be unique")
-            else
-              let* _ = protocol_payload "$.command.search_attributes" payload in
-              validate_keys (key :: seen) rest
+      let* search_attributes =
+        protocol_payload_map ~path:"$.command.search_attributes"
+          ~label:"search-attribute" search_attributes
       in
-      let* () = validate_keys [] search_attributes in
-      let rec convert reversed = function
-        | [] -> Ok (List.rev reversed)
-        | (key, payload) :: rest ->
-            let* payload = protocol_payload "$.command.search_attributes" payload in
-            convert ((key, payload) :: reversed) rest
-      in
-      let* search_attributes = convert [] search_attributes in
       Ok (Protocol.Upsert_search_attributes { search_attributes })
+  | Activation.Modify_workflow_properties { upserted_memo } ->
+      let* upserted_memo =
+        protocol_payload_map ~path:"$.command.upserted_memo" ~label:"memo"
+          upserted_memo
+      in
+      Ok (Protocol.Modify_workflow_properties { upserted_memo })
   | Activation.Complete_workflow payload ->
       let* payload = protocol_payload "$.command.result" payload in
       let result =
@@ -1260,10 +1267,11 @@ let command_to_protocol command =
   | Activation.Fail_workflow error ->
       let* failure = protocol_failure "$.command.failure" error in
       Ok (Protocol.Fail_workflow { failure })
-  | Activation.Continue_as_new { workflow_type; input } ->
+  | Activation.Continue_as_new { workflow_type; input; memo } ->
       let* () = validate_identifier "$.command.workflow_type" workflow_type in
       let* input = protocol_input "$.command.input" input in
-      Ok (Protocol.Continue_as_new { workflow_type; input })
+      let* memo = protocol_payload_map ~path:"$.command.memo" ~label:"memo" memo in
+      Ok (Protocol.Continue_as_new { workflow_type; input; memo })
   | Activation.Cancel_workflow_execution ->
       Ok Protocol.Cancel_workflow_execution
 
