@@ -1695,9 +1695,8 @@ take the same definitions and handlers as `Temporal.Worker`.
 existing definition's name and codecs and replace any other registration of
 that name, so a test can reuse an application's registration list and swap
 out the activities that perform I/O or a child implemented by another
-worker. A remote reference or asynchronous activity registered with
-`Testing.activity` cannot run in-process and fails with a message asking for
-a mock.
+worker. A remote reference registered with `Testing.activity` cannot run
+in-process and fails with a message asking for a mock.
 
 For interactive workflows, start the workflow and drive it step by step:
 
@@ -1737,14 +1736,67 @@ Temporal.Testing.mock_activity charge
   (fun order -> Ok (receipt order))
 ```
 
-The simulator is not a server. Schedule-to-start timeouts never expire; a
-workflow task failure (an exception or a
-`Defect`, `Codec`, or `Bridge` error) ends the run with that error instead of
-being retried; child cancellation types are not distinguished; and
-asynchronous activities, Nexus, visibility queries, and workflow ID reuse
-policies are not simulated. A run's memo and search-attribute upserts are
-merged and carried across continue-as-new, and `Testing.memo` and
-`Testing.search_attributes` read them back, but a start cannot set them.
+An asynchronous activity (`Activity.define_async`, or a stub registered
+with `Testing.mock_async_activity`) runs in-process too. An attempt that
+returns `Will_complete_async` stays pending until the test finishes the
+handle the callback handed off, through the ordinary
+`Activity.Async_handle` functions: `complete` resolves the activity, `fail`
+fails the attempt (retried under the policy with a new handle), `heartbeat`
+restarts the heartbeat timeout and reports a cancellation request, and
+`cancel` reports a requested cancellation. Its timeouts expire in virtual
+time while it is pending, so finish the handle before waiting on `result`:
+
+```ocaml
+let pending = ref None in
+let charge_stub =
+  Temporal.Testing.mock_async_activity charge (fun context _order ->
+      let handle = Temporal.Activity.Async_context.handle context in
+      pending := Some handle;
+      Temporal.Activity.Will_complete_async handle)
+in
+(* ... create the environment with charge_stub and start the workflow ... *)
+let* () = Temporal.Activity.Async_handle.complete (Option.get !pending) receipt in
+Temporal.Testing.result handle
+```
+
+`Testing.start` and `Testing.execute` take the `Client.start` options a test
+usually needs. `?memo` and `?search_attributes` are the run's start maps;
+upserts are merged into them and carried across continue-as-new, and
+`Testing.memo` and `Testing.search_attributes` read them back.
+`?id_conflict_policy` and `?id_reuse_policy` apply to a workflow ID that is
+running or closed, and a refused start returns the error
+`Client.already_started` recognizes (a child start applies its own reuse
+policy). `?execution_timeout` and `?run_timeout`, and a child's timeouts,
+expire in virtual time with an error whose `Error.timeout_type` is
+`` `Start_to_close ``; a run timeout is retried under `?retry_policy`.
+
+By default a workflow task failure (an exception or a `Defect`, `Codec`, or
+`Bridge` error) ends the run with that error, so `result` reports it at
+once. Create the environment with `~workflow_task_failure:`Retry` to keep the
+run open instead, as a server does: `result` returns the failure,
+`Testing.workflow_task_failure` reports it, queries answer from the state
+before the failing task, and signals queue up. After fixing what the
+workflow reads, `Testing.retry_workflow_tasks` replays the run's completed
+tasks against a fresh execution and delivers the failed one again:
+
+```ocaml
+let* env =
+  Temporal.Testing.create ~workflow_task_failure:`Retry ~workflows ~activities ()
+in
+let* handle = Temporal.Testing.start env order_workflow order in
+(match Temporal.Testing.result handle with
+ | Error _ -> assert (Temporal.Testing.workflow_task_failure handle <> None)
+ | Ok _ -> assert false);
+fix_the_bug ();
+let* () = Temporal.Testing.retry_workflow_tasks env in
+Temporal.Testing.result handle
+```
+
+The simulator is not a server. Schedule-to-start timeouts never expire, a
+workflow task timeout is only reported, task retries happen only when the
+test asks, and the replay does not check for nondeterminism; child
+cancellation types are not distinguished; and Nexus and visibility queries
+are not simulated. `Testing`'s interface lists every remaining difference.
 An environment must be used from one system
 thread. [`examples/testing`](../../examples/testing/example_workflow_test.ml)
 tests the example application's workflow this way, with both its real and a
