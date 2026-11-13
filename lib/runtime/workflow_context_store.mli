@@ -13,7 +13,12 @@ type start_metadata = {
     top-level workflow. [start_time] is the server's run start time when
     reported. The three timeouts and [retry_policy] are the exact values the
     server recorded on this run's start event ([None] when absent); they are
-    metadata only and the runtime never schedules them. [continued_from]
+    metadata only and the runtime never schedules them.
+    [first_workflow_task_backoff] is the delay the server already applied
+    before this run's first task (a start delay, the wait for the next cron
+    time, or continuation throttling) and [cron_schedule] the cron schedule
+    recorded on the start event (#1158); both are [None] when absent and the
+    runtime never acts on them. [continued_from]
     pairs the predecessor run ID with Core's reason for creating this run and
     is [None] for the first run of a chain, including a Temporal Schedule
     action whose continuation carries an empty run ID (#1015); a [Some]
@@ -31,6 +36,8 @@ type run_info = {
   run_timeout : Temporal_protocol.Workflow_protocol.duration option;
   task_timeout : Temporal_protocol.Workflow_protocol.duration option;
   retry_policy : Temporal_protocol.Workflow_protocol.retry_policy option;
+  first_workflow_task_backoff : Temporal_protocol.Workflow_protocol.duration option;
+  cron_schedule : string option;
   continued_from :
     (string * Temporal_protocol.Workflow_protocol.continue_as_new_initiator)
     option;

@@ -246,6 +246,8 @@ let test_client_protocol_adapter () =
       run_timeout_ms = None;
       task_timeout_ms = None;
       retry_policy = None;
+      cron_schedule = None;
+      start_delay_ms = None;
       rpc_deadline = None;
     }
   in
@@ -636,6 +638,8 @@ let test_native_client_lifecycle_guards () =
       run_timeout_ms = None;
       task_timeout_ms = None;
       retry_policy = None;
+      cron_schedule = None;
+      start_delay_ms = None;
       rpc_deadline = None;
     }
   in
@@ -747,6 +751,8 @@ let test_expired_rpc_deadline_is_not_sent () =
       run_timeout_ms = None;
       task_timeout_ms = None;
       retry_policy = None;
+      cron_schedule = None;
+      start_delay_ms = None;
       rpc_deadline;
     }
   in
@@ -914,6 +920,8 @@ let test_submitted_client_calls () =
       run_timeout_ms = None;
       task_timeout_ms = None;
       retry_policy = None;
+      cron_schedule = None;
+      start_delay_ms = None;
       rpc_deadline;
     }
   in

@@ -276,13 +276,14 @@ supervisor cycles under GC pressure. A concurrent stress runs graphs on several 
 and shared runtimes, and an OCaml test closes runtimes across Domains while
 their owners are inside native calls.
 
-There is one normal-start compatibility default in the initializer: Temporal
-Core maps the server's `first_workflow_task_backoff` to
-`cron_schedule_to_schedule_interval`, and Temporal Server sends an explicit
-zero duration for an ordinary non-cron start. The bridge accepts exactly that
-zero value because it carries no scheduling meaning. A non-zero duration (or a
-cron schedule) remains `Unsupported` until the semantic protocol models the
-delay explicitly.
+Temporal Core maps the server's `first_workflow_task_backoff` to
+`cron_schedule_to_schedule_interval`; Temporal Server sends an explicit zero
+duration for an ordinary start and a non-zero one for a start delay, a cron
+schedule's wait, or continuation throttling. The bridge carries the exact
+duration as `first_workflow_task_backoff` and a non-empty
+`InitializeWorkflow.cron_schedule` as `cron_schedule` (#1158); neither is
+rejected, and the server has already applied the delay before the task is
+polled.
 
 After protocol decoding, the private pure-OCaml
 [`Native_execution`](native-execution-translation.md) adapter translates jobs

@@ -1414,6 +1414,14 @@ let activate_translated ?versioning_behavior execution
                    Option.bind context
                      (fun (context : Protocol.initialize_context) ->
                        context.retry_policy);
+                 first_workflow_task_backoff =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.first_workflow_task_backoff);
+                 cron_schedule =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.cron_schedule);
                  (* Only provenance is retained: the predecessor's failure and
                     completion payloads are not part of the public run info,
                     so their mutable payload bytes are never shared here. A

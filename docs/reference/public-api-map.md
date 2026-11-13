@@ -44,7 +44,9 @@ for those rules.
   (`execution_timeout`, `run_timeout`, `task_timeout`, and `retry_policy` as
   a `Retry_policy.t`), its continuation provenance
   (`continued_from_run_id` and `continuation_initiator`: `` `Continue_as_new ``,
-  `` `Retry ``, or the reserved `` `Cron_schedule ``), and the current
+  `` `Retry ``, or `` `Cron_schedule ``), the cron schedule and server-applied
+  first-task backoff of the run (`cron_schedule`,
+  `first_workflow_task_backoff`, #1158), and the current
   activation's replay flag, history length and size, and continue-as-new
   suggestion and its reasons, all taken from Temporal's activations (#512).
   `start_metadata ()` returns the start memo, search attributes, and execution
@@ -155,7 +157,10 @@ for those rules.
   `` `Allow_duplicate_failed_only ``, or `` `Reject_duplicate ``) decides
   whether a closed run's ID may be reused, and `?execution_timeout`,
   `?run_timeout`, `?task_timeout`, and `?retry_policy` set server-side
-  execution policies (#499). Start and the other bounded operations accept a
+  execution policies (#499). `?start_delay` holds the first workflow task
+  for a positive duration and `?cron_schedule` makes the start a cron chain
+  whose runs Temporal starts on schedule (#1158); they are mutually
+  exclusive, as in Temporal. Start and the other bounded operations accept a
   per-call `?rpc_timeout`; an expired start deadline is recognized by
   `Client.is_start_outcome_uncertain`, and `Client.uncertain_start_request_id`
   returns the request ID to retry it with. The client retains the exact workflow/run identity, rebuilds a
@@ -186,7 +191,8 @@ for those rules.
   exact update until it has a typed outcome, while `Client.update_id` exposes
   the server-correlated update ID for diagnostics and retry bookkeeping.
   `Client.signal_with_start` and `Client.update_with_start` (#1151) take
-  every start option and deliver a typed signal or update to the workflow,
+  every start option (update-with-start excepting `?cron_schedule` and
+  `?start_delay`, which Temporal refuses there) and deliver a typed signal or update to the workflow,
   starting it first when its ID has no open run, as one atomic Temporal
   operation. Signal-with-start returns the exact-run handle that received the
   signal (`Client.started` tells whether it was created) and accepts only the

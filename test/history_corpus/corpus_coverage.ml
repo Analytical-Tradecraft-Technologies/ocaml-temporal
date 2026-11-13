@@ -97,6 +97,11 @@ let table =
     (* Continue-as-new successor options (#1153), captured by
        corpus-v4-continue-as-new-options. *)
     replayed "continue-as-new-options";
+    (* Delayed starts and cron chains (#1158), captured by
+       corpus-v5-cron-start-delay. *)
+    replayed "start-delay";
+    replayed "cron-schedule";
+    replayed "cron-successor";
     (* Remote activities. *)
     replayed "activity";
     replayed "activity-retry";

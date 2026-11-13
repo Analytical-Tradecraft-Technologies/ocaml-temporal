@@ -1982,8 +1982,10 @@ fn preserves_start_metadata_on_roots_and_continuations() {
     }
 }
 
-/// Continuation identity must not bypass unsupported cron/delay validation or
-/// the shape checks on represented metadata and exact expiration timestamps.
+/// A cron schedule and a cron-initiated continuation are carried as data on
+/// root and continued runs alike (#1158), and continuation identity never
+/// bypasses the shape checks on represented metadata and exact expiration
+/// timestamps.
 #[test]
 fn validates_start_metadata_without_continuation_bypass() {
     use temporalio_protos::temporal::api::common::v1::{Memo, SearchAttributes};
@@ -2002,11 +2004,29 @@ fn validates_start_metadata_without_continuation_bypass() {
                     init.continued_initiator = 3;
                 }
             }
-            assert_eq!(
+            let activation =
                 workflow_protocol::activation_from_core(&start_metadata_activation(init))
-                    .unwrap_err()
-                    .code,
-                workflow_protocol::CoreConversionErrorCode::Unsupported
+                    .expect("cron metadata is supported");
+            let workflow_protocol::ActivationJob::InitializeWorkflow {
+                context: Some(context),
+                ..
+            } = &activation.jobs[0]
+            else {
+                panic!("missing context")
+            };
+            if field == "cron" {
+                assert_eq!(context.cron_schedule.as_deref(), Some("0 * * * * *"));
+            } else {
+                assert_eq!(context.cron_schedule, None);
+                assert_eq!(
+                    context.continuation.as_ref().map(|value| value.initiator),
+                    Some(workflow_protocol::ContinueAsNewInitiator::CronSchedule)
+                );
+            }
+            let json = workflow_protocol::encode_activation(&activation).unwrap();
+            assert_eq!(
+                workflow_protocol::decode_activation(&json).unwrap(),
+                activation
             );
         }
         // A memo key the protocol cannot carry is client-supplied and
@@ -2048,26 +2068,30 @@ fn validates_start_metadata_without_continuation_bypass() {
     }
 }
 
-/// Temporal throttles a rapid continue-as-new with a nonzero first-task
-/// backoff even without cron. Preserve that server-applied duration on known
-/// workflow/retry continuations while keeping root start delay unsupported.
+/// Temporal applies a first-task backoff for a root start delay, for the
+/// wait until a cron schedule's next time, and to throttle a rapid
+/// continue-as-new or retry. Every such server-applied duration is preserved
+/// exactly, on a root run and for every initiator including an unknown future
+/// one (#1017), while an out-of-range nanosecond field is still rejected.
 #[test]
 fn preserves_server_continuation_backoff() {
     for initiator in [0, 1, 2, 3, 99] {
-        for nanos in [0, 989_282_667, -1, 1_000_000_000] {
+        for (seconds, nanos) in [
+            (0, 0),
+            (0, 989_282_667),
+            (86_400, 5),
+            (0, -1),
+            (0, 1_000_000_000),
+        ] {
             let mut init = start_metadata_initializer();
             init.cron_schedule_to_schedule_interval =
-                Some(prost_wkt_types::Duration { seconds: 0, nanos });
+                Some(prost_wkt_types::Duration { seconds, nanos });
             if initiator != 0 {
                 init.continued_from_execution_run_id = "previous-run".to_owned();
                 init.continued_initiator = initiator;
             }
             let result = workflow_protocol::activation_from_core(&start_metadata_activation(init));
-            // An unknown future initiator (99) reads as unspecified (#1017),
-            // so it is admitted exactly like a root start: only without delay.
-            if ((matches!(initiator, 0 | 99) && nanos == 0) || matches!(initiator, 1 | 2))
-                && (0..1_000_000_000).contains(&nanos)
-            {
+            if (0..1_000_000_000).contains(&nanos) {
                 let activation = result.unwrap();
                 let workflow_protocol::ActivationJob::InitializeWorkflow {
                     context: Some(context),
@@ -2079,10 +2103,8 @@ fn preserves_server_continuation_backoff() {
                 assert_eq!(
                     context
                         .first_workflow_task_backoff
-                        .as_ref()
-                        .unwrap()
-                        .nanoseconds,
-                    nanos
+                        .map(|backoff| (backoff.seconds, backoff.nanoseconds)),
+                    Some((seconds, nanos))
                 );
                 let json = workflow_protocol::encode_activation(&activation).unwrap();
                 assert_eq!(
@@ -2090,7 +2112,7 @@ fn preserves_server_continuation_backoff() {
                     activation
                 );
             } else {
-                assert!(result.is_err(), "unsupported or invalid delay was admitted");
+                assert!(result.is_err(), "an invalid delay was admitted");
             }
         }
     }
@@ -2849,24 +2871,32 @@ fn preserves_realistic_first_workflow_activation() {
         semantic
     );
 
-    // A non-zero first-task backoff carries scheduling semantics and must not
-    // be silently discarded while this protocol slice has no representation
-    // for it.
-    let mut unsupported_backoff = core.clone();
-    let Some(Variant::InitializeWorkflow(initialize)) =
-        unsupported_backoff.jobs[0].variant.as_mut()
-    else {
+    // A root start delay (#1158) is a non-zero first-task backoff on a root
+    // run. The server has already applied it, so it is carried exactly as
+    // metadata rather than rejected or discarded.
+    let mut delayed = core.clone();
+    let Some(Variant::InitializeWorkflow(initialize)) = delayed.jobs[0].variant.as_mut() else {
         panic!("realistic activation must contain initialization");
     };
     initialize.cron_schedule_to_schedule_interval = Some(prost_wkt_types::Duration {
         seconds: 1,
         nanos: 0,
     });
-    let error = workflow_protocol::activation_from_core(&unsupported_backoff).unwrap_err();
+    let semantic = workflow_protocol::activation_from_core(&delayed).unwrap();
+    let workflow_protocol::ActivationJob::InitializeWorkflow {
+        context: Some(context),
+        ..
+    } = &semantic.jobs[0]
+    else {
+        panic!("delayed activation must retain initialization context");
+    };
     assert_eq!(
-        error.code,
-        workflow_protocol::CoreConversionErrorCode::Unsupported
+        context
+            .first_workflow_task_backoff
+            .map(|backoff| (backoff.seconds, backoff.nanoseconds)),
+        Some((1, 0))
     );
+    assert_eq!(context.cron_schedule, None);
 
     // Core copies the raw reason numbers into every later activation, so an
     // unknown reason (the reserved 4 from older servers, or a future one)
@@ -4449,6 +4479,7 @@ fn rejects_omitted_required_nullable_fields() {
         "search_attributes",
         "workflow_execution_expiration_time",
         "first_workflow_task_backoff",
+        "cron_schedule",
         "parent_workflow",
         "workflow_execution_timeout",
         "workflow_run_timeout",

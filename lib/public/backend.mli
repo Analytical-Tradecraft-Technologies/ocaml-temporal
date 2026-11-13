@@ -49,6 +49,11 @@ type start_request = {
   task_timeout_ms : int64 option;
   (* Server-side workflow retry policy; [None] means no retry. *)
   retry_policy : Temporal_sdk_kernel.Activation.retry_policy option;
+  (* Cron schedule and first-task delay (#1158), already validated by
+     [Client.start] and never both present; [None] means none. Part of the
+     mock's request-ID fingerprint. *)
+  cron_schedule : string option;
+  start_delay_ms : int64 option;
   (* Caller deadline of the start RPC, fixed on the monotonic clock when the
      call began. It bounds one call, not the workflow, so it is not part of
      the request-ID fingerprint. *)

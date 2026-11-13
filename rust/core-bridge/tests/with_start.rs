@@ -623,6 +623,40 @@ fn signal_with_start_starts_or_signals() {
     close_runtime(runtime);
 }
 
+/// Signal-with-start forwards a cron schedule and a start delay to
+/// `SignalWithStartWorkflowExecution` unchanged (#1158), and leaves both at
+/// Temporal's "none" values when they are omitted.
+#[test]
+fn signal_with_start_forwards_schedule_options() {
+    let observed = Observed::default();
+    let runtime = start_runtime(spawn_server(Arc::clone(&observed)));
+    for (field, value) in [
+        ("cron_schedule", serde_json::json!("@every 5s")),
+        ("start_delay_ms", serde_json::json!(2_250)),
+    ] {
+        let mut document: serde_json::Value =
+            serde_json::from_str(&signal_with_start("fresh", "use_existing", None)).expect("JSON");
+        document["start"][field] = value;
+        let value = outcome(runtime, CALL_SIGNAL_WITH_START, &document.to_string());
+        assert_eq!(value["kind"], "accepted", "{value}");
+    }
+    let seen = observed.lock().expect("observed lock");
+    let cron = &seen.signal_with_starts[0];
+    assert_eq!(cron.cron_schedule, "@every 5s");
+    assert_eq!(cron.workflow_start_delay, None);
+    let delayed = &seen.signal_with_starts[1];
+    assert_eq!(delayed.cron_schedule, "");
+    assert_eq!(
+        delayed
+            .workflow_start_delay
+            .as_ref()
+            .map(|delay| (delay.seconds, delay.nanos)),
+        Some((2, 250_000_000))
+    );
+    drop(seen);
+    close_runtime(runtime);
+}
+
 /// A rejected signal-with-start is a start rejection, and a transport
 /// failure is an uncertain start.
 #[test]
@@ -878,6 +912,22 @@ fn with_start_documents_validate_before_the_rpc() {
         serde_json::from_str(&update_with_start("w", None)).expect("JSON");
     bad_start["start"]["rpc_timeout_ms"] = serde_json::json!(60_001);
     update_documents.push(bad_start.to_string());
+    // Temporal refuses a cron schedule or start delay on update-with-start
+    // and a schedule combined with a delay anywhere (#1158).
+    for (field, value) in [
+        ("cron_schedule", serde_json::json!("@every 5s")),
+        ("start_delay_ms", serde_json::json!(1_000)),
+    ] {
+        let mut document: serde_json::Value =
+            serde_json::from_str(&update_with_start("w", None)).expect("JSON");
+        document["start"][field] = value;
+        update_documents.push(document.to_string());
+    }
+    let mut both: serde_json::Value =
+        serde_json::from_str(&signal_with_start("w", "use_existing", None)).expect("JSON");
+    both["start"]["cron_schedule"] = serde_json::json!("@every 5s");
+    both["start"]["start_delay_ms"] = serde_json::json!(1_000);
+    signal_documents.push(both.to_string());
     for document in &signal_documents {
         let refused = submit(runtime, CALL_SIGNAL_WITH_START, document).expect_err(document);
         assert_eq!(refused.0, STATUS_PROTOCOL, "{document}: {}", refused.1);

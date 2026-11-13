@@ -50,6 +50,11 @@ type start_request = {
   task_timeout_ms : int64 option;
   (* Server-side workflow retry policy; [None] means no retry. *)
   retry_policy : Temporal_sdk_kernel.Activation.retry_policy option;
+  (* Cron schedule and first-task delay (#1158), already validated by
+     [Client.start] and never both present; [None] means none. Part of the
+     mock's request-ID fingerprint. *)
+  cron_schedule : string option;
+  start_delay_ms : int64 option;
   (* Caller deadline of the start RPC, fixed on the monotonic clock when the
      call began. It bounds one call, not the workflow, so it is not part of
      the request-ID fingerprint. *)
@@ -548,6 +553,8 @@ let equal_start_request (left : start_request) (right : start_request) =
   && left.run_timeout_ms = right.run_timeout_ms
   && left.task_timeout_ms = right.task_timeout_ms
   && left.retry_policy = right.retry_policy
+  && Option.equal String.equal left.cron_schedule right.cron_schedule
+  && left.start_delay_ms = right.start_delay_ms
   && String.equal left.workflow_name right.workflow_name
   && String.equal left.workflow_id right.workflow_id
   && String.equal left.task_queue right.task_queue
@@ -1321,6 +1328,8 @@ let native_start_request client (request : start_request) : Client_protocol.star
     run_timeout_ms = request.run_timeout_ms;
     task_timeout_ms = request.task_timeout_ms;
     retry_policy = Option.map protocol_retry_policy request.retry_policy;
+    cron_schedule = request.cron_schedule;
+    start_delay_ms = request.start_delay_ms;
     rpc_deadline = request.rpc_deadline;
   }
 

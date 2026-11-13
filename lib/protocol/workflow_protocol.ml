@@ -159,6 +159,7 @@ type initialize_context = {
   search_attributes : (string * payload) list option;
   workflow_execution_expiration_time : timestamp option;
   first_workflow_task_backoff : duration option;
+  cron_schedule : string option;
   identity : string;
   parent_workflow : namespaced_workflow_execution option;
   workflow_execution_timeout : duration option;
@@ -1938,6 +1939,7 @@ let initialize_context path json =
       "memo";
       "search_attributes";
       "workflow_execution_expiration_time"; "first_workflow_task_backoff";
+      "cron_schedule";
       "identity";
       "parent_workflow";
       "workflow_execution_timeout";
@@ -1973,6 +1975,17 @@ let initialize_context path json =
     nullable (path ^ "." ^ name) duration value
   in
   let* first_workflow_task_backoff = timeout "first_workflow_task_backoff" in
+  (* Rust encodes an absent schedule as [null], never as an empty string. *)
+  let* cron_json = field path "cron_schedule" entries in
+  let* cron_schedule =
+    nullable (path ^ ".cron_schedule")
+      (fun path json ->
+        let* schedule = string path json in
+        if String.equal schedule "" then
+          Error (invalid path "cron schedule must not be empty")
+        else Ok schedule)
+      cron_json
+  in
   let* workflow_execution_timeout = timeout "workflow_execution_timeout" in
   let* workflow_run_timeout = timeout "workflow_run_timeout" in
   let* workflow_task_timeout = timeout "workflow_task_timeout" in
@@ -1996,6 +2009,7 @@ let initialize_context path json =
       memo;
       search_attributes;
       workflow_execution_expiration_time; first_workflow_task_backoff;
+      cron_schedule;
       identity;
       parent_workflow;
       workflow_execution_timeout;
@@ -2108,6 +2122,10 @@ let initialize_context_json value =
           | None -> `Null
           | Some value -> time_json value.seconds value.nanoseconds);
         ("first_workflow_task_backoff", optional_time value.first_workflow_task_backoff);
+        ( "cron_schedule",
+          match value.cron_schedule with
+          | None -> `Null
+          | Some schedule -> `String schedule );
         ("identity", `String value.identity);
         ("parent_workflow", parent_workflow);
         ("workflow_execution_timeout", optional_time value.workflow_execution_timeout);

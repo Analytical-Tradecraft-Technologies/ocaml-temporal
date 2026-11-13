@@ -218,11 +218,25 @@ fn validate_signal_with_start_request(
     validate_message_payloads(&value.signal_input, "$.signal_input")
 }
 
-/// Validates the embedded start and the update.
+/// Validates the embedded start and the update. Temporal refuses a cron
+/// schedule or start delay on the start operation of update-with-start, so
+/// the bridge rejects both before any RPC (#1158).
 fn validate_update_with_start_request(
     value: &UpdateWithStartRequest,
 ) -> Result<(), protocol::ProtocolError> {
     validate_start_request(&value.start)?;
+    if value.start.cron_schedule.is_some() {
+        return Err(protocol::ProtocolError::invalid(
+            "$.start.cron_schedule",
+            "update-with-start does not accept a cron schedule",
+        ));
+    }
+    if value.start.start_delay_ms.is_some() {
+        return Err(protocol::ProtocolError::invalid(
+            "$.start.start_delay_ms",
+            "update-with-start does not accept a start delay",
+        ));
+    }
     validate_identifier(&value.update_id, "$.update_id")?;
     validate_identifier(&value.update_name, "$.update_name")?;
     validate_message_payloads(&value.update_input, "$.update_input")
@@ -254,10 +268,33 @@ pub(crate) async fn signal_with_start_workflow(
     connection: Connection,
     request: SignalWithStartRequest,
 ) -> Result<StartWorkflowResponse, ClientOperationError> {
-    let start = start_execution_request(&request.start, connection.identity())?;
+    let rpc_request = signal_with_start_execution_request(&request, connection.identity())?;
+    let budget = rpc_budget(request.start.rpc_timeout_ms, START_RPC_TIMEOUT);
+    let started = tokio::time::Instant::now();
+    let mut service = connection.clone();
+    let response = budgeted_rpc(
+        budget,
+        started,
+        service.signal_with_start_workflow_execution(budgeted_request(rpc_request, budget)),
+        |status| map_start_status(&request.start.workflow_id, status),
+    )
+    .await?;
+    start_response_from_core(&request.start, response.run_id, response.started)
+}
+
+/// Builds Temporal's `SignalWithStartWorkflowExecutionRequest` from one
+/// validated request. The start fields are copied from
+/// [`start_execution_request`], so signal-with-start applies exactly the
+/// policies, timeouts, metadata, cron schedule, and start delay of a plain
+/// start (#1158).
+fn signal_with_start_execution_request(
+    request: &SignalWithStartRequest,
+    identity: &str,
+) -> Result<SignalWithStartWorkflowExecutionRequest, ClientOperationError> {
+    let start = start_execution_request(&request.start, identity)?;
     let signal_input =
         payloads_to_core(&request.signal_input).map_err(ClientOperationError::Core)?;
-    let rpc_request = SignalWithStartWorkflowExecutionRequest {
+    Ok(SignalWithStartWorkflowExecutionRequest {
         namespace: start.namespace,
         workflow_id: start.workflow_id,
         workflow_type: start.workflow_type,
@@ -275,20 +312,12 @@ pub(crate) async fn signal_with_start_workflow(
         retry_policy: start.retry_policy,
         memo: start.memo,
         search_attributes: start.search_attributes,
-        // Cron schedules and start delays stay unsupported, as for start.
+        // Temporal skips the rest of the delay when another signal-with-start
+        // reaches the run first (#1158).
+        cron_schedule: start.cron_schedule,
+        workflow_start_delay: start.workflow_start_delay,
         ..Default::default()
-    };
-    let budget = rpc_budget(request.start.rpc_timeout_ms, START_RPC_TIMEOUT);
-    let started = tokio::time::Instant::now();
-    let mut service = connection.clone();
-    let response = budgeted_rpc(
-        budget,
-        started,
-        service.signal_with_start_workflow_execution(budgeted_request(rpc_request, budget)),
-        |status| map_start_status(&request.start.workflow_id, status),
-    )
-    .await?;
-    start_response_from_core(&request.start, response.run_id, response.started)
+    })
 }
 
 /// Starts a workflow if needed and admits one update on it through

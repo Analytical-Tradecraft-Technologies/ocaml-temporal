@@ -237,9 +237,9 @@ module Info : sig
       - [`Continue_as_new]: the previous run called {!continue_as_new}.
       - [`Retry]: the previous run failed or timed out and the workflow
         retry policy started this run.
-      - [`Cron_schedule]: a cron schedule fired. OCaml workers currently
-        reject cron-initiated runs before workflow code starts, so this
-        constructor is reserved and is not observed today. *)
+      - [`Cron_schedule]: the previous run of a cron chain closed and the
+        schedule ([?cron_schedule] on [Client.start]) started this run at its
+        next scheduled time. *)
   type continuation_initiator = [ `Continue_as_new | `Retry | `Cron_schedule ]
 
   (** Returns the run ID this run was continued or retried from, or [None]
@@ -279,10 +279,27 @@ module Info : sig
       reported as [None]. *)
   val retry_policy : t -> Retry_policy.t option
 
+  (** Returns the cron schedule this run belongs to ([?cron_schedule] on
+      [Client.start]), or [None] when it is not part of a cron chain. Every
+      run of the chain reports the same schedule. *)
+  val cron_schedule : t -> string option
+
+  (** Returns how long Temporal held this run's first workflow task before
+      dispatching it, or [None] when it did not delay it: the
+      [?start_delay] on [Client.start], the wait until a cron schedule's
+      next time, or the brief throttle Temporal applies to a rapid retry or
+      continue-as-new. The delay has already elapsed when workflow code
+      runs; it is history metadata, and reading it schedules nothing.
+      Durations are rounded up to whole milliseconds. *)
+  val first_workflow_task_backoff : t -> Duration.t option
+
   (** Returns the parent workflow, or [None] for a top-level workflow. *)
   val parent : t -> parent option
 
-  (** Returns when the server started this run, if Temporal reported it. *)
+  (** Returns when the server started this run, if Temporal reported it.
+      This is when the run was created, before any
+      {!first_workflow_task_backoff}: a delayed or cron run's first
+      {!val-now} is later by at least that backoff. *)
   val start_time : t -> Time.t option
 
   (** Returns whether Temporal was replaying history for the activation

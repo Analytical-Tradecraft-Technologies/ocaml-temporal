@@ -653,6 +653,8 @@ fn start_request(rpc_timeout_ms: Option<u64>) -> StartWorkflowRequest {
         run_timeout_ms: None,
         task_timeout_ms: None,
         retry_policy: None,
+        cron_schedule: None,
+        start_delay_ms: None,
         rpc_timeout_ms,
     }
 }

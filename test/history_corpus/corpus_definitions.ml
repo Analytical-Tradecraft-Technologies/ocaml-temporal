@@ -861,6 +861,35 @@ let continue_as_new_options_workflow =
             (Temporal.Error.defect
                ~message:(Printf.sprintf "unexpected continue-as-new options input %S" input)))
 
+(** {1 Cron schedule and start delay workflow (#1158)}
+
+    Frozen with the [corpus-v5-cron-start-delay] capture. *)
+
+let cron_start_delay_workflow_type = "corpus.cron_start_delay"
+
+(** [corpus.cron_start_delay]: completes at once with
+    ["CRON:<schedule>/<backoff>/<initiator>"], where [<schedule>] is the
+    recorded cron schedule, [<backoff>] is ["delayed"] when Temporal held the
+    first workflow task, and [<initiator>] is ["cron"] for a run a cron
+    schedule started; each is ["-"] when absent. The output depends only on
+    history, so it is identical under replay. *)
+let cron_start_delay_workflow =
+  Temporal.Workflow.define ~name:cron_start_delay_workflow_type
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun _input ->
+      let open Temporal.Result_syntax in
+      let* info = Temporal.Workflow.info () in
+      let module Info = Temporal.Workflow.Info in
+      Ok
+        (Printf.sprintf "CRON:%s/%s/%s"
+           (Option.value (Info.cron_schedule info) ~default:"-")
+           (match Info.first_workflow_task_backoff info with
+           | None -> "-"
+           | Some _ -> "delayed")
+           (match Info.continuation_initiator info with
+           | Some `Cron_schedule -> "cron"
+           | Some (`Continue_as_new | `Retry) -> "other"
+           | None -> "-")))
+
 (** {1 Reused fixture definitions} *)
 
 (** The corrected generation of [test/integration/temporal/task_failure]. The
@@ -937,6 +966,7 @@ let definition_sets =
     ( "negative-random-reordered",
       [ plain (random_parent ~reordered:true); plain random_child_workflow ] );
     ("corpus-v4-continue-as-new-options", [ plain continue_as_new_options_workflow ]);
+    ("corpus-v5-cron-start-delay", [ plain cron_start_delay_workflow ]);
   ]
 
 (** Set names in declaration order. *)

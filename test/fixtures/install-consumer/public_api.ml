@@ -780,6 +780,8 @@ let _client_start :
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
     ?retry_policy:T.Retry_policy.t ->
+    ?cron_schedule:string ->
+    ?start_delay:T.Duration.t ->
     ?rpc_timeout:T.Duration.t ->
     workflow:('input, 'output) T.Workflow.t ->
     task_queue:string ->
@@ -800,6 +802,8 @@ let _client_signal_with_start :
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
     ?retry_policy:T.Retry_policy.t ->
+    ?cron_schedule:string ->
+    ?start_delay:T.Duration.t ->
     ?rpc_timeout:T.Duration.t ->
     workflow:('input, 'output) T.Workflow.t ->
     task_queue:string ->
@@ -1054,6 +1058,14 @@ let _workflow_info_task_timeout : T.Workflow.Info.t -> T.Duration.t option =
 let _workflow_info_retry_policy :
     T.Workflow.Info.t -> T.Retry_policy.t option =
   T.Workflow.Info.retry_policy
+
+(* The cron schedule and server-applied first-task delay of a run (#1158). *)
+let _workflow_info_cron_schedule : T.Workflow.Info.t -> string option =
+  T.Workflow.Info.cron_schedule
+
+let _workflow_info_first_workflow_task_backoff :
+    T.Workflow.Info.t -> T.Duration.t option =
+  T.Workflow.Info.first_workflow_task_backoff
 
 let _workflow_info_parent : T.Workflow.Info.t -> T.Workflow.Info.parent option =
   T.Workflow.Info.parent
