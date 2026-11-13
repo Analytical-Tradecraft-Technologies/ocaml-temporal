@@ -6984,3 +6984,11 @@ on an OTLP runtime with an in-process collector stub and requires the same
 families as the Prometheus path. Tracing is not exported, by recorded
 decision, until headers (#1139) and interceptors (#1162) make context
 propagation possible.
+
+## 2026-11-13: `Temporal.Testing` fidelity (#1160)
+
+- The opt-in `` `Retry `` workflow-task-failure mode keeps a failing run open, answers queries from its last completed task, and retries it with `Testing.retry_workflow_tasks` by replaying the completed activations.
+- `Testing.start`/`execute` take memo, search attributes, ID conflict and reuse policies (refused starts return the client's already-started error), timeouts and a retry policy. Child starts apply their reuse policy.
+- Workflow execution and run timeouts, top-level and child, expire in virtual time.
+- Asynchronous activities wait for their real `Activity.Async_handle`, with heartbeats, cancellation and timeouts (`Testing.mock_async_activity`).
+- Covered by `test/unit/test_testing_fidelity.ml`. Schedule-to-start timeouts and visibility queries remain deliberately unsimulated.
