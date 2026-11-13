@@ -1166,6 +1166,23 @@ let _runtime_metrics_prometheus :
     unit ->
     (T.Runtime.Metrics.t, T.Error.t) result =
   T.Runtime.Metrics.prometheus
+
+(* Opt-in OTLP push export of the same metrics (#1161). *)
+let _runtime_metrics_otlp :
+    ?headers:(string * string) list ->
+    ?period:T.Duration.t ->
+    ?protocol:[ `Grpc | `Http_protobuf ] ->
+    ?temporality:[ `Cumulative | `Delta ] ->
+    ?global_tags:(string * string) list ->
+    ?durations_as_seconds:bool ->
+    endpoint:string ->
+    unit ->
+    (T.Runtime.Metrics.t, T.Error.t) result =
+  T.Runtime.Metrics.otlp
+let _runtime_metrics_otlp_protocol : T.Runtime.Metrics.otlp_protocol list =
+  [ `Grpc; `Http_protobuf ]
+let _runtime_metrics_temporality : T.Runtime.Metrics.temporality list =
+  [ `Cumulative; `Delta ]
 let _runtime_metrics_address : T.Runtime.t -> string option =
   T.Runtime.metrics_address
 let _runtime_shutdown : T.Runtime.t -> (unit, T.Error.t) result =

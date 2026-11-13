@@ -712,6 +712,13 @@ and bridge, read the [documentation guide](../README.md) first.
   creation fails). `Runtime.shutdown` refuses with a typed defect while any
   lease is outstanding and otherwise returns only after Core's threads are
   gone.
+- A shared runtime's metrics exporter (#500, #1161) has one owner: the
+  `MetricsExporter` guard stored with Core, released with Core and before
+  Core's Tokio runtime. An OTLP exporter's meter provider is owned by that
+  guard alone; clients, workers and the GC-released SDK recorder hold only
+  a detachable reference, so the exporter's final export and thread stop
+  happen at runtime release, never from a finalizer, and never after Core.
+  Exporter threads and tasks never call OCaml.
 - Backend state never appears in a producer-facing operation or result. Typed
   GADT operations may expose ordinary copied values but cannot return a raw
   native handle.

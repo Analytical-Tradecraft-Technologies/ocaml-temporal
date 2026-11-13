@@ -551,9 +551,12 @@ val shared_runtime_create :
 
 (** Like {!shared_runtime_create}, additionally passing [telemetry], a strict
     JSON telemetry document (#500), to Rust. On success returns the handle
-    and the socket address the metrics endpoint is bound to, or [""] when
-    the document configures no exporter. An invalid document or an unusable
-    address is a [Configuration] error, and nothing is left running. *)
+    and the socket address the Prometheus endpoint is bound to, or [""]
+    when the document configures no exporter or an OTLP exporter (#1161),
+    which listens on nothing. An invalid document or an unusable address is
+    a [Configuration] error, and nothing is left running. The document of an
+    OTLP exporter carries header credentials; it is passed to Rust only and
+    never logged. *)
 val shared_runtime_create_with_telemetry :
   ?worker_threads:int ->
   telemetry:string ->
@@ -577,13 +580,16 @@ val shared_runtime_close : shared_runtime -> (unit, error) result
 
     Core instruments its own workers and clients. Worker states that exist
     only in the OCaml SDK are recorded through a {!metric_meter} into the
-    same Prometheus registry, with Core's [temporal_] name prefix, its
-    [service_name] label and the runtime's global tags. *)
+    same Prometheus registry or OTLP pipeline (#1161), with Core's
+    [temporal_] name prefix, its [service_name] label and the runtime's
+    global tags. *)
 
 (** Recorder over one shared runtime's Core meter. It references the
-    meter, not Core, so it stays valid (recording into a registry nobody
-    scrapes any longer) after the runtime is shut down. It is released only
-    by the GC, so values may be shared freely between Domains. *)
+    meter, not Core or an OTLP exporter, so it stays valid (recording into a
+    registry or pipeline nobody scrapes or exports any longer; series first
+    registered after an OTLP runtime's release are no-ops) after the runtime
+    is shut down. It is released only by the GC, so values may be shared
+    freely between Domains. *)
 type metric_meter
 
 (** Kind of one series; one metric name keeps one kind. [Up_down_counter]
