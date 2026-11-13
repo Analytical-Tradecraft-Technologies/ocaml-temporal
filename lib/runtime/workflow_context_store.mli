@@ -93,13 +93,14 @@ val validate_namespace : string -> (unit, string) result
     Sibling threads of one Domain never observe each other's context. *)
 val current : unit -> t option
 
-(** True only while a synchronous read-only query on this thread inspects the
+(** True only while a synchronous read-only callback on this thread (a query
+    handler or a live update validator, see {!with_read_only}) inspects the
     live execution whose scheduler has [owner_id]. Does not grant scheduler
     ownership or permission to mutate workflow state. *)
 val query_read_owner_matches : int -> bool
 
 (** True only in the current execution's scheduler turn, outside a read-only
-    query. Scoped command starts use this before allocating durable state. *)
+    callback. Scoped command starts use this before allocating durable state. *)
 val in_owner_turn : t -> bool
 
 (** Allocates a key for execution-local workflow state. The key itself may be
@@ -111,8 +112,20 @@ val create_local : unit -> 'a local
     assigned a value. *)
 val get_local : t -> 'a local -> 'a option
 
-(** Writes a key in one execution context. *)
+(** Writes a key in one execution context. Raises [Invalid_argument] inside a
+    read-only callback (see {!with_read_only}) before the value changes; the
+    public setter returns a typed defect there instead of reaching this. *)
 val set_local : t -> 'a local -> 'a -> unit
+
+(** True while [t] runs a read-only callback: a live update validator or a
+    query handler, inside {!with_read_only}. *)
+val is_read_only : t -> bool
+
+(** Returns [Ok ()], or inside a read-only callback (see {!with_read_only}) a
+    non-retryable defect naming [what]. Public operations whose contract
+    returns a result or future call it before validating, encoding, or
+    allocating anything, so a rejected call mutates nothing. *)
+val check_writable : t -> what:string -> (unit, Temporal_base.Error.t) result
 
 (** Installs this run's start snapshot before workflow code executes. *)
 val set_start_metadata : t -> start_metadata option -> unit
@@ -185,7 +198,9 @@ val notify_has_patch : t -> patch_id:string -> unit
     decision is true emits a non-deprecated marker command. A false decision
     emits one only after Core reported the marker following that decision, so
     Core can consume it; otherwise it emits nothing. The ID is copied before retention and emission. Calling this
-    after shutdown raises [Invalid_argument]. *)
+    after shutdown, or inside a read-only callback (see {!with_read_only})
+    where it could fix the run's decision, raises [Invalid_argument] before
+    any decision or command changes. *)
 val patched : t -> patch_id:string -> bool
 
 (** Emits a deprecated marker command for [patch_id] when its retained
@@ -194,7 +209,8 @@ val patched : t -> patch_id:string -> bool
     deprecation calls are allowed. Mixing [patched] and [deprecate_patch] for one ID in the same
     execution raises [Invalid_argument] before a conflicting command is emitted;
     Core would otherwise keep only the first mode. The ID is copied before
-    retention and emission, and calls after shutdown raise [Invalid_argument]. *)
+    retention and emission, and calls after shutdown or inside a read-only
+    callback raise [Invalid_argument], as for {!patched}. *)
 val deprecate_patch : t -> patch_id:string -> unit
 
 (** Replaces the deterministic stream with Core's reset seed. The activation
@@ -227,10 +243,23 @@ val random_bytes : t -> length:int -> (string, Temporal_base.Error.t) result
     of 16 bytes with the RFC 9562 version and variant bits set. *)
 val uuid4 : t -> (string, Temporal_base.Error.t) result
 
-(** Runs a callback in the read-only mode used by live update validators.
-    Deterministic workflow helpers that would mutate execution state, such as
-    [random_int], return a typed defect while this callback is active. *)
-val with_randomness_disabled : t -> (unit -> 'value) -> 'value
+(** Runs [action] in the read-only mode shared by live update validators and
+    query handlers (#513). While it runs, every SDK-managed mutation of [t]
+    is rejected before it changes state: random draws, timer, activity and
+    child cancellation, and the public start operations return a typed
+    defect; local writes, patch calls, upserts, sequence allocation, command
+    emission and terminal commands raise [Invalid_argument]. The scheduler
+    owner id is cleared, so no future can suspend and owner-checked scope
+    and condition operations fail closed, and scheduler work, pending
+    futures and observers cannot be created (see
+    {!Future_store.with_read_only}). The callback may still read execution
+    state, including its own scopes' status through
+    {!query_read_owner_matches}. The previous mode is restored when [action]
+    returns or raises, so nested extents and the update implementation that
+    follows a successful validator are unaffected. This guards only state
+    the SDK manages: OCaml references, objects, I/O and foreign calls in
+    the callback are the application's responsibility. *)
+val with_read_only : t -> (unit -> 'value) -> 'value
 
 (** Emits one durable command that merges encoded values into the workflow's
     indexed search attributes. Keys and payloads are validated by the strict
@@ -238,7 +267,7 @@ val with_randomness_disabled : t -> (unit -> 'value) -> 'value
     no command, because Temporal Server rejects an empty upsert and replay
     would repeat the rejection on every task retry. Raises [Invalid_argument]
     after the execution has ended or inside a read-only callback (an update
-    validator or query handler, see {!with_randomness_disabled}), even for an
+    validator or query handler, see {!with_read_only}), even for an
     empty list, before any state changes. *)
 val upsert_search_attributes :
    t -> (string * Temporal_base.Codec.payload) list -> unit
@@ -268,9 +297,10 @@ val merge_upsert :
     context even if [action] raises. Nested calls are supported. *)
 val with_context : t -> (unit -> 'value) -> 'value
 
-(** Installs [t] for one synchronous query callback and permits owner-checked
-    scope status reads while disabling deterministic randomness. Restores the
-    previous thread-local bindings even if the callback raises. *)
+(** Installs [t] for one synchronous query callback and runs it in the
+    read-only mode of {!with_read_only}, which permits owner-checked scope
+    status reads. Restores the previous thread-local bindings even if the
+    callback raises. *)
 val with_read_only_query : t -> (unit -> 'value) -> 'value
 
 (** Runs [action] with no workflow context installed and restores the previous
@@ -279,12 +309,15 @@ val with_read_only_query : t -> (unit -> 'value) -> 'value
 val without_context : (unit -> 'value) -> 'value
 
 (** Sum of the threads on the calling Domain that hold a current-context
-    binding and those that hold a read-only query marker. It is zero whenever
-    no [with_context], [with_read_only_query], or [without_context] extent is
-    active on the Domain; tests use it to detect leaked bindings. *)
+    binding, a read-only callback marker, or a read-only future marker. It
+    is zero whenever no [with_context], [with_read_only],
+    [with_read_only_query], or [without_context] extent is active on the
+    Domain; tests use it to detect leaked bindings. *)
 val bound_thread_count : unit -> int
 
-(** Creates an already-resolved future owned by the context scheduler. *)
+(** Creates an already-resolved future owned by the context scheduler. It is
+    permitted inside a read-only callback, which uses it for typed
+    rejections, because it leaves no scheduler state behind. *)
 val resolved :
   t ->
   ('value, Temporal_base.Error.t) result ->
@@ -293,7 +326,9 @@ val resolved :
 (** Creates a pending, scheduler-owned notification future and its resolver.
     This is an internal coordination primitive for deterministic workflow
     helpers such as cancellation scopes; it emits no Temporal command and is
-    closed automatically with the workflow context. *)
+    closed automatically with the workflow context. Raises [Invalid_argument]
+    inside a read-only callback, where the pending future would outlive the
+    callback on the live path only. *)
 val create_signal :
   t ->
   (unit, Temporal_base.Error.t) Future_store.t
@@ -323,7 +358,10 @@ val detached_error :
     Temporal requires at least one activity timeout. The cancellation operation
     emits at most one activity-cancellation command for its sequence and
     remains a valid no-op after a terminal result or activity-start failure.
-    Calls made without this context current are typed lifecycle defects.
+    Calls made without this context current are typed lifecycle defects, and
+    so is a cancellation from a read-only callback, which changes nothing.
+    Scheduling itself raises [Invalid_argument] inside a read-only callback
+    (the public layer rejects that case first with {!check_writable}).
     [input] is the exact argument list sent to Core; the public layer decides
     it from the input codec ([Codec_private.encode_arguments]). *)
 val schedule_activity :
@@ -382,8 +420,10 @@ val schedule_local_activity :
     valid only while this context is current; it emits at most one cancellation
     command and leaves Core to resolve the future. A repeated valid call is a
     no-op, including after Core has delivered a terminal result or start
-    failure; a call after context shutdown remains a typed lifecycle defect.
-    [input] is the exact argument list sent to Core, as for
+    failure; a call after context shutdown remains a typed lifecycle defect,
+    as does a cancellation from a read-only callback, which emits nothing.
+    Starting a child raises [Invalid_argument] inside a read-only callback,
+    as for [schedule_activity]. [input] is the exact argument list sent to Core, as for
     [schedule_activity]. The optional timeouts are exact milliseconds that
     the caller has already validated; they and [id_reuse_policy] are copied
     into the command, and omitting them keeps the command unchanged. *)
@@ -407,7 +447,9 @@ val start_child_workflow :
   * (reason:string -> (unit, Temporal_base.Error.t) result) )
 
 (** Sends a signal to an external workflow and returns a future resolved by
-    Core's delivery acknowledgement or structured failure. *)
+    Core's delivery acknowledgement or structured failure. Raises
+    [Invalid_argument] inside a read-only callback, before a sequence is
+    allocated. *)
 val signal_external_workflow :
   t ->
   workflow_id:string ->
@@ -420,7 +462,8 @@ val signal_external_workflow :
   (unit, Temporal_base.Error.t) Future_store.t
 
 (** Requests cancellation of an external workflow and returns a future for
-    Core's asynchronous resolution. *)
+    Core's asynchronous resolution. Raises [Invalid_argument] inside a
+    read-only callback, before a sequence is allocated. *)
 val cancel_external_workflow :
   t ->
   workflow_id:string ->
@@ -435,7 +478,9 @@ val cancel_external_workflow :
     [Cancel_timer] once and settles the future with a [`Cancelled] error;
     cancelling after it fired or was already cancelled is [Ok ()] with no
     command, as is any cancellation after a terminal command sealed the
-    context. Cancellation outside this execution is a typed defect. *)
+    context. Cancellation outside this execution, or of a pending timer from
+    a read-only callback, is a typed defect that changes nothing. Starting a
+    timer raises [Invalid_argument] inside a read-only callback. *)
 val start_timer :
   t ->
   int64 ->
@@ -502,12 +547,14 @@ val resolve_child_workflow_start :
 val fire_timer : t -> seq:int64 -> (unit, Temporal_base.Error.t) result
 
 (** Appends a command to the current activation output buffer. Once sealed,
-    only query responses can be appended; durable commands remain suppressed. *)
+    only query responses can be appended; durable commands remain suppressed.
+    Inside a read-only callback any command other than a query response
+    raises [Invalid_argument] before the buffer changes. *)
 val emit : t -> Activation.command -> unit
 
 (** Raises [Invalid_argument] naming [what] when [context] is running a
     read-only callback (a live update validator or a query handler, see
-    {!with_randomness_disabled}), and returns otherwise. A terminal public
+    {!with_read_only}), and returns otherwise. A terminal public
     operation calls it before any validation or encoding whose failure would
     call {!terminate}: terminating there would seal the context and fail the
     whole workflow task from a path that replay skips, instead of rejecting
@@ -515,7 +562,9 @@ val emit : t -> Activation.command -> unit
 val reject_in_read_only_callback : t -> what:string -> unit
 
 (** Buffers a terminal command and stops the current workflow fiber. This is a
-    package-private control boundary used by terminal workflow operations. *)
+    package-private control boundary used by terminal workflow operations.
+    Raises [Invalid_argument] inside a read-only callback before the command
+    is buffered or the context sealed. *)
 val terminate : t -> Activation.command -> 'value
 
 (** Buffers a continue-as-new command and stops the current workflow fiber.
@@ -526,7 +575,7 @@ val terminate : t -> Activation.command -> 'value
     memo) when there was none. [options] (default
     {!Activation.Continue_as_new_options.none}) holds the other successor
     settings, already validated by the public API. Raises [Invalid_argument]
-    inside a read-only callback (see {!with_randomness_disabled}) before
+    inside a read-only callback (see {!with_read_only}) before
     anything is buffered, as {!upsert_memo} does. *)
 val continue_as_new :
   ?memo:(string * Temporal_base.Codec.payload) list ->

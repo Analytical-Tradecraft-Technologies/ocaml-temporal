@@ -596,13 +596,20 @@ let check_scope = function
     task queue, or zero close timeout must not invoke an application codec, allocate workflow state,
     or perform any user conversion before the request is rejected. The native
     runtime receives a base payload; its result decoder is converted back to
-    public errors at the same boundary. *)
+    public errors at the same boundary. A start from a read-only callback (an
+    update validator or a query handler) returns a failed handle whose
+    future and [cancel] carry the typed defect. *)
 let start_handle_internal ?scope ?activity_id ?task_queue ?schedule_to_close_timeout
     ?schedule_to_start_timeout ?start_to_close_timeout ?heartbeat_timeout
     ?retry_policy ?priority ?(cancellation_type = Try_cancel)
     ?(do_not_eagerly_execute = false) ?(local = false)
     definition input =
-  match check_scope scope with
+  (* A read-only callback is rejected before any option check or codec call,
+     so its typed defect is the same whatever else is wrong (#513). *)
+  match
+    Result.bind (Error_private.check_writable ~what:"activity start") (fun () ->
+        check_scope scope)
+  with
   | Error error -> failed_handle error
   | Ok () -> (
       match validate_optional_identifier "activity id" activity_id with

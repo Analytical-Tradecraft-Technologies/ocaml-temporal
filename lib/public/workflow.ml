@@ -96,7 +96,10 @@ let start_sleep ?scope duration =
   match Temporal_sdk_kernel.Workflow_context_store.current () with
   | None -> failed (Error.defect ~message:outside_message)
   | Some context -> (
-      match check_scope scope with
+      match
+        Result.bind (Error_private.check_writable ~what:"sleep") (fun () ->
+            check_scope scope)
+      with
       | Error error -> failed error
       | Ok () ->
           let milliseconds = Duration.to_ms duration in
@@ -124,6 +127,8 @@ let start_sleep ?scope duration =
             future)
 
 (** Implements direct-style sleep as timer creation followed by a future wait.
+    In a read-only callback the start fails, so the call returns that typed
+    defect without suspending.
     A scoped sleep is awaited through its scope, so cancelling the scope from
     another fiber both cancels the durable timer and resumes this caller with
     the scope's [`Cancelled] error. A start that already failed (outside a
@@ -181,7 +186,10 @@ let signal_external_workflow ~workflow_id ?run_id ~(signal : 'input Signal.t)
   match Temporal_sdk_kernel.Workflow_context_store.current () with
   | None -> Future_private.resolved ~outside_error (Error (outside_error ()))
   | Some context -> (
-      match validate_external_target ~workflow_id ~run_id with
+      match
+        Result.bind (Error_private.check_writable ~what:"external workflow signal")
+          (fun () -> validate_external_target ~workflow_id ~run_id)
+      with
       | Error error ->
           failed_external_operation context error
       | Ok () -> (
@@ -212,7 +220,11 @@ let cancel_external_workflow ~workflow_id ?run_id ~reason () =
   match Temporal_sdk_kernel.Workflow_context_store.current () with
   | None -> Future_private.resolved ~outside_error (Error (outside_error ()))
   | Some context -> (
-      match validate_external_target ~workflow_id ~run_id with
+      match
+        Result.bind
+          (Error_private.check_writable ~what:"external workflow cancellation")
+          (fun () -> validate_external_target ~workflow_id ~run_id)
+      with
       | Error error ->
           failed_external_operation context error
       | Ok () when String.equal reason "" ->

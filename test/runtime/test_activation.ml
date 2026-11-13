@@ -2295,7 +2295,7 @@ let test_update_validator_cannot_consume_workflow_randomness () =
   (match !validator_error with
   | Some message
     when String.equal message
-           "workflow randomness is unavailable in a read-only update validator" ->
+           "workflow randomness is unavailable in a read-only update validator or query handler" ->
       ()
   | Some message ->
       failwith ("unexpected validator randomness result: " ^ message)

@@ -2,9 +2,15 @@
 
     A query reads workflow state and returns a value without changing durable
     history. Query handlers are required by contract to be read-only and
-    non-suspending. The deterministic dispatcher invokes them outside an active
-    workflow scheduler, so accidental use of a scheduler-owned operation
-    returns a typed lifecycle error rather than blocking a thread. *)
+    non-suspending. A native worker invokes them outside an active workflow
+    scheduler, in the read-only mode it also uses for update validators: an
+    SDK operation that would change replay-sensitive state, emit a command,
+    or suspend is rejected before it changes anything, with a typed defect
+    where the operation returns a result or future and [Invalid_argument]
+    where its contract raises for misuse (see {!Update.Handler.dispatch} for
+    the list). A raised rejection fails only this query. The mode guards SDK
+    state only: OCaml references, objects, I/O and foreign calls a handler
+    reaches remain the application's responsibility. *)
 
 (** A validated query name paired with the type of its result. This type keeps
     the original output-only API source-compatible. Use [typed] and
@@ -47,7 +53,7 @@ val output_with_input : ('input, 'output) typed -> 'output Codec.t
 
 (** A query handler closes over read-only workflow state and computes one typed
     result. The callback must not mutate workflow state, schedule commands, or
-    wait for a future. *)
+    wait for a future; the SDK rejects such operations, as described above. *)
 module Handler : sig
   (** An existentially packaged query handler. *)
   type t
