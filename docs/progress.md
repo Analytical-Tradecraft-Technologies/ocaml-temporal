@@ -6992,3 +6992,21 @@ propagation possible.
 - Workflow execution and run timeouts, top-level and child, expire in virtual time.
 - Asynchronous activities wait for their real `Activity.Async_handle`, with heartbeats, cancellation and timeouts (`Testing.mock_async_activity`).
 - Covered by `test/unit/test_testing_fidelity.ml`. Schedule-to-start timeouts and visibility queries remain deliberately unsimulated.
+
+## 2026-11-14: Signal-with-start and update-with-start across SDKs
+
+The official-SDK interoperability regression now runs signal-with-start and
+update-with-start in both directions (#1151). The official Python client
+signal-with-starts an OCaml entity workflow on an absent workflow, its open
+run, under `TERMINATE_EXISTING` and after the run closed, and
+update-with-starts it with accepted updates, an OCaml validator rejection on
+an open and on a newly started run, and a `FAIL` conflict. The driver also
+hosts a Python entity with the same protocol, which the OCaml client drives
+with `Client.signal_with_start` and `Client.update_with_start` through the
+same cases while the driver runs its own. Each side checks the other's runs:
+exact run IDs, signals recorded before the first workflow task, the replaced
+run terminated, update results, the validator rejection's type and detail
+beside the run, the typed already-started refusal, and only accepted updates
+in history. The two processes coordinate through `python-ready` and
+`ocaml-with-start.json` in the shared evidence directory. The whole suite
+took 24 seconds locally against Temporal Server 1.32.2.

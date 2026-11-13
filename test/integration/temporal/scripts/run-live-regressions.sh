@@ -93,7 +93,10 @@ in_dev 60 "$container_cli" --version
 # different image. The OCaml executable hosts the workflow worker and publishes
 # its task queues in ready.json under the shared evidence directory; the
 # pinned `sdk-interop-python` service then runs the official Python SDK driver,
-# which writes python-report.json. This function records the driver's exit
+# which writes python-report.json. While the driver runs, the two processes
+# also exchange python-ready and ocaml-with-start.json in that directory so the
+# OCaml client can drive the driver's Python workflow (#1151); that handshake
+# needs nothing from this controller. This function records the driver's exit
 # status in driver-exit (through a rename, so it is never read half-written),
 # after which the OCaml process checks the reported exact runs through its own
 # client. Both statuses must be zero. The driver's container is bounded by the
