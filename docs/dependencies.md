@@ -308,6 +308,7 @@ and `make license-check` audits them alongside the lock.
 | OCaml series | Package | License | Reason |
 |---|---|---|---|
 | 5.5 | ocamlfind | MIT | `ocamlfind.1.9.8` declares `ocaml < 5.5.0~`; build-only tool reached through topkg and not linked into the SDK |
+| 5.6 | ocamlfind | MIT | Same reason, for the non-blocking 5.6 readiness lane (#1164); `1.9.9~preview` has no upper OCaml bound |
 
 ## Toolchain and CI images
 

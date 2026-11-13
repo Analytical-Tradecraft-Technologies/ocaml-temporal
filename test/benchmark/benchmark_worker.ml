@@ -313,8 +313,12 @@ let expect_empty = function
   | _ -> failwith "expected an empty completion"
 
 (** Returns reachable OCaml data in bytes. [Gc.stat] forces a full major
-    collection, so this is used only outside timed phases. *)
-let live_bytes () = (Gc.stat ()).live_words * (Sys.word_size / 8)
+    collection, so this is used only outside timed phases. OCaml 5.6
+    deprecates [Gc.stat] in favour of [full_major] then [quick_stat]; the
+    alert is silenced here because the exact live-word count must stay
+    identical on every supported series (5.2-5.5 included). *)
+let live_bytes () =
+  ((Gc.stat [@alert "-deprecated"]) ()).live_words * (Sys.word_size / 8)
 
 (** Reads a bounded positive integer from the environment, so suite-specific
     sizes travel through the shared Makefile command without extending the
