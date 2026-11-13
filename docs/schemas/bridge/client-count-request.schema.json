@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-count-request.schema.json",
+  "title": "OCaml Temporal native client visibility count request",
+  "description": "Closed JSON document used only by the private Rust client bridge, submitted with the COUNT client call selector (#1152). Runtime validators also reject duplicate keys, NUL bytes, and strings over the 65,536-byte safety limit; maxLength is the character-count bound expressible in standard JSON Schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["namespace", "query"],
+  "properties": {
+    "namespace": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
+    "query": {"type": "string", "maxLength": 65536, "pattern": "^[^\\u0000]*$", "description": "Temporal visibility query; the empty string counts every execution."},
+    "rpc_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 60000,
+      "description": "Optional caller deadline in milliseconds. Omitted means 10 seconds."
+    }
+  }
+}

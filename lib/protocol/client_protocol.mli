@@ -228,6 +228,63 @@ type visibility_page = {
 }
 (** One visibility page and its optional opaque continuation token. *)
 
+type describe_request = {
+  execution : execution;
+  rpc_deadline : rpc_deadline option;
+}
+(** One run to describe (#1152). An empty run ID selects the current run,
+    which Temporal resolves when it handles the RPC. *)
+
+type pending_activity_state =
+  [ `Scheduled
+  | `Started
+  | `Cancel_requested
+  | `Paused
+  | `Pause_requested
+  | `Unknown of int ]
+(** Temporal [PendingActivityState] decoded from its Rust name. A value the
+    SDK does not name, including the unspecified [0], is [`Unknown n] with its
+    wire value. *)
+
+type pending_activity = {
+  activity_id : string;
+  activity_type : string;
+  state : pending_activity_state;
+  attempt : int;
+}
+(** One activity a described run has scheduled and not yet resolved. *)
+
+type pending_child = {
+  workflow_id : string;
+  run_id : string option;
+  workflow_type : string;
+}
+(** One child workflow a described run has initiated and not yet seen close;
+    [run_id] is [None] while the child's start is still being initiated. *)
+
+type describe_response = {
+  execution : execution;
+  workflow_type : string;
+  task_queue : string;
+  status : visibility_status;
+  start_time : Workflow_protocol.timestamp;
+  close_time : Workflow_protocol.timestamp option;
+  history_length : int64;
+  memo : metadata_field list;
+  search_attributes : metadata_field list;
+  pending_activities : pending_activity list;
+  pending_children : pending_child list;
+}
+(** The reduced description of one run. [execution] always names a concrete
+    run; memo and search attributes are sorted by key. *)
+
+type count_request = {
+  namespace : string;
+  query : string;
+  rpc_deadline : rpc_deadline option;
+}
+(** One visibility count (#1152); an empty query counts every execution. *)
+
 type update_request = {
   execution : execution;
   update_id : string;
@@ -371,6 +428,22 @@ val decode_visibility_response : string -> (visibility_page, error) result
 val encode_history_request : history_request -> (string, error) result
 (** Validates and serializes one history fetch request; an empty run ID is
     allowed. *)
+
+val encode_describe_request : describe_request -> (string, error) result
+(** Validates and serializes one describe request; an empty run ID is
+    allowed. *)
+
+val decode_describe_response :
+  request:describe_request -> string -> (describe_response, error) result
+(** Strictly decodes one describe answer. The described execution must name
+    the request's namespace and workflow ID and, for an exact request, its
+    run. *)
+
+val encode_count_request : count_request -> (string, error) result
+(** Validates and serializes one visibility count request. *)
+
+val decode_count_response : string -> (int64, error) result
+(** Strictly decodes one non-negative visibility count. *)
 
 val encode_update_request : update_request -> (string, error) result
 (** Validates and serializes one update admission request; an empty run ID

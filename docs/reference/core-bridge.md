@@ -124,6 +124,19 @@ one budget. It is the one selector whose success value is binary rather than
 JSON: a single serialized `temporal.api.history.v1.History` message, at most
 the payload safety limit, built by appending each page's re-encoded history.
 
+The describe and count selectors (`DESCRIBE` 14 and `COUNT` 15, #1152) are
+additive in the same way and have no synchronous symbol either. `DESCRIBE`
+takes the run document of
+[`client-describe-request.schema.json`](../schemas/bridge/client-describe-request.schema.json)
+and succeeds with the reduced, closed document of
+[`client-describe-response.schema.json`](../schemas/bridge/client-describe-response.schema.json);
+`COUNT` takes
+[`client-count-request.schema.json`](../schemas/bridge/client-count-request.schema.json)
+and succeeds with
+[`client-count-response.schema.json`](../schemas/bridge/client-count-response.schema.json).
+Both are single bounded RPCs (10 s by default) whose Rust task owns only a
+connection clone and the decoded request, like every other submitted call.
+
 The canonical header is
 `rust/core-bridge/include/ocaml_temporal_core.h`. Both Rust and C compile-time
 assertions protect the status width, every numeric status value, and field

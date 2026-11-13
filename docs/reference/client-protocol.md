@@ -1317,6 +1317,58 @@ The [fetch-history live regression](../../test/integration/fetch_history/README.
 replays fetched histories with the default page size and with one and three
 events per page.
 
+## Describe one run and count executions (#1152)
+
+`Temporal.Client.describe handle` returns a snapshot of the run the handle
+addresses without waiting for it, and `Temporal.Client.count client ~query ()`
+counts the executions a visibility query matches:
+
+```ocaml
+Temporal.Client.describe handle
+Temporal.Client.count client ~query:"ExecutionStatus = 'Running'" ()
+```
+
+Both are submitted calls without a synchronous symbol: `DESCRIBE` (14) and
+`COUNT` (15). The closed describe request
+([`client-describe-request.schema.json`](../schemas/bridge/client-describe-request.schema.json))
+carries the connected namespace, the handle's workflow ID, its run ID (empty
+for a current-run handle, which Temporal resolves) and the optional
+`rpc_timeout_ms`. Rust calls `DescribeWorkflowExecution` once within the
+budget (10 seconds by default) and reduces the answer to the closed document
+of [`client-describe-response.schema.json`](../schemas/bridge/client-describe-response.schema.json):
+the execution as Temporal resolved it, workflow type, task queue, status (the
+visibility vocabulary, so `Client.execution_status` is shared with listing
+rows), exact start and optional close timestamps, history length, the memo and
+search attributes as named payloads sorted by key, and each pending activity
+(ID, type, state, attempt) and pending child (workflow ID, run ID or `null`
+while its start is still being initiated, type). Pending-activity states use
+the fixed names `scheduled`, `started`, `cancel_requested`, `paused` and
+`pause_requested`, and `unknown_<n>` for any other wire value (including the
+unspecified `0`), as statuses do (#1078). Heartbeat details, failures, timing
+fields, callbacks and Nexus operations stay in Rust. An answer that names
+another workflow or, for an exact request, another run, lacks an execution
+record or start time, or has an unspecified status is a `core_invalid`
+protocol error; OCaml checks the identity again.
+
+The count request
+([`client-count-request.schema.json`](../schemas/bridge/client-count-request.schema.json))
+carries the namespace, the query (validated like a visibility query; empty
+counts every execution) and the optional `rpc_timeout_ms`. Rust calls
+`CountWorkflowExecutions` and returns `{"count":n}`
+([`client-count-response.schema.json`](../schemas/bridge/client-count-response.schema.json));
+for a `GROUP BY` query that is the server's total over every group, and the
+groups themselves are not returned. A negative count is a protocol error.
+
+gRPC failures of either call (for example `not_found` for an unknown run or
+`invalid_argument` for a malformed query) arrive as the closed `rpc` document,
+so `Client.rpc_status` classifies them. The deterministic `mock://` backend
+describes its ledger (the start's memo and search attributes, ledger start
+and close times, no pending work, and a history length of `0`, since it
+records no history) and counts every retained run for an empty query only.
+
+The [describe/count live regression](../../test/integration/describe_count/README.md)
+checks both against Temporal Server.
+
 ## List workflow executions through visibility
 
 `Temporal.Client.list_visibility` requests one bounded page from Temporal's

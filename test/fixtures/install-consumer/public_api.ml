@@ -1269,6 +1269,51 @@ let _client_visibility_page_fields (page : T.Client.visibility_page) :
       page.executions,
     page.next_page_token )
 
+let _client_describe :
+    'input 'output.
+    ?rpc_timeout:T.Duration.t ->
+    ('input, 'output) T.Client.handle ->
+    (T.Client.execution_description, T.Error.t) result =
+  T.Client.describe
+
+let _client_count :
+    ?rpc_timeout:T.Duration.t ->
+    T.Client.t -> query:string -> unit -> (int64, T.Error.t) result =
+  T.Client.count
+
+let _client_pending_activity_state_cases :
+    T.Client.pending_activity_state -> int = function
+  | `Scheduled -> 1
+  | `Started -> 2
+  | `Cancel_requested -> 3
+  | `Paused -> 4
+  | `Pause_requested -> 5
+  | `Unknown value -> value
+
+let _client_execution_description_fields
+    (description : T.Client.execution_description) =
+  let ({ namespace; workflow_id; run_id } : T.Client.execution) =
+    description.execution
+  in
+  ( (namespace, workflow_id, run_id),
+    (description.workflow_type, description.task_queue),
+    (description.status : T.Client.execution_status),
+    ((description.start_time : T.Time.t), (description.close_time : T.Time.t option)),
+    (description.history_length : int64),
+    ((description.memo : (string * T.Payload.t) list),
+     (description.search_attributes : (string * T.Payload.t) list)),
+    List.map
+      (fun (activity : T.Client.pending_activity) ->
+        ( activity.activity_id,
+          activity.activity_type,
+          (activity.state : T.Client.pending_activity_state),
+          (activity.attempt : int) ))
+      description.pending_activities,
+    List.map
+      (fun (child : T.Client.pending_child) ->
+        (child.child_workflow_id, (child.child_run_id : string option), child.child_workflow_type))
+      description.pending_children )
+
 let _client_start_update :
     'workflow_input 'workflow_output 'input 'output.
     ?update_id:string ->

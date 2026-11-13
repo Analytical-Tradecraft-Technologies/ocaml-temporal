@@ -260,6 +260,12 @@ enum ClientCallKind {
     /// `History` message rather than a JSON document; see
     /// [`client_protocol::fetch_history`].
     History,
+    /// Describe one run (#1152). It has no synchronous symbol; see
+    /// [`client_protocol::describe_workflow`].
+    Describe,
+    /// Count the executions a visibility query matches (#1152). It has no
+    /// synchronous symbol; see [`client_protocol::count_workflows`].
+    Count,
 }
 
 impl TryFrom<u32> for ClientCallKind {
@@ -281,6 +287,8 @@ impl TryFrom<u32> for ClientCallKind {
             11 => Self::AsyncActivityCompletion,
             12 => Self::AsyncActivityHeartbeat,
             13 => Self::History,
+            14 => Self::Describe,
+            15 => Self::Count,
             _ => {
                 return Err(Failure {
                     status: STATUS_INVALID_ARGUMENT,
@@ -305,6 +313,8 @@ enum ClientRpc {
     PollUpdate(client_protocol::PollWorkflowUpdateRequest),
     Visibility(client_protocol::VisibilityRequest),
     History(client_protocol::HistoryRequest),
+    Describe(client_protocol::DescribeRequest),
+    Count(client_protocol::CountRequest),
     /// A namespace-bound async activity completion, failure, or
     /// cancellation (#1025). `binding` is `None` straight after
     /// [`ClientRpc::decode`], which has no runtime;
@@ -420,6 +430,12 @@ impl ClientRpc {
             ClientCallKind::History => Self::History(
                 client_protocol::decode_history_request(text).map_err(protocol_failure)?,
             ),
+            ClientCallKind::Describe => Self::Describe(
+                client_protocol::decode_describe_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::Count => {
+                Self::Count(client_protocol::decode_count_request(text).map_err(protocol_failure)?)
+            }
             ClientCallKind::AsyncActivityCompletion => Self::AsyncActivity {
                 request: AsyncActivityRequest::decode_completion(text)?,
                 binding: None,
@@ -523,6 +539,18 @@ impl ClientRpc {
                 client_protocol::fetch_history(connection, request)
                     .await
                     .map_err(client_operation_failure)
+            }),
+            Self::Describe(request) => Box::pin(async move {
+                let response = client_protocol::describe_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_describe_response(&response))
+            }),
+            Self::Count(request) => Box::pin(async move {
+                let response = client_protocol::count_workflows(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_count_response(&response))
             }),
             Self::AsyncActivity { request, binding } => Box::pin(async move {
                 let binding = binding.ok_or_else(unbound_async_activity)?;

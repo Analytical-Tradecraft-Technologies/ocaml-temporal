@@ -158,6 +158,52 @@ type visibility_page = {
   next_page_token : string option;
 }
 
+type describe_request = {
+  execution : execution;
+  rpc_deadline : rpc_deadline option;
+}
+
+type pending_activity_state =
+  [ `Scheduled
+  | `Started
+  | `Cancel_requested
+  | `Paused
+  | `Pause_requested
+  | `Unknown of int ]
+
+type pending_activity = {
+  activity_id : string;
+  activity_type : string;
+  state : pending_activity_state;
+  attempt : int;
+}
+
+type pending_child = {
+  workflow_id : string;
+  run_id : string option;
+  workflow_type : string;
+}
+
+type describe_response = {
+  execution : execution;
+  workflow_type : string;
+  task_queue : string;
+  status : visibility_status;
+  start_time : Workflow.timestamp;
+  close_time : Workflow.timestamp option;
+  history_length : int64;
+  memo : metadata_field list;
+  search_attributes : metadata_field list;
+  pending_activities : pending_activity list;
+  pending_children : pending_child list;
+}
+
+type count_request = {
+  namespace : string;
+  query : string;
+  rpc_deadline : rpc_deadline option;
+}
+
 type update_request = {
   execution : execution;
   update_id : string;
@@ -869,6 +915,265 @@ let decode_visibility_response input : (visibility_page, error) result =
   let* token_json = field "$" "next_page_token" entries in
   let* next_page_token = nullable "$.next_page_token" (identifier "$.next_page_token") token_json in
   Ok { executions; next_page_token }
+
+let encode_describe_request (value : describe_request) =
+  let* () = validate_identifier "$.namespace" value.execution.namespace in
+  let* () = validate_identifier "$.workflow_id" value.execution.workflow_id in
+  let* () = validate_run_selector "$.run_id" value.execution.run_id in
+  let* rpc = rpc_timeout_member value.rpc_deadline in
+  encode_object
+    (`Assoc
+      ([
+         ("namespace", json_string value.execution.namespace);
+         ("workflow_id", json_string value.execution.workflow_id);
+         ("run_id", json_string value.execution.run_id);
+       ]
+      @ rpc))
+
+(** Reads a non-negative JSON integer in the signed 64-bit range, such as a
+    history length or a visibility count. Rust writes these as plain decimal
+    numbers; one too large for OCaml's [int] arrives as [`Intlit]. *)
+let nonnegative_int64 path = function
+  | `Int value when value >= 0 -> Ok (Int64.of_int value)
+  | `Intlit text -> (
+      match Int64.of_string_opt text with
+      | Some value
+        when Int64.compare value 0L >= 0
+             && String.equal (Int64.to_string value) text ->
+          Ok value
+      | Some _ | None ->
+          Error
+            (invalid ~path
+               "integer is negative or outside the signed 64-bit range"))
+  | _ -> Error (invalid ~path "expected a non-negative JSON integer")
+
+(** Decodes a protobuf timestamp with the shared semantic decoder, keeping
+    this module's error type. *)
+let json_timestamp path json =
+  Workflow.Internal.timestamp path json |> Result.map_error of_workflow_error
+
+(** Decodes a JSON array element by element with indexed error paths. *)
+let json_list path decode json =
+  match json with
+  | `List values ->
+      let rec loop index acc = function
+        | [] -> Ok (List.rev acc)
+        | value :: rest ->
+            let* value = decode (Printf.sprintf "%s[%d]" path index) value in
+            loop (index + 1) (value :: acc) rest
+      in
+      loop 0 [] values
+  | _ -> Error (invalid ~path "expected JSON array")
+
+(** Decodes a list of named payloads, the shape of a described memo or
+    search-attribute map. Keys are identifiers and must be unique, as Rust
+    validates them; the list keeps the sorted order Rust wrote. *)
+let metadata_fields path json =
+  let* fields =
+    json_list path
+      (fun path json ->
+        let* entries = exact_object path [ "key"; "value" ] json in
+        let* key_json = field path "key" entries in
+        let* key = identifier (path ^ ".key") key_json in
+        let* value_json = field path "value" entries in
+        let* value = payload (path ^ ".value") value_json in
+        Ok { key; value })
+      json
+  in
+  let rec unique seen index = function
+    | [] -> Ok fields
+    | { key; _ } :: rest ->
+        if List.mem key seen then
+          Error
+            (invalid
+               ~path:(Printf.sprintf "%s[%d].key" path index)
+               "duplicate metadata key")
+        else unique (key :: seen) (index + 1) rest
+  in
+  unique [] 0 fields
+
+(** Highest [PendingActivityState] wire value with a fixed name. *)
+let max_known_pending_activity_state = 5
+
+(** Decodes a pending-activity state name Rust can emit, mirroring
+    [is_pending_activity_state_name] in
+    [rust/core-bridge/src/client_protocol.rs]: a fixed name, or
+    [unknown_<n>] in canonical decimal for a 32-bit value without one,
+    including the unspecified [0], so each wire value has exactly one
+    accepted spelling. *)
+let pending_activity_state_of_name state : pending_activity_state option =
+  match state with
+  | "scheduled" -> Some `Scheduled
+  | "started" -> Some `Started
+  | "cancel_requested" -> Some `Cancel_requested
+  | "paused" -> Some `Paused
+  | "pause_requested" -> Some `Pause_requested
+  | _ -> (
+      let prefix = unknown_visibility_status_prefix in
+      let prefix_length = String.length prefix in
+      if not (String.starts_with ~prefix state) then None
+      else
+        let digits =
+          String.sub state prefix_length (String.length state - prefix_length)
+        in
+        match int_of_string_opt digits with
+        | Some value
+          when String.equal (string_of_int value) digits
+               && value >= Int32.to_int Int32.min_int
+               && value <= Int32.to_int Int32.max_int
+               && (value < 1 || value > max_known_pending_activity_state) ->
+            Some (`Unknown value)
+        | Some _ | None -> None)
+
+(** Decodes one required identifier member of a response object. *)
+let identifier_member path name entries =
+  Result.bind (field path name entries) (identifier (path ^ "." ^ name))
+
+(** Decodes one pending activity row. *)
+let pending_activity path json : (pending_activity, error) result =
+  let* entries =
+    exact_object path [ "activity_id"; "activity_type"; "state"; "attempt" ] json
+  in
+  let* activity_id = identifier_member path "activity_id" entries in
+  let* activity_type = identifier_member path "activity_type" entries in
+  let* state_name = identifier_member path "state" entries in
+  let* state =
+    match pending_activity_state_of_name state_name with
+    | Some state -> Ok state
+    | None ->
+        Error (invalid ~path:(path ^ ".state") "unknown pending activity state")
+  in
+  let* attempt_json = field path "attempt" entries in
+  let* attempt = nonnegative_int64 (path ^ ".attempt") attempt_json in
+  if Int64.compare attempt 2_147_483_647L > 0 then
+    Error
+      (invalid ~path:(path ^ ".attempt")
+         "attempt is outside the signed 32-bit range")
+  else Ok { activity_id; activity_type; state; attempt = Int64.to_int attempt }
+
+(** Decodes one pending child row; a [null] run is a start still being
+    initiated. *)
+let pending_child path json : (pending_child, error) result =
+  let* entries =
+    exact_object path [ "workflow_id"; "run_id"; "workflow_type" ] json
+  in
+  let* workflow_id = identifier_member path "workflow_id" entries in
+  let* run_id_json = field path "run_id" entries in
+  let* run_id =
+    nullable (path ^ ".run_id") (identifier (path ^ ".run_id")) run_id_json
+  in
+  let* workflow_type = identifier_member path "workflow_type" entries in
+  Ok { workflow_id; run_id; workflow_type }
+
+let decode_describe_response ~(request : describe_request) input :
+    (describe_response, error) result =
+  let* json = decode_object input in
+  let* entries =
+    exact_object "$"
+      [
+        "execution";
+        "workflow_type";
+        "task_queue";
+        "status";
+        "start_time";
+        "close_time";
+        "history_length";
+        "memo";
+        "search_attributes";
+        "pending_activities";
+        "pending_children";
+      ]
+      json
+  in
+  let* execution =
+    Result.bind (field "$" "execution" entries) (decode_execution "$.execution")
+  in
+  let* () =
+    if
+      String.equal execution.namespace request.execution.namespace
+      && String.equal execution.workflow_id request.execution.workflow_id
+      && (String.equal request.execution.run_id ""
+         || String.equal execution.run_id request.execution.run_id)
+    then Ok ()
+    else
+      Error
+        (invalid ~path:"$.execution"
+           "described execution does not match the request")
+  in
+  let* workflow_type = identifier_member "$" "workflow_type" entries in
+  let* task_queue = identifier_member "$" "task_queue" entries in
+  let* status_name = identifier_member "$" "status" entries in
+  let* status =
+    (* Rust rejects an unspecified status before encoding, so the legacy
+       [unspecified] name that visibility pages accept never appears here. *)
+    match visibility_status_of_name status_name with
+    | Some status when not (String.equal status_name "unspecified") -> Ok status
+    | Some _ | None ->
+        Error (invalid ~path:"$.status" "unknown execution status")
+  in
+  let* start_time =
+    Result.bind (field "$" "start_time" entries) (json_timestamp "$.start_time")
+  in
+  let* close_time_json = field "$" "close_time" entries in
+  let* close_time =
+    nullable "$.close_time" (json_timestamp "$.close_time") close_time_json
+  in
+  let* history_length =
+    Result.bind
+      (field "$" "history_length" entries)
+      (nonnegative_int64 "$.history_length")
+  in
+  let* memo = Result.bind (field "$" "memo" entries) (metadata_fields "$.memo") in
+  let* search_attributes =
+    Result.bind
+      (field "$" "search_attributes" entries)
+      (metadata_fields "$.search_attributes")
+  in
+  let* pending_activities =
+    Result.bind
+      (field "$" "pending_activities" entries)
+      (json_list "$.pending_activities" pending_activity)
+  in
+  let* pending_children =
+    Result.bind
+      (field "$" "pending_children" entries)
+      (json_list "$.pending_children" pending_child)
+  in
+  Ok
+    {
+      execution;
+      workflow_type;
+      task_queue;
+      status;
+      start_time;
+      close_time;
+      history_length;
+      memo;
+      search_attributes;
+      pending_activities;
+      pending_children;
+    }
+
+let encode_count_request (value : count_request) =
+  let* () = validate_identifier "$.namespace" value.namespace in
+  if String.length value.query > 65_536 || String.contains value.query '\000'
+  then
+    Error
+      (invalid ~path:"$.query" "query exceeds the protocol string safety limit")
+  else
+    let* rpc = rpc_timeout_member value.rpc_deadline in
+    encode_object
+      (`Assoc
+        ([
+           ("namespace", json_string value.namespace);
+           ("query", json_string value.query);
+         ]
+        @ rpc))
+
+let decode_count_response input =
+  let* json = decode_object input in
+  let* entries = exact_object "$" [ "count" ] json in
+  Result.bind (field "$" "count" entries) (nonnegative_int64 "$.count")
 
 let decode_update_outcome path json =
   let* kind_json =
