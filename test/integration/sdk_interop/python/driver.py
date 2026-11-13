@@ -56,7 +56,7 @@ STATE_TIMEOUT = 60.0
 # longer after heartbeating HEARTBEAT, which must come back separately from
 # the failure details.
 TIMEOUT_MS = 3000
-SLOW_ACTIVITY_SECONDS = 30.0
+SLOW_ACTIVITY_SECONDS = 10.0
 HEARTBEAT = {"progress": 42}
 
 # The signal document exercises every JSON value kind. 2**53 + 1 is not
