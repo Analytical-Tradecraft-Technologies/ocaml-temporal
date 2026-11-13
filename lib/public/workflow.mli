@@ -362,7 +362,9 @@ val deprecate_patch : id:string -> unit
     is accepted. Duplicate, empty, malformed, or oversized keys raise
     [Invalid_argument] as programmer misuse; payload ownership is copied. An
     empty list is a no-op and emits no command, because Temporal rejects an
-    empty upsert.
+    empty upsert. Calling it from an update validator or a query handler also
+    raises [Invalid_argument]: those callbacks are read-only, and a command
+    recorded there could not be reproduced on replay.
 
     Temporal Server decodes search-attribute values itself rather than
     through the worker's codecs. Each value must therefore be a [json/plain]
@@ -387,7 +389,8 @@ val upsert_search_attributes : (string * Payload.t) list -> unit
     command. An update that {!Search_attribute.encode} rejects (an invalid or
     repeated name, a non-UTF-8 string, a non-finite double, or an
     out-of-range datetime) is programmer misuse and raises
-    [Invalid_argument], as does a call outside workflow execution. *)
+    [Invalid_argument], as does a call outside workflow execution or from a
+    read-only update validator or query handler. *)
 val upsert_typed_search_attributes : Search_attribute.update list -> unit
 
 (** Merges [values] into the run's memo (#1154) through one
@@ -407,8 +410,9 @@ val upsert_typed_search_attributes : Search_attribute.update list -> unit
     {!val-start_metadata} keeps reporting the memo the run started with.
 
     Keys follow the rules of {!upsert_search_attributes}: duplicate, empty,
-    malformed, or oversized keys, and calls outside workflow execution, raise
-    [Invalid_argument] as programmer misuse. Payload bytes are copied. *)
+    malformed, or oversized keys, and calls outside workflow execution or from
+    a read-only update validator or query handler, raise [Invalid_argument]
+    as programmer misuse. Payload bytes are copied. *)
 val upsert_memo : (string * Payload.t) list -> unit
 
 (** Ends the current run and starts a new run of [definition] with [input].

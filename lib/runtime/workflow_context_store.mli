@@ -230,7 +230,9 @@ val with_randomness_disabled : t -> (unit -> 'value) -> 'value
     protocol encoder before Core receives the completion. An empty list emits
     no command, because Temporal Server rejects an empty upsert and replay
     would repeat the rejection on every task retry. Raises [Invalid_argument]
-    after the execution has ended, even for an empty list. *)
+    after the execution has ended or inside a read-only callback (an update
+    validator or query handler, see {!with_randomness_disabled}), even for an
+    empty list, before any state changes. *)
 val upsert_search_attributes :
    t -> (string * Temporal_base.Codec.payload) list -> unit
 
@@ -240,8 +242,9 @@ val upsert_search_attributes :
     value removes its key. {!continue_as_new} passes that current memo to the
     successor once any memo upsert has run. Payloads are copied. An empty
     list emits no command and leaves the current memo unchanged. Raises
-    [Invalid_argument] after the execution has ended, even for an empty
-    list. *)
+    [Invalid_argument] after the execution has ended or inside a read-only
+    callback (an update validator or query handler), even for an empty list,
+    before the current memo or command buffer changes. *)
 val upsert_memo : t -> (string * Temporal_base.Codec.payload) list -> unit
 
 (** [merge_upsert current upserted] applies one memo or search-attribute

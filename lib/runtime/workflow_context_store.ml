@@ -671,6 +671,19 @@ let with_randomness_disabled context action =
   context.randomness_disabled <- true;
   Fun.protect action ~finally:(fun () -> context.randomness_disabled <- previous)
 
+(** Rejects a durable command from a read-only callback. [randomness_disabled]
+    is set for exactly the read-only extents: update validators, which run
+    only for live requests and are skipped on replay, and query handlers,
+    whose activations must not record commands. A command buffered there
+    would reach history on the live path only, so replay could not reproduce
+    it; the call is a programmer error, like use after the execution ended,
+    and is rejected before any state or command buffer changes. *)
+let reject_in_read_only_callback context ~what =
+  if context.randomness_disabled then
+    invalid_arg
+      ("Temporal workflow " ^ what
+     ^ " cannot be changed in a read-only update validator or query handler")
+
 (** Buffers a search-attribute merge without consulting wall-clock or process
     state. The payload list is copied at the public boundary before this
     command is retained by the execution context.
@@ -686,6 +699,7 @@ let upsert_search_attributes context search_attributes =
   if context.sealed then
     invalid_arg
       "Temporal workflow search attributes used after workflow execution ended";
+  reject_in_read_only_callback context ~what:"search attributes";
   match search_attributes with
   | [] -> ()
   | _ :: _ ->
@@ -730,6 +744,7 @@ let merge_upsert memo upserted =
 let upsert_memo context upserted =
   if context.sealed then
     invalid_arg "Temporal workflow memo used after workflow execution ended";
+  reject_in_read_only_callback context ~what:"memo";
   match upserted with
   | [] -> ()
   | _ :: _ ->
