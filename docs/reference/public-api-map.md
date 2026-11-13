@@ -96,8 +96,9 @@ for those rules.
   `Context.is_worker_shutting_down` reports that the worker has begun to stop.
 - `Temporal.Child_workflow` schedules a child workflow and exposes its typed
   future. Use its operation handle when the parent must cancel one exact child;
-  child retry and cancellation policies are passed to the durable command; see
-  the [operation policy reference](durable-operation-policies.md) for their
+  child retry and cancellation policies, timeouts, ID reuse policy, memo and
+  search attributes are passed to the durable command; see the
+  [operation policy reference](durable-operation-policies.md) for their
   parent-side behavior.
   Child scheduling and completion are durable workflow operations, not ordinary
   function calls; the [workflow guide](../guides/workflows.md) marks the

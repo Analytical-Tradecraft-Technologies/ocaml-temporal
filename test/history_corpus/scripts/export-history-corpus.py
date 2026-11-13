@@ -144,6 +144,16 @@ CASES = {
         "Run started by the cron schedule; it reads the schedule and the "
         "Cron_schedule initiator through Workflow.info.",
     ),
+    # corpus-v6-child-start-metadata (#1135).
+    "child-metadata-parent": (
+        ["child-workflow", "child-start-metadata"],
+        "Parent starts a child with a memo and a keyword search attribute.",
+    ),
+    "child-metadata-child": (
+        ["child-workflow", "child-side", "child-start-metadata"],
+        "Child run started with that memo and search attribute; it reads "
+        "both through Workflow.start_metadata.",
+    ),
 }
 
 # Patch lifecycle cases (issue #531). Each stage of the lifecycle captures the

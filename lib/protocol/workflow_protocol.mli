@@ -490,7 +490,10 @@ type completion_command =
       commands from earlier releases byte-identical; when present they obey
       the [Client.start] rules (positive, run no larger than execution, task
       at most 120 seconds and no larger than the run or execution timeout),
-      checked by both encoder and decoder and again by the Rust bridge. *)
+      checked by both encoder and decoder and again by the Rust bridge.
+      [memo] and [search_attributes] (#1135) are the child's start memo and
+      indexed search attributes; [None] omits the member, and a present map
+      obeys the same key and payload rules as the other payload maps. *)
   | Start_child_workflow of {
       task_queue : string option;
       parent_close_policy : child_workflow_parent_close_policy option;
@@ -504,6 +507,8 @@ type completion_command =
       run_timeout : duration option;
       task_timeout : duration option;
       id_reuse_policy : child_workflow_id_reuse_policy option;
+      memo : (string * payload) list option;
+      search_attributes : (string * payload) list option;
     }
   (** Requests cancellation of a previously started child workflow.  [reason]
       is retained in history and is therefore part of deterministic replay. *)

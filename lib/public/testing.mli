@@ -46,8 +46,9 @@
     schedule-to-close and heartbeat timeouts with the native error shape;
     workflow execution and run timeouts of a top-level or child workflow;
     workflow ID reuse and conflict policies with the client's
-    already-started error; a run's start memo and search attributes and
-    their upserts; asynchronous activities completed through their real
+    already-started error; a run's start memo and search attributes,
+    including those a parent passes to a child start (#1135), and their
+    upserts; asynchronous activities completed through their real
     {!Activity.Async_handle}; and, on request, retrying a failed workflow
     task (see {!type-workflow_task_failure}).
 

@@ -835,6 +835,7 @@ pub enum CompletionCommand {
     /// code. The optional workflow timeouts and ID reuse policy are omitted
     /// from the document when unset, so commands without them are unchanged;
     /// [`validate_completion`] applies the same timeout rules as root starts.
+    /// The memo and search attributes (#1135) are likewise omitted when unset.
     StartChildWorkflow {
         seq: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -855,6 +856,12 @@ pub enum CompletionCommand {
         task_timeout: Option<Duration>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id_reuse_policy: Option<ChildWorkflowIdReusePolicy>,
+        /// The child's start memo; absent (or empty) starts it with none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memo: Option<BTreeMap<String, Payload>>,
+        /// The child's indexed search attributes; absent starts it with none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search_attributes: Option<BTreeMap<String, Payload>>,
     },
     /// Requests cancellation of a previously started child workflow.
     CancelChildWorkflow {
@@ -1917,6 +1924,8 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                 execution_timeout,
                 run_timeout,
                 task_timeout,
+                memo,
+                search_attributes,
                 ..
             } => {
                 identifier(workflow_id, "$.commands.workflow_id")?;
@@ -1928,6 +1937,12 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                     validate_retry_policy(retry_policy, "$.commands.retry_policy")?;
                 }
                 validate_child_timeouts(*execution_timeout, *run_timeout, *task_timeout)?;
+                if let Some(memo) = memo {
+                    validate_payload_map(memo, "$.commands.memo")?;
+                }
+                if let Some(search_attributes) = search_attributes {
+                    validate_payload_map(search_attributes, "$.commands.search_attributes")?;
+                }
             }
             CompletionCommand::SignalExternalWorkflow {
                 workflow_id,
@@ -4047,6 +4062,8 @@ fn command_to_core(
             run_timeout,
             task_timeout,
             id_reuse_policy,
+            memo,
+            search_attributes,
         } => Variant::StartChildWorkflowExecution(core_commands::StartChildWorkflowExecution {
             seq: *seq,
             task_queue: task_queue.clone().unwrap_or_default(),
@@ -4068,9 +4085,22 @@ fn command_to_core(
             workflow_run_timeout: run_timeout.map(duration_to_core),
             workflow_task_timeout: task_timeout.map(duration_to_core),
             workflow_id_reuse_policy: id_reuse_to_core(*id_reuse_policy),
-            // Cron, headers, memo, search attributes and the remaining child
-            // options stay at Core defaults until they have a stable public
-            // representation.
+            // An absent memo is Core's empty map: the child has no memo.
+            memo: memo
+                .as_ref()
+                .map(payload_map_to_core)
+                .transpose()?
+                .unwrap_or_default(),
+            search_attributes: search_attributes
+                .as_ref()
+                .map(|values| {
+                    Ok::<_, CoreConversionError>(api_common::SearchAttributes {
+                        indexed_fields: payload_map_to_core(values)?,
+                    })
+                })
+                .transpose()?,
+            // Cron, headers and the remaining child options stay at Core
+            // defaults until they have a stable public representation.
             ..Default::default()
         }),
         CompletionCommand::CancelChildWorkflow { seq, reason } => {
@@ -4383,8 +4413,6 @@ fn command_from_core(
             if !value.namespace.is_empty()
                 || !value.cron_schedule.is_empty()
                 || !value.headers.is_empty()
-                || !value.memo.is_empty()
-                || value.search_attributes.is_some()
                 || value.versioning_intent != 0
                 || value.priority.is_some()
             {
@@ -4425,6 +4453,18 @@ fn command_from_core(
                     .map(duration_from_core)
                     .transpose()?,
                 id_reuse_policy: id_reuse_from_core(value.workflow_id_reuse_policy)?,
+                // Core cannot tell an absent memo from an empty one; both
+                // mean "no memo", which the protocol writes as absent.
+                memo: if value.memo.is_empty() {
+                    None
+                } else {
+                    Some(payload_map_from_core(&value.memo)?)
+                },
+                search_attributes: value
+                    .search_attributes
+                    .as_ref()
+                    .map(|values| payload_map_from_core(&values.indexed_fields))
+                    .transpose()?,
             })
         }
         Variant::CancelChildWorkflowExecution(value) => {

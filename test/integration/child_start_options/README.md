@@ -4,8 +4,15 @@ Start a disposable Temporal server with the `default` namespace, then run:
 
 ```sh
 dune exec test/integration/child_start_options/regression.exe -- \
-  check http://127.0.0.1:7233
+  check http://127.0.0.1:7233 /path/to/temporal-cli
 ```
+
+The second argument is an official Temporal CLI that reaches the same
+disposable server, such as a wrapper around the pinned admin-tools image of
+the Compose stack (`make test-temporal-live-regressions` supplies one). Never
+pass a CLI configured for a shared or production cluster. It is used only to
+register the `ChildStartOptionsKeyword` search attribute in `default` when it
+is not registered yet.
 
 The test starts and reaps its own worker on a unique task queue. It checks
 that the options a parent passes to `Child_workflow` (#1135) reach Temporal:
@@ -23,6 +30,11 @@ that the options a parent passes to `Child_workflow` (#1135) reach Temporal:
 - After a child completes, starting another child with the same workflow ID
   is refused under `` `Reject_duplicate `` (its `started` future fails) and
   allowed under `` `Allow_duplicate ``.
+- A child started with the memo `note` and the keyword
+  `ChildStartOptionsKeyword` set to its own workflow ID reads both through
+  `Workflow.start_metadata`, before and after the worker replacement. A
+  `Client.list_visibility` query on the keyword finds exactly that child, and
+  `Client.describe` reports the memo and the keyword.
 
 Each parent waits for a `finish` signal after recording its outcome, so the
 outcome is read before and after the worker replacement and must then equal
