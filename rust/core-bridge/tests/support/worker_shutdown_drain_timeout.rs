@@ -132,6 +132,12 @@ fn start_worker(double: &grpc_double::Double) -> *mut Runtime {
     // SAFETY: Both output locations are writable and exclusively owned.
     unsafe { ocaml_temporal_core_v4_runtime_new(&mut runtime, &mut result) };
     assert_eq!(release(result).0, STATUS_OK);
+    // A successful `runtime_new` writes a live graph through the out-pointer;
+    // checking it here keeps every later dereference of `runtime` justified.
+    assert!(
+        !runtime.is_null(),
+        "runtime_new succeeded without a runtime"
+    );
 
     let client = format!(
         r#"{{"target_url":"http://{}","identity":"drain-timeout-test"}}"#,
@@ -196,9 +202,11 @@ fn drain_timeout_keeps_worker_and_runtime_free_still_disposes_it() {
         thread::sleep(Duration::from_millis(10));
     }
 
-    // SAFETY: The test thread exclusively owns the live runtime here; no ABI
-    // call is in progress.
-    let graph = unsafe { &mut *runtime };
+    // SAFETY: `start_worker` checked that `runtime` is non-null, and the test
+    // thread exclusively owns the live runtime here; no ABI call is in
+    // progress. `as_mut` repeats the null check so the borrow never comes
+    // from an unchecked pointer.
+    let graph = unsafe { runtime.as_mut() }.expect("start_worker returned a live runtime");
     let handle = live_worker_tokio_handle(&graph.core);
     let core = Arc::downgrade(graph.core.as_ref().expect("a live runtime owns Core"));
     let worker = graph.worker.as_mut().expect("the worker was started");
@@ -217,8 +225,9 @@ fn drain_timeout_keeps_worker_and_runtime_free_still_disposes_it() {
     // outstanding task, so the only thing that can block finalization is the
     // lost poll lease the timed-out drain recorded.
     {
-        // SAFETY: Exclusive ownership came back with the call's result.
-        let graph = unsafe { &*runtime };
+        // SAFETY: Exclusive ownership came back with the call's result, and
+        // `worker_shutdown` never frees or replaces the runtime pointer.
+        let graph = unsafe { runtime.as_ref() }.expect("worker_shutdown kept the runtime");
         let worker = graph
             .worker
             .as_ref()
