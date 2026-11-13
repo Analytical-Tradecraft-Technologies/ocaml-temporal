@@ -318,9 +318,12 @@ omitted on encoding, preserving existing default command bytes. Optional
 `id_reuse_policy` (`allow_duplicate`, `allow_duplicate_failed_only`,
 `reject_duplicate`) follow the same rule (#1135); both sides enforce the
 root-start timeout rules, and an absent reuse policy maps to Core's
-`Unspecified`. The command omits namespace, cron, headers, memo, search
-attributes, versioning, and priority because the current OCaml runtime does
-not expose them. For a live or replay worker, Rust injects
+`Unspecified`. Optional `memo` and `search_attributes` payload maps (#1135)
+are likewise omitted when unset; both sides check their keys as for the other
+payload maps, and Rust fills Core's `memo` and `search_attributes`. Core has
+no absent memo, so an empty one converts back from Core as absent. The
+command omits namespace, cron, headers, versioning, and priority because the
+current OCaml runtime does not expose them. For a live or replay worker, Rust injects
 the worker's already-validated namespace into Core's child-start command before
 submission; this is worker configuration, not workflow input. The remaining
 omitted Core fields receive explicit defaults and non-default values are

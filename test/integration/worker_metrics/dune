@@ -2,4 +2,4 @@
 ; make test-temporal-live-regressions against a disposable server.
 (executable
  (name regression)
- (libraries logs temporal-sdk temporal_base unix))
+ (libraries logs temporal-sdk temporal_base threads.posix unix))

@@ -56,6 +56,12 @@
  (name test_testing_timeouts)
  (libraries temporal-sdk))
 
+; Task-failure retry, start metadata, ID policies, asynchronous activities
+; and workflow timeouts in Temporal.Testing (#1160).
+(test
+ (name test_testing_fidelity)
+ (libraries temporal-sdk))
+
 ; Typed search attributes, memo upserts and their Testing simulation (#1154).
 (test
  (name test_search_attributes)

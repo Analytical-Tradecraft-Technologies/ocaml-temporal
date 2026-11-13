@@ -6964,3 +6964,71 @@ does not end on a chain, server rejection of an invalid expression, and
 replay. Capture `live-2026-11-13-cron` adds a delayed run and two cron runs
 to the history corpus. Child cron schedules, Temporal Schedules and access to
 a cron run's previous result remain unimplemented.
+
+## 2026-11-13: OTLP metrics export and the tracing decision
+
+`Runtime.Metrics.otlp ~endpoint ?headers ?period ?protocol ?temporality
+?global_tags ?durations_as_seconds ()` pushes Temporal Core's worker and
+client metrics, and the SDK's `temporal_ocaml_` series, to an OTLP collector
+over gRPC or HTTP/protobuf (#1161). It enables only `temporalio-common`'s
+`otel` feature at the existing Core pin; the lock gains two dependency edges
+and no package, every newly compiled crate is permissive, and the Cargo
+licence scanner and the dependency inventory pass. The options are validated
+with the same grammar in OCaml and Rust, header values never appear in a
+message, a log record or `Debug` output, and the bridge owns the exporter: a
+detachable meter keeps clients, workers and the GC-released SDK recorder from
+extending its life, and runtime release makes one final export before Core's
+Tokio runtime stops. Rust tests run against loopback OTLP/gRPC and OTLP/HTTP
+collector doubles; the `worker_metrics` live regression repeats its scenario
+on an OTLP runtime with an in-process collector stub and requires the same
+families as the Prometheus path. Tracing is not exported, by recorded
+decision, until headers (#1139) and interceptors (#1162) make context
+propagation possible.
+
+## 2026-11-13: `Temporal.Testing` fidelity (#1160)
+
+- The opt-in `` `Retry `` workflow-task-failure mode keeps a failing run open, answers queries from its last completed task, and retries it with `Testing.retry_workflow_tasks` by replaying the completed activations.
+- `Testing.start`/`execute` take memo, search attributes, ID conflict and reuse policies (refused starts return the client's already-started error), timeouts and a retry policy. Child starts apply their reuse policy.
+- Workflow execution and run timeouts, top-level and child, expire in virtual time.
+- Asynchronous activities wait for their real `Activity.Async_handle`, with heartbeats, cancellation and timeouts (`Testing.mock_async_activity`).
+- Covered by `test/unit/test_testing_fidelity.ml`. Schedule-to-start timeouts and visibility queries remain deliberately unsimulated.
+
+## 2026-11-14: Signal-with-start and update-with-start across SDKs
+
+The official-SDK interoperability regression now runs signal-with-start and
+update-with-start in both directions (#1151). The official Python client
+signal-with-starts an OCaml entity workflow on an absent workflow, its open
+run, under `TERMINATE_EXISTING` and after the run closed, and
+update-with-starts it with accepted updates, an OCaml validator rejection on
+an open and on a newly started run, and a `FAIL` conflict. The driver also
+hosts a Python entity with the same protocol, which the OCaml client drives
+with `Client.signal_with_start` and `Client.update_with_start` through the
+same cases while the driver runs its own. Each side checks the other's runs:
+exact run IDs, signals recorded before the first workflow task, the replaced
+run terminated, update results, the validator rejection's type and detail
+beside the run, the typed already-started refusal, and only accepted updates
+in history. The two processes coordinate through `python-ready` and
+`ocaml-with-start.json` in the shared evidence directory. The whole suite
+took 24 seconds locally against Temporal Server 1.32.2.
+
+## 2026-11-14: Child memo and search attributes
+
+`Child_workflow.start`, `start_handle` and `execute` take `?memo` and
+`?search_attributes` (#1135), as raw `(string * Payload.t)` lists like
+`Client.start`; typed values come from `Search_attribute.encode`. Their keys
+are checked by the rules `Workflow.upsert_memo` and continue-as-new already
+use, now in one private module. A bad key returns a ready typed defect before
+any command. An omitted or empty map leaves the start command byte-identical
+to earlier releases. The maps travel through the runtime command, the OCaml
+protocol, the completion schema and the Rust `StartChildWorkflow` decoder,
+which re-checks the keys and fills Core's `memo` and `search_attributes`
+fields instead of leaving them at their defaults. `Temporal.Testing` passes
+both maps to the child's start metadata. Bilateral exact-document tests pin
+the protocol. The `child_start_options` live regression now registers a
+keyword and starts a child with a memo and that keyword. The child reads both
+through `Workflow.start_metadata` before and after worker replacement,
+`Client.list_visibility` finds it by the keyword, and `Client.describe`
+reports both. Capture `live-2026-11-13-child-metadata` adds the parent and
+child histories to the corpus. With the child timeouts, reuse policy and
+typed timeout origin already merged, this completes the #1135 scope. Child
+cron schedules and headers stay out of scope.

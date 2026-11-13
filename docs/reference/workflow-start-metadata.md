@@ -1,7 +1,9 @@
 # Workflow start metadata
 
 `Client.start` accepts memo and registered search attributes independently or
-in combination. The worker retains those maps from `InitializeWorkflow` and
+in combination, and so do the child starts of `Temporal.Child_workflow`
+(`~memo`, `~search_attributes`, #1135), which a child reads exactly as a root
+run reads its own. The worker retains those maps from `InitializeWorkflow` and
 workflow code can inspect an owned historical snapshot:
 
 ```ocaml

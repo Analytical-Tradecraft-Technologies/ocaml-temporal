@@ -11,6 +11,8 @@ type t = Shared.t
     validation rules and the bridge document. *)
 module Metrics = struct
   type t = Temporal_base.Metrics_config.t
+  type otlp_protocol = [ `Grpc | `Http_protobuf ]
+  type temporality = [ `Cumulative | `Delta ]
 
   let prometheus ?global_tags ?counters_total_suffix ?unit_suffix
       ?durations_as_seconds ~bind_address () =
@@ -18,6 +20,14 @@ module Metrics = struct
       ?unit_suffix ?durations_as_seconds ~bind_address ()
     |> Result.map_error (fun message ->
            Error.defect ~message:("Runtime.Metrics.prometheus: " ^ message))
+
+  let otlp ?headers ?period ?protocol ?temporality ?global_tags
+      ?durations_as_seconds ~endpoint () =
+    let period_ms = Option.map Duration.to_ms period in
+    Temporal_base.Metrics_config.otlp ?headers ?period_ms ?protocol
+      ?temporality ?global_tags ?durations_as_seconds ~endpoint ()
+    |> Result.map_error (fun message ->
+           Error.defect ~message:("Runtime.Metrics.otlp: " ^ message))
 end
 
 let create ?io_threads ?metrics () =

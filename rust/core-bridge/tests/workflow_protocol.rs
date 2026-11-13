@@ -912,6 +912,8 @@ fn converts_start_child_workflow_command() {
             run_timeout: None,
             task_timeout: None,
             id_reuse_policy: None,
+            memo: None,
+            search_attributes: None,
         }],
     };
     let encoded = workflow_protocol::encode_completion(&completion).unwrap();
@@ -989,6 +991,8 @@ fn child_start_with_options(
             run_timeout,
             task_timeout,
             id_reuse_policy,
+            memo: None,
+            search_attributes: None,
         }],
     }
 }
@@ -1175,6 +1179,182 @@ fn child_workflow_timeout_rules_are_enforced() {
     }
 }
 
+/// A semantic memo or search-attribute map.
+type PayloadMap = BTreeMap<String, workflow_protocol::Payload>;
+
+/// Returns `completion`'s only command, which must be a child start, so a
+/// test can set the memo and search attributes (#1135) on a command built by
+/// [`child_start_with_options`].
+fn child_start_metadata(
+    completion: &mut workflow_protocol::Completion,
+) -> (&mut Option<PayloadMap>, &mut Option<PayloadMap>) {
+    let Some(workflow_protocol::CompletionCommand::StartChildWorkflow {
+        memo,
+        search_attributes,
+        ..
+    }) = completion.commands.first_mut()
+    else {
+        panic!("completion must start a child");
+    };
+    (memo, search_attributes)
+}
+
+/// Returns the Core start-child command of a converted one-command
+/// completion.
+fn core_start_child(
+    core: &core_completion::WorkflowActivationCompletion,
+) -> &core_commands::StartChildWorkflowExecution {
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_ref()
+    else {
+        panic!("child completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::StartChildWorkflowExecution(child)) =
+        success.commands[0].variant.as_ref()
+    else {
+        panic!("child command must map to Core's start-child variant");
+    };
+    child
+}
+
+/// The exact child-start document with a memo and search attributes, shared
+/// with the OCaml decoder test `test_child_start_metadata` so both ends agree
+/// byte for byte.
+const CHILD_START_METADATA_DOCUMENT: &str = concat!(
+    r#"{"commands":[{"cancellation_type":"try_cancel","input":[],"#,
+    r#""kind":"start_child_workflow","memo":{"note":{"data":{"data":"ImhlbGxvIg==","#,
+    r#""encoding":"base64"},"metadata":{"encoding":{"data":"anNvbi9wbGFpbg==","#,
+    r#""encoding":"base64"}}}},"retry_policy":null,"search_attributes":"#,
+    r#"{"CustomKeywordField":{"data":{"data":"ImNoaWxkIg==","encoding":"base64"},"#,
+    r#""metadata":{"encoding":{"data":"anNvbi9wbGFpbg==","encoding":"base64"}}}},"#,
+    r#""seq":2,"workflow_id":"child/1","workflow_type":"child"}],"#,
+    r#""run_id":"parent-run"}"#
+);
+
+/// Pins the child memo and search-attribute fields (#1135) through the exact
+/// JSON document, Core's start-child command, and Core's reverse conversion.
+/// Unset maps are omitted and leave Core's memo empty and its search
+/// attributes absent, so existing child starts are unchanged. Core cannot
+/// tell an empty memo from an absent one, so an empty memo comes back from
+/// Core as absent; an empty search-attribute map stays present.
+#[test]
+fn child_workflow_memo_and_search_attributes_round_trip() {
+    let mut completion = child_start_with_options(None, None, None, None);
+    {
+        let (memo, search_attributes) = child_start_metadata(&mut completion);
+        *memo = Some([("note".to_owned(), json_string_payload("hello"))].into());
+        *search_attributes = Some(
+            [(
+                "CustomKeywordField".to_owned(),
+                json_string_payload("child"),
+            )]
+            .into(),
+        );
+    }
+    let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+    assert_eq!(encoded, CHILD_START_METADATA_DOCUMENT);
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        completion
+    );
+    let core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let child = core_start_child(&core);
+    assert_eq!(child.memo["note"].data, br#""hello""#.to_vec());
+    assert_eq!(
+        child.memo["note"].metadata["encoding"],
+        b"json/plain".to_vec()
+    );
+    assert_eq!(
+        child.search_attributes.as_ref().unwrap().indexed_fields["CustomKeywordField"].data,
+        br#""child""#.to_vec()
+    );
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        completion
+    );
+
+    let unset = child_start_with_options(None, None, None, None);
+    let encoded = workflow_protocol::encode_completion(&unset).unwrap();
+    assert!(!encoded.contains("memo"), "unset memo must be omitted");
+    assert!(
+        !encoded.contains("search_attributes"),
+        "unset search attributes must be omitted"
+    );
+    let core = workflow_protocol::completion_to_core(&unset).unwrap();
+    let child = core_start_child(&core);
+    assert!(child.memo.is_empty());
+    assert!(child.search_attributes.is_none());
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        unset
+    );
+
+    let mut empty = child_start_with_options(None, None, None, None);
+    {
+        let (memo, search_attributes) = child_start_metadata(&mut empty);
+        *memo = Some(BTreeMap::new());
+        *search_attributes = Some(BTreeMap::new());
+    }
+    let encoded = workflow_protocol::encode_completion(&empty).unwrap();
+    assert!(encoded.contains(r#""memo":{}"#), "{encoded}");
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        empty
+    );
+    let core = workflow_protocol::completion_to_core(&empty).unwrap();
+    assert!(core_start_child(&core).memo.is_empty());
+    let mut expected = empty.clone();
+    *child_start_metadata(&mut expected).0 = None;
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        expected
+    );
+}
+
+/// Rejects child memo and search-attribute maps the OCaml encoder would never
+/// write: an empty key, a key with NUL, and a map that is not an object, both
+/// when decoding a document and when validating a command before encoding.
+#[test]
+fn rejects_invalid_child_start_metadata() {
+    let document = |options: &str| {
+        format!(
+            r#"{{"run_id":"parent-run","commands":[{{"kind":"start_child_workflow","seq":2,"workflow_id":"child/1","workflow_type":"child","input":[],"retry_policy":null,"cancellation_type":"try_cancel",{options}}}]}}"#
+        )
+    };
+    let valid = r#"{"k":{"metadata":{},"data":{"encoding":"base64","data":""}}}"#;
+    for name in ["memo", "search_attributes"] {
+        // The template itself is well formed: a valid map decodes.
+        assert!(
+            workflow_protocol::decode_completion(&document(&format!(r#""{name}":{valid}"#)))
+                .is_ok()
+        );
+        for invalid in [
+            r#"{"":{"metadata":{},"data":{"encoding":"base64","data":""}}}"#,
+            r#"{"a\u0000b":{"metadata":{},"data":{"encoding":"base64","data":""}}}"#,
+            "[]",
+        ] {
+            let document = document(&format!(r#""{name}":{invalid}"#));
+            assert!(
+                workflow_protocol::decode_completion(&document).is_err(),
+                "{document}"
+            );
+        }
+    }
+    for (memo_key, search_key, path) in [
+        ("", "k", "$.commands.memo"),
+        ("k", "", "$.commands.search_attributes"),
+    ] {
+        let mut completion = child_start_with_options(None, None, None, None);
+        {
+            let (memo, search_attributes) = child_start_metadata(&mut completion);
+            *memo = Some([(memo_key.to_owned(), json_string_payload("v"))].into());
+            *search_attributes = Some([(search_key.to_owned(), json_string_payload("v"))].into());
+        }
+        let error = workflow_protocol::encode_completion(&completion).unwrap_err();
+        assert_eq!(error.path, path);
+    }
+}
+
 /// Proves the local-activity command and its distinct cancellation command are
 /// preserved through the strict semantic JSON protocol and Core protobuf
 /// conversion. Local activities intentionally omit remote task-queue fields,
@@ -1352,6 +1532,8 @@ fn injects_worker_namespace_into_child_workflow_command() {
             run_timeout: None,
             task_timeout: None,
             id_reuse_policy: None,
+            memo: None,
+            search_attributes: None,
         }],
     };
     let core = workflow_protocol::completion_to_core_for_activation_with_namespace(
@@ -1435,6 +1617,8 @@ fn converts_all_child_cancellation_policies() {
                 run_timeout: None,
                 task_timeout: None,
                 id_reuse_policy: None,
+                memo: None,
+                search_attributes: None,
             }],
         };
         let encoded = workflow_protocol::encode_completion(&completion).unwrap();
@@ -1567,6 +1751,8 @@ fn rejects_invalid_child_cancellation_commands() {
             run_timeout: None,
             task_timeout: None,
             id_reuse_policy: None,
+            memo: None,
+            search_attributes: None,
         }],
     };
     assert!(workflow_protocol::encode_completion(&outgoing_nul).is_err());
@@ -4635,6 +4821,8 @@ fn child_routing_and_parent_close_round_trip() {
                 run_timeout: None,
                 task_timeout: None,
                 id_reuse_policy: None,
+                memo: None,
+                search_attributes: None,
             }],
         };
         let encoded = workflow_protocol::encode_completion(&completion).unwrap();

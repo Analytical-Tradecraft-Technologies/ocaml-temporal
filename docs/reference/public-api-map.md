@@ -96,8 +96,9 @@ for those rules.
   `Context.is_worker_shutting_down` reports that the worker has begun to stop.
 - `Temporal.Child_workflow` schedules a child workflow and exposes its typed
   future. Use its operation handle when the parent must cancel one exact child;
-  child retry and cancellation policies are passed to the durable command; see
-  the [operation policy reference](durable-operation-policies.md) for their
+  child retry and cancellation policies, timeouts, ID reuse policy, memo and
+  search attributes are passed to the durable command; see the
+  [operation policy reference](durable-operation-policies.md) for their
   parent-side behavior.
   Child scheduling and completion are durable workflow operations, not ordinary
   function calls; the [workflow guide](../guides/workflows.md) marks the
@@ -252,8 +253,13 @@ for those rules.
   switches); the endpoint is bound before `create` returns, a busy address
   is a typed `Bridge` error, and `Runtime.metrics_address` reports the bound
   address. Every client and worker attached to the runtime reports there.
-  Metric names and labels match the official SDKs; see
-  [observability](observability.md#worker-metrics).
+  `Runtime.Metrics.otlp ~endpoint ?headers ?period ?protocol ?temporality
+  ()` instead pushes the same metrics to an OTLP collector over gRPC or
+  HTTP/protobuf (#1161), with credential headers that are never logged and
+  one final export at `Runtime.shutdown`; `Runtime.metrics_address` is then
+  `None`. Metric names and labels match the official SDKs; see
+  [observability](observability.md#worker-metrics) and
+  [OTLP export](observability.md#otlp-export).
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.
@@ -307,9 +313,13 @@ for those rules.
 - `Temporal.Testing` is the in-process workflow test environment. It drives
   the same private workflow runtime as a native worker against a
   deterministic server simulator, skipping virtual time whenever every
-  workflow is blocked on a timer or activity retry. `mock_activity` and
-  `mock_workflow` stub definitions by name; `start`, `signal`, `query`,
-  `update`, `cancel`, `skip`, and `result` drive a workflow step by step. It is
+  workflow is blocked on a timer or activity retry. `mock_activity`,
+  `mock_async_activity`, and `mock_workflow` stub definitions by name;
+  `start`, `signal`, `query`, `update`, `cancel`, `skip`, and `result` drive a
+  workflow step by step, and `start` accepts the `Client.start` memo, search
+  attribute, ID policy, timeout, and retry options. In the `` `Retry ``
+  workflow-task-failure mode, `workflow_task_failure` reports a failing task
+  and `retry_workflow_tasks` retries it. It is
   independent of `Client` and `Worker`, whose `mock://` target remains a
   plumbing-only backend that never runs workflow code. The simulated
   semantics and their limits are listed in the module documentation and the

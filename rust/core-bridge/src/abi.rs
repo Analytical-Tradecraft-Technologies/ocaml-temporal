@@ -1309,13 +1309,15 @@ impl Drop for CoreDropMarker {
 /// panics.
 ///
 /// Field order is load-bearing: Rust drops fields in declaration order, so
-/// the metrics exporter's scrape server is aborted first, then Core is
-/// dropped (its Tokio shutdown closes the scrape socket) before the log
-/// writer (which then flushes Core's shutdown records within
-/// `CORE_LOG_CLOSE_TIMEOUT`), and the drop marker last.
+/// the metrics exporter is stopped first (a Prometheus scrape server is
+/// aborted; an OTLP exporter makes its final export, which for gRPC needs
+/// Core's Tokio runtime still running), then Core is dropped (its Tokio
+/// shutdown closes the scrape socket) before the log writer (which then
+/// flushes Core's shutdown records within `CORE_LOG_CLOSE_TIMEOUT`), and the
+/// drop marker last.
 pub(crate) struct SharedCore {
-    /// Opt-in Prometheus scrape server running on Core's Tokio pool (#500);
-    /// see [`telemetry::MetricsExporter`].
+    /// Opt-in Prometheus scrape server (#500) or OTLP push exporter (#1161)
+    /// running on Core's Tokio pool; see [`telemetry::MetricsExporter`].
     metrics: Option<telemetry::MetricsExporter>,
     core: CoreRuntime,
     /// Writer thread draining Core's log queue to stderr, absent when Core
@@ -2779,9 +2781,12 @@ impl Runtime {
     /// 1. initiate Core shutdown, unless [`Self::initiate_worker_shutdown`]
     ///    already did when the run loop stopped (#1028; it is idempotent);
     /// 2. retire every outstanding task while joining both poll lanes, for at
-    ///    most [`WORKER_SHUTDOWN_DRAIN_TIMEOUT`];
+    ///    most the worker's drain bound ([`WORKER_SHUTDOWN_DRAIN_TIMEOUT`]);
     /// 3. run Core's finalizer in a task that owns the worker, waiting for at
-    ///    most [`WORKER_FINALIZE_TIMEOUT`].
+    ///    most its finalize bound ([`WORKER_FINALIZE_TIMEOUT`]).
+    ///
+    /// Both bounds are read from the worker (see
+    /// [`PollLanes::shutdown_drain_bound`]); only tests change them.
     ///
     /// Contract: tasks that never reached OCaml (queued handoffs, polls in
     /// flight at shutdown, Core's own cache evictions) are retired silently,
@@ -2802,14 +2807,16 @@ impl Runtime {
             let _runtime_guard = handle.enter();
             worker.initiate_shutdown();
         }
+        let drain_bound = worker.shutdown_drain_bound();
         let retirement = handle
-            .block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT))
+            .block_on(worker.drain_and_join_for_shutdown(drain_bound))
             .map_err(shutdown_drain_failure)?;
         let worker = self
             .worker
             .take()
             .expect("drained worker remains owned until terminal finalization");
-        let released = match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+        let finalize_bound = worker.finalize_bound();
+        let released = match handle.block_on(worker.finalize_bounded(finalize_bound)) {
             BoundedFinalize::Refused(worker, error) => {
                 // The bridge would not consume the worker (for example after a
                 // lost poll lease). Keep it owned by the graph so runtime close
@@ -3628,7 +3635,8 @@ fn drop_runtime_graph(
         // while the lanes stop, and is bounded so dispose cannot hang on a
         // debt Core keeps outstanding (issue #769). A timeout leaves the
         // worker unfinalizable, which the match below handles.
-        let _ = handle.block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT));
+        let drain_bound = worker.shutdown_drain_bound();
+        let _ = handle.block_on(worker.drain_and_join_for_shutdown(drain_bound));
         // An admitted workflow completion that outlived the bounded drain is
         // still awaiting Core and holds a worker reference. Abort it and wait
         // for the abort, so no task outlives the graph; its outcome is
@@ -3640,7 +3648,8 @@ fn drop_runtime_graph(
         // the only window in which a late task could otherwise be dropped with
         // an outstanding Core completion debt.
         handle.block_on(worker.force_complete_outstanding_for_dispose());
-        match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+        let finalize_bound = worker.finalize_bound();
+        match handle.block_on(worker.finalize_bounded(finalize_bound)) {
             BoundedFinalize::Refused(worker, _) => {
                 // Dispose cannot wait for OCaml. Dropping after force-complete
                 // is the last-resort reclaim path.
@@ -5053,9 +5062,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new(
     }
 }
 
-/// Upper bound on a runtime telemetry document. The largest valid document
-/// (sixteen maximal global tags) is well below this.
-const MAX_TELEMETRY_CONFIG_BYTES: usize = 16 * 1024;
+/// Upper bound on a runtime telemetry document. The largest valid document,
+/// an OTLP exporter with sixteen maximal headers whose values are entirely
+/// JSON-escaped characters (about 136 KiB) plus a maximal endpoint and
+/// global tags, is below this.
+const MAX_TELEMETRY_CONFIG_BYTES: usize = 256 * 1024;
 
 /// Create a shareable Core runtime with opt-in telemetry export (#500).
 ///
@@ -5063,16 +5074,19 @@ const MAX_TELEMETRY_CONFIG_BYTES: usize = 16 * 1024;
 /// telemetry document (see `docs/reference/core-bridge.md`). `{}` configures
 /// no exporter. With a `prometheus` member, Core's built-in worker and client
 /// metrics are served at `http://<bind_address>/metrics` from a scrape server
-/// on the runtime's own Tokio pool; the server stops when Core is destroyed,
-/// that is, when the last of the shared handle and its attached graphs is
-/// released.
+/// on the runtime's own Tokio pool; with an `otlp` member (#1161) they are
+/// pushed to an OTLP collector by Core's OpenTelemetry exporter. Either
+/// exporter stops when Core is destroyed, that is, when the last of the
+/// shared handle and its attached graphs is released; an OTLP exporter makes
+/// one final export then (see [`crate::otlp::OtlpExporter`]).
 ///
-/// The document is validated, and the endpoint bound, before the handle is
-/// published: an invalid document or an unusable address fails with
-/// `STATUS_CONFIGURATION` and leaves `*shared` null with nothing running. On
-/// success the result value is the UTF-8 socket address the endpoint
-/// actually listens on (an ephemeral port `0` is resolved), or empty when no
-/// exporter was configured.
+/// The document is validated, and a Prometheus endpoint bound, before the
+/// handle is published: an invalid document or an unusable address fails
+/// with `STATUS_CONFIGURATION` and leaves `*shared` null with nothing
+/// running. No message echoes an OTLP header value. On success the result
+/// value is the UTF-8 socket address a Prometheus endpoint actually listens
+/// on (an ephemeral port `0` is resolved), or empty when no exporter or an
+/// OTLP exporter was configured.
 ///
 /// # Safety
 ///
@@ -5140,10 +5154,13 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new_with_telemetr
                 &telemetry,
                 diagnostics::CoreLogWriter::spawn_stderr,
             )?;
+            // Only a Prometheus endpoint listens; an OTLP exporter reports
+            // the empty address like a runtime without an exporter.
             let address = core
                 .metrics
                 .as_ref()
-                .map(|exporter| exporter.bound_address().to_string())
+                .and_then(telemetry::MetricsExporter::bound_address)
+                .map(|address| address.to_string())
                 .unwrap_or_default();
             let owned = Box::into_raw(Box::new(SharedRuntime::new(core)?));
             // SAFETY: The slot was validated above and is exclusively owned
@@ -6728,7 +6745,7 @@ pub unsafe fn test_runtime_has_metrics_meter(runtime: *const Runtime) -> Option<
 /// Stops Core's own Prometheus scrape server on a shared handle while the
 /// bridge's public accept loop keeps running, reproducing the state an accept
 /// error on Core's private listener leaves behind (#1030). Returns whether
-/// the handle had an exporter. Not part of the C ABI.
+/// the handle had a Prometheus exporter. Not part of the C ABI.
 ///
 /// # Safety
 ///
@@ -6739,18 +6756,16 @@ pub unsafe fn test_shared_runtime_stop_core_metrics_server(shared: *const Shared
     let Some(shared) = (unsafe { shared.as_ref() }) else {
         return false;
     };
-    match shared.core.metrics.as_ref() {
-        Some(exporter) => {
-            exporter.stop_core_server();
-            true
-        }
-        None => false,
-    }
+    shared
+        .core
+        .metrics
+        .as_ref()
+        .is_some_and(telemetry::MetricsExporter::stop_core_server)
 }
 
 /// Reports whether Core's own Prometheus scrape server on a shared handle has
-/// stopped (#1030); `None` for a null or released handle or one without an
-/// exporter. Not part of the C ABI.
+/// stopped (#1030); `None` for a null or released handle or one without a
+/// Prometheus exporter. Not part of the C ABI.
 ///
 /// # Safety
 ///
@@ -6761,8 +6776,7 @@ pub unsafe fn test_shared_runtime_core_metrics_server_stopped(
 ) -> Option<bool> {
     // SAFETY: The caller promises a null or live handle.
     let shared = unsafe { shared.as_ref() }?;
-    let exporter = shared.core.metrics.as_ref()?;
-    Some(exporter.core_server_stopped())
+    shared.core.metrics.as_ref()?.core_server_stopped()
 }
 
 /// Returns the number of live references to a shared handle's Core (the
@@ -6809,6 +6823,31 @@ pub fn test_runtime_new_with_core_log_sink(
         })
         .ok_or_else(|| "runtime has no Core log writer".to_owned())?;
     Ok((Box::into_raw(Box::new(runtime)), queue))
+}
+
+/// Creates a shared runtime from a telemetry document, like
+/// [`ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json`], whose
+/// Core log records at `level` drain into `sink` instead of stderr.
+///
+/// This is intentionally not part of the C ABI. It lets the OTLP tests
+/// (#1161) capture every record Core and the exporter emit and prove that a
+/// header value never reaches the log. The handle must be released with
+/// [`ocaml_temporal_core_v4_shared_runtime_free`].
+#[doc(hidden)]
+pub fn test_shared_runtime_new_with_telemetry_and_log_sink(
+    document: &[u8],
+    level: diagnostics::CoreLogLevel,
+    sink: Box<dyn std::io::Write + Send>,
+) -> std::result::Result<*mut SharedRuntime, String> {
+    let telemetry =
+        telemetry::parse_telemetry_config(document).map_err(|failure| failure.message)?;
+    let worker_threads = runtime_worker_threads(0).map_err(|failure| failure.message)?;
+    let core = create_shared_core(Some(level), worker_threads, &telemetry, || {
+        diagnostics::CoreLogWriter::spawn(sink, diagnostics::CORE_LOG_QUEUE_CAPACITY)
+    })
+    .map_err(|failure| failure.message)?;
+    let shared = SharedRuntime::new(core).map_err(|failure| failure.message)?;
+    Ok(Box::into_raw(Box::new(shared)))
 }
 
 /// Returns the number of Tokio worker threads driving a live runtime, or
@@ -7316,6 +7355,10 @@ mod runtime_release_bound;
 #[cfg(test)]
 #[path = "../tests/support/worker_shutdown_outcomes.rs"]
 mod worker_shutdown_outcomes;
+
+#[cfg(test)]
+#[path = "../tests/support/worker_shutdown_drain_timeout.rs"]
+mod worker_shutdown_drain_timeout;
 
 /// SDK name reported to Temporal as the `client-name` RPC header and recorded
 /// in `WorkflowTaskCompleted.sdk_metadata`. Core would otherwise attribute

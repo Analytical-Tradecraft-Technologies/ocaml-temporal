@@ -1166,11 +1166,12 @@ let schedule_local_activity context ~name ~input ?activity_id
     only correlates Core completion jobs with this in-memory execution. Both
     returned futures are allocated before the command so the start stage and
     the result share the sequence's lifetime. Timeouts are exact milliseconds
-    already validated by the public layer; they and the ID reuse policy are
-    copied into the command unchanged. *)
+    already validated by the public layer; they, the ID reuse policy, and the
+    memo and search-attribute maps (#1135, keys likewise validated, payloads
+    already copied) are placed in the command unchanged. *)
 let start_child_workflow context ~id ~name ~input
     ?retry_policy ?task_queue ?parent_close_policy ?execution_timeout
-    ?run_timeout ?task_timeout ?id_reuse_policy
+    ?run_timeout ?task_timeout ?id_reuse_policy ?memo ?search_attributes
     ?(cancellation_type = Activation.Child_try_cancel) ~decode () =
   let seq = allocate_sequence context in
   (* The handle closure owns this cell so a repeated cancel remains idempotent
@@ -1214,7 +1215,7 @@ let start_child_workflow context ~id ~name ~input
     (Activation.Start_child_workflow
        { seq; id; name; input; retry_policy; cancellation_type; task_queue;
          parent_close_policy; execution_timeout; run_timeout; task_timeout;
-         id_reuse_policy });
+         id_reuse_policy; memo; search_attributes });
   let cancel ~reason =
     match current () with
     | Some current when current == context ->

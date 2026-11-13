@@ -102,6 +102,9 @@ let table =
     replayed "start-delay";
     replayed "cron-schedule";
     replayed "cron-successor";
+    (* Child memo and search attributes (#1135), captured by
+       corpus-v6-child-start-metadata. *)
+    replayed "child-start-metadata";
     (* Remote activities. *)
     replayed "activity";
     replayed "activity-retry";

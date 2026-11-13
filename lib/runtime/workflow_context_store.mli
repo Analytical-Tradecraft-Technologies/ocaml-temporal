@@ -425,8 +425,10 @@ val schedule_local_activity :
     Starting a child raises [Invalid_argument] inside a read-only callback,
     as for [schedule_activity]. [input] is the exact argument list sent to Core, as for
     [schedule_activity]. The optional timeouts are exact milliseconds that
-    the caller has already validated; they and [id_reuse_policy] are copied
-    into the command, and omitting them keeps the command unchanged. *)
+    the caller has already validated; they, [id_reuse_policy], and the
+    [memo] and [search_attributes] maps (#1135, keys validated and payloads
+    copied by the caller) are placed in the command, and omitting them keeps
+    the command unchanged. *)
 val start_child_workflow :
   t ->
   id:string ->
@@ -439,6 +441,8 @@ val start_child_workflow :
   ?run_timeout:int64 ->
   ?task_timeout:int64 ->
   ?id_reuse_policy:Activation.child_workflow_id_reuse_policy ->
+  ?memo:(string * Temporal_base.Codec.payload) list ->
+  ?search_attributes:(string * Temporal_base.Codec.payload) list ->
   ?cancellation_type:Activation.child_workflow_cancellation_type ->
   decode:(Temporal_base.Codec.payload -> ('output, Temporal_base.Error.t) result) ->
   unit ->

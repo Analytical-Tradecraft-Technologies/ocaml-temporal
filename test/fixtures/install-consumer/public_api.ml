@@ -338,6 +338,8 @@ let _child_start :
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
     ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
@@ -355,6 +357,8 @@ let _child_start_handle :
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
     ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input -> 'output T.Child_workflow.handle =
@@ -387,6 +391,8 @@ let _child_execute :
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
     ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
@@ -1166,6 +1172,23 @@ let _runtime_metrics_prometheus :
     unit ->
     (T.Runtime.Metrics.t, T.Error.t) result =
   T.Runtime.Metrics.prometheus
+
+(* Opt-in OTLP push export of the same metrics (#1161). *)
+let _runtime_metrics_otlp :
+    ?headers:(string * string) list ->
+    ?period:T.Duration.t ->
+    ?protocol:[ `Grpc | `Http_protobuf ] ->
+    ?temporality:[ `Cumulative | `Delta ] ->
+    ?global_tags:(string * string) list ->
+    ?durations_as_seconds:bool ->
+    endpoint:string ->
+    unit ->
+    (T.Runtime.Metrics.t, T.Error.t) result =
+  T.Runtime.Metrics.otlp
+let _runtime_metrics_otlp_protocol : T.Runtime.Metrics.otlp_protocol list =
+  [ `Grpc; `Http_protobuf ]
+let _runtime_metrics_temporality : T.Runtime.Metrics.temporality list =
+  [ `Cumulative; `Delta ]
 let _runtime_metrics_address : T.Runtime.t -> string option =
   T.Runtime.metrics_address
 let _runtime_shutdown : T.Runtime.t -> (unit, T.Error.t) result =
@@ -1636,11 +1659,27 @@ let _testing_mock_activity :
     T.Testing.registered_activity =
   T.Testing.mock_activity
 
+let _testing_mock_async_activity :
+    'input 'output.
+    ?durations:T.Duration.t list ->
+    ('input, 'output) T.Activity.t ->
+    ('output T.Activity.async_context -> 'input -> 'output T.Activity.async_result) ->
+    T.Testing.registered_activity =
+  T.Testing.mock_async_activity
+
+(* The task-failure modes are matched exhaustively so a renamed or added
+   mode breaks the consumer build. *)
+let _testing_workflow_task_failure : T.Testing.workflow_task_failure -> string =
+  function
+  | `Fail_run -> "fail_run"
+  | `Retry -> "retry"
+
 let _testing_create :
     ?namespace:string ->
     ?task_queue:string ->
     ?start_time:T.Time.t ->
     ?max_activity_attempts:int ->
+    ?workflow_task_failure:T.Testing.workflow_task_failure ->
     workflows:T.Testing.registered_workflow list ->
     activities:T.Testing.registered_activity list ->
     unit -> (T.Testing.t, T.Error.t) result =
@@ -1655,6 +1694,14 @@ let _testing_skip : T.Testing.t -> T.Duration.t -> (unit, T.Error.t) result =
 let _testing_start :
     'input 'output.
     ?id:string ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
+    ?id_conflict_policy:T.Client.id_conflict_policy ->
+    ?id_reuse_policy:T.Client.id_reuse_policy ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
     T.Testing.t ->
     ('input, 'output) T.Workflow.t ->
     'input -> (('input, 'output) T.Testing.handle, T.Error.t) result =
@@ -1669,6 +1716,14 @@ let _testing_result :
 let _testing_execute :
     'input 'output.
     ?id:string ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
+    ?id_conflict_policy:T.Client.id_conflict_policy ->
+    ?id_reuse_policy:T.Client.id_reuse_policy ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
     ?timeout:T.Duration.t ->
     T.Testing.t ->
     ('input, 'output) T.Workflow.t -> 'input -> ('output, T.Error.t) result =
@@ -1711,6 +1766,16 @@ let _testing_workflow_id : 'input 'output. ('input, 'output) T.Testing.handle ->
 
 let _testing_run_id : 'input 'output. ('input, 'output) T.Testing.handle -> string =
   T.Testing.run_id
+
+let _testing_started : 'input 'output. ('input, 'output) T.Testing.handle -> bool =
+  T.Testing.started
+
+let _testing_task_failure :
+    'input 'output. ('input, 'output) T.Testing.handle -> T.Error.t option =
+  T.Testing.workflow_task_failure
+
+let _testing_retry_workflow_tasks : T.Testing.t -> (unit, T.Error.t) result =
+  T.Testing.retry_workflow_tasks
 
 let _testing_memo :
     'input 'output. ('input, 'output) T.Testing.handle -> (string * T.Payload.t) list =
