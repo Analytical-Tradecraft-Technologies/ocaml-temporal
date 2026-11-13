@@ -11,7 +11,9 @@ metadata; it does not run the scanner. Cargo license scanning deliberately
 does not run in the compiler/architecture matrix or as a Makefile target.
 `make license-check` also audits the CI-only official Python SDK closure of
 the interoperability regression in the pinned Python image; see
-[CI-only interoperability tooling](#ci-only-interoperability-tooling).
+[CI-only interoperability tooling](#ci-only-interoperability-tooling). It
+applies the OPAM policy to the CI-only closure of the Eio integration example
+as well; see [CI-only Eio example dependencies](#ci-only-eio-example-dependencies).
 The Makefile's `quality` target is a separate contributor/CI gate for RustSec,
 unused-dependency, and spelling checks.
 
@@ -34,6 +36,7 @@ nor Docker.
 | [Per-compiler lock overrides](#per-compiler-lock-overrides) | The compiler series and package of each entry in `scripts/opam-lock-overrides.txt` |
 | [Linking-exception scope](#linking-exception-scope) | `ocaml`, `ocaml-base-compiler`, and `ocamlbuild` in `temporal-sdk.opam.locked`, and `tyxml`, `re`, and `camlp-streams` in `scripts/docs-tools.locked` |
 | [CI-only documentation tooling](#ci-only-documentation-tooling) | Every package and exact version in `scripts/docs-tools.locked`, which no licence gate audits |
+| [CI-only Eio example dependencies](#ci-only-eio-example-dependencies) | Every package in `scripts/eio-example.locked` |
 | [CI-only interoperability tooling](#ci-only-interoperability-tooling) | Every package in `test/integration/sdk_interop/python/requirements.lock` |
 | [Builder image tooling](#builder-image-tooling), [toolchain and CI images](#toolchain-and-ci-images), and [local integration service images](#local-integration-service-images) | The repository of every digest-pinned image reference in `Dockerfile.dev`, `docker/ocaml-*/Dockerfile`, `Dockerfile.rust-ci`, `test/integration/temporal/compose.yaml`, and the GitHub workflows and composite actions |
 | [Locked Cargo closure](#locked-cargo-closure) | The Temporal Core revision in `rust/Cargo.toml` |
@@ -70,8 +73,14 @@ versions and ordinary LGPL packages remain prohibited.
 `CC0-1.0+` metadata. CC0 is permissive; the exception is package- and
 version-specific rather than a general substring match.
 
-The `base-*` entries below are virtual packages shipped by the OCaml compiler
-distribution. Their OPAM records contain no independent source or license, so
+`bigstringaf.0.10.0`, a CI-only dependency of the
+[Eio example](#ci-only-eio-example-dependencies), declares `BSD-3-clause`.
+SPDX license identifiers match case-insensitively, so this is BSD-3-Clause,
+the license of the upstream project. The checker admits that spelling only
+for this exact package and version.
+
+The `base-*` entries below, and `seq.base` in the CI-only tool locks, are
+virtual packages shipped by the OCaml compiler distribution. Their OPAM records contain no independent source or license, so
 the checker recognizes only these exact package names at version `base` and
 attributes them to the reviewed compiler distribution.
 
@@ -178,6 +187,52 @@ Packages the docs stage reuses from the SDK lock (`dune`, `ocamlfind`,
 | tyxml | 4.6.0 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | HTML generation (see [linking-exception scope](#linking-exception-scope)) |
 | re | 1.14.0 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | Regular expressions used by tyxml (see [linking-exception scope](#linking-exception-scope)) |
 | camlp-streams | 5.0.1 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | Stream compatibility library used by odoc-parser (see [linking-exception scope](#linking-exception-scope)) |
+
+## CI-only Eio example dependencies
+
+The [Eio integration example](../examples/README.md#use-the-sdk-from-an-eio-program)
+(#1141) shows how an Eio program calls the blocking client and hosts a worker.
+It needs `eio` and `eio_posix`, whose exact closure is
+`scripts/eio-example.locked`. The `examples-eio` stage of `Dockerfile.dev`
+and the native macOS lane install it with `scripts/opam-tool-lock.sh` on top
+of the locked SDK closure. That script fails if opam adds or moves any
+package the tool lock does not list, including a locked SDK dependency, and
+then re-checks the SDK closure. None of these packages is an SDK dependency:
+they are absent from `temporal-sdk.opam` and its lock, are used only by
+`examples/eio` (whose Dune stanza is enabled only by `TEMPORAL_EIO_EXAMPLE`),
+and are not linked into or redistributed with any SDK artifact. The macOS lane
+installs them only after its SDK library artifact has been verified and
+uploaded. Packages the example reuses from the SDK lock (`dune`, `mtime`,
+`ocamlfind`, and `topkg`) are listed only in the locked OCaml closure;
+`dune-configurator` is pinned to the locked `dune` release so the install
+cannot move it. Installing `fmt` makes opam rebuild the locked `logs` with
+its optional `fmt` support in that image or lane; its version, and every SDK
+artifact built without the tool lock, are unchanged. The closure was solved for OCaml 5.5, the compiler of the live
+smoke executables.
+
+Unlike the documentation tools, every package here meets the SDK's own OPAM
+policy, so `make license-check` audits each locked version exactly as it
+audits the SDK lock, and this table records only the names. The closure is
+not `eio_main`, which would add the Linux `io_uring` backend's packages; the
+example runs `Eio_posix` directly. Lwt is not used.
+
+| Package | License | Role |
+|---|---|---|
+| eio | ISC | Effect-based direct-style I/O API: fibers, switches, promises and `Eio_unix.run_in_systhread` |
+| eio_posix | ISC | Eio's POSIX backend, which runs the example's event loop |
+| bigstringaf | BSD-3-Clause | Bigstring primitives used by Eio's buffered readers and writers (metadata spells `BSD-3-clause`; see [Policy](#policy)) |
+| cstruct | ISC | Buffer slices used by Eio's I/O interfaces |
+| domain-local-await | ISC | Cross-Domain blocking used by Eio |
+| thread-table | ISC | Thread-indexed table used by domain-local-await |
+| fmt | ISC | Formatting utilities |
+| hmap | ISC | Heterogeneous maps for Eio's fiber-local values |
+| iomux | ISC | `poll`/`ppoll` bindings for the POSIX backend |
+| lwt-dllist | MIT | Doubly linked lists for Eio's switches; the Lwt runtime is not used |
+| optint | ISC | Integer type used by Eio's file offsets |
+| psq | ISC | Priority search queues for Eio's timer queue |
+| csexp | MIT | Canonical S-expressions used by dune-configurator |
+| dune-configurator | MIT | Build-time C configuration for bigstringaf; pinned to the locked dune release |
+| seq | compiler virtual package | No independent source; part of OCaml distribution |
 
 ## CI-only interoperability tooling
 

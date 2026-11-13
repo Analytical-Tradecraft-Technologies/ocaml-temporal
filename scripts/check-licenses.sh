@@ -26,6 +26,12 @@ allowed_license() {
     'CC0-1.0+')
       [ "$package" = "ocaml-options-vanilla" ] && [ "$version" = "1" ] && return 0
       ;;
+    'BSD-3-clause')
+      # SPDX identifiers match case-insensitively, so this is BSD-3-Clause,
+      # the licence of upstream bigstringaf. Only the reviewed version of this
+      # CI-only Eio example dependency is admitted under the lower-case form.
+      [ "$package" = "bigstringaf" ] && [ "$version" = "0.10.0" ] && return 0
+      ;;
   esac
   return 1
 }
@@ -33,7 +39,8 @@ allowed_license() {
 # Check one package's complete OPAM license field. OPAM may return a quoted list
 # or a comma-separated value, so normalize either form before applying the
 # exact allowlist. Missing licenses fail except for named compiler virtual
-# packages, which have no independent source distribution.
+# packages, which have no independent source distribution (`seq.base` is the
+# OCaml >= 4.07 placeholder for the standard library's own Seq module).
 check_license_value() {
   package=$1
   version=$2
@@ -41,7 +48,7 @@ check_license_value() {
 
   if [ -z "$value" ]; then
     case "$package:$version" in
-      base-bigarray:base|base-domains:base|base-nnp:base|base-threads:base|base-unix:base)
+      base-bigarray:base|base-domains:base|base-nnp:base|base-threads:base|base-unix:base|seq:base)
         echo "ALLOW $package $version compiler-virtual-package"
         return
         ;;
@@ -102,6 +109,13 @@ else
     awk '{ print $2, $3 }')
   [ -z "$overrides" ] || dependencies="$dependencies
 $overrides"
+  # The CI-only closure of the Eio integration example (#1141) is never an SDK
+  # dependency, but every entry must meet the same policy, so a dependency of
+  # a published example cannot need a licence the SDK would refuse.
+  eio_example=$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' scripts/eio-example.locked |
+    awk '{ print $1, $2 }')
+  dependencies="$dependencies
+$eio_example"
   while read -r package version; do
     [ -n "$package" ] || continue
     value=$(opam show "$package.$version" --field=license 2>/dev/null || true)

@@ -457,3 +457,65 @@ instead of re-recording the history.
 The replay example is an offline `test` stanza rather than a long-lived
 `executable`, so it is deliberately outside the live example gate described
 above.
+
+## Use the SDK from an Eio program
+
+Every `Temporal.Client` call and `Temporal.Worker.run` blocks its calling
+system thread, so an Eio program must keep them off its fibers' scheduler.
+[`examples/eio`](eio/eio_example.ml) is a compiled, self-checking version of
+the two patterns in the workflow guide's section
+[Use the SDK from Eio and Lwt applications](../docs/guides/workflows.md#use-the-sdk-from-eio-and-lwt-applications)
+(#1141). One process:
+
+- creates a worker with `Eio_unix.run_in_systhread` and hosts it on its own
+  Domain with `Eio.Domain_manager.run`, where `Worker.run` and then
+  `Worker.shutdown` run. A daemon fiber turns Eio cancellation into
+  `Worker.request_shutdown`;
+- creates a client the same way, and from three fibers starts and awaits one
+  workflow each, every `Client.start` and `Client.wait` running in a system
+  thread, while a ticker fiber keeps running;
+- shuts the client down, then resolves a promise that cancels the hosting
+  fiber.
+
+It checks that all three blocking calls were in flight at once, that the
+ticker ran while they waited, and that the worker was drained and released,
+successfully, before the hosting fiber finished. A blocking call made
+directly on a fiber fails the first check.
+
+Eio is not an SDK dependency. `eio`, `eio_posix` and their closure are
+CI-only dependencies of this one executable, pinned at exact versions in
+[`scripts/eio-example.locked`](../scripts/eio-example.locked) and audited by
+`make license-check` (see the
+[dependency inventory](../docs/dependencies.md#ci-only-eio-example-dependencies)).
+`examples/eio/dune` is therefore enabled only when `TEMPORAL_EIO_EXAMPLE` is
+`enabled`, and every other build skips it. To build and run it on a host
+switch, install that closure first, with the server and environment from the
+start of this guide:
+
+```sh
+sh scripts/opam-tool-lock.sh install scripts/eio-example.locked
+TEMPORAL_EIO_EXAMPLE=enabled dune exec examples/eio/eio_example.exe
+```
+
+`opam-tool-lock.sh` installs each listed package at its exact version and
+fails if opam adds or moves any package the lock does not list, including a
+locked SDK dependency. In a switch that already has a compatible Eio, the
+second command alone is enough. `make build-examples-eio` builds the example
+in the `examples-eio` Compose image instead, and
+`make native-build-examples-eio` builds it natively after checking the switch
+against the lock.
+
+```text
+Eio client: three fibers shared one client and each started and awaited a workflow.
+Eio client: all three blocking calls were in flight at once, each in its own system thread.
+Eio fibers: another fiber kept running while the client calls waited.
+Eio worker: hosted on its own Domain, drained and shut down when its fiber was cancelled.
+Eio example passed.
+```
+
+It exits 1 with a description of the first failed check otherwise. It uses
+the task queue `$TEMPORAL_TASK_QUEUE-eio` and fresh workflow IDs. CI builds it
+into the Linux smoke artifact, where `make test-temporal-examples-live` runs
+it, and the native macOS lane builds it as well. Windows is not covered:
+`eio_posix` does not support it, and Eio's Windows backend is still
+experimental.

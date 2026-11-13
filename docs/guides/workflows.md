@@ -1501,6 +1501,13 @@ rules below keep the scheduler responsive (#1141). Workflow code is a separate
 matter. It runs under the SDK's own deterministic scheduler and must never use
 Eio, Lwt or any other I/O, as described in section 1.
 
+[`examples/eio`](../../examples/README.md#use-the-sdk-from-an-eio-program) is
+a compiled, self-checking program built from the two Eio patterns below. CI
+builds it and runs it against Temporal Server, and it checks that the client
+calls ran concurrently with other fibers and that the hosted worker shut down
+before its fiber finished. It uses `Eio_posix.run` where these snippets use
+`Eio_main.run`; both work.
+
 ### Client calls from Eio fibers
 
 Run each blocking client call in a system thread with
@@ -1572,8 +1579,9 @@ any fiber, thread or Domain:
 ```ocaml
 (* Runs [worker] on a new Domain until the calling fiber is cancelled, then
    drains and releases it. Eio cannot interrupt [Worker.run] (it is not Eio
-   code), so a daemon fiber requests the stop instead. *)
-let serve_worker ~domain_mgr worker =
+   code), so a daemon fiber requests the stop instead. [on_stopped] receives
+   the run and shutdown result on the hosting Domain. *)
+let serve_worker ~domain_mgr ~on_stopped worker =
   Eio.Switch.run @@ fun sw ->
   Eio.Fiber.fork_daemon ~sw (fun () ->
       Fun.protect
@@ -1582,7 +1590,13 @@ let serve_worker ~domain_mgr worker =
   Eio.Domain_manager.run domain_mgr (fun () ->
       let run_result = Temporal.Worker.run worker in
       let shutdown_result = Temporal.Worker.shutdown worker in
-      Result.bind run_result (fun () -> shutdown_result))
+      let result = Result.bind run_result (fun () -> shutdown_result) in
+      on_stopped result;
+      result)
+
+let report_stopped = function
+  | Ok () -> ()
+  | Error error -> prerr_endline (Temporal.Error.message error)
 
 let () =
   Eio_main.run @@ fun env ->
@@ -1603,9 +1617,9 @@ let () =
          the worker Domain has shut the worker down. *)
       Eio.Fiber.first
         (fun () ->
-          match serve_worker ~domain_mgr:(Eio.Stdenv.domain_mgr env) worker with
-          | Ok () -> ()
-          | Error error -> prerr_endline (Temporal.Error.message error))
+          ignore
+            (serve_worker ~domain_mgr:(Eio.Stdenv.domain_mgr env)
+               ~on_stopped:report_stopped worker))
         (fun () -> Eio.Promise.await stop)
 ```
 
@@ -1614,7 +1628,10 @@ requests the stop. `Worker.run` returns once each lane has finished its
 current task, or once the worker's grace period has elapsed for an activity
 callback, and the same Domain then runs the bounded `Worker.shutdown`.
 `Domain_manager.run` returns only after both have finished, so the worker
-never outlives the switch. For `SIGTERM`, keep the `Sys.signal` handler of
+never outlives the switch. The cancelled fiber then ends with Eio's
+`Cancelled` exception instead of `serve_worker`'s return value, so a failed
+drain or release would go unseen; `on_stopped` reports the result in every
+case, including when the worker stops on its own. For `SIGTERM`, keep the `Sys.signal` handler of
 [section 8](#8-register-a-worker) that calls `Worker.request_shutdown`. It
 works unchanged in an Eio program, because the handler does no I/O.
 

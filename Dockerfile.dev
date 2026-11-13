@@ -61,31 +61,38 @@ CMD ["opam", "exec", "--", "dune", "build"]
 
 # CI-only API documentation tooling for `make docs`. odoc and its closure are
 # installed at the exact versions in scripts/docs-tools.locked on top of the
-# locked SDK closure, which is re-checked so the documentation tool cannot
-# silently move an SDK dependency. The set of packages the install adds must
-# equal the manifest exactly: opam also installs transitive dependencies, so an
-# unlisted package (a manifest omission or new upstream metadata) fails the
-# build instead of slipping past the licence review. Nothing in this stage is linked into or
-# shipped with the SDK; see docs/reference/quality-gates.md.
+# locked SDK closure. scripts/opam-tool-lock.sh requires the set of packages
+# the install adds to equal the manifest exactly (opam also installs transitive
+# dependencies, so an unlisted package fails the build instead of slipping past
+# the licence review) and then re-checks the SDK closure, so the documentation
+# tool cannot silently move an SDK dependency. Nothing in this stage is linked
+# into or shipped with the SDK; see docs/reference/quality-gates.md.
 FROM dev-base AS docs
-COPY --chown=opam:opam scripts/docs-tools.locked ./scripts/
-RUN set -eu; \
-    tools=$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' scripts/docs-tools.locked); \
-    installed() { opam list --installed --short --columns=name,version \
-        | awk '{ print $1 " " $2 }' | LC_ALL=C sort; }; \
-    installed > /tmp/docs-before; \
-    opam install --yes --no-depexts $(printf '%s\n' "$tools" | awk '{ print $1 "." $2 }'); \
-    installed > /tmp/docs-after; \
-    LC_ALL=C comm -13 /tmp/docs-before /tmp/docs-after > /tmp/docs-added; \
-    printf '%s\n' "$tools" | awk '{ print $1 " " $2 }' | LC_ALL=C sort > /tmp/docs-expected; \
-    if ! cmp -s /tmp/docs-added /tmp/docs-expected; then \
-        echo "docs tool closure differs from scripts/docs-tools.locked" >&2; \
-        echo "(< installed by opam, > listed in the manifest):" >&2; \
-        diff /tmp/docs-added /tmp/docs-expected >&2 || true; \
-        exit 1; \
-    fi; \
-    rm -f /tmp/docs-before /tmp/docs-after /tmp/docs-added /tmp/docs-expected; \
-    sh scripts/opam-locked-deps.sh check
+COPY --chown=opam:opam scripts/docs-tools.locked scripts/opam-tool-lock.sh ./scripts/
+RUN sh scripts/opam-tool-lock.sh install scripts/docs-tools.locked --no-depexts
+
+USER root
+# Make supplies a fresh value on every invocation, so cached toolchains and
+# dependencies remain reusable while runtime Cargo/opam HTTPS uses current roots.
+ARG CA_CERTIFICATES_REFRESH
+RUN test -n "${CA_CERTIFICATES_REFRESH}" \
+    && apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install --reinstall --no-install-recommends -y ca-certificates \
+    && update-ca-certificates --fresh \
+    && rm -rf /var/lib/apt/lists/*
+USER opam
+
+# CI-only dependencies of the Eio integration example (examples/eio, #1141):
+# eio, eio_posix and their closure at the exact versions in
+# scripts/eio-example.locked, installed and checked like the documentation
+# tools above. They are dependencies of that one example executable only,
+# never of the SDK, and `make license-check` audits every entry; see
+# docs/dependencies.md. TEMPORAL_EIO_EXAMPLE enables examples/eio/dune, which
+# every other image and build skips.
+FROM dev-base AS examples-eio
+COPY --chown=opam:opam scripts/eio-example.locked scripts/opam-tool-lock.sh ./scripts/
+RUN sh scripts/opam-tool-lock.sh install scripts/eio-example.locked --no-depexts
+ENV TEMPORAL_EIO_EXAMPLE=enabled
 
 USER root
 # Make supplies a fresh value on every invocation, so cached toolchains and
@@ -99,7 +106,8 @@ RUN test -n "${CA_CERTIFICATES_REFRESH}" \
 USER opam
 
 # The default (last) stage stays the ordinary development image, so builds
-# that do not request the `docs` target never install the documentation tools.
+# that do not request the `docs` or `examples-eio` target never install the
+# documentation tools or the Eio example's dependencies.
 FROM dev-base AS dev
 
 USER root

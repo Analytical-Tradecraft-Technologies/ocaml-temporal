@@ -281,6 +281,27 @@ EXAMPLE_EXECUTABLES := examples/workflow_worker/workflow_worker.exe examples/act
 build-examples:
 	$(RUN) dune build $(DUNE_BUILD_ARGS) $(EXAMPLE_EXECUTABLES)
 
+# The Eio integration example (#1141) needs eio and eio_posix, CI-only
+# dependencies of that one executable pinned with their closure in
+# scripts/eio-example.locked; they are never SDK dependencies. It therefore
+# builds in the `examples-eio` Compose service (the development image plus that
+# closure, Dockerfile.dev's `examples-eio` stage, which also sets
+# TEMPORAL_EIO_EXAMPLE=enabled), or natively after
+# `sh scripts/opam-tool-lock.sh install scripts/eio-example.locked`.
+# examples/eio/dune is disabled without that variable, so every other build
+# skips it. The smoke artifact and test-temporal-examples-live include it, and
+# test/smoke/test_examples_live_contract.sh counts it as a declared example.
+EIO_EXAMPLE_EXECUTABLES := examples/eio/eio_example.exe
+EIO_COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --profile examples-eio --progress plain build examples-eio >&2 && \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --profile examples-eio --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) examples-eio
+.PHONY: build-examples-eio native-build-examples-eio
+build-examples-eio:
+	$(EIO_COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(EIO_EXAMPLE_EXECUTABLES)
+
+native-build-examples-eio:
+	$(NATIVE_RUN) sh scripts/opam-tool-lock.sh check scripts/eio-example.locked
+	TEMPORAL_EIO_EXAMPLE=enabled $(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) $(EIO_EXAMPLE_EXECUTABLES)
+
 # Emits only the locked Cargo metadata document on stdout, allowing CI to pipe
 # it into the isolated license scanner without knowing the Compose fixture path.
 cargo-metadata:
@@ -577,6 +598,7 @@ test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inve
 	$(LICENSE_POLICY_TEST)
 	sh test/smoke/test_build_jobs_contract.sh .
 	sh test/smoke/test_opam_locked_deps.sh .
+	sh test/smoke/test_opam_tool_lock.sh .
 	sh test/smoke/test_release_tag_contract.sh .
 	sh test/smoke/test_release_notes_contract.sh .
 	sh test/smoke/test_release_tag_commit_contract.sh .
@@ -1529,6 +1551,7 @@ native-verify: native-version-check native-build native-lint native-test
 .PHONY: test-temporal-examples-live test-temporal-examples-contract
 test-temporal-examples-live: test-temporal-examples-contract test-temporal-config
 	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(EXAMPLE_EXECUTABLES)
+	$(if $(filter 1,$(TEMPORAL_PREBUILT_SMOKE)),,$(MAKE) build-examples-eio)
 	@set -eu; \
 	cleanup() { \
 		status=$$?; \
@@ -1617,7 +1640,8 @@ test-temporal-cli-retry:
 # Compile once in the selected Linux OCaml job; the live job only executes them.
 .PHONY: build-smoke-executables test-ci-artifacts
 build-smoke-executables:
-	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(shell cat scripts/ci-smoke-executables.txt)
+	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(filter-out $(EIO_EXAMPLE_EXECUTABLES),$(shell cat scripts/ci-smoke-executables.txt))
+	$(MAKE) build-examples-eio
 
 test-ci-artifacts:
 	python3 -m unittest discover -s test/smoke -p 'test_*artifact*.py'

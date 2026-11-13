@@ -615,6 +615,21 @@ jobs:
           if-no-files-found: error
           retention-days: ${{ vars.RUST_BRIDGE_ARTIFACT_RETENTION_DAYS || '90' }}
           compression-level: 0
+      - name: Build the Eio integration example natively
+        # examples/eio (#1141) needs the CI-only closure in
+        # scripts/eio-example.locked. It is installed only after the SDK
+        # library above was verified and uploaded, so it cannot reach that
+        # artifact, and opam-tool-lock.sh fails if the install adds an
+        # unlisted package or moves a locked SDK one. The Linux build of the
+        # same example runs in the live job; Windows is not covered, because
+        # eio_posix does not support it.
+        shell: bash
+        env:
+          TEMPORAL_RUST_BRIDGE_DIR: ${{ github.workspace }}/_build/rust-bridge
+          TEMPORAL_RUST_BRIDGE_KEY: ${{ needs.rust-macos.outputs.key }}
+        run: |
+          sh scripts/opam-tool-lock.sh install scripts/eio-example.locked --assume-depexts
+          make native-build-examples-eio
 
   native-windows:
     if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
