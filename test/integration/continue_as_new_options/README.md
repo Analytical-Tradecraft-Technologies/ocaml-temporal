@@ -3,12 +3,15 @@
 Start a disposable Temporal server with the `default` namespace, then run:
 
 ```sh
-_build/default/test/integration/continue_as_new_options/regression.exe check http://127.0.0.1:7233 "$(command -v temporal)"
+_build/default/test/integration/continue_as_new_options/regression.exe check http://127.0.0.1:7233 /path/to/temporal-cli
 ```
 
-The second argument is the official Temporal CLI, used only to register the
-`ContinueAsNewOptionsKeyword` search attribute in `default` when it is not
-registered yet. The test starts and reaps one worker on each of two unique
+The second argument is an official Temporal CLI that reaches the same
+disposable server, such as a wrapper around the pinned admin-tools image of
+the Compose stack (`make test-temporal-live-regressions` supplies one). Never
+pass a CLI configured for a shared or production cluster. It is used only to
+register the `ContinueAsNewOptionsKeyword` search attribute in `default` when
+it is not registered yet. The test starts and reaps one worker on each of two unique
 task queues, A and B, and covers the successor options of
 `Workflow.continue_as_new` (#1153):
 
