@@ -307,9 +307,13 @@ for those rules.
 - `Temporal.Testing` is the in-process workflow test environment. It drives
   the same private workflow runtime as a native worker against a
   deterministic server simulator, skipping virtual time whenever every
-  workflow is blocked on a timer or activity retry. `mock_activity` and
-  `mock_workflow` stub definitions by name; `start`, `signal`, `query`,
-  `update`, `cancel`, `skip`, and `result` drive a workflow step by step. It is
+  workflow is blocked on a timer or activity retry. `mock_activity`,
+  `mock_async_activity`, and `mock_workflow` stub definitions by name;
+  `start`, `signal`, `query`, `update`, `cancel`, `skip`, and `result` drive a
+  workflow step by step, and `start` accepts the `Client.start` memo, search
+  attribute, ID policy, timeout, and retry options. In the `` `Retry ``
+  workflow-task-failure mode, `workflow_task_failure` reports a failing task
+  and `retry_workflow_tasks` retries it. It is
   independent of `Client` and `Worker`, whose `mock://` target remains a
   plumbing-only backend that never runs workflow code. The simulated
   semantics and their limits are listed in the module documentation and the

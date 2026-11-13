@@ -76,7 +76,7 @@ val activity :
 (** Packs an asynchronous activity (#1160). Each attempt runs the callback
     with a fresh handle whose operations the engine applies as Temporal
     Server would: an attempt whose callback returns [Completed] or [Failed]
-    takes its [durations_ms] entry like {!activity}, and one that returns
+    takes its [durations_ms] entry like {!val-activity}, and one that returns
     [Will_complete_async] stays pending until a test completes, fails, or
     cancels the handle, or one of its timeouts expires in virtual time
     (each heartbeat restarts the heartbeat timeout). The handle's

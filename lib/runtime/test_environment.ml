@@ -142,7 +142,9 @@ type activity_request = {
     is only reported, because a simulated workflow task never waits for a
     worker. A continue-as-new command that sets any of them (#1153) replaces
     it for the successor and later runs, as the server does; an unset one is
-    inherited. [execution_timeout] bounds the whole chain, and
+    inherited. [execution_timeout] bounds the whole chain from its first
+    run's start, so [execution_deadline_ms] is fixed when the chain is
+    created and every run reports it as its execution expiration time;
     [execution_event] is the pending event that expires it. *)
 type chain = {
   workflow_id : string;
@@ -154,6 +156,7 @@ type chain = {
   mutable retry_policy : Activation.retry_policy option;
   mutable task_queue : string;
   execution_timeout : int64 option;
+  execution_deadline_ms : int64 option;
   mutable run_timeout : int64 option;
   mutable task_timeout : int64 option;
   mutable execution_event : event option;
@@ -774,7 +777,8 @@ let create_run ?(attempt = 1) ?delay_ms
                 (match search_attributes with
                 | [] -> None
                 | _ :: _ -> Some search_attributes);
-              execution_expiration_time = None;
+              execution_expiration_time =
+                Option.map protocol_timestamp chain.execution_deadline_ms;
             }
           in
           let run_info =
@@ -908,6 +912,8 @@ let new_chain ?retry_policy ?task_queue ?execution_timeout ?run_timeout
       retry_policy;
       task_queue = Option.value task_queue ~default:environment.task_queue;
       execution_timeout;
+      execution_deadline_ms =
+        Option.map (saturating_add environment.now_ms) execution_timeout;
       run_timeout;
       task_timeout;
       execution_event = None;
@@ -1539,7 +1545,7 @@ and async_submit environment run entry operation =
             ()))
   else
     match (operation : Async_activity.operation) with
-    | Heartbeat details ->
+    | Async_activity.Heartbeat details ->
         request.heartbeat_details <- details;
         entry.last_heartbeat_ms <- environment.now_ms;
         schedule_async_deadline environment run entry;
@@ -1549,12 +1555,12 @@ and async_submit environment run entry operation =
                (Error.make ~non_retryable:true ~category:`Cancelled
                   ~message:"activity cancellation requested: cancelled" ()))
         else Ok ()
-    | Cancel _ when not request.cancel_requested ->
+    | Async_activity.Cancel _ when not request.cancel_requested ->
         Error
           (Async_activity.Rejected_submission
              (Error.make ~non_retryable:true ~category:`Activity
                 ~message:"activity cancellation was not requested" ()))
-    | Cancel details ->
+    | Async_activity.Cancel details ->
         retire ();
         if not entry.async_resolved then
           push_job environment run
@@ -1567,8 +1573,8 @@ and async_submit environment run entry operation =
                         ~details ~message:"activity cancelled" ());
                });
         Ok ()
-    | Complete payload -> settle (Finished (Ok payload))
-    | Fail error -> settle (Finished (Error error))
+    | Async_activity.Complete payload -> settle (Finished (Ok payload))
+    | Async_activity.Fail error -> settle (Finished (Error error))
 
 (** Applies a workflow's activity cancellation request. An activity waiting
     for a retry is cancelled at once. An attempt that already finished but
@@ -1722,6 +1728,19 @@ let deliver_external environment run ~workflow_id ~run_id ~job ~resolve =
              ())
   in
   push_job environment run (resolve result)
+
+(** Installs the per-activation facts Core sends with every activation:
+    its virtual timestamp, replay status, and history length. *)
+let stamp_activation execution ~at_ms ~replaying ~history_length =
+  Execution.set_activation_timestamp execution (Some (protocol_timestamp at_ms));
+  Execution.set_activation_is_replaying execution replaying;
+  Execution.set_activation_history execution
+    {
+      Workflow_context_store.history_length;
+      history_size_bytes = None;
+      continue_as_new_suggested = false;
+      continue_as_new_reasons = [];
+    }
 
 (** Interprets one command emitted by [run]. Query answers and update
     responses are recorded even after the run closes, because a query-only
@@ -1916,19 +1935,6 @@ and is_dispatched_by_server : Activation.command -> bool = function
   | Modify_workflow_properties _ | Complete_workflow _ | Fail_workflow _
   | Cancel_workflow_execution | Continue_as_new _ ->
       false
-
-(** Installs the per-activation facts Core sends with every activation:
-    its virtual timestamp, replay status, and history length. *)
-and stamp_activation execution ~at_ms ~replaying ~history_length =
-  Execution.set_activation_timestamp execution (Some (protocol_timestamp at_ms));
-  Execution.set_activation_is_replaying execution replaying;
-  Execution.set_activation_history execution
-    {
-      Workflow_context_store.history_length;
-      history_size_bytes = None;
-      continue_as_new_suggested = false;
-      continue_as_new_reasons = [];
-    }
 
 (** Delivers [jobs] to [run] in one activation stamped with the current
     virtual time and interprets the resulting commands in emission order.

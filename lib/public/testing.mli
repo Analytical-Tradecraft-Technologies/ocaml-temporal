@@ -229,13 +229,14 @@ val mock_async_activity :
       server does, so a test can assert the stuck run and fix whatever the
       workflow reads before retrying (#1160). {!result} and {!update} then
       return the failure while the run stays open,
-      {!workflow_task_failure} reports it, signals and cancellations are
+      {!val-workflow_task_failure} reports it, signals and cancellations are
       queued for the retried task, timers and activities keep running in
       virtual time, and a query is answered from the state before the
       failing task. {!retry_workflow_tasks} retries it by replaying the
       run's completed workflow tasks against a fresh execution, as a worker
       does after a failure, then delivering the failed task again. *)
 type workflow_task_failure = [ `Fail_run | `Retry ]
+
 (** One simulated namespace and task queue with its own virtual clock. *)
 type t
 
