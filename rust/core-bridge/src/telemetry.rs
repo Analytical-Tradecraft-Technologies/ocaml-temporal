@@ -47,8 +47,13 @@
 //! value that OCaml accepts is never rejected here, while a caller that
 //! bypasses OCaml still cannot register a label that collides with Core's own
 //! labels or exceeds the documented bounds.
+//!
+//! OTLP push export (#1161) lives in [`crate::otlp`]; this module parses the
+//! telemetry document for both exporters and owns the shared global-tag
+//! rules, the [`MetricsExporter`] guard, and the SDK [`MetricMeter`].
 
 use crate::abi::{Failure, STATUS_CONFIGURATION, STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
+use crate::otlp::{OtlpConfig, OtlpExporter};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -192,13 +197,18 @@ pub(crate) const RESERVED_METRICS_TAG_NAMES: &[&str] = &[
 /// `ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json`.
 ///
 /// Every member is optional so later exporters can be added without an ABI
-/// version change; an empty object configures no exporter.
+/// version change; an empty object configures no exporter. At most one
+/// exporter may be configured, because Core attaches exactly one meter to a
+/// runtime.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TelemetryConfig {
     /// Serve Core's metrics on a Prometheus scrape endpoint.
     #[serde(default)]
     prometheus: Option<PrometheusConfig>,
+    /// Push Core's metrics to an OTLP collector (#1161).
+    #[serde(default)]
+    otlp: Option<OtlpConfig>,
 }
 
 /// Prometheus scrape-endpoint options, a strict subset of Core's
@@ -232,6 +242,65 @@ struct GlobalTag {
     value: String,
 }
 
+/// Owns the running metrics exporter of one Core runtime, whichever kind
+/// the telemetry document selected.
+///
+/// Stored in `SharedCore` ahead of Core itself, so it is dropped (and the
+/// exporter stopped) before Core is torn down; see each variant for what
+/// dropping it does.
+#[derive(Debug)]
+pub(crate) enum MetricsExporter {
+    /// Prometheus scrape endpoint (#500).
+    Prometheus(PrometheusExporter),
+    /// OTLP push exporter (#1161).
+    Otlp(OtlpExporter),
+}
+
+impl MetricsExporter {
+    /// The address a Prometheus endpoint actually listens on, with any
+    /// ephemeral port resolved; `None` for a push exporter, which listens on
+    /// nothing.
+    pub(crate) fn bound_address(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Prometheus(exporter) => Some(exporter.bound_address),
+            Self::Otlp(_) => None,
+        }
+    }
+
+    /// Names of the configured global tags, in configuration order. Every
+    /// series already carries them, so an SDK instrument label with one of
+    /// these names would duplicate a label; [`MetricMeter::register`]
+    /// refuses it.
+    pub(crate) fn global_tag_names(&self) -> &[String] {
+        match self {
+            Self::Prometheus(exporter) => &exporter.global_tag_names,
+            Self::Otlp(exporter) => exporter.global_tag_names(),
+        }
+    }
+
+    /// Stops Core's scrape server while leaving the public accept loop
+    /// running, as an accept error on Core's private listener would. Returns
+    /// whether this is a Prometheus exporter. Test support only.
+    pub(crate) fn stop_core_server(&self) -> bool {
+        match self {
+            Self::Prometheus(exporter) => {
+                exporter.core_server.abort();
+                true
+            }
+            Self::Otlp(_) => false,
+        }
+    }
+
+    /// Whether Core's scrape server task has ended; `None` for a push
+    /// exporter. Test support only.
+    pub(crate) fn core_server_stopped(&self) -> Option<bool> {
+        match self {
+            Self::Prometheus(exporter) => Some(exporter.core_server.is_finished()),
+            Self::Otlp(_) => None,
+        }
+    }
+}
+
 /// Owns the running Prometheus scrape endpoint of one Core runtime: the
 /// bridge's accept loop on the public address and Core's scrape server on a
 /// private loopback port.
@@ -240,7 +309,7 @@ struct GlobalTag {
 /// its task is dropped, which happens no later than the owning Tokio
 /// runtime's shutdown.
 #[derive(Debug)]
-pub(crate) struct MetricsExporter {
+pub(crate) struct PrometheusExporter {
     bound_address: SocketAddr,
     /// The bridge's retrying accept loop on `bound_address`.
     accept_loop: AbortHandle,
@@ -248,38 +317,12 @@ pub(crate) struct MetricsExporter {
     /// [`AbortHandle::is_finished`] to tell a stopped server from a transient
     /// connect failure.
     core_server: Arc<AbortHandle>,
-    /// Names of the configured global tags. Every series already carries
-    /// them, so an SDK instrument label with one of these names would
-    /// duplicate a label; [`MetricMeter::register`] refuses it.
+    /// Names of the configured global tags; see
+    /// [`MetricsExporter::global_tag_names`].
     global_tag_names: Vec<String>,
 }
 
-impl MetricsExporter {
-    /// The address the endpoint actually listens on, with any ephemeral port
-    /// resolved.
-    pub(crate) fn bound_address(&self) -> SocketAddr {
-        self.bound_address
-    }
-
-    /// Stops Core's scrape server while leaving the public accept loop
-    /// running, as an accept error on Core's private listener would. Test
-    /// support only.
-    pub(crate) fn stop_core_server(&self) {
-        self.core_server.abort();
-    }
-
-    /// Whether Core's scrape server task has ended. Test support only.
-    pub(crate) fn core_server_stopped(&self) -> bool {
-        self.core_server.is_finished()
-    }
-
-    /// Names of the configured global tags, in configuration order.
-    pub(crate) fn global_tag_names(&self) -> &[String] {
-        &self.global_tag_names
-    }
-}
-
-impl Drop for MetricsExporter {
+impl Drop for PrometheusExporter {
     /// Stops accepting scrapes before Core is torn down.
     fn drop(&mut self) {
         self.accept_loop.abort();
@@ -733,8 +776,18 @@ fn parse_bind_address(text: &str) -> Option<SocketAddr> {
 pub(crate) fn parse_telemetry_config(bytes: &[u8]) -> Result<TelemetryConfig, Failure> {
     let config: TelemetryConfig = serde_json::from_slice(bytes)
         .map_err(|_error| invalid("invalid runtime telemetry configuration JSON".to_owned()))?;
-    if let Some(prometheus) = &config.prometheus {
-        validate_prometheus(prometheus)?;
+    match (&config.prometheus, &config.otlp) {
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "runtime telemetry configures at most one metrics exporter".to_owned(),
+            ));
+        }
+        (Some(prometheus), None) => validate_prometheus(prometheus)?,
+        (None, Some(otlp)) => {
+            crate::otlp::validate_otlp(otlp)?;
+            validate_global_tags(otlp.global_tag_pairs())?;
+        }
+        (None, None) => {}
     }
     Ok(config)
 }
@@ -748,30 +801,45 @@ fn validate_prometheus(config: &PrometheusConfig) -> Result<(), Failure> {
             "metrics bind_address must be an IP socket address such as 127.0.0.1:9464".to_owned(),
         ));
     }
-    if config.global_tags.len() > MAX_METRICS_GLOBAL_TAGS {
+    validate_global_tags(
+        config
+            .global_tags
+            .iter()
+            .map(|tag| (tag.name.as_str(), tag.value.as_str())),
+    )
+}
+
+/// Applies the global-tag rules shared by every exporter: at most
+/// [`MAX_METRICS_GLOBAL_TAGS`] tags, valid unique names that are not one of
+/// Core's labels, and bounded values without control characters. Messages
+/// name only the violated rule.
+fn validate_global_tags<'a>(
+    tags: impl ExactSizeIterator<Item = (&'a str, &'a str)>,
+) -> Result<(), Failure> {
+    if tags.len() > MAX_METRICS_GLOBAL_TAGS {
         return Err(invalid(format!(
             "metrics global_tags accepts at most {MAX_METRICS_GLOBAL_TAGS} tags"
         )));
     }
     let mut seen = HashSet::new();
-    for tag in &config.global_tags {
-        if tag.name.len() > MAX_METRICS_TAG_NAME_BYTES || !valid_tag_name(&tag.name) {
+    for (name, value) in tags {
+        if name.len() > MAX_METRICS_TAG_NAME_BYTES || !valid_tag_name(name) {
             return Err(invalid(format!(
                 "metrics global tag names must match [A-Za-z_][A-Za-z0-9_]*, be at most \
                  {MAX_METRICS_TAG_NAME_BYTES} bytes, not start with __, and not be a \
                  label Temporal Core uses"
             )));
         }
-        if tag.value.is_empty()
-            || tag.value.len() > MAX_METRICS_TAG_VALUE_BYTES
-            || tag.value.chars().any(char::is_control)
+        if value.is_empty()
+            || value.len() > MAX_METRICS_TAG_VALUE_BYTES
+            || value.chars().any(char::is_control)
         {
             return Err(invalid(format!(
                 "metrics global tag values must be 1 to {MAX_METRICS_TAG_VALUE_BYTES} bytes \
                  without control characters"
             )));
         }
-        if !seen.insert(tag.name.as_str()) {
+        if !seen.insert(name) {
             return Err(invalid(
                 "metrics global tag names must be unique".to_owned(),
             ));
@@ -783,18 +851,32 @@ fn validate_prometheus(config: &PrometheusConfig) -> Result<(), Failure> {
 /// Starts the configured exporter, if any, and attaches its meter to `core`.
 ///
 /// Must run before any client or worker is created on `core`, because Core
-/// hands each of them the meter that is attached at that moment. The public
-/// listener binds synchronously (so a busy port fails here, before the
-/// runtime is published); Core's scrape server and the bridge's accept loop
-/// then run on `core`'s Tokio pool. Any failure drops whatever was already
-/// bound or spawned here, so nothing keeps running.
+/// hands each of them the meter that is attached at that moment. Any failure
+/// drops whatever was already bound or spawned, so nothing keeps running.
+/// See [`start_prometheus`] and [`crate::otlp::start_otlp`].
 pub(crate) fn start_metrics(
     core: &mut CoreRuntime,
     config: &TelemetryConfig,
 ) -> Result<Option<MetricsExporter>, Failure> {
-    let Some(prometheus) = &config.prometheus else {
-        return Ok(None);
-    };
+    if let Some(prometheus) = &config.prometheus {
+        return start_prometheus(core, prometheus)
+            .map(|exporter| Some(MetricsExporter::Prometheus(exporter)));
+    }
+    if let Some(otlp) = &config.otlp {
+        return crate::otlp::start_otlp(core, otlp)
+            .map(|exporter| Some(MetricsExporter::Otlp(exporter)));
+    }
+    Ok(None)
+}
+
+/// Starts a Prometheus scrape endpoint. The public listener binds
+/// synchronously (so a busy port fails here, before the runtime is
+/// published); Core's scrape server and the bridge's accept loop then run on
+/// `core`'s Tokio pool.
+fn start_prometheus(
+    core: &mut CoreRuntime,
+    prometheus: &PrometheusConfig,
+) -> Result<PrometheusExporter, Failure> {
     let socket_addr = parse_bind_address(&prometheus.bind_address)
         .ok_or_else(|| invalid("metrics bind_address must be an IP socket address".to_owned()))?;
     // Only the I/O error kind is reported: it is stable and cannot carry
@@ -869,7 +951,7 @@ pub(crate) fn start_metrics(
     drop(context);
     core.telemetry_mut()
         .attach_late_init_metrics(started.meter.clone());
-    Ok(Some(MetricsExporter {
+    Ok(PrometheusExporter {
         bound_address,
         accept_loop,
         core_server,
@@ -878,7 +960,7 @@ pub(crate) fn start_metrics(
             .iter()
             .map(|tag| tag.name.clone())
             .collect(),
-    }))
+    })
 }
 
 /// Most *live* series one [`MetricMeter`] holds: series with at least one
@@ -991,10 +1073,13 @@ struct InstrumentRegistry {
 /// runtime's global tags.
 ///
 /// Ownership: the meter holds a clone of Core's meter (the Prometheus
-/// registry), not of Core itself, so it never keeps Core's Tokio runtime
-/// alive and may be dropped on any thread, including from a GC finalizer.
-/// Recording after Core was destroyed updates a registry that nobody scrapes
-/// any longer, which is harmless. Registration takes the write lock and
+/// registry, or the OTLP exporter's [`crate::otlp::DetachableMeter`], which
+/// does not own the exporter), not of Core itself, so it never keeps Core's
+/// Tokio runtime or an OTLP exporter alive and may be dropped on any thread,
+/// including from a GC finalizer. Recording after Core was destroyed updates
+/// a registry or pipeline that nobody scrapes or exports any longer, which is
+/// harmless; series registered after an OTLP runtime's release are no-ops.
+/// Registration takes the write lock and
 /// recording only the read lock, so concurrent recorders on several threads
 /// never wait for each other.
 pub struct MetricMeter {

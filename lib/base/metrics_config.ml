@@ -1,7 +1,11 @@
-(** The Rust bridge's [telemetry.rs] defines the same bounds; the two must
-    change together (see docs/reference/core-bridge.md). *)
+(** The Rust bridge's [telemetry.rs] and [otlp.rs] define the same bounds;
+    the two must change together (see docs/reference/core-bridge.md). *)
 
-type t = {
+type otlp_protocol = [ `Grpc | `Http_protobuf ]
+type temporality = [ `Cumulative | `Delta ]
+
+(** Options of a Prometheus scrape endpoint (#500). *)
+type prometheus = {
   bind_address : string;
   global_tags : (string * string) list;
   counters_total_suffix : bool;
@@ -9,10 +13,49 @@ type t = {
   durations_as_seconds : bool;
 }
 
+(** Options of an OTLP push exporter (#1161). [headers] hold credentials:
+    they are written only into the bridge document and never into a
+    message. *)
+type otlp = {
+  endpoint : string;
+  protocol : otlp_protocol;
+  headers : (string * string) list;
+  period_ms : int64;
+  temporality : temporality;
+  otlp_global_tags : (string * string) list;
+  otlp_durations_as_seconds : bool;
+}
+
+(** Exactly one exporter, as the bridge requires. *)
+type t = Prometheus of prometheus | Otlp of otlp
+
 let max_global_tags = 16
 let max_tag_name_bytes = 64
 let max_tag_value_bytes = 256
 let max_bind_address_bytes = 128
+let max_endpoint_bytes = 2048
+let max_headers = 16
+let max_header_name_bytes = 64
+let max_header_value_bytes = 4096
+let min_period_ms = 100L
+let max_period_ms = 3_600_000L
+let default_period_ms = 1_000L
+
+let reserved_header_names =
+  [
+    "connection";
+    "content-encoding";
+    "content-length";
+    "content-type";
+    "host";
+    "keep-alive";
+    "proxy-connection";
+    "te";
+    "trailer";
+    "transfer-encoding";
+    "upgrade";
+    "user-agent";
+  ]
 
 let reserved_tag_names =
   [
@@ -207,30 +250,236 @@ let prometheus ?(global_tags = []) ?(counters_total_suffix = false)
   let* () = validate_bind_address bind_address in
   let* () = validate_global_tags global_tags in
   Ok
-    {
-      bind_address;
-      global_tags;
-      counters_total_suffix;
-      unit_suffix;
-      durations_as_seconds;
-    }
+    (Prometheus
+       {
+         bind_address;
+         global_tags;
+         counters_total_suffix;
+         unit_suffix;
+         durations_as_seconds;
+       })
 
-let bind_address config = config.bind_address
+(** The one message for every rejected endpoint. It never echoes the
+    endpoint, whose query string might carry a credential. Identical to
+    [ENDPOINT_RULE] in the Rust bridge's [otlp.rs]. *)
+let endpoint_rule =
+  "metrics OTLP endpoint must be an http:// or https:// URL of at most 2048 \
+   bytes with a host name, IPv4 or bracketed IPv6 host, an optional port 1 \
+   to 65535, no user information, no fragment, and no spaces or control \
+   characters"
 
-let to_json config =
-  let tag (name, value) =
-    `Assoc [ ("name", `String name); ("value", `String value) ]
+(** Whether [label] is one DNS label: 1 to 63 ASCII letters, digits or
+    hyphens, not starting or ending with a hyphen. *)
+let valid_dns_label label =
+  let length = String.length label in
+  length >= 1 && length <= 63
+  && String.for_all
+       (function 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '-' -> true | _ -> false)
+       label
+  && label.[0] <> '-'
+  && label.[length - 1] <> '-'
+
+(** Whether [host] is a bracketed IPv6 address without a zone, a dotted-quad
+    IPv4 address, or a DNS name of at most 253 bytes. URL parsers read a name
+    whose last label is all digits as IPv4 ([127.1] means [127.0.0.1]), so
+    such a host must be a canonical dotted quad. *)
+let valid_host host =
+  let length = String.length host in
+  if length >= 2 && host.[0] = '[' && host.[length - 1] = ']' then
+    valid_ipv6 (String.sub host 1 (length - 2))
+  else
+    let labels = String.split_on_char '.' host in
+    let last = List.nth labels (List.length labels - 1) in
+    if all_digits last then valid_ipv4 host
+    else length <= 253 && List.for_all valid_dns_label labels
+
+(** Validates the collector URL with the grammar documented in the
+    interface; the Rust bridge applies the same grammar before handing the
+    URL to Core. *)
+let validate_endpoint endpoint =
+  let invalid = Error endpoint_rule in
+  let length = String.length endpoint in
+  let printable = String.for_all (fun character -> character >= '!' && character <= '~') in
+  if length = 0 || length > max_endpoint_bytes || (not (printable endpoint))
+     || String.contains endpoint '#'
+  then invalid
+  else
+    let rest =
+      if String.starts_with ~prefix:"http://" endpoint then
+        Some (String.sub endpoint 7 (length - 7))
+      else if String.starts_with ~prefix:"https://" endpoint then
+        Some (String.sub endpoint 8 (length - 8))
+      else None
+    in
+    match rest with
+    | None -> invalid
+    | Some rest ->
+        let authority_end =
+          let rec find index =
+            if index >= String.length rest then index
+            else match rest.[index] with '/' | '?' -> index | _ -> find (index + 1)
+          in
+          find 0
+        in
+        let authority = String.sub rest 0 authority_end in
+        if String.contains authority '@' then invalid
+        else
+          (* A bracketed IPv6 host contains colons, so the port separator is
+             the last colon that has no closing bracket after it. *)
+          let host_end =
+            match String.rindex_opt authority ':' with
+            | Some colon
+              when not
+                     (String.contains
+                        (String.sub authority colon (String.length authority - colon))
+                        ']') ->
+                colon
+            | _ -> String.length authority
+          in
+          let host = String.sub authority 0 host_end in
+          let port_ok =
+            host_end = String.length authority
+            ||
+            let port =
+              String.sub authority (host_end + 1)
+                (String.length authority - host_end - 1)
+            in
+            canonical_decimal ~max_digits:5 port
+            &&
+            let value = int_of_string port in
+            value >= 1 && value <= 65_535
+          in
+          if port_ok && valid_host host then Ok () else invalid
+
+(** Whether [name] is an accepted header name; see the interface. *)
+let valid_header_name name =
+  let length = String.length name in
+  length >= 1
+  && length <= max_header_name_bytes
+  && (match name.[0] with 'a' .. 'z' | '0' .. '9' -> true | _ -> false)
+  && String.for_all
+       (function 'a' .. 'z' | '0' .. '9' | '-' | '_' | '.' -> true | _ -> false)
+       name
+  && (not (String.ends_with ~suffix:"-bin" name))
+  && (not (String.starts_with ~prefix:"grpc-" name))
+  && not (List.mem name reserved_header_names)
+
+(** Whether [value] is an accepted header value: printable ASCII (space
+    through [~]) without a leading or trailing space. *)
+let valid_header_value value =
+  let length = String.length value in
+  length >= 1
+  && length <= max_header_value_bytes
+  && String.for_all (fun character -> character >= ' ' && character <= '~') value
+  && value.[0] <> ' '
+  && value.[length - 1] <> ' '
+
+(** Applies the header count, name, value, and uniqueness rules. Messages
+    name only the violated rule: a header value is a credential. *)
+let validate_headers headers =
+  if List.length headers > max_headers then
+    Error (Printf.sprintf "metrics OTLP headers accepts at most %d headers" max_headers)
+  else
+    let rec check seen = function
+      | [] -> Ok ()
+      | (name, value) :: rest ->
+          if not (valid_header_name name) then
+            Error
+              (Printf.sprintf
+                 "metrics OTLP header names must be 1 to %d bytes of \
+                  [a-z0-9_.-] starting with a letter or digit, must not end \
+                  in -bin or start with grpc-, and must not be a header the \
+                  transport sets"
+                 max_header_name_bytes)
+          else if not (valid_header_value value) then
+            Error
+              (Printf.sprintf
+                 "metrics OTLP header values must be 1 to %d bytes of \
+                  printable ASCII without leading or trailing spaces"
+                 max_header_value_bytes)
+          else if List.mem name seen then
+            Error "metrics OTLP header names must be unique"
+          else check (name :: seen) rest
+    in
+    check [] headers
+
+let otlp ?(headers = []) ?(period_ms = default_period_ms) ?(protocol = `Grpc)
+    ?(temporality = `Cumulative) ?(global_tags = [])
+    ?(durations_as_seconds = false) ~endpoint () =
+  let* () = validate_endpoint endpoint in
+  let* () =
+    if Int64.compare period_ms min_period_ms < 0
+       || Int64.compare period_ms max_period_ms > 0
+    then
+      Error
+        (Printf.sprintf "metrics OTLP period must be %Ld ms to %Ld ms"
+           min_period_ms max_period_ms)
+    else Ok ()
   in
-  Yojson.Safe.to_string
-    (`Assoc
-      [
-        ( "prometheus",
-          `Assoc
-            [
-              ("bind_address", `String config.bind_address);
-              ("global_tags", `List (List.map tag config.global_tags));
-              ("counters_total_suffix", `Bool config.counters_total_suffix);
-              ("unit_suffix", `Bool config.unit_suffix);
-              ("durations_as_seconds", `Bool config.durations_as_seconds);
-            ] );
-      ])
+  let* () = validate_headers headers in
+  let* () = validate_global_tags global_tags in
+  Ok
+    (Otlp
+       {
+         endpoint;
+         protocol;
+         headers;
+         period_ms;
+         temporality;
+         otlp_global_tags = global_tags;
+         otlp_durations_as_seconds = durations_as_seconds;
+       })
+
+let bind_address = function
+  | Prometheus { bind_address; _ } -> Some bind_address
+  | Otlp _ -> None
+
+let endpoint = function
+  | Prometheus _ -> None
+  | Otlp { endpoint; _ } -> Some endpoint
+
+(** One [{"name": ..., "value": ...}] member of a tag or header list. *)
+let name_value (name, value) =
+  `Assoc [ ("name", `String name); ("value", `String value) ]
+
+let to_json = function
+  | Prometheus config ->
+      Yojson.Safe.to_string
+        (`Assoc
+          [
+            ( "prometheus",
+              `Assoc
+                [
+                  ("bind_address", `String config.bind_address);
+                  ("global_tags", `List (List.map name_value config.global_tags));
+                  ("counters_total_suffix", `Bool config.counters_total_suffix);
+                  ("unit_suffix", `Bool config.unit_suffix);
+                  ("durations_as_seconds", `Bool config.durations_as_seconds);
+                ] );
+          ])
+  | Otlp config ->
+      Yojson.Safe.to_string
+        (`Assoc
+          [
+            ( "otlp",
+              `Assoc
+                [
+                  ("endpoint", `String config.endpoint);
+                  ( "protocol",
+                    `String
+                      (match config.protocol with
+                      | `Grpc -> "grpc"
+                      | `Http_protobuf -> "http_protobuf") );
+                  ("headers", `List (List.map name_value config.headers));
+                  (* Bounded to one hour above, so the conversion is exact. *)
+                  ("period_ms", `Int (Int64.to_int config.period_ms));
+                  ( "temporality",
+                    `String
+                      (match config.temporality with
+                      | `Cumulative -> "cumulative"
+                      | `Delta -> "delta") );
+                  ( "global_tags",
+                    `List (List.map name_value config.otlp_global_tags) );
+                  ("durations_as_seconds", `Bool config.otlp_durations_as_seconds);
+                ] );
+          ])

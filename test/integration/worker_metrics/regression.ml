@@ -17,6 +17,10 @@
     clean shutdown for the worker's task queue. After [Runtime.shutdown] the
     endpoint must be closed.
 
+    The same scenario then runs on an OTLP runtime (#1161) that pushes to an
+    in-process OTLP/HTTP collector stub ({!Otlp_collector}); see
+    {!check_otlp}.
+
     Run against a disposable Temporal Server only:
     [dune exec test/integration/worker_metrics/regression.exe -- check
     http://127.0.0.1:7233]. [TEMPORAL_NAMESPACE] defaults to
@@ -384,9 +388,114 @@ let check address =
     (List.length families) (List.length lines) (List.length for_run)
     (String.concat " " families)
 
+(** Header value the OTLP exporter must deliver to the collector. *)
+let otlp_credential = "Bearer worker-metrics-regression-token"
+
+(** The OTLP half (#1161): the same scenario on a runtime that pushes to the
+    in-process {!Otlp_collector} over OTLP/HTTP. After [Runtime.shutdown],
+    which makes the final export, the union of exported metric names must
+    contain every family the Prometheus path requires, every request must
+    carry the configured credential header, the global tag must be a
+    resource attribute, and no execution identifier may appear in any
+    export. *)
+let check_otlp address =
+  ignore (Unix.alarm 120);
+  let collector = Otlp_collector.start () in
+  let suffix =
+    Printf.sprintf "%d-%d" (Unix.getpid ())
+      (Random.State.bits (Random.State.make_self_init ()))
+  in
+  let queue = "worker-metrics-otlp-" ^ suffix in
+  let workflow_id = "worker-metrics-otlp-wf-" ^ suffix in
+  let metrics =
+    get
+      (Runtime.Metrics.otlp
+         ~endpoint:(Otlp_collector.endpoint collector)
+         ~protocol:`Http_protobuf
+         ~headers:[ ("authorization", otlp_credential) ]
+         ~period:(Duration.of_ms 200L)
+         ~global_tags:[ ("deployment", "worker-metrics-otlp-regression") ]
+         ())
+  in
+  let runtime = get (Runtime.create ~metrics ()) in
+  if Runtime.metrics_address runtime <> None then
+    failwith "an OTLP runtime reported a listening address";
+  let worker =
+    get
+      (Worker.create ~runtime ~target_url:address ~namespace ~task_queue:queue
+         ~identity:"worker-metrics-otlp" ~workflows:[ Worker.workflow workflow ]
+         ~activities:[ Worker.activity greet ] ())
+  in
+  let running = Domain.spawn (fun () -> Worker.run worker) in
+  let client = get (Client.create ~runtime ~target_url:address ~namespace ()) in
+  let outcome =
+    try
+      let handle =
+        get
+          (Client.start client ~workflow ~task_queue:queue ~id:workflow_id
+             ~input:"metrics" ())
+      in
+      (match get (Client.wait handle) with
+      | Client.Completed { output = "hello metrics"; _ } -> ()
+      | _ -> failwith "workflow did not complete with the expected output");
+      Ok (Option.get (Client.run_id handle))
+    with exception_ -> Error exception_
+  in
+  ignore (Client.shutdown client);
+  ignore (get (Worker.shutdown worker));
+  ignore (Domain.join running);
+  get (Runtime.shutdown runtime);
+  Otlp_collector.stop collector;
+  let run_id =
+    match outcome with Ok run_id -> run_id | Error exception_ -> raise exception_
+  in
+  let exports = Otlp_collector.exports collector in
+  if exports = [] then failwith "the OTLP collector received no export";
+  List.iter
+    (fun (export : Otlp_collector.export) ->
+      if export.path <> "/v1/metrics" then
+        failwith ("unexpected OTLP request path " ^ export.path);
+      if List.assoc_opt "authorization" export.headers <> Some otlp_credential
+      then failwith "an OTLP export lacked the configured header";
+      List.iter
+        (fun identifier ->
+          if contains ~haystack:export.body ~needle:identifier then
+            failwith "an execution identifier appeared in an OTLP export")
+        [ workflow_id; run_id ])
+    exports;
+  let names =
+    List.sort_uniq compare
+      (List.concat_map
+         (fun (export : Otlp_collector.export) ->
+           Otlp_collector.metric_names export.body)
+         exports)
+  in
+  let missing = List.filter (fun name -> not (List.mem name names)) required_metrics in
+  if missing <> [] then
+    failwith ("missing OTLP metrics: " ^ String.concat ", " missing);
+  if
+    not
+      (List.exists
+         (fun (export : Otlp_collector.export) ->
+           contains ~haystack:export.body ~needle:"worker-metrics-otlp-regression")
+         exports)
+  then failwith "global tag missing from the OTLP exports";
+  if
+    not
+      (List.exists
+         (fun (export : Otlp_collector.export) ->
+           contains ~haystack:export.body ~needle:queue)
+         exports)
+  then failwith "task_queue attribute missing from the OTLP exports";
+  Printf.printf
+    "worker metrics live regression (OTLP): %d exports, %d metrics\nmetrics: %s\n%!"
+    (List.length exports) (List.length names) (String.concat " " names)
+
 let () =
   match Sys.argv with
-  | [| _; "check"; address |] -> check address
+  | [| _; "check"; address |] ->
+      check address;
+      check_otlp address
   | _ ->
       prerr_endline "usage: regression.exe check TEMPORAL_ADDRESS";
       exit 2

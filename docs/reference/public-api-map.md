@@ -246,8 +246,13 @@ for those rules.
   switches); the endpoint is bound before `create` returns, a busy address
   is a typed `Bridge` error, and `Runtime.metrics_address` reports the bound
   address. Every client and worker attached to the runtime reports there.
-  Metric names and labels match the official SDKs; see
-  [observability](observability.md#worker-metrics).
+  `Runtime.Metrics.otlp ~endpoint ?headers ?period ?protocol ?temporality
+  ()` instead pushes the same metrics to an OTLP collector over gRPC or
+  HTTP/protobuf (#1161), with credential headers that are never logged and
+  one final export at `Runtime.shutdown`; `Runtime.metrics_address` is then
+  `None`. Metric names and labels match the official SDKs; see
+  [observability](observability.md#worker-metrics) and
+  [OTLP export](observability.md#otlp-export).
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.
