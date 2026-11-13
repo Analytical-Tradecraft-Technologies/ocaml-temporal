@@ -399,7 +399,6 @@ type update_response =
   | Update_rejected of failure
   | Update_completed of payload
 
-(** Supported workflow commands in scheduler emission order. *)
 (** How the first workflow task of a continue-as-new successor is routed on a
     deployment-versioned worker (#1153), mirroring Temporal's experimental
     [ContinueAsNewVersioningBehavior]. [Successor_auto_upgrade] starts the
@@ -446,6 +445,7 @@ module Continue_as_new_options : sig
   val none : t
 end
 
+(** Supported workflow commands in scheduler emission order. *)
 type completion_command =
   | Schedule_activity of {
       seq : int64;

@@ -868,9 +868,13 @@ let terminate context command =
     the merged memo, and without one the memo is left empty so Core reuses
     the start memo; those payloads are shared with [current_memo], which
     nothing mutates once the run has ended. [options] are already validated
-    and owned by the caller. *)
+    and owned by the caller. Inside a read-only callback (an update validator
+    or query handler) the call raises [Invalid_argument] before anything is
+    buffered: the successor command, and the memo and search attributes it
+    carries, would reach history on the live path only. *)
 let continue_as_new ?memo ?(options = Activation.Continue_as_new_options.none)
     context ~workflow_type ~input =
+  reject_in_read_only_callback context ~what:"run (continue-as-new)";
   let memo =
     match memo with
     | Some (_ :: _ as memo) ->

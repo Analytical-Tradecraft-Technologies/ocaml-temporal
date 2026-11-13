@@ -2758,15 +2758,15 @@ let continue_as_new_versioning_behavior path = function
   | _ -> Error (invalid path "unknown continue-as-new versioning behavior")
 
 (** Decodes the optional successor settings of a continue-as-new command from
-    its already closed-checked [entries]. An absent member is [None]; unlike
-    a child start, [null] is not accepted because the encoder never writes it
-    and a present member must carry a value. The timeouts obey the
+    its already closed-checked [entries]. An absent member is [None], and so
+    is an explicit [null], as for a child start and as the Rust decoder reads
+    it; the encoder never writes [null]. The timeouts obey the
     [Client.start] rules that apply without an execution timeout: Rust and the
     OCaml encoder enforce the same ones. *)
 let continue_as_new_options path entries =
   let optional name decode =
     match List.assoc_opt name entries with
-    | None -> Ok None
+    | None | Some `Null -> Ok None
     | Some json ->
         let* value = decode (path ^ "." ^ name) json in
         Ok (Some value)

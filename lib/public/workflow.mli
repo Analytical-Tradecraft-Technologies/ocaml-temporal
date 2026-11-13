@@ -404,8 +404,8 @@ val upsert_typed_search_attributes : Search_attribute.update list -> unit
     and emits no command.
 
     The merged memo is carried into a successor started by
-    {!continue_as_new}, which otherwise inherits only the memo the run
-    started with. Temporal cannot express an empty successor memo, so when
+    {!continue_as_new} unless its [~memo] replaces it; without an upsert the
+    successor inherits the memo the run started with. Temporal cannot express an empty successor memo, so when
     upserts have removed every key the successor inherits the start memo.
     {!val-start_metadata} keeps reporting the memo the run started with.
 
@@ -421,12 +421,66 @@ val upsert_memo : (string * Payload.t) list -> unit
     the successor command is emitted. A codec failure fails only the current
     workflow task, like any propagated [Codec] error: no continue-as-new
     command is emitted and the run stays open so a corrected worker can replay
-    it. Calling it outside workflow execution is programmer misuse and raises
-    [Invalid_argument].
+    it. Calling it outside workflow execution, or inside an update validator
+    or query handler, is programmer misuse and raises [Invalid_argument].
+
+    The optional arguments (#1153) change the successor; each one omitted
+    keeps what Temporal would otherwise do, and omitting all of them emits
+    exactly the command earlier releases emitted, so existing histories
+    replay unchanged.
+
+    - [task_queue] routes the successor's workflow tasks to another queue,
+      which must be served by a worker that registers [definition].
+      Omitted, the successor stays on the current run's queue.
+    - [run_timeout] bounds the successor run and [task_timeout] each of its
+      workflow tasks (Temporal's default is 10 seconds). Omitted, each is
+      inherited from the current run. The execution timeout set by
+      {!Client.start} bounds the whole chain and cannot be changed here.
+    - [retry_policy] replaces the workflow retry policy for the successor
+      and later runs. Omitted, Temporal keeps the policy the chain started
+      with; there is no way to remove it.
+    - [memo] replaces the successor's memo. Omitted, the successor receives
+      the current memo, including {!upsert_memo} changes. Temporal cannot
+      express an empty successor memo, so [~memo:[]] behaves as omitted.
+    - [search_attributes] replaces the successor's search attributes;
+      [~search_attributes:[]] starts it with none. Omitted, the successor
+      receives the current values, including upserts. Values must be
+      encoded as for {!Client.start}, for example with
+      {!Search_attribute.encode}.
+    - [initial_versioning_behavior] (experimental in Temporal) chooses the
+      deployment version for the successor's first workflow task on a
+      versioned worker: [`Auto_upgrade] the task queue's current version,
+      [`Use_ramping_version] its ramping version. Afterwards the successor
+      follows its own versioning behavior, and a pinned versioning override
+      on the execution always wins. Omitted, the successor inherits the
+      current run's version.
+
+    The successor reads these through {!Info.task_queue},
+    {!Info.run_timeout}, {!Info.task_timeout}, {!Info.retry_policy} and
+    {!val-start_metadata}. Timeouts follow the rules of {!Client.start}:
+    each must be positive, [task_timeout] at most 120 seconds and no larger
+    than the successor's run timeout (supplied or inherited, else the
+    chain's execution timeout), and [run_timeout] no larger than the chain's
+    execution timeout, because Temporal would silently lower a larger value.
+    An invalid setting (a bad timeout, an empty or malformed [task_queue],
+    or an empty, malformed or repeated memo or search-attribute key) fails
+    the current workflow task with a typed [Defect] before any command is
+    emitted, exactly like an input encoding failure. Payload bytes are
+    copied.
 
     The fiber ends through a private exception that cleanup code
     ([Fun.protect ~finally]) observes but must let through. Do not wrap the
     call in a catch-all ([try ... with _ ->]): the run still continues as
     new, but whatever the handler returns is ignored with a
     [workflow_result_after_abort_ignored] warning (#1225). *)
-val continue_as_new : ('input, 'output) t -> 'input -> 'value
+val continue_as_new :
+  ?task_queue:string ->
+  ?run_timeout:Duration.t ->
+  ?task_timeout:Duration.t ->
+  ?retry_policy:Retry_policy.t ->
+  ?memo:(string * Payload.t) list ->
+  ?search_attributes:(string * Payload.t) list ->
+  ?initial_versioning_behavior:[ `Auto_upgrade | `Use_ramping_version ] ->
+  ('input, 'output) t ->
+  'input ->
+  'value

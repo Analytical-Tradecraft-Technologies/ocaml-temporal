@@ -1003,6 +1003,35 @@ ordered payload list. The bridge maps it to Temporal Core's
 `ContinueAsNewWorkflowExecution` command, fills only explicit Core defaults,
 and rejects unsupported non-default options instead of silently dropping them.
 
+By default the successor keeps the current task queue, run and task
+timeouts, retry policy, search attributes (including upserts) and memo
+(including `upsert_memo` changes). Optional arguments change them for the
+successor and, because a successor inherits from its predecessor, for later
+runs too (#1153):
+
+```ocaml
+Temporal.Workflow.continue_as_new
+  ~task_queue:"batch-v2"
+  ~run_timeout:(Temporal.Duration.of_minutes 30L)
+  ~task_timeout:(Temporal.Duration.of_seconds 20L)
+  ~retry_policy
+  ~memo:[ ("phase", phase_payload) ]
+  ~search_attributes:(Result.get_ok (Temporal.Search_attribute.encode [ set phase_key "two" ]))
+  process_batch_workflow next_batch
+```
+
+`~search_attributes` replaces the successor's search attributes, so
+`~search_attributes:[]` clears them; `~memo` replaces its memo, but Temporal
+cannot express an empty one, so `~memo:[]` behaves as omitted. The execution
+timeout set by `Client.start` bounds the whole chain and cannot be changed.
+`~initial_versioning_behavior` (Temporal marks it experimental) picks the
+deployment version of the successor's first workflow task on a versioned
+worker. An invalid option, such as a task timeout above 120 seconds or above
+the run timeout, or a malformed key, fails the workflow task with a typed
+`Defect` exactly like an input encoding failure, and continue-as-new is
+rejected with `Invalid_argument` inside an update validator or query
+handler.
+
 Long-running workflows should not count events by hand. `Temporal.Workflow.info ()`
 returns a snapshot whose `Info.continue_as_new_suggested`,
 `Info.history_length`, and `Info.history_size_bytes` report what Temporal sent

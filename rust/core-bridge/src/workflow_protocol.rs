@@ -758,6 +758,19 @@ pub struct RetryPolicy {
     pub non_retryable_error_types: Vec<String>,
 }
 
+/// Deployment version for the first workflow task of a continue-as-new
+/// successor (#1153), Temporal's experimental `ContinueAsNewVersioningBehavior`.
+/// After that task the successor follows its own versioning behavior; a
+/// pinned versioning override on the execution takes precedence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinueAsNewVersioningBehavior {
+    /// Start on the task queue's current (target) deployment version.
+    AutoUpgrade,
+    /// Start on the task queue's ramping deployment version.
+    UseRampingVersion,
+}
+
 /// Supported deterministic command emitted by OCaml for Core.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -881,8 +894,12 @@ pub enum CompletionCommand {
         failure: Failure,
     },
     /// Replaces the current run with a fresh run of the same workflow type.
-    /// The language layer supplies the workflow type, input, and memo; all
-    /// other Core options remain explicit defaults until exposed safely.
+    /// The language layer supplies the workflow type, input, and memo, and
+    /// optionally the successor settings of #1153. Each unset option is
+    /// omitted from the document, so a command without options is unchanged
+    /// from earlier releases, and stays unset in Core, which (with the
+    /// server) then inherits the current run's value. Headers and the start
+    /// backoff remain Core defaults.
     ContinueAsNew {
         workflow_type: String,
         input: Vec<Payload>,
@@ -892,6 +909,26 @@ pub enum CompletionCommand {
         /// survives continue-as-new.
         #[serde(default)]
         memo: BTreeMap<String, Payload>,
+        /// Task queue for the successor; absent keeps the current queue.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_queue: Option<String>,
+        /// Successor run timeout; absent inherits the current run's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_timeout: Option<Duration>,
+        /// Successor workflow-task timeout; absent inherits the current one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_timeout: Option<Duration>,
+        /// Successor retry policy; absent makes Core reuse the chain's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_policy: Option<RetryPolicy>,
+        /// Successor search attributes, replacing the current ones (an empty
+        /// map clears them); absent makes Core carry the current values.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search_attributes: Option<BTreeMap<String, Payload>>,
+        /// Deployment version for the successor's first workflow task;
+        /// absent inherits the current run's versioning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_versioning_behavior: Option<ContinueAsNewVersioningBehavior>,
     },
     CancelWorkflow,
     /// Returns one query result to Core without scheduling workflow work.
@@ -1946,10 +1983,28 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
             CompletionCommand::ContinueAsNew {
                 workflow_type,
                 memo,
+                task_queue,
+                run_timeout,
+                task_timeout,
+                retry_policy,
+                search_attributes,
                 ..
             } => {
                 identifier(workflow_type, "$.commands.workflow_type")?;
                 validate_payload_map(memo, "$.commands.memo")?;
+                if let Some(task_queue) = task_queue {
+                    identifier(task_queue, "$.commands.task_queue")?;
+                }
+                if let Some(retry_policy) = retry_policy {
+                    validate_retry_policy(retry_policy, "$.commands.retry_policy")?;
+                }
+                // A successor has no execution timeout of its own: the
+                // chain's bound is enforced by the OCaml public API, which
+                // can read it from the current run's start event.
+                validate_child_timeouts(None, *run_timeout, *task_timeout)?;
+                if let Some(search_attributes) = search_attributes {
+                    validate_payload_map(search_attributes, "$.commands.search_attributes")?;
+                }
             }
             CompletionCommand::StartTimer {
                 start_to_fire_timeout,
@@ -3569,7 +3624,8 @@ pub fn activation_from_core(
     Ok(activation)
 }
 
-/// Applies the root-start workflow-timeout rules to a child start, mirroring
+/// Applies the root-start workflow-timeout rules to a child start (and, with
+/// no execution timeout, to a continue-as-new successor), mirroring
 /// the OCaml encoder so a hand-built document cannot bypass them: each
 /// supplied timeout is positive (Temporal reads zero as unset), the task
 /// timeout is at most 120 seconds, the run timeout is no larger than the
@@ -3851,6 +3907,32 @@ fn id_reuse_to_core(value: Option<ChildWorkflowIdReusePolicy>) -> i32 {
     })
 }
 
+/// Maps the successor versioning behavior to Core's enum; `None` is Core's
+/// unspecified value, which inherits the current run's versioning.
+fn continue_as_new_versioning_to_core(value: Option<ContinueAsNewVersioningBehavior>) -> i32 {
+    use temporalio_protos::temporal::api::enums::v1::ContinueAsNewVersioningBehavior as Core;
+    i32::from(match value {
+        None => Core::Unspecified,
+        Some(ContinueAsNewVersioningBehavior::AutoUpgrade) => Core::AutoUpgrade,
+        Some(ContinueAsNewVersioningBehavior::UseRampingVersion) => Core::UseRampingVersion,
+    })
+}
+
+/// Maps Core's successor versioning behavior back, preserving unspecified
+/// as `None` and rejecting values this protocol does not know.
+fn continue_as_new_versioning_from_core(
+    value: i32,
+) -> Result<Option<ContinueAsNewVersioningBehavior>, CoreConversionError> {
+    use temporalio_protos::temporal::api::enums::v1::ContinueAsNewVersioningBehavior as Core;
+    match Core::try_from(value)
+        .map_err(|_| invalid_core("unknown Core continue-as-new versioning behavior"))?
+    {
+        Core::Unspecified => Ok(None),
+        Core::AutoUpgrade => Ok(Some(ContinueAsNewVersioningBehavior::AutoUpgrade)),
+        Core::UseRampingVersion => Ok(Some(ContinueAsNewVersioningBehavior::UseRampingVersion)),
+    }
+}
+
 /// Rejects Core reuse policies this protocol does not offer, including the
 /// deprecated terminate-if-running value, and preserves an unspecified one.
 fn id_reuse_from_core(
@@ -4081,14 +4163,41 @@ fn command_to_core(
             workflow_type,
             input,
             memo,
+            task_queue,
+            run_timeout,
+            task_timeout,
+            retry_policy,
+            search_attributes,
+            initial_versioning_behavior,
         } => {
             Variant::ContinueAsNewWorkflowExecution(core_commands::ContinueAsNewWorkflowExecution {
                 workflow_type: workflow_type.clone(),
+                // An empty queue is Core's "unset": the current queue.
+                task_queue: task_queue.clone().unwrap_or_default(),
                 arguments: payload_vec_to_core(input)?,
+                workflow_run_timeout: run_timeout.map(duration_to_core),
+                workflow_task_timeout: task_timeout.map(duration_to_core),
                 // An empty map is Core's "unset": it reuses the start memo.
                 memo: payload_map_to_core(memo)?,
-                // The semantic protocol intentionally exposes no task queue,
-                // timeout, header, retry, or versioning controls yet.
+                // `None` makes Core carry the current search attributes;
+                // `Some` (even empty) replaces them.
+                search_attributes: search_attributes
+                    .as_ref()
+                    .map(|values| {
+                        Ok::<_, CoreConversionError>(api_common::SearchAttributes {
+                            indexed_fields: payload_map_to_core(values)?,
+                        })
+                    })
+                    .transpose()?,
+                retry_policy: retry_policy
+                    .as_ref()
+                    .map(retry_policy_to_core)
+                    .transpose()?,
+                initial_versioning_behavior: continue_as_new_versioning_to_core(
+                    *initial_versioning_behavior,
+                ),
+                // Headers, the deprecated build-ID versioning intent and the
+                // start backoff have no semantic representation.
                 ..Default::default()
             })
         }
@@ -4407,14 +4516,8 @@ fn command_from_core(
             )?,
         }),
         Variant::ContinueAsNewWorkflowExecution(value) => {
-            if !value.task_queue.is_empty()
-                || value.workflow_run_timeout.is_some()
-                || value.workflow_task_timeout.is_some()
-                || !value.headers.is_empty()
-                || value.search_attributes.is_some()
-                || value.retry_policy.is_some()
+            if !value.headers.is_empty()
                 || value.versioning_intent != 0
-                || value.initial_versioning_behavior != 0
                 || value.backoff_start_interval.is_some()
             {
                 return Err(unsupported(
@@ -4427,6 +4530,34 @@ fn command_from_core(
                 workflow_type: value.workflow_type.clone(),
                 input: payload_vec_from_core(&value.arguments)?,
                 memo: payload_map_from_core(&value.memo)?,
+                task_queue: if value.task_queue.is_empty() {
+                    None
+                } else {
+                    Some(value.task_queue.clone())
+                },
+                run_timeout: value
+                    .workflow_run_timeout
+                    .as_ref()
+                    .map(duration_from_core)
+                    .transpose()?,
+                task_timeout: value
+                    .workflow_task_timeout
+                    .as_ref()
+                    .map(duration_from_core)
+                    .transpose()?,
+                retry_policy: value
+                    .retry_policy
+                    .as_ref()
+                    .map(retry_policy_from_core)
+                    .transpose()?,
+                search_attributes: value
+                    .search_attributes
+                    .as_ref()
+                    .map(|values| payload_map_from_core(&values.indexed_fields))
+                    .transpose()?,
+                initial_versioning_behavior: continue_as_new_versioning_from_core(
+                    value.initial_versioning_behavior,
+                )?,
             })
         }
         Variant::CancelWorkflowExecution(value) => {

@@ -1805,12 +1805,15 @@ let test_command_order_and_validation () =
   let continue_completion =
     unwrap "continue-as-new command conversion"
       (Native_execution.completion_of_commands ~run_id:"run-native-translation"
-         [ Activation.Continue_as_new { workflow_type = "native"; input = []; memo = [] } ])
+         [ Activation.Continue_as_new
+             { workflow_type = "native"; input = []; memo = [];
+               options = Activation.Continue_as_new_options.none } ])
   in
   (* A unit continue-as-new input arrives as zero arguments (#819), matching
      other SDKs; the next run's start decodes [[]] back to unit. *)
   (match continue_completion.commands with
-  | [ Protocol.Continue_as_new { workflow_type = "native"; input = []; memo = [] } ] ->
+  | [ Protocol.Continue_as_new { workflow_type = "native"; input = []; memo = []; options } ]
+    when options = Protocol.Continue_as_new_options.none ->
       ()
   | _ -> failwith "continue-as-new command was not translated as terminal");
   (* A non-unit argument whose bytes are [binary/null], such as an option's
@@ -1821,12 +1824,14 @@ let test_command_order_and_validation () =
            ~run_id:"run-native-translation"
            [
              Activation.Continue_as_new
-               { workflow_type = "native"; input = [ runtime_unit_payload () ]; memo = [] };
+               { workflow_type = "native"; input = [ runtime_unit_payload () ]; memo = [];
+                 options = Activation.Continue_as_new_options.none };
            ]))
        .commands
    with
-  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ null ]; memo = [] } ]
-    when null.Protocol.metadata = [ ("encoding", Bytes.of_string "binary/null") ]
+  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ null ]; memo = []; options } ]
+    when options = Protocol.Continue_as_new_options.none
+         && null.Protocol.metadata = [ ("encoding", Bytes.of_string "binary/null") ]
          && Bytes.length null.data = 0 ->
       ()
   | _ -> failwith "continue-as-new collapsed a null argument");
@@ -1835,12 +1840,14 @@ let test_command_order_and_validation () =
       (Native_execution.completion_of_commands ~run_id:"run-native-translation"
          [
            Activation.Continue_as_new
-             { workflow_type = "native"; input = [ runtime_payload "next" ]; memo = [] };
+             { workflow_type = "native"; input = [ runtime_payload "next" ]; memo = [];
+               options = Activation.Continue_as_new_options.none };
          ])
   in
   (match continue_completion.commands with
-  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ next ]; memo = [] } ]
-    when next = protocol_payload "next" ->
+  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ next ]; memo = []; options } ]
+    when options = Protocol.Continue_as_new_options.none
+         && next = protocol_payload "next" ->
       ()
   | _ -> failwith "continue-as-new command did not keep its non-unit input");
   (* A memo upsert and the merged memo a successor carries (#1154) cross the
@@ -1854,7 +1861,8 @@ let test_command_order_and_validation () =
                { upserted_memo = [ ("note", runtime_payload "n"); ("draft", runtime_unit_payload ()) ] };
              Activation.Continue_as_new
                { workflow_type = "native"; input = [];
-                 memo = [ ("note", runtime_payload "n") ] };
+                 memo = [ ("note", runtime_payload "n") ];
+                 options = Activation.Continue_as_new_options.none };
            ]))
        .commands
    with
@@ -1872,7 +1880,8 @@ let test_command_order_and_validation () =
   expect_error_code "empty continue-as-new memo key" "invalid_message"
     (Native_execution.command_to_protocol
        (Activation.Continue_as_new
-          { workflow_type = "native"; input = []; memo = [ ("", runtime_payload "a") ] }))
+          { workflow_type = "native"; input = []; memo = [ ("", runtime_payload "a") ];
+            options = Activation.Continue_as_new_options.none }))
 
 (** Activity commands retain every Core-required field through translation, and
     malformed timeout/identity options fail before a completion is returned. *)

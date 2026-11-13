@@ -2,6 +2,7 @@
  (names
   test_activation
   test_continue_as_new_encode_error
+  test_continue_as_new_options
   test_handler_teardown
   test_initial_handlers
   test_native_execution

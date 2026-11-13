@@ -509,7 +509,9 @@ val terminate : t -> Activation.command -> 'value
     memo after an {!upsert_memo}, and an empty memo (Core reuses the start
     memo) when there was none. [options] (default
     {!Activation.Continue_as_new_options.none}) holds the other successor
-    settings, already validated by the public API. *)
+    settings, already validated by the public API. Raises [Invalid_argument]
+    inside a read-only callback (see {!with_randomness_disabled}) before
+    anything is buffered, as {!upsert_memo} does. *)
 val continue_as_new :
   ?memo:(string * Temporal_base.Codec.payload) list ->
   ?options:Activation.Continue_as_new_options.t ->
