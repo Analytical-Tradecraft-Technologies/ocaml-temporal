@@ -55,7 +55,10 @@ for those rules.
   from typed `Temporal.Search_attribute` updates, and `upsert_memo` merges
   values into the run's memo, which a later `continue_as_new` carries to the
   successor (#1154). `continue_as_new` ends the current run and starts
-  a successor. `patched ~id`
+  a successor; its optional `?task_queue`, `?run_timeout`, `?task_timeout`,
+  `?retry_policy`, `?memo`, `?search_attributes` and
+  `?initial_versioning_behavior` change the successor, and omitting them all
+  emits the command earlier releases emitted (#1153). `patched ~id`
   introduces a new deterministic branch while allowing histories created
   before that marker to replay the old branch. `deprecate_patch ~id` is the
   later unit-returning lifecycle marker used while phasing that branch gate

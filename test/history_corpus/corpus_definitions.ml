@@ -795,6 +795,72 @@ let random_parent ~reordered =
 let random_workflows =
   [ plain (random_parent ~reordered:false); plain random_child_workflow ]
 
+(** {1 Continue-as-new options workflow (#1153)}
+
+    Frozen with the [corpus-v4-continue-as-new-options] capture. *)
+
+let continue_as_new_options_workflow_type = "corpus.continue_as_new_options"
+
+(** Command-only reference naming the successor without a recursive value. *)
+let continue_as_new_options_target =
+  Temporal.Workflow.remote ~name:continue_as_new_options_workflow_type
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string
+
+(** The successor's retry policy: three attempts, one-second backoff. *)
+let continue_as_new_options_policy =
+  match
+    Temporal.Retry_policy.make ~initial_interval:(Temporal.Duration.of_seconds 1L)
+      ~backoff_coefficient:2.0 ~maximum_interval:(Temporal.Duration.of_seconds 10L)
+      ~maximum_attempts:3 ()
+  with
+  | Ok policy -> policy
+  | Error error -> invalid_arg (Temporal.Error.message error)
+
+(** [corpus.continue_as_new_options]: ["first"] continues as new with
+    ["second"], setting every successor option that needs no registered
+    search attribute or versioned deployment: its own task queue named
+    explicitly, a 30 s run timeout, a 7 s task timeout, the three-attempt
+    retry policy, a replacement memo, and an explicitly empty
+    search-attribute map. ["second"] returns the recorded run and task
+    timeouts, retry attempts and memo value it observes. *)
+let continue_as_new_options_workflow =
+  Temporal.Workflow.define ~name:continue_as_new_options_workflow_type
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun input ->
+      let open Temporal.Result_syntax in
+      let* info = Temporal.Workflow.info () in
+      match input with
+      | "first" ->
+          let* memo = Temporal.Codec.encode Temporal.Codec.string "replaced" in
+          Temporal.Workflow.continue_as_new
+            ~task_queue:(Temporal.Workflow.Info.task_queue info)
+            ~run_timeout:(Temporal.Duration.of_seconds 30L)
+            ~task_timeout:(Temporal.Duration.of_seconds 7L)
+            ~retry_policy:continue_as_new_options_policy ~memo:[ ("corpus", memo) ]
+            ~search_attributes:[] continue_as_new_options_target "second"
+      | "second" ->
+          let* metadata = Temporal.Workflow.start_metadata () in
+          let* memo =
+            match Option.bind metadata.memo (List.assoc_opt "corpus") with
+            | None -> Ok "-"
+            | Some payload -> Temporal.Codec.decode Temporal.Codec.string payload
+          in
+          let milliseconds = function
+            | None -> "-"
+            | Some value -> Int64.to_string (Temporal.Duration.to_ms value)
+          in
+          Ok
+            (Printf.sprintf "OPTIONS:%s/%s/%s/%s"
+               (milliseconds (Temporal.Workflow.Info.run_timeout info))
+               (milliseconds (Temporal.Workflow.Info.task_timeout info))
+               (match Temporal.Workflow.Info.retry_policy info with
+               | None -> "-"
+               | Some policy -> string_of_int (Temporal.Retry_policy.maximum_attempts policy))
+               memo)
+      | input ->
+          Error
+            (Temporal.Error.defect
+               ~message:(Printf.sprintf "unexpected continue-as-new options input %S" input)))
+
 (** {1 Reused fixture definitions} *)
 
 (** The corrected generation of [test/integration/temporal/task_failure]. The
@@ -870,6 +936,7 @@ let definition_sets =
     ("corpus-v3-random", random_workflows);
     ( "negative-random-reordered",
       [ plain (random_parent ~reordered:true); plain random_child_workflow ] );
+    ("corpus-v4-continue-as-new-options", [ plain continue_as_new_options_workflow ]);
   ]
 
 (** Set names in declaration order. *)

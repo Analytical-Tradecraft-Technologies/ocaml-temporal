@@ -10,6 +10,7 @@ test/integration/client_policies/regression.exe
 test/integration/client_request_ids/regression.exe
 test/integration/completed_queries/regression.exe
 test/integration/concurrent_client/regression.exe
+test/integration/continue_as_new_options/regression.exe
 test/integration/describe_count/regression.exe
 test/integration/fetch_history/regression.exe
 test/integration/interaction_recovery/regression.exe

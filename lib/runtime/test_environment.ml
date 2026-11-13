@@ -105,10 +105,15 @@ type activity_request = {
     first run is being constructed. [outcome] is set exactly once, when the
     last run closes; continue-as-new and a retry replace [current] without
     setting it. [parent] identifies the parent run and the child command
-    sequence to resolve when the chain closes. [retry_policy] is the child
-    command's workflow retry policy, which the server applies to every run
-    of the chain; top-level starts have none. [task_queue] is the queue
-    reported by [Workflow.info] for every run of the chain. *)
+    sequence to resolve when the chain closes. [retry_policy] is the
+    workflow retry policy the server applies to the current run (a child
+    command's policy; top-level starts have none). [task_queue] is the queue
+    [Workflow.info] reports for the current run, and [run_timeout] and
+    [task_timeout] the recorded run and workflow-task timeouts in
+    milliseconds, which the environment reports but does not enforce. A
+    continue-as-new command that sets any of them (#1153) replaces it for
+    the successor and later runs, as the server does; an unset one is
+    inherited. *)
 type chain = {
   workflow_id : string;
   mutable current : run option;
@@ -116,8 +121,10 @@ type chain = {
   mutable outcome : (Codec.payload, Error.t) result option;
   parent : (run * int64) option;
   parent_close_policy : Activation.child_workflow_parent_close_policy option;
-  retry_policy : Activation.retry_policy option;
-  task_queue : string;
+  mutable retry_policy : Activation.retry_policy option;
+  mutable task_queue : string;
+  mutable run_timeout : int64 option;
+  mutable task_timeout : int64 option;
 }
 
 (** One workflow run and the engine-side state of its outstanding commands.
@@ -672,12 +679,13 @@ let create_run ?(attempt = 1) ?delay_ms
                        })
                      chain.parent;
                  start_time = Some (protocol_timestamp environment.now_ms);
-                 (* The environment records no workflow timeouts, matching a
-                    server start without those options. Only a child command
-                    supplies a retry policy. *)
+                 (* The environment records no execution timeout, and run
+                    and task timeouts only once a continue-as-new set them,
+                    matching a server start without those options. A child
+                    command or a continue-as-new supplies a retry policy. *)
                  execution_timeout = None;
-                 run_timeout = None;
-                 task_timeout = None;
+                 run_timeout = Option.map protocol_duration chain.run_timeout;
+                 task_timeout = Option.map protocol_duration chain.task_timeout;
                  retry_policy = Option.map protocol_retry_policy chain.retry_policy;
                  (* [chain.current] still names the predecessor here: it is
                     replaced only after this run is built. *)
@@ -748,6 +756,8 @@ let new_chain ?retry_policy ?task_queue environment ~workflow_id
       parent_close_policy;
       retry_policy;
       task_queue = Option.value task_queue ~default:environment.task_queue;
+      run_timeout = None;
+      task_timeout = None;
     }
   in
   let* _run = create_run environment chain ~workflow_type ~input in
@@ -1392,15 +1402,26 @@ let rec apply_command environment run command =
   | Cancel_workflow_execution ->
       finish environment run Run_cancelled
         (Error (cancelled "workflow cancelled"))
-  | Continue_as_new { workflow_type; input; memo } -> (
+  | Continue_as_new { workflow_type; input; memo; options } -> (
       close_run environment run;
       (* As Core does, an empty command memo reuses the start memo, and the
-         successor inherits the current search attributes. *)
+         successor inherits the current search attributes unless the command
+         replaces them. Set routing, timeout and retry options replace the
+         chain's for the successor and later runs; unset ones are inherited
+         (#1153). The versioning behavior has no effect without deployments. *)
       let memo = match memo with [] -> run.start_memo | _ :: _ -> memo in
+      let search_attributes =
+        Option.value options.search_attributes ~default:run.search_attributes
+      in
+      let chain = run.chain in
+      Option.iter (fun queue -> chain.task_queue <- queue) options.task_queue;
+      Option.iter (fun timeout -> chain.run_timeout <- Some timeout) options.run_timeout;
+      Option.iter (fun timeout -> chain.task_timeout <- Some timeout) options.task_timeout;
+      Option.iter (fun policy -> chain.retry_policy <- Some policy) options.retry_policy;
       match
         Result.bind (workflow_input_of_arguments input) (fun input ->
-            create_run ~memo ~search_attributes:run.search_attributes environment
-              run.chain ~workflow_type ~input)
+            create_run ~memo ~search_attributes environment chain
+              ~workflow_type ~input)
       with
       | Ok _ -> ()
       | Error error -> close_chain environment run.chain (Error error))

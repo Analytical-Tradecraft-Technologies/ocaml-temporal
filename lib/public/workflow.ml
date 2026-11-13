@@ -552,32 +552,44 @@ let deprecate_patch ~id =
   | Some context ->
       Temporal_sdk_kernel.Workflow_context_store.deprecate_patch context ~patch_id
 
-(** Validates one search-attribute or memo key at the public boundary;
-    [label] names the collection in the message. Both maps are persisted in
-    workflow history, so rejecting malformed keys before buffering a command
-    prevents a programmer error from becoming a delayed worker failure. *)
-let validate_metadata_key ~label key =
-  if String.equal key "" then invalid_arg (Printf.sprintf "Temporal %s key is empty" label);
-  if String.contains key '\000' then
-    invalid_arg (Printf.sprintf "Temporal %s key contains a NUL byte" label);
-  if String.length key > max_name_bytes then
-    invalid_arg (Printf.sprintf "Temporal %s key exceeds 65536 bytes" label);
-  if not (Temporal_base.Codec.valid_utf_8 key) then
-    invalid_arg (Printf.sprintf "Temporal %s key must be valid UTF-8" label)
+(** Checks one search-attribute or memo key at the public boundary and
+    returns the problem, if any; [label] names the collection in the
+    message. Both maps are persisted in workflow history, so rejecting
+    malformed keys before buffering a command prevents a programmer error
+    from becoming a delayed worker failure. *)
+let metadata_key_problem ~label key =
+  if String.equal key "" then Some (Printf.sprintf "Temporal %s key is empty" label)
+  else if String.contains key '\000' then
+    Some (Printf.sprintf "Temporal %s key contains a NUL byte" label)
+  else if String.length key > max_name_bytes then
+    Some (Printf.sprintf "Temporal %s key exceeds 65536 bytes" label)
+  else if not (Temporal_base.Codec.valid_utf_8 key) then
+    Some (Printf.sprintf "Temporal %s key must be valid UTF-8" label)
+  else None
 
-(** Validates every key of one upsert and rejects repeats, which the bridge's
-    payload map could not represent. [label] names the collection
-    (["search-attribute"] or ["memo"]) in the [Invalid_argument] message. *)
-let validate_metadata_keys ~label values =
-  let rec validate_keys seen = function
-    | [] -> ()
-    | (key, _) :: rest ->
-        validate_metadata_key ~label key;
-        if List.exists (String.equal key) seen then
-          invalid_arg (Printf.sprintf "Temporal %s keys must be unique" label)
-        else validate_keys (key :: seen) rest
+(** Returns the first problem with the keys of one metadata map, checking
+    each key with {!metadata_key_problem} and rejecting repeats, which the
+    bridge's payload map could not represent; [None] when every key is
+    valid. [label] (["search-attribute"] or ["memo"]) names the collection
+    in the message. *)
+let metadata_keys_problem ~label values =
+  let rec check seen = function
+    | [] -> None
+    | (key, _) :: rest -> (
+        match metadata_key_problem ~label key with
+        | Some _ as problem -> problem
+        | None ->
+            if List.exists (String.equal key) seen then
+              Some (Printf.sprintf "Temporal %s keys must be unique" label)
+            else check (key :: seen) rest)
   in
-  validate_keys [] values
+  check [] values
+
+(** Validates every key of one upsert as {!metadata_keys_problem} does and
+    raises [Invalid_argument] with the first problem, the upserts'
+    programmer-misuse contract. *)
+let validate_metadata_keys ~label values =
+  Option.iter invalid_arg (metadata_keys_problem ~label values)
 
 (** Converts public payloads into private owned values and emits one Core
     search-attribute merge command. No network or nondeterministic operation
@@ -638,27 +650,123 @@ let continue_as_new_encode_error error =
              (Temporal_base.Error.kind error) view.message)
         ()
 
+(** Checks the successor settings of {!continue_as_new} (#1153) and
+    converts them to the private runtime record, or returns a typed defect
+    naming the first violation. [run_info] is the current run's recorded
+    start metadata, [None] only in a synthetic execution: a supplied
+    [run_timeout] must not exceed the chain's execution timeout, and a
+    supplied [task_timeout] must not exceed the successor's run timeout (the
+    supplied one, else the inherited one, else the execution timeout),
+    because Temporal would silently lower either instead of honouring it.
+    The other rules are those of [Client.start]: positive timeouts, a task
+    timeout of at most 120 seconds, a non-empty UTF-8 task queue of at most
+    65,536 bytes without NUL, and valid, unique memo and search-attribute
+    keys. Payloads are copied. *)
+let continue_as_new_options ~run_info ?task_queue ?run_timeout ?task_timeout
+    ?retry_policy ?memo ?search_attributes ?initial_versioning_behavior () =
+  let ( let* ) = Result.bind in
+  let defect message =
+    Error (Error.defect ~message:("Temporal.Workflow.continue_as_new: " ^ message))
+  in
+  let check_keys ~label = function
+    | None -> Ok ()
+    | Some values -> (
+        match metadata_keys_problem ~label values with
+        | None -> Ok ()
+        | Some problem -> defect problem)
+  in
+  let* () =
+    match task_queue with
+    | Some queue
+      when String.equal queue "" || String.contains queue '\000'
+           || String.length queue > max_name_bytes
+           || not (Temporal_base.Codec.valid_utf_8 queue) ->
+        defect
+          "task_queue must be a non-empty UTF-8 identifier of at most 65536 bytes without NUL"
+    | Some _ | None -> Ok ()
+  in
+  let recorded select =
+    Option.bind run_info (fun (run : Temporal_sdk_kernel.Workflow_context_store.run_info) ->
+        Option.map Info.duration (select run))
+  in
+  let execution_timeout = recorded (fun run -> run.execution_timeout) in
+  let successor_run_timeout =
+    match run_timeout with
+    | Some _ -> run_timeout
+    | None -> recorded (fun run -> run.run_timeout)
+  in
+  let* _, run_timeout_ms, task_timeout_ms =
+    match
+      Workflow_timeouts_private.validate ~execution_timeout
+        ~run_timeout:successor_run_timeout ~task_timeout
+    with
+    | Ok (execution, run, task) ->
+        (* Only a supplied run timeout is sent; an inherited one was
+           validated as the bound for the task timeout. *)
+        Ok (execution, Option.bind run_timeout (fun _ -> run), task)
+    | Error error -> defect (Error.message error)
+  in
+  let* () = check_keys ~label:"memo" memo in
+  let* () = check_keys ~label:"search-attribute" search_attributes in
+  let copy = List.map (fun (key, payload) -> (key, Payload_private.to_base payload)) in
+  Ok
+    ( Option.map copy memo,
+      {
+        Temporal_sdk_kernel.Activation.Continue_as_new_options.task_queue;
+        run_timeout = run_timeout_ms;
+        task_timeout = task_timeout_ms;
+        retry_policy = Option.map Retry_policy_private.to_runtime retry_policy;
+        search_attributes = Option.map copy search_attributes;
+        initial_versioning_behavior =
+          Option.map
+            (function
+              | `Auto_upgrade -> Temporal_sdk_kernel.Workflow_protocol.Successor_auto_upgrade
+              | `Use_ramping_version ->
+                  Temporal_sdk_kernel.Workflow_protocol.Successor_use_ramping_version)
+            initial_versioning_behavior;
+      } )
+
 (** Requests a fresh run of the same workflow type with [input]. This is a
-    terminal direct-style operation: it encodes the successor input, buffers a
-    Core continue-as-new command, and aborts the current private workflow
-    fiber. If encoding fails, the typed error terminates the fiber instead of
-    raising through the worker loop. Whatever category the encoder returned,
+    terminal direct-style operation: it validates the successor settings,
+    encodes the successor input, buffers a Core continue-as-new command, and
+    aborts the current private workflow fiber. If validation or encoding
+    fails, the typed error terminates the fiber instead of raising through
+    the worker loop. Whatever category the encoder returned,
     {!continue_as_new_encode_error} ensures the runtime classifies it as a
-    workflow-task failure, so the task fails with no commands and the run
-    stays open for a corrected worker to replay. *)
-let continue_as_new definition next_input =
+    workflow-task failure, and an invalid setting is a [Defect], which the
+    runtime also treats as one: the task fails with no commands and the run
+    stays open for a corrected worker to replay. Inside a read-only callback
+    it raises [Invalid_argument] before validating or encoding anything, so
+    neither failure path can seal the context from a query or validator. *)
+let continue_as_new ?task_queue ?run_timeout ?task_timeout ?retry_policy ?memo
+    ?search_attributes ?initial_versioning_behavior definition next_input =
   match Temporal_sdk_kernel.Workflow_context_store.current () with
   | None ->
       invalid_arg "Temporal.Workflow.continue_as_new used outside a workflow execution"
   | Some context -> (
-      match Codec_private.encode_arguments (input definition) next_input with
-      | Ok arguments ->
-          Temporal_sdk_kernel.Workflow_context_store.continue_as_new context
-            ~workflow_type:(name definition) ~input:arguments
-      | Error error ->
-          Temporal_sdk_kernel.Workflow_context_store.terminate context
-            (Temporal_sdk_kernel.Activation.Fail_workflow
-               (continue_as_new_encode_error error)))
+      (* The read-only guard must come first: an invalid option or encoder
+         failure below terminates the context, which inside a query handler
+         or update validator would fail the whole workflow task from a path
+         replay skips, instead of rejecting only that callback. *)
+      Temporal_sdk_kernel.Workflow_context_store.reject_in_read_only_callback context
+        ~what:"run (continue-as-new)";
+      let fail error =
+        Temporal_sdk_kernel.Workflow_context_store.terminate context
+          (Temporal_sdk_kernel.Activation.Fail_workflow error)
+      in
+      match
+        continue_as_new_options
+          ~run_info:(Temporal_sdk_kernel.Workflow_context_store.run_info context)
+          ?task_queue ?run_timeout ?task_timeout ?retry_policy ?memo
+          ?search_attributes ?initial_versioning_behavior ()
+      with
+      | Error error -> fail (Error_private.to_base error)
+      | Ok (memo, options) -> (
+          match Codec_private.encode_arguments (input definition) next_input with
+          | Ok arguments ->
+              Temporal_sdk_kernel.Workflow_context_store.continue_as_new ?memo
+                ~options context ~workflow_type:(name definition) ~input:arguments
+          | Error error -> fail (continue_as_new_encode_error error)))
 
 (** Independently owned metadata observed on the run's durable start event. *)
 type start_metadata = {

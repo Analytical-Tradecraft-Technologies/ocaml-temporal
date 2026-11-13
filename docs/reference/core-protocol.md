@@ -493,13 +493,34 @@ decoder treats an absent member as an empty map. An empty map is Core's
 "unset", which reuses the memo the current run started with, so the OCaml
 runtime fills it only after a `Workflow.upsert_memo`, with the start memo
 merged with every upsert: otherwise the upserted values would be lost.
-Core also gives the successor the run's current search attributes. The
-current semantic protocol intentionally does not expose a task queue,
-timeout, headers, search attributes, retry policy, or versioning controls
-for this command. The Rust reverse
-conversion accepts only Core's explicit defaults for those fields and returns
-`core_unsupported` for a non-default value, preventing silent loss of workflow
-semantics. The successor run is not followed by the bridge or by
+Core also gives the successor the run's current search attributes.
+
+The command may also carry optional successor settings (#1153), each written
+only when `Workflow.continue_as_new` received the matching option, so a
+command without options keeps exactly the shape above and existing histories
+replay unchanged:
+
+| Member | Core field | When absent |
+| --- | --- | --- |
+| `task_queue` (identifier) | `task_queue` | Empty: the server keeps the current queue. |
+| `run_timeout` (duration) | `workflow_run_timeout` | The server inherits the current run timeout. |
+| `task_timeout` (duration) | `workflow_task_timeout` | The server inherits the current task timeout. |
+| `retry_policy` | `retry_policy` | Core reuses the policy the chain started with. |
+| `search_attributes` (payload map) | `search_attributes` | Core carries the current values, including upserts; a present map, even `{}`, replaces them. |
+| `initial_versioning_behavior` (`auto_upgrade` or `use_ramping_version`) | `initial_versioning_behavior` | Unspecified: the successor inherits the current run's versioning. |
+
+Both decoders read an explicit `null` as absent; the encoder never writes it.
+Both validate a present task queue as an identifier, the retry policy by the
+activity rules, and the search-attribute keys and payloads as for an upsert,
+and apply the `Client.start` timeout rules that need no execution timeout:
+positive timeouts, a task timeout of at most 120 seconds and no larger than
+a present run timeout. The public API also checks the run timeout against
+the chain's recorded execution timeout and the task timeout against an
+inherited run timeout, which only it can read. Headers, the deprecated
+build-ID `versioning_intent` and `backoff_start_interval` have no semantic
+representation: the Rust reverse conversion accepts only Core's explicit
+defaults for those fields and returns `core_unsupported` for a non-default
+value, preventing silent loss of workflow semantics. The successor run is not followed by the bridge or by
 `Temporal.Client.wait` automatically.
 
 Temporal identifiers must be nonempty but use the protocol's 65,536-byte text

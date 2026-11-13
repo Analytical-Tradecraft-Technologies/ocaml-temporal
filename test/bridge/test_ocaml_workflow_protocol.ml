@@ -52,9 +52,9 @@ let require_invalid_activation name =
       if view.message = "" then failwith (name ^ " omitted its safe diagnostic")
   | Ok _ -> failwith (name ^ " was accepted")
 
-(** Compares normalized JSON output exactly. *)
+(** Compares normalized JSON output exactly, reporting the actual text. *)
 let check_string label expected actual =
-  if not (String.equal expected actual) then failwith (label ^ " differed")
+  if not (String.equal expected actual) then failwith (label ^ " differed: " ^ actual)
 
 (** Finds a short ASCII marker in encoded JSON without making the protocol
     test depend on a particular JSON parser representation. The helper is only
@@ -824,7 +824,8 @@ let test_continue_as_new_command () =
       commands =
         [
           Continue_as_new
-            { workflow_type = "counter"; input = [ input ]; memo = [] };
+            { workflow_type = "counter"; input = [ input ]; memo = [];
+              options = Protocol.Continue_as_new_options.none };
         ];
     }
   in
@@ -850,7 +851,9 @@ let test_memo_commands () =
   let value =
     completion
       [ Modify_workflow_properties { upserted_memo = [ ("note", note) ] };
-        Continue_as_new { workflow_type = "counter"; input = []; memo = [ ("note", note) ] } ]
+        Continue_as_new
+          { workflow_type = "counter"; input = []; memo = [ ("note", note) ];
+            options = Protocol.Continue_as_new_options.none } ]
   in
   let encoded = unwrap (Protocol.encode_completion value) in
   let note_json =
@@ -876,6 +879,86 @@ let test_memo_commands () =
   with
   | Ok _ -> failwith "a continue-as-new without its memo member was decoded"
   | Error _ -> ()
+
+(** Proves the continue-as-new successor options (#1153) use the JSON shape
+    the Rust decoder reads, round-trip (an explicit empty search-attribute
+    map stays present while a [null] member reads as unset), and that
+    options Temporal would lower or the protocol does not know are rejected
+    on both paths. *)
+let test_continue_as_new_options () =
+  let value : Protocol.payload =
+    { metadata = [ ("encoding", Bytes.of_string "json/plain") ]; data = Bytes.of_string "1" }
+  in
+  let seconds seconds : Protocol.duration = { seconds; nanoseconds = 0 } in
+  let completion options : Protocol.completion =
+    { run_id = "options-run"; versioning_behavior = None; task_failure = None;
+      commands =
+        [ Continue_as_new { workflow_type = "counter"; input = []; memo = []; options } ] }
+  in
+  let options : Protocol.Continue_as_new_options.t =
+    { task_queue = Some "successor-queue";
+      run_timeout = Some (seconds 60L);
+      task_timeout = Some (seconds 15L);
+      retry_policy =
+        Some
+          { initial_interval = seconds 1L;
+            backoff_coefficient_bits = Int64.to_string (Int64.bits_of_float 2.0);
+            maximum_interval = seconds 10L;
+            maximum_attempts = 3;
+            non_retryable_error_types = [ "Fatal" ] };
+      search_attributes = Some [ ("CustomKeywordField", value) ];
+      initial_versioning_behavior = Some Successor_use_ramping_version }
+  in
+  let encoded = unwrap (Protocol.encode_completion (completion options)) in
+  check_string "continue-as-new options"
+    {|{"commands":[{"initial_versioning_behavior":"use_ramping_version","input":[],"kind":"continue_as_new","memo":{},"retry_policy":{"backoff_coefficient_bits":"4611686018427387904","initial_interval":{"nanoseconds":0,"seconds":1},"maximum_attempts":3,"maximum_interval":{"nanoseconds":0,"seconds":10},"non_retryable_error_types":["Fatal"]},"run_timeout":{"nanoseconds":0,"seconds":60},"search_attributes":{"CustomKeywordField":{"data":{"data":"MQ==","encoding":"base64"},"metadata":{"encoding":{"data":"anNvbi9wbGFpbg==","encoding":"base64"}}}},"task_queue":"successor-queue","task_timeout":{"nanoseconds":0,"seconds":15},"workflow_type":"counter"}],"run_id":"options-run"}|}
+    encoded;
+  if unwrap (Protocol.decode_completion encoded) <> completion options then
+    failwith "continue-as-new options did not round-trip";
+  let cleared =
+    completion { Protocol.Continue_as_new_options.none with search_attributes = Some [] }
+  in
+  let encoded = unwrap (Protocol.encode_completion cleared) in
+  check_string "cleared search attributes"
+    {|{"commands":[{"input":[],"kind":"continue_as_new","memo":{},"search_attributes":{},"workflow_type":"counter"}],"run_id":"options-run"}|}
+    encoded;
+  if unwrap (Protocol.decode_completion encoded) <> cleared then
+    failwith "an empty search-attribute map did not round-trip as present";
+  List.iter
+    (fun (label, invalid) ->
+      match Protocol.encode_completion (completion invalid) with
+      | Ok _ -> failwith ("encoded " ^ label)
+      | Error _ -> ())
+    [ ("an empty task queue", { Protocol.Continue_as_new_options.none with task_queue = Some "" });
+      ("a zero run timeout", { Protocol.Continue_as_new_options.none with run_timeout = Some (seconds 0L) });
+      ("a task timeout above 120 s",
+       { Protocol.Continue_as_new_options.none with task_timeout = Some (seconds 121L) });
+      ("a task timeout above the run timeout",
+       { Protocol.Continue_as_new_options.none with
+         run_timeout = Some (seconds 10L); task_timeout = Some (seconds 11L) });
+      ("a repeated search-attribute key",
+       { Protocol.Continue_as_new_options.none with
+         search_attributes = Some [ ("k", value); ("k", value) ] }) ];
+  List.iter
+    (fun member ->
+      match
+        Protocol.decode_completion
+          (Printf.sprintf
+             {|{"commands":[{"input":[],"kind":"continue_as_new","memo":{},"workflow_type":"counter",%s}],"run_id":"options-run"}|}
+             member)
+      with
+      | Ok _ -> failwith ("decoded continue-as-new member " ^ member)
+      | Error _ -> ())
+    [ {|"task_queue":""|};
+      {|"initial_versioning_behavior":"pinned"|};
+      {|"task_timeout":{"nanoseconds":0,"seconds":121}|};
+      {|"headers":{}|} ];
+  match
+    Protocol.decode_completion
+      {|{"commands":[{"input":[],"kind":"continue_as_new","memo":{},"task_queue":null,"workflow_type":"counter"}],"run_id":"options-run"}|}
+  with
+  | Ok decoded when decoded = completion Protocol.Continue_as_new_options.none -> ()
+  | Ok _ | Error _ -> failwith "a null continue-as-new option was not read as unset"
 
 (** Proves closed nested objects, numeric bounds, canonical binary data, and
     workflow semantic invariants are rejected identically by both languages. *)
@@ -2054,6 +2137,7 @@ let () =
   run "child cancellation validation" test_child_cancellation_validation;
   run "continue-as-new command" test_continue_as_new_command;
   run "memo commands" test_memo_commands;
+  run "continue-as-new options" test_continue_as_new_options;
   run "malformed workflow documents" test_invalid_documents;
   run "strict JSON error paths" test_strict_json_error_paths;
   run "large nested payload" test_large_nested_payload;

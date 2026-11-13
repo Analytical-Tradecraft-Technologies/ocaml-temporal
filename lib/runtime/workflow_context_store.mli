@@ -498,16 +498,32 @@ val fire_timer : t -> seq:int64 -> (unit, Temporal_base.Error.t) result
     only query responses can be appended; durable commands remain suppressed. *)
 val emit : t -> Activation.command -> unit
 
+(** Raises [Invalid_argument] naming [what] when [context] is running a
+    read-only callback (a live update validator or a query handler, see
+    {!with_randomness_disabled}), and returns otherwise. A terminal public
+    operation calls it before any validation or encoding whose failure would
+    call {!terminate}: terminating there would seal the context and fail the
+    whole workflow task from a path that replay skips, instead of rejecting
+    only the query or update. *)
+val reject_in_read_only_callback : t -> what:string -> unit
+
 (** Buffers a terminal command and stops the current workflow fiber. This is a
     package-private control boundary used by terminal workflow operations. *)
 val terminate : t -> Activation.command -> 'value
 
 (** Buffers a continue-as-new command and stops the current workflow fiber.
     The successor input is encoded into its argument list before it reaches
-    this private operation. The command carries the current memo after an
-    {!upsert_memo}, and an empty memo (Core reuses the start memo)
-    otherwise. *)
+    this private operation. A non-empty [memo] (#1153) becomes the
+    successor's memo and is copied; otherwise the command carries the current
+    memo after an {!upsert_memo}, and an empty memo (Core reuses the start
+    memo) when there was none. [options] (default
+    {!Activation.Continue_as_new_options.none}) holds the other successor
+    settings, already validated by the public API. Raises [Invalid_argument]
+    inside a read-only callback (see {!with_randomness_disabled}) before
+    anything is buffered, as {!upsert_memo} does. *)
 val continue_as_new :
+  ?memo:(string * Temporal_base.Codec.payload) list ->
+  ?options:Activation.Continue_as_new_options.t ->
   t -> workflow_type:string -> input:Temporal_base.Codec.payload list -> 'value
 
 (** True when the pending command buffer already holds a terminal workflow

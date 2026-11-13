@@ -1651,7 +1651,8 @@ let test_continue_as_new_terminal () =
   (* A [Codec.unit] successor input is sent as zero arguments (#819). *)
   expect "continue-as-new command"
     [ Activation.Continue_as_new
-        { workflow_type = "continuation_target"; input = []; memo = [] } ]
+        { workflow_type = "continuation_target"; input = []; memo = [];
+          options = Activation.Continue_as_new_options.none } ]
     (Execution.activate execution [ Activation.Start_workflow ]);
   expect "continue-as-new activation is terminal" []
     (Execution.activate execution [ Activation.Start_workflow ]);
@@ -1685,7 +1686,8 @@ let test_codec_callback_preserves_terminal_control () =
   in
   let expected =
     [ Activation.Continue_as_new
-        { workflow_type = "codec_continuation_target"; input = []; memo = [] } ]
+        { workflow_type = "codec_continuation_target"; input = []; memo = [];
+          options = Activation.Continue_as_new_options.none } ]
   in
   expect "activity codec callback terminal command" expected
     (Execution.activate (Execution.start source ()) [ Activation.Start_workflow ]);
@@ -2451,7 +2453,8 @@ let test_workflow_memo_upsert_and_continue_as_new () =
         { upserted_memo = [ ("note", payload "note"); ("dropped", null) ] };
       Activation.Continue_as_new
         { workflow_type = "memo_successor"; input = [];
-          memo = [ ("kept", payload "kept"); ("note", payload "note") ] } ]
+          memo = [ ("kept", payload "kept"); ("note", payload "note") ];
+          options = Activation.Continue_as_new_options.none } ]
     (Execution.activate execution [ Activation.Start_workflow ])
 
 (** Verifies memo keys follow the search-attribute key rules: an empty or

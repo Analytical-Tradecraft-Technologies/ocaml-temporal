@@ -582,8 +582,21 @@ let _workflow_random_bytes : length:int -> (string, T.Error.t) result =
 let _workflow_uuid4 : unit -> (string, T.Error.t) result = T.Workflow.uuid4
 let _workflow_continue_as_new :
     'input 'output 'value.
+    ?task_queue:string ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
+    ?initial_versioning_behavior:[ `Auto_upgrade | `Use_ramping_version ] ->
     ('input, 'output) T.Workflow.t -> 'input -> 'value =
   T.Workflow.continue_as_new
+
+(* Omitting every continue-as-new option keeps the earlier two-argument
+   call shape (#1153). *)
+let _workflow_continue_as_new_without_options :
+    'input 'output 'value. ('input, 'output) T.Workflow.t -> 'input -> 'value =
+ fun definition input -> T.Workflow.continue_as_new definition input
 
 let _signal_define :
     'input.

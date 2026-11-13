@@ -382,6 +382,252 @@ fn rejects_malformed_memo_upserts() {
     assert!(workflow_protocol::completion_from_core(&core).is_err());
 }
 
+/// Builds a continue-as-new command with every #1153 successor option unset,
+/// the shape earlier releases emitted.
+fn continue_as_new_without_options(
+    workflow_type: &str,
+    input: Vec<workflow_protocol::Payload>,
+    memo: BTreeMap<String, workflow_protocol::Payload>,
+) -> workflow_protocol::CompletionCommand {
+    workflow_protocol::CompletionCommand::ContinueAsNew {
+        workflow_type: workflow_type.to_owned(),
+        input,
+        memo,
+        task_queue: None,
+        run_timeout: None,
+        task_timeout: None,
+        retry_policy: None,
+        search_attributes: None,
+        initial_versioning_behavior: None,
+    }
+}
+
+/// Wraps one command in a successful completion for the current run.
+fn single_command_completion(
+    command: workflow_protocol::CompletionCommand,
+) -> workflow_protocol::Completion {
+    workflow_protocol::Completion {
+        versioning_behavior: None,
+        task_failure: None,
+        run_id: "current-run".to_owned(),
+        commands: vec![command],
+    }
+}
+
+/// Extracts Core's continue-as-new command from a converted completion.
+fn core_continue_as_new(
+    core: &core_completion::WorkflowActivationCompletion,
+) -> &core_commands::ContinueAsNewWorkflowExecution {
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_ref()
+    else {
+        panic!("continue-as-new completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::ContinueAsNewWorkflowExecution(command)) =
+        success.commands[0].variant.as_ref()
+    else {
+        panic!("continue-as-new must map to Core's continue-as-new variant");
+    };
+    command
+}
+
+/// Proves that a continue-as-new command without #1153 options encodes to
+/// exactly the document earlier releases wrote (no option member at all) and
+/// leaves every corresponding Core field unset, so existing histories replay
+/// against the same command.
+#[test]
+fn continue_as_new_without_options_is_unchanged() {
+    let completion = single_command_completion(continue_as_new_without_options(
+        "counter",
+        Vec::new(),
+        BTreeMap::new(),
+    ));
+    let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+    assert!(
+        encoded.contains(
+            r#"{"input":[],"kind":"continue_as_new","memo":{},"workflow_type":"counter"}"#
+        ),
+        "{encoded}"
+    );
+    let core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let command = core_continue_as_new(&core);
+    assert_eq!(
+        *command,
+        core_commands::ContinueAsNewWorkflowExecution {
+            workflow_type: "counter".to_owned(),
+            ..Default::default()
+        }
+    );
+}
+
+/// Proves every #1153 successor option reaches its Core field and converts
+/// back losslessly, including an explicitly empty search-attribute map, which
+/// Core must see as present (clear) rather than absent (inherit).
+#[test]
+fn converts_continue_as_new_options() {
+    let mut search_attributes = BTreeMap::new();
+    search_attributes.insert("CustomKeywordField".to_owned(), json_string_payload("next"));
+    let command = workflow_protocol::CompletionCommand::ContinueAsNew {
+        workflow_type: "counter".to_owned(),
+        input: Vec::new(),
+        memo: BTreeMap::new(),
+        task_queue: Some("successor-queue".to_owned()),
+        run_timeout: Some(workflow_protocol::Duration {
+            seconds: 60,
+            nanoseconds: 0,
+        }),
+        task_timeout: Some(workflow_protocol::Duration {
+            seconds: 15,
+            nanoseconds: 0,
+        }),
+        retry_policy: Some(workflow_protocol::RetryPolicy {
+            initial_interval: workflow_protocol::Duration {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+            backoff_coefficient_bits: 2.0_f64.to_bits().to_string(),
+            maximum_interval: workflow_protocol::Duration {
+                seconds: 10,
+                nanoseconds: 0,
+            },
+            maximum_attempts: 3,
+            non_retryable_error_types: vec!["Fatal".to_owned()],
+        }),
+        search_attributes: Some(search_attributes),
+        initial_versioning_behavior: Some(
+            workflow_protocol::ContinueAsNewVersioningBehavior::AutoUpgrade,
+        ),
+    };
+    let completion = single_command_completion(command);
+    let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+    assert!(encoded.contains(r#""initial_versioning_behavior":"auto_upgrade""#));
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        completion
+    );
+    let core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let core_command = core_continue_as_new(&core);
+    assert_eq!(core_command.task_queue, "successor-queue");
+    assert_eq!(
+        core_command
+            .workflow_run_timeout
+            .as_ref()
+            .map(|value| value.seconds),
+        Some(60)
+    );
+    assert_eq!(
+        core_command
+            .workflow_task_timeout
+            .as_ref()
+            .map(|value| value.seconds),
+        Some(15)
+    );
+    let policy = core_command.retry_policy.as_ref().unwrap();
+    assert_eq!(policy.maximum_attempts, 3);
+    assert_eq!(policy.backoff_coefficient.to_bits(), 2.0_f64.to_bits());
+    assert_eq!(
+        core_command
+            .search_attributes
+            .as_ref()
+            .unwrap()
+            .indexed_fields["CustomKeywordField"]
+            .data,
+        br#""next""#.to_vec()
+    );
+    assert_eq!(
+        core_command.initial_versioning_behavior,
+        i32::from(
+            temporalio_protos::temporal::api::enums::v1::ContinueAsNewVersioningBehavior::AutoUpgrade
+        )
+    );
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        completion
+    );
+
+    let cleared = single_command_completion(workflow_protocol::CompletionCommand::ContinueAsNew {
+        workflow_type: "counter".to_owned(),
+        input: Vec::new(),
+        memo: BTreeMap::new(),
+        task_queue: None,
+        run_timeout: None,
+        task_timeout: None,
+        retry_policy: None,
+        search_attributes: Some(BTreeMap::new()),
+        initial_versioning_behavior: Some(
+            workflow_protocol::ContinueAsNewVersioningBehavior::UseRampingVersion,
+        ),
+    });
+    let encoded = workflow_protocol::encode_completion(&cleared).unwrap();
+    assert!(encoded.contains(r#""search_attributes":{}"#), "{encoded}");
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        cleared
+    );
+    let core = workflow_protocol::completion_to_core(&cleared).unwrap();
+    assert_eq!(
+        core_continue_as_new(&core).search_attributes,
+        Some(temporalio_protos::temporal::api::common::v1::SearchAttributes::default())
+    );
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        cleared
+    );
+}
+
+/// Proves the bridge rejects successor options Temporal would silently
+/// lower or that the OCaml encoder would never write, and Core versioning
+/// values the protocol does not know.
+#[test]
+fn rejects_invalid_continue_as_new_options() {
+    let documents = [
+        r#""task_queue":"""#,
+        r#""run_timeout":{"seconds":"0","nanoseconds":0}"#,
+        r#""task_timeout":{"seconds":"121","nanoseconds":0}"#,
+        r#""run_timeout":{"seconds":"10","nanoseconds":0},"task_timeout":{"seconds":"11","nanoseconds":0}"#,
+        r#""search_attributes":{"":{"metadata":{},"data":{"encoding":"base64","data":""}}}"#,
+        r#""initial_versioning_behavior":"pinned""#,
+        r#""headers":{}"#,
+    ];
+    let document = |options: &str| {
+        format!(
+            r#"{{"run_id":"current-run","commands":[{{"kind":"continue_as_new","workflow_type":"counter","input":[],"memo":{{}},{options}}}]}}"#
+        )
+    };
+    // The template itself is well formed: valid options decode.
+    assert!(
+        workflow_protocol::decode_completion(&document(
+            r#""task_queue":"q","search_attributes":{"k":{"metadata":{},"data":{"encoding":"base64","data":""}}}"#
+        ))
+        .is_ok()
+    );
+    for options in documents {
+        let document = document(options);
+        assert!(
+            workflow_protocol::decode_completion(&document).is_err(),
+            "{document}"
+        );
+    }
+    let completion = single_command_completion(continue_as_new_without_options(
+        "counter",
+        Vec::new(),
+        BTreeMap::new(),
+    ));
+    let mut core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_mut()
+    else {
+        panic!("continue-as-new completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::ContinueAsNewWorkflowExecution(command)) =
+        success.commands[0].variant.as_mut()
+    else {
+        panic!("continue-as-new must map to Core's continue-as-new variant");
+    };
+    command.initial_versioning_behavior = 99;
+    assert!(workflow_protocol::completion_from_core(&core).is_err());
+}
+
 /// Proves the continue-as-new memo (#1154) reaches Core's command field, so
 /// an upserted memo survives continue-as-new, and that a completion written
 /// without the member decodes with an empty memo, which Core treats as
@@ -394,11 +640,7 @@ fn converts_continue_as_new_memo() {
         versioning_behavior: None,
         task_failure: None,
         run_id: "current-run".to_owned(),
-        commands: vec![workflow_protocol::CompletionCommand::ContinueAsNew {
-            workflow_type: "counter".to_owned(),
-            input: Vec::new(),
-            memo,
-        }],
+        commands: vec![continue_as_new_without_options("counter", Vec::new(), memo)],
     };
     let encoded = workflow_protocol::encode_completion(&completion).unwrap();
     assert_eq!(
@@ -1356,11 +1598,11 @@ fn converts_continue_as_new_command() {
         versioning_behavior: None,
         task_failure: None,
         run_id: "current-run".to_owned(),
-        commands: vec![workflow_protocol::CompletionCommand::ContinueAsNew {
-            workflow_type: "counter".to_owned(),
-            input: vec![input],
-            memo: BTreeMap::new(),
-        }],
+        commands: vec![continue_as_new_without_options(
+            "counter",
+            vec![input],
+            BTreeMap::new(),
+        )],
     };
     let encoded = workflow_protocol::encode_completion(&completion).unwrap();
     assert!(encoded.contains("\"kind\":\"continue_as_new\""));
@@ -1396,7 +1638,10 @@ fn converts_continue_as_new_command() {
     else {
         panic!("continue-as-new must map to Core's continue-as-new variant");
     };
-    command.task_queue = "other".to_owned();
+    command.headers.insert(
+        "header".to_owned(),
+        temporalio_protos::temporal::api::common::v1::Payload::default(),
+    );
     assert_eq!(
         workflow_protocol::completion_from_core(&unsupported)
             .unwrap_err()
@@ -1416,11 +1661,7 @@ fn rejects_continue_as_new_with_follow_up_command() {
         task_failure: None,
         run_id: "current-run".to_owned(),
         commands: vec![
-            workflow_protocol::CompletionCommand::ContinueAsNew {
-                workflow_type: "counter".to_owned(),
-                input: Vec::new(),
-                memo: BTreeMap::new(),
-            },
+            continue_as_new_without_options("counter", Vec::new(), BTreeMap::new()),
             workflow_protocol::CompletionCommand::StartTimer {
                 seq: 1,
                 start_to_fire_timeout: workflow_protocol::Duration {
