@@ -43,6 +43,10 @@ evidence="$root/_build/examples-live"
 # previous run's result (the client's default workflow ID is fixed).
 suffix="$(date +%s)-$$"
 task_queue="ocaml-temporal-example-live-$suffix"
+# The Eio integration example (#1141), built in the examples-eio image and run
+# in the development image like the others; see its section below.
+eio_example="$project-example-eio"
+eio_executable=examples/eio/eio_example.exe
 activity_worker="$project-example-activity-worker"
 workflow_worker="$project-example-workflow-worker"
 client="$project-example-client"
@@ -99,6 +103,7 @@ example() {
 cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
+  docker rm -f "$eio_example" >/dev/null 2>&1 || true
   for container in "$activity_worker" "$workflow_worker"; do
     docker logs "$container" >"$evidence/$container.log" 2>&1 || true
   done
@@ -187,6 +192,33 @@ grep -Fx 'workflow worker stopped cleanly' "$evidence/$workflow_worker.log" >/de
   echo "workflow worker did not report a clean stop" >&2
   exit 1
 }
+
+# Eio integration (#1141): one self-checking process that hosts its own
+# worker on a Domain with Eio.Domain_manager and drives it from Eio fibers
+# through Eio_unix.run_in_systhread, on the "$task_queue-eio" queue.
+test -x "$root/_build/default/$eio_executable" || {
+  echo "missing compiled example executable: $eio_executable" >&2
+  exit 1
+}
+status=0
+example "$eio_example" "$client_timeout" "$eio_executable" --rm -- \
+  >"$evidence/eio.stdout" 2>"$evidence/eio.stderr" || status=$?
+if [ "$status" -ne 0 ]; then
+  echo "Eio example exited with status $status" >&2
+  exit 1
+fi
+printf '%s\n' \
+  'Eio client: three fibers shared one client and each started and awaited a workflow.' \
+  'Eio client: all three blocking calls were in flight at once, each in its own system thread.' \
+  'Eio fibers: another fiber kept running while the client calls waited.' \
+  'Eio worker: hosted on its own Domain, drained and shut down when its fiber was cancelled.' \
+  'Eio example passed.' \
+  >"$evidence/eio.expected"
+if ! cmp -s "$evidence/eio.expected" "$evidence/eio.stdout"; then
+  echo "Eio example output differs from the documented report" >&2
+  diff "$evidence/eio.expected" "$evidence/eio.stdout" >&2 || true
+  exit 1
+fi
 
 # Cooperative cancellation (#494): one self-checking process with its own
 # worker, on the "$task_queue-cancellation" queue, so the example workers above

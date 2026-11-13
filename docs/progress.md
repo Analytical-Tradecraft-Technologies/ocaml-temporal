@@ -7084,3 +7084,34 @@ generation. `test/idempotency` tests the ledger contract (including
 concurrent requests from several Domains) and the same lost-completion
 redelivery under `Temporal.Testing`. Fault scenarios over TLS remain for
 #496.
+
+## 2026-11-14: compiled Eio integration example (#1141)
+
+- `examples/eio/eio_example.ml` is a self-checking Eio program built from the
+  workflow guide's "Use the SDK from Eio and Lwt applications" patterns. It
+  creates a worker and a client through `Eio_unix.run_in_systhread`, hosts the
+  worker on its own Domain with `Eio.Domain_manager.run` (a daemon fiber turns
+  cancellation into `Worker.request_shutdown`), and starts and awaits three
+  workflows from three fibers while a ticker fiber runs. It checks that all
+  three blocking calls were in flight at once, that the ticker ran while they
+  waited, and that the worker was drained and released before its hosting
+  fiber finished. Calling the client directly on a fiber fails the first
+  check (verified by mutation).
+- Building it showed that a cancelled hosting fiber ends with Eio's
+  `Cancelled` exception, not `serve_worker`'s result, so the guide's snippet
+  now reports the run/shutdown result through `~on_stopped` on the hosting
+  Domain. Both guide snippets were type-checked against the tree again.
+- Eio stays out of the SDK. `scripts/eio-example.locked` pins the CI-only
+  closure (eio, eio_posix 1.6 and 13 dependencies; dune-configurator pinned
+  to the locked dune). The `examples-eio` stage of `Dockerfile.dev` and the
+  native macOS lane install it with the new `scripts/opam-tool-lock.sh`, which
+  the docs stage now shares and which fails if opam adds or moves an unlisted
+  package. `examples/eio/dune` is enabled only by `TEMPORAL_EIO_EXAMPLE`.
+  `make license-check` audits the closure (exact exceptions:
+  `bigstringaf.0.10.0`'s lower-case `BSD-3-clause`, and `seq.base`), and
+  docs/dependencies.md inventories it.
+- CI: smoke-build compiles it in the `examples-eio` image into the smoke
+  artifact; the baseline live shard runs it in `make
+  test-temporal-examples-live`; macOS builds it natively after uploading its
+  library artifact. Windows is not covered (`eio_posix` has no Windows
+  support). Lwt has no compiled example.

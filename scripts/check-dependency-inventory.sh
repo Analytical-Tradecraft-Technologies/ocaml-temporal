@@ -127,6 +127,14 @@ cut -f1 "$scratch/expected" > "$scratch/docs-tools"
 doc_table '## CI-only documentation tooling' | columns 1,2 > "$scratch/documented"
 compare 'CI-only documentation tooling'
 
+# CI-only closure of the Eio integration example (#1141): every package of
+# scripts/eio-example.locked. `make license-check` audits each locked version,
+# as it does the SDK lock, so only the names are inventoried here.
+sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$root/scripts/eio-example.locked" \
+  | tr -d '\r' | awk '{ print $1 }' > "$scratch/expected"
+doc_table '## CI-only Eio example dependencies' | columns 1 > "$scratch/documented"
+compare 'CI-only Eio example dependencies'
+
 # CI-only official Temporal Python SDK closure for the interoperability
 # regression (#517): the package of every `name==version` requirement line of
 # the hash-locked file that test/integration/sdk_interop/python/run-driver.sh

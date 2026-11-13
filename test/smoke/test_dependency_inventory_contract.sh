@@ -18,6 +18,7 @@ temporal-sdk.opam
 temporal-sdk.opam.locked
 scripts/opam-lock-overrides.txt
 scripts/docs-tools.locked
+scripts/eio-example.locked
 scripts/check-dependency-inventory.sh
 test/integration/sdk_interop/python/requirements.lock
 Dockerfile.dev
@@ -141,6 +142,7 @@ edit rust/Cargo.lock '/^name = "tokio"$/{n;s/^version = ".*"/version = "9.9.9"/;
 edit rust/Cargo.toml 's/^uuid = { version = "[^"]*"/uuid = { version = "9.9.9"/'
 edit .github/workflows/build-pr.yml 's/typos@[0-9.]*/typos@9.9.9/'
 edit Makefile 's/^QUALITY_TYPOS_VERSION ?= .*/QUALITY_TYPOS_VERSION ?= 9.9.9/'
+edit scripts/eio-example.locked 's/^eio .*/eio 9.9.9/'
 expect_clean 'OPAM, Python, image, toolchain, Cargo, and quality-tool versions'
 
 fresh_fixture
@@ -189,6 +191,14 @@ expect_drift 'docs-tool LGPL upgrade without a review' 'CI-only documentation to
 fresh_fixture
 append scripts/docs-tools.locked 'logs 0.10.0'
 expect_drift 'new documentation tool' 'CI-only documentation tooling'
+
+fresh_fixture
+append scripts/eio-example.locked 'eio_linux 1.6'
+expect_drift 'new Eio example package' 'CI-only Eio example dependencies'
+
+fresh_fixture
+edit docs/dependencies.md '/^| iomux | /d'
+expect_drift 'removed Eio example row' 'CI-only Eio example dependencies'
 
 fresh_fixture
 insert_before test/integration/sdk_interop/python/requirements.lock 'typing-extensions==' 'grpcio==1.0.0'

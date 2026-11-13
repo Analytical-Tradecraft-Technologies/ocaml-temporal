@@ -4,8 +4,10 @@
 set -eu
 
 # Docker-free guard for the live example gate (#798). Every executable declared
-# under examples/ must be compiled by EXAMPLE_EXECUTABLES, shipped in the CI
-# smoke artifact, and started by the live controller, and that controller must
+# under examples/ must be compiled by EXAMPLE_EXECUTABLES (or, for the Eio
+# example, whose CI-only dependencies live in their own image, by
+# EIO_EXAMPLE_EXECUTABLES, #1141), shipped in the CI smoke artifact, and
+# started by the live controller, and that controller must
 # remain part of the Linux live CI recipe. A newly added example therefore
 # fails here instead of being compiled but silently never executed. This is a
 # source check only; it never claims that a live run passed.
@@ -60,12 +62,13 @@ done >"$scratch/declared.unsorted"
 LC_ALL=C sort -u "$scratch/declared.unsorted" >"$scratch/declared"
 [ -s "$scratch/declared" ] || fail "no example executables were found"
 
-# EXAMPLE_EXECUTABLES is one Make assignment line of space-separated paths.
-sed -n 's/^EXAMPLE_EXECUTABLES[[:space:]]*:=[[:space:]]*//p' "$makefile" \
+# EXAMPLE_EXECUTABLES and EIO_EXAMPLE_EXECUTABLES are each one Make
+# assignment line of space-separated paths.
+sed -n 's/^\(EIO_\)\{0,1\}EXAMPLE_EXECUTABLES[[:space:]]*:=[[:space:]]*//p' "$makefile" \
   | tr -d '\r' | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u >"$scratch/compiled"
 if ! cmp -s "$scratch/declared" "$scratch/compiled"; then
   diff "$scratch/declared" "$scratch/compiled" >&2 || true
-  fail "EXAMPLE_EXECUTABLES must list exactly the declared example executables"
+  fail "EXAMPLE_EXECUTABLES and EIO_EXAMPLE_EXECUTABLES must list exactly the declared example executables"
 fi
 
 [ -f "$controller" ] || fail "missing live controller $controller"
@@ -89,6 +92,12 @@ recipe() {
 recipe test-temporal-examples-live >"$scratch/live"
 grep -F 'build-temporal-executables.sh $(EXAMPLE_EXECUTABLES)' "$scratch/live" >/dev/null \
   || fail "test-temporal-examples-live must build EXAMPLE_EXECUTABLES"
+grep -F '$(MAKE) build-examples-eio' "$scratch/live" >/dev/null \
+  || fail "test-temporal-examples-live must build the Eio example"
+recipe build-examples-eio | grep -F 'build-temporal-executables.sh $(EIO_EXAMPLE_EXECUTABLES)' >/dev/null \
+  || fail "build-examples-eio must build EIO_EXAMPLE_EXECUTABLES"
+recipe build-smoke-executables | grep -F '$(MAKE) build-examples-eio' >/dev/null \
+  || fail "build-smoke-executables must build the Eio example into the smoke artifact"
 grep -F 'scripts/run-examples-live.sh' "$scratch/live" >/dev/null \
   || fail "test-temporal-examples-live must run run-examples-live.sh"
 grep -F '$(MAKE) temporal-clean' "$scratch/live" >/dev/null \

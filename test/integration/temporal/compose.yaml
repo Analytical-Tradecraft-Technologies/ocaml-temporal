@@ -41,6 +41,17 @@ services:
     build:
       target: docs
 
+  # `make build-examples-eio` runs here: the development image plus the exact
+  # CI-only closure of the Eio integration example from
+  # scripts/eio-example.locked. The image sets TEMPORAL_EIO_EXAMPLE=enabled,
+  # which turns examples/eio on; the built executable then runs in the plain
+  # development image like every other example.
+  examples-eio:
+    extends: dev
+    profiles: [examples-eio]
+    build:
+      target: examples-eio
+
   postgresql:
     profiles: [temporal]
     image: postgres:18.6-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5

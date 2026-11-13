@@ -347,7 +347,9 @@ identical charges are both posted.
 
 See the [examples guide](examples/README.md) for the startup order, connection
 settings, and commands. CI compiles every example executable on every Docker
-and native build, and the Linux live job runs them against Temporal Server with
+and native build, except the [Eio example](examples/README.md#use-the-sdk-from-an-eio-program),
+whose CI-only dependencies are installed only for the Linux smoke build and
+the macOS lane. The Linux live job runs them all against Temporal Server with
 `make test-temporal-examples-live`.
 
 See [Writing Workflows in OCaml](docs/guides/workflows.md) for codecs, worker
