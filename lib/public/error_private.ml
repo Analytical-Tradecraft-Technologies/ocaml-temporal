@@ -25,3 +25,17 @@ let to_base (error : Error.t) : Temporal_base.Error.t =
     ~last_heartbeat_details:
       (List.map Payload_private.to_base (Error.last_heartbeat_details error))
     ~category:view.category ~message:view.message ()
+
+(** Returns [Ok ()] unless the calling thread runs a read-only callback (an
+    update validator or a query handler) of the current workflow, in which
+    case the public operation named by [what] receives the runtime's typed
+    defect (#513). Operations whose contract returns a result or future call
+    this before validating, encoding, or allocating anything, so a rejected
+    call mutates nothing; without a current workflow the operation's own
+    outside-workflow error applies instead. *)
+let check_writable ~what =
+  match Temporal_sdk_kernel.Workflow_context_store.current () with
+  | None -> Ok ()
+  | Some context ->
+      Temporal_sdk_kernel.Workflow_context_store.check_writable context ~what
+      |> Result.map_error of_base

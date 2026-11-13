@@ -80,8 +80,13 @@ let is_running scheduler = scheduler.running
 let is_active scheduler = scheduler.active
 
 (** Assigns FIFO sequence numbers at enqueue time. Work submitted after shutdown
-    is intentionally discarded only by internal callbacks already being torn down. *)
+    is intentionally discarded only by internal callbacks already being torn down.
+    Inside a read-only callback (#513) nothing may be queued: the work would
+    run in a later drain on the live path only, because replay skips update
+    validators and never sees queries, so the call raises [Invalid_argument]
+    before the queue changes. *)
 let enqueue scheduler thunk =
+  Future_store.reject_in_read_only ~operation:"workflow scheduling";
   if scheduler.active then (
     let sequence = scheduler.next_sequence in
     scheduler.next_sequence <- sequence + 1;
@@ -134,10 +139,25 @@ let take_teardown_failures scheduler =
   failures
 
 (** Rejects new future allocation after shutdown, when no continuation could be
-    safely resumed. *)
+    safely resumed, and inside a read-only callback, where a pending future
+    would change the scheduler's pending count and teardown ledger on the
+    live path only (#513). *)
 let promise scheduler ~outside_error =
   if not scheduler.active then invalid_arg "Temporal scheduler is shut down";
+  Future_store.reject_in_read_only ~operation:"workflow future allocation";
   Future_store.create ~owner:(owner scheduler) ~outside_error
+
+(** Creates a future that is already settled with [result]. It is allowed in a
+    read-only callback because it leaves no trace: the pending count rises and
+    falls within this call, its teardown registration is removed on
+    resolution, and resolving a future without waiters or observers queues
+    nothing. Read-only rejections use it to return a typed failure owned by
+    the workflow scheduler. *)
+let resolved scheduler ~outside_error result =
+  if not scheduler.active then invalid_arg "Temporal scheduler is shut down";
+  let future, resolve = Future_store.create ~owner:(owner scheduler) ~outside_error in
+  resolve result;
+  future
 
 (** Handles the private [Await] effect by saving the paused workflow fiber on
     its future. Effects not owned by this scheduler continue to an outer

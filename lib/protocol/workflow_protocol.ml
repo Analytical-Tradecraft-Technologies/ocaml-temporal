@@ -459,6 +459,8 @@ type completion_command =
       run_timeout : duration option;
       task_timeout : duration option;
       id_reuse_policy : child_workflow_id_reuse_policy option;
+      memo : (string * payload) list option;
+      search_attributes : (string * payload) list option;
     }
   | Cancel_child_workflow of { seq : int64; reason : string }
   (** Sends a signal to another workflow execution. Core resolves the command
@@ -3027,7 +3029,8 @@ let completion_command path json =
             List.filter
               (fun name -> List.mem_assoc name entries)
               [ "task_queue"; "parent_close_policy"; "execution_timeout";
-                "run_timeout"; "task_timeout"; "id_reuse_policy" ]
+                "run_timeout"; "task_timeout"; "id_reuse_policy"; "memo";
+                "search_attributes" ]
         | _ -> [] in
       let* entries =
         exact_object path
@@ -3083,6 +3086,8 @@ let completion_command path json =
       let* run_timeout = optional "run_timeout" duration in
       let* task_timeout = optional "task_timeout" duration in
       let* id_reuse_policy = optional "id_reuse_policy" child_id_reuse_policy in
+      let* memo = optional "memo" payload_map in
+      let* search_attributes = optional "search_attributes" payload_map in
       let* () =
         validate_child_timeouts path ~execution_timeout ~run_timeout ~task_timeout
       in
@@ -3090,7 +3095,8 @@ let completion_command path json =
         (Start_child_workflow
            { seq; workflow_id; workflow_type; input; retry_policy;
              cancellation_type; task_queue; parent_close_policy;
-             execution_timeout; run_timeout; task_timeout; id_reuse_policy })
+             execution_timeout; run_timeout; task_timeout; id_reuse_policy;
+             memo; search_attributes })
   | "cancel_child_workflow" ->
       let* entries = exact_object path [ "kind"; "seq"; "reason" ] json in
       let* seq_json = field path "seq" entries in
@@ -3312,11 +3318,21 @@ let completion_command_json = function
   | Start_child_workflow
       { seq; workflow_id; workflow_type; input; retry_policy; cancellation_type;
         task_queue; parent_close_policy; execution_timeout; run_timeout;
-        task_timeout; id_reuse_policy } ->
+        task_timeout; id_reuse_policy; memo; search_attributes } ->
       let* () =
         validate_child_timeouts "$.commands" ~execution_timeout
           ~run_timeout ~task_timeout
       in
+      (* Like the other options, an unset memo or search-attribute map is
+         omitted rather than encoded, keeping earlier commands unchanged. *)
+      let optional_map name = function
+        | None -> Ok []
+        | Some values ->
+            let* encoded = payload_map_json ("$.commands." ^ name) values in
+            Ok [ (name, encoded) ]
+      in
+      let* memo = optional_map "memo" memo in
+      let* search_attributes = optional_map "search_attributes" search_attributes in
       let* input = payloads_json input in
       let* retry_policy =
         match retry_policy with
@@ -3337,7 +3353,8 @@ let completion_command_json = function
             ("run_timeout", run_timeout);
             ("task_timeout", task_timeout) ] @
         (match id_reuse_policy with None -> [] | Some value ->
-          ["id_reuse_policy", `String (child_id_reuse_policy_string value)]) in
+          ["id_reuse_policy", `String (child_id_reuse_policy_string value)]) @
+        memo @ search_attributes in
       Ok
         (`Assoc
           (options @ [

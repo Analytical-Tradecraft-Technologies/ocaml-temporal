@@ -96,7 +96,10 @@ let start_sleep ?scope duration =
   match Temporal_sdk_kernel.Workflow_context_store.current () with
   | None -> failed (Error.defect ~message:outside_message)
   | Some context -> (
-      match check_scope scope with
+      match
+        Result.bind (Error_private.check_writable ~what:"sleep") (fun () ->
+            check_scope scope)
+      with
       | Error error -> failed error
       | Ok () ->
           let milliseconds = Duration.to_ms duration in
@@ -124,6 +127,8 @@ let start_sleep ?scope duration =
             future)
 
 (** Implements direct-style sleep as timer creation followed by a future wait.
+    In a read-only callback the start fails, so the call returns that typed
+    defect without suspending.
     A scoped sleep is awaited through its scope, so cancelling the scope from
     another fiber both cancels the durable timer and resumes this caller with
     the scope's [`Cancelled] error. A start that already failed (outside a
@@ -181,7 +186,10 @@ let signal_external_workflow ~workflow_id ?run_id ~(signal : 'input Signal.t)
   match Temporal_sdk_kernel.Workflow_context_store.current () with
   | None -> Future_private.resolved ~outside_error (Error (outside_error ()))
   | Some context -> (
-      match validate_external_target ~workflow_id ~run_id with
+      match
+        Result.bind (Error_private.check_writable ~what:"external workflow signal")
+          (fun () -> validate_external_target ~workflow_id ~run_id)
+      with
       | Error error ->
           failed_external_operation context error
       | Ok () -> (
@@ -212,7 +220,11 @@ let cancel_external_workflow ~workflow_id ?run_id ~reason () =
   match Temporal_sdk_kernel.Workflow_context_store.current () with
   | None -> Future_private.resolved ~outside_error (Error (outside_error ()))
   | Some context -> (
-      match validate_external_target ~workflow_id ~run_id with
+      match
+        Result.bind
+          (Error_private.check_writable ~what:"external workflow cancellation")
+          (fun () -> validate_external_target ~workflow_id ~run_id)
+      with
       | Error error ->
           failed_external_operation context error
       | Ok () when String.equal reason "" ->
@@ -565,38 +577,9 @@ let deprecate_patch ~id =
   | Some context ->
       Temporal_sdk_kernel.Workflow_context_store.deprecate_patch context ~patch_id
 
-(** Checks one search-attribute or memo key at the public boundary and
-    returns the problem, if any; [label] names the collection in the
-    message. Both maps are persisted in workflow history, so rejecting
-    malformed keys before buffering a command prevents a programmer error
-    from becoming a delayed worker failure. *)
-let metadata_key_problem ~label key =
-  if String.equal key "" then Some (Printf.sprintf "Temporal %s key is empty" label)
-  else if String.contains key '\000' then
-    Some (Printf.sprintf "Temporal %s key contains a NUL byte" label)
-  else if String.length key > max_name_bytes then
-    Some (Printf.sprintf "Temporal %s key exceeds 65536 bytes" label)
-  else if not (Temporal_base.Codec.valid_utf_8 key) then
-    Some (Printf.sprintf "Temporal %s key must be valid UTF-8" label)
-  else None
-
-(** Returns the first problem with the keys of one metadata map, checking
-    each key with {!metadata_key_problem} and rejecting repeats, which the
-    bridge's payload map could not represent; [None] when every key is
-    valid. [label] (["search-attribute"] or ["memo"]) names the collection
-    in the message. *)
-let metadata_keys_problem ~label values =
-  let rec check seen = function
-    | [] -> None
-    | (key, _) :: rest -> (
-        match metadata_key_problem ~label key with
-        | Some _ as problem -> problem
-        | None ->
-            if List.exists (String.equal key) seen then
-              Some (Printf.sprintf "Temporal %s keys must be unique" label)
-            else check (key :: seen) rest)
-  in
-  check [] values
+(** The shared memo and search-attribute key check (#1135), also used by
+    child workflow starts; see {!Metadata_keys_private.keys_problem}. *)
+let metadata_keys_problem = Metadata_keys_private.keys_problem
 
 (** Validates every key of one upsert as {!metadata_keys_problem} does and
     raises [Invalid_argument] with the first problem, the upserts'

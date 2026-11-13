@@ -7010,3 +7010,77 @@ beside the run, the typed already-started refusal, and only accepted updates
 in history. The two processes coordinate through `python-ready` and
 `ocaml-with-start.json` in the shared evidence directory. The whole suite
 took 24 seconds locally against Temporal Server 1.32.2.
+
+## 2026-11-14: Child memo and search attributes
+
+`Child_workflow.start`, `start_handle` and `execute` take `?memo` and
+`?search_attributes` (#1135), as raw `(string * Payload.t)` lists like
+`Client.start`; typed values come from `Search_attribute.encode`. Their keys
+are checked by the rules `Workflow.upsert_memo` and continue-as-new already
+use, now in one private module. A bad key returns a ready typed defect before
+any command. An omitted or empty map leaves the start command byte-identical
+to earlier releases. The maps travel through the runtime command, the OCaml
+protocol, the completion schema and the Rust `StartChildWorkflow` decoder,
+which re-checks the keys and fills Core's `memo` and `search_attributes`
+fields instead of leaving them at their defaults. `Temporal.Testing` passes
+both maps to the child's start metadata. Bilateral exact-document tests pin
+the protocol. The `child_start_options` live regression now registers a
+keyword and starts a child with a memo and that keyword. The child reads both
+through `Workflow.start_metadata` before and after worker replacement,
+`Client.list_visibility` finds it by the keyword, and `Client.describe`
+reports both. Capture `live-2026-11-13-child-metadata` adds the parent and
+child histories to the corpus. With the child timeouts, reuse policy and
+typed timeout origin already merged, this completes the #1135 scope. Child
+cron schedules and headers stay out of scope.
+
+## 2026-11-14: Enforced read-only mode for queries and update validators
+
+Query handlers and live update validators now run in one read-only mode
+(#513), `Workflow_context_store.with_read_only`. Replay never runs a query
+and skips every validator, so the mode rejects each SDK operation that would
+change replay-sensitive state, emit a command, or suspend before it changes
+anything. Operations that return a result or future fail with a typed
+defect: `Workflow_context.Local.set`, random draws, `Workflow.sleep` and
+`start_sleep` (unscoped and zero-duration included), activity, local activity
+and child starts, external signals and cancellations, handle and scope
+cancellation, `Scope.create`, condition waits, and `Future.await` of a pending
+future. Operations that already raise for misuse raise `Invalid_argument`:
+`patched`, `deprecate_patch`, the upserts, `continue_as_new`, and future
+combinators over a workflow future. The dispatcher turns a raised rejection
+into a failed query or a rejected update. `emit`, sequence allocation,
+`set_local`, `terminate`, and scheduler enqueue and promise allocation keep
+raising backstops. The mode clears the scheduler owner id, so a validator can
+no longer suspend, and it restores every binding on return, exception, and
+nesting. Validators may now read their own scopes' status, as queries could.
+`test/runtime/test_read_only_mode.ml` runs one workflow live with interleaved
+queries and rejected, raising and accepted updates that try every mutating
+operation, live without them, after an eviction, and as a full replay with
+validation skipped, and requires identical durable commands. It also checks
+restoration and that an accepted update can then mutate and suspend. The
+guard covers SDK state only, not OCaml references, I/O, or foreign calls; the
+v1 policy keeps queries and updates Experimental pending the #489 decision
+and the live update qualification of #505.
+
+## 2026-11-14: Idempotent side effects across a worker restart
+
+The idempotent side-effect example (`examples/idempotency`, #504) posts each
+line of an order to a file-backed ledger under the business key
+`<order ID>/line-<N>`, carried in the activity input. The ledger's contract
+is atomic: a complete, synced record is published with a hard link that
+fails if the key's record exists, so the first request performs the posting
+and every later one gets the original record back as a duplicate, while a
+different posting under the same key is a conflict that fails the activity
+non-retryably. The self-checking example, run by
+`make test-temporal-examples-live`, shows two identical lines posted under
+two keys, a resubmitted order (a new run) answered entirely as duplicates,
+and a second order with identical lines posted under its own keys. The
+`activity_idempotency` live regression kills the worker with `SIGKILL` right
+after line 1's posting commits and before its completion; Temporal times the
+attempt out, a replacement process's attempt 2 is answered as a duplicate,
+and the run completes with one posting per line. Its artifacts (the ledger,
+`correlation.json`, `Client.describe` snapshots, history and worker logs)
+correlate every request with its workflow, run, activity, attempt and worker
+generation. `test/idempotency` tests the ledger contract (including
+concurrent requests from several Domains) and the same lost-completion
+redelivery under `Temporal.Testing`. Fault scenarios over TLS remain for
+#496.

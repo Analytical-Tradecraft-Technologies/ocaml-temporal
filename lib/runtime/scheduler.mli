@@ -29,13 +29,26 @@ val is_running : t -> bool
 val is_active : t -> bool
 
 (** Creates a pending future owned by this scheduler and the function that will
-    provide its result. *)
+    provide its result. Raises [Invalid_argument] after shutdown and inside a
+    read-only callback (see {!Future_store.with_read_only}). *)
 val promise :
   t ->
   outside_error:(unit -> 'error) ->
   ('value, 'error) Future_store.t * ('value, 'error) Future_store.resolver
 
-(** Adds a new workflow fiber after work already waiting in the queue. *)
+(** Creates a future owned by this scheduler that already holds [result].
+    Unlike {!promise} it is permitted inside a read-only callback, because it
+    leaves the pending count, teardown ledger, and run queue unchanged.
+    Raises [Invalid_argument] after shutdown. *)
+val resolved :
+  t ->
+  outside_error:(unit -> 'error) ->
+  ('value, 'error) result ->
+  ('value, 'error) Future_store.t
+
+(** Adds a new workflow fiber after work already waiting in the queue. Like
+    every enqueue it raises [Invalid_argument] inside a read-only callback
+    (see {!Future_store.with_read_only}) before the queue changes. *)
 val spawn : t -> (unit -> unit) -> unit
 
 (** Runs queued fibers in order until none can continue. [on_idle], when given,

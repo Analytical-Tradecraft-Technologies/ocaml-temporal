@@ -1694,10 +1694,12 @@ let reuse_refused (policy : Activation.child_workflow_id_reuse_policy option)
     governs its runs as on a server, its execution and run timeouts are
     enforced in virtual time (#1160), and [task_queue] and [task_timeout]
     are reported by its [Workflow.info]; every registered workflow runs
-    regardless of the queue, as if a worker polled each one. *)
+    regardless of the queue, as if a worker polled each one. [memo] and
+    [search_attributes] (#1135) become the child's start maps, read back by
+    its [Workflow.start_metadata] as on a server. *)
 let start_child environment run ~seq ~id ~name ~input ~parent_close_policy
     ~retry_policy ~task_queue ~execution_timeout ~run_timeout ~task_timeout
-    ~id_reuse_policy =
+    ~id_reuse_policy ~memo ~search_attributes =
   let start_failed cause =
     push_job environment run
       (Activation.Resolve_child_workflow_start
@@ -1723,8 +1725,9 @@ let start_child environment run ~seq ~id ~name ~input ~parent_close_policy
     match
       Result.bind (workflow_input_of_arguments input) (fun input ->
           new_chain ?retry_policy ?task_queue ?execution_timeout ?run_timeout
-            ?task_timeout environment ~workflow_id:id ~workflow_type:name
-            ~input ~parent:(Some (run, seq)) ~parent_close_policy)
+            ?task_timeout ?memo ?search_attributes environment ~workflow_id:id
+            ~workflow_type:name ~input ~parent:(Some (run, seq))
+            ~parent_close_policy)
     with
     | Error error -> start_failed (Error.message error)
     | Ok chain ->
@@ -1866,11 +1869,13 @@ let rec apply_command environment run command =
         run_timeout;
         task_timeout;
         id_reuse_policy;
+        memo;
+        search_attributes;
         _;
       } ->
       start_child environment run ~seq ~id ~name ~input ~parent_close_policy
         ~retry_policy ~task_queue ~execution_timeout ~run_timeout ~task_timeout
-        ~id_reuse_policy
+        ~id_reuse_policy ~memo ~search_attributes
   | Cancel_child_workflow { seq; _ } -> (
       match Hashtbl.find_opt run.children seq with
       | Some child ->

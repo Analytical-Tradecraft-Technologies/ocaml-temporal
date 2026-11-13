@@ -6,8 +6,9 @@ set -eu
 # the workflow worker are separate long-lived containers sharing one task
 # queue; the client is a one-shot container. The caller owns the server
 # lifecycle; this script owns, and always removes, only its example
-# containers. The self-checking cooperative cancellation example (#494) runs
-# afterwards as one more one-shot container on its own task queue.
+# containers. The self-checking cooperative cancellation example (#494) and
+# idempotent side-effect example (#504) run afterwards as one-shot containers,
+# each on its own task queue.
 #
 # Assertions:
 # - a valid name completes and the client prints exactly the documented
@@ -20,7 +21,11 @@ set -eu
 #   a cancelled synchronous and a cancelled asynchronous activity each release
 #   their reservation before acknowledging, and an activity whose worker shuts
 #   down releases its reservation and is committed by a replacement worker,
-#   and a new run reusing that workflow ID does its own work.
+#   and a new run reusing that workflow ID does its own work;
+# - the idempotency example exits 0 and prints exactly its documented report:
+#   two identical lines of one order are both posted under distinct keys, a
+#   resubmitted order posts nothing again, and another order with identical
+#   lines posts its own.
 #
 # The executables must already exist under _build/default: the Makefile target
 # compiles them locally, and CI unpacks the verified smoke artifact. Running
@@ -46,15 +51,17 @@ activity_worker="$project-example-activity-worker"
 workflow_worker="$project-example-workflow-worker"
 client="$project-example-client"
 cancellation="$project-example-cancellation"
+idempotency="$project-example-idempotency"
 activity_executable=examples/activity_worker/activity_worker.exe
 workflow_executable=examples/workflow_worker/workflow_worker.exe
 client_executable=examples/client/client.exe
 cancellation_executable=examples/cancellation/cancellation.exe
+idempotency_executable=examples/idempotency/idempotency.exe
 
 rm -rf "$evidence"
 mkdir -p "$evidence"
 
-for executable in "$activity_executable" "$workflow_executable" "$client_executable" "$cancellation_executable"; do
+for executable in "$activity_executable" "$workflow_executable" "$client_executable" "$cancellation_executable" "$idempotency_executable"; do
   test -x "$root/_build/default/$executable" || {
     echo "missing compiled example executable: $executable" >&2
     exit 1
@@ -107,14 +114,14 @@ cleanup() {
       tail -n 100 "$log"
     done
   fi
-  docker rm -f "$activity_worker" "$workflow_worker" "$client" "$cancellation" >/dev/null 2>&1 || true
+  docker rm -f "$activity_worker" "$workflow_worker" "$client" "$cancellation" "$idempotency" >/dev/null 2>&1 || true
   exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-docker rm -f "$activity_worker" "$workflow_worker" "$client" "$cancellation" >/dev/null 2>&1 || true
+docker rm -f "$activity_worker" "$workflow_worker" "$client" "$cancellation" "$idempotency" >/dev/null 2>&1 || true
 
 # Fails when a worker container has exited, so a startup error is reported as
 # such rather than as an unrelated client timeout.
@@ -236,6 +243,28 @@ if ! cmp -s "$evidence/cancellation.expected" "$evidence/cancellation.stdout"; t
   exit 1
 fi
 
+# Idempotent side effects (#504): one self-checking process with its own
+# worker and ledger directory, on the "$task_queue-idempotency" queue.
+status=0
+example "$idempotency" "$client_timeout" "$idempotency_executable" --rm -- \
+  >"$evidence/idempotency.stdout" 2>"$evidence/idempotency.stderr" || status=$?
+if [ "$status" -ne 0 ]; then
+  echo "idempotency example exited with status $status" >&2
+  exit 1
+fi
+printf '%s\n' \
+  'Identical lines: each line has its own idempotency key, so both charges were posted.' \
+  'Resubmitted order: the new run found both lines already posted and posted nothing again.' \
+  'Another order with identical lines: it has its own keys, so both of its charges were posted.' \
+  'Idempotent payments example passed.' \
+  >"$evidence/idempotency.expected"
+if ! cmp -s "$evidence/idempotency.expected" "$evidence/idempotency.stdout"; then
+  echo "idempotency example output differs from the documented report" >&2
+  diff "$evidence/idempotency.expected" "$evidence/idempotency.stdout" >&2 || true
+  exit 1
+fi
+
 cat "$evidence/client-success.stdout"
 cat "$evidence/cancellation.stdout"
+cat "$evidence/idempotency.stdout"
 printf 'Example application acceptance passed. Logs: %s\n' "$evidence"

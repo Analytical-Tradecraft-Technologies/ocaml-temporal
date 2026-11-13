@@ -287,9 +287,14 @@ end
 (** Read-only identity and scheduling facts for one activity attempt, copied
     from the task Temporal delivered. The type is abstract so later releases
     can add fields compatibly. A common use is an idempotency key for
-    at-least-once side effects, for example combining {!Info.val-workflow},
-    {!Info.activity_id}, and, when each retry must be distinct,
-    {!Info.attempt}. *)
+    at-least-once side effects: the run ID from {!Info.val-workflow} with
+    {!Info.activity_id} names one scheduled activity of one run, which every
+    retry and redelivery shares. A key that must survive workflow retries and
+    continue-as-new belongs in the activity input instead, as in the
+    idempotent side-effect example (examples/idempotency). {!Info.attempt}
+    tells retries apart, so it must not be part of a deduplication key; use
+    it only where each retry must be distinct, such as a per-attempt log
+    line. *)
 module Info : sig
   (** Metadata for one activity attempt. *)
   type t
@@ -561,7 +566,9 @@ type 'output handle
 (** Schedules an activity and retains a handle for explicit cancellation. The
     command is emitted immediately and [future] remains pending until Core
     reports a terminal result. Invalid options or input encoding return a ready
-    failed handle without emitting a command or consuming a sequence. The
+    failed handle without emitting a command or consuming a sequence, and so
+    does a start from a read-only update validator or query handler, checked
+    before the options or the input codec. The
     default policy is [Try_cancel]. When [scope] is supplied, cancellation of
     that scope emits the activity's Core cancellation command exactly once;
     the scope must belong to the same workflow execution. *)
@@ -586,8 +593,9 @@ val future : 'output handle -> ('output, Error.t) Future.t
 
 (** Requests cancellation of the exact activity represented by [handle].
     Repeated calls are idempotent, including a call after natural completion
-    or activity-start failure. Calls made outside the owning workflow return a
-    typed lifecycle error and emit no command. The underlying Temporal Core
+    or activity-start failure. Calls made outside the owning workflow, and
+    calls from a read-only update validator or query handler while the
+    activity is pending, return a typed lifecycle error and emit no command. The underlying Temporal Core
     command identifies the activity by its private sequence and carries no
     user-supplied reason. *)
 val cancel : 'output handle -> (unit, Error.t) result

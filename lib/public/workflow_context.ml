@@ -30,7 +30,9 @@ module Local = struct
 
   (** Stores a value in the current workflow execution. The owner scheduler
       serializes workflow and signal-handler callbacks, so a replacement is a
-      deterministic history-derived state transition. *)
+      deterministic history-derived state transition. A read-only callback
+      (an update validator or a query handler) receives a typed defect and
+      the value is unchanged, because replay would not repeat the write. *)
   let set local value =
     match Temporal_sdk_kernel.Workflow_context_store.current () with
     | None ->
@@ -38,6 +40,8 @@ module Local = struct
           (Error.defect
              ~message:"Temporal.Workflow_context.Local.set used outside a workflow execution")
     | Some context ->
-        Temporal_sdk_kernel.Workflow_context_store.set_local context local.key value;
-        Ok ()
+        Result.map
+          (fun () ->
+            Temporal_sdk_kernel.Workflow_context_store.set_local context local.key value)
+          (Error_private.check_writable ~what:"local value")
 end

@@ -136,7 +136,6 @@ for executable in "$@"; do
   case "$executable" in
     test/integration/activity_cancellation/regression.exe|\
     test/integration/bounded_shutdown/regression.exe|\
-    test/integration/child_start_options/regression.exe|\
     test/integration/client_request_ids/regression.exe|\
     test/integration/completed_queries/regression.exe|\
     test/integration/concurrent_client/regression.exe|\
@@ -146,6 +145,7 @@ for executable in "$@"; do
     test/integration/worker_resource_options/regression.exe|\
     test/integration/workflow_start_info/regression.exe)
       cli_argument='' ;;
+    test/integration/child_start_options/regression.exe|\
     test/integration/client_policies/regression.exe|\
     test/integration/continue_as_new_options/regression.exe|\
     test/integration/cron_start_delay/regression.exe|\
@@ -161,6 +161,11 @@ for executable in "$@"; do
     test/integration/with_start/regression.exe|\
     test/integration/worker_versioning/regression.exe)
       cli_argument=$container_cli ;;
+    test/integration/activity_idempotency/regression.exe)
+      # The CLI path, then the suite's evidence directory (#504) for its
+      # ledger, correlation summary, describe snapshots, exact-run history
+      # and worker generation logs.
+      cli_argument="$container_cli /workspace/_build/live-regressions/activity_idempotency" ;;
     test/integration/activity_worker_crash/regression.exe)
       # The CLI path, then the suite's evidence directory (#519) for its
       # describe snapshots, exact-run history and worker generation logs.

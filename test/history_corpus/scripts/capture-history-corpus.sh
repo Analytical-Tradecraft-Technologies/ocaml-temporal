@@ -45,6 +45,26 @@ esac
 rm -rf "$capture_dir"
 mkdir -p "$capture_dir"
 
+# The corpus-v6-child-start-metadata generation (#1135) sets the
+# CorpusChildKeyword search attribute on a child, and Temporal fails the
+# parent's workflow task for an unknown attribute. Register it (an existing
+# registration is fine), wait until the namespace lists it, then allow the
+# frontend's search-attribute cache a few seconds to refresh, so the captured
+# parent history does not record a failed workflow task.
+register_corpus_child_keyword() {
+  eval "$HISTORY_CORPUS_TEMPORAL_CLI"' operator search-attribute create --namespace "$namespace" --name CorpusChildKeyword --type Keyword' >/dev/null 2>&1 || true
+  attempts=0
+  until eval "$HISTORY_CORPUS_TEMPORAL_CLI"' operator search-attribute list --namespace "$namespace"' 2>/dev/null | grep -q CorpusChildKeyword; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 60 ]; then
+      echo "CorpusChildKeyword was not registered in $namespace" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+  sleep 5
+}
+
 # Generation order is fixed: the two older patch generations run before the
 # current corpus-v1 worker, so each patch history is produced by exactly one
 # source generation and the workflow IDs never collide with an open run. The
@@ -55,6 +75,9 @@ corpus-lifecycle-legacy corpus-lifecycle-patched corpus-lifecycle-deprecated \
 corpus-lifecycle-removed"
 for generation in ${HISTORY_CORPUS_GENERATIONS:-$default_generations}; do
   echo "history corpus capture: generation=$generation" >&2
+  case "$generation" in
+    corpus-v6-child-start-metadata) register_corpus_child_keyword ;;
+  esac
   # The prefix is shell text (it may carry quoted paths and leading
   # environment assignments, as Make's Compose commands do), so it is
   # evaluated rather than word-split. The arguments stay quoted.

@@ -1075,6 +1075,34 @@ longer proves Core is gone, so `Runtime.shutdown` reports the same
 holds Core's blocking pool makes both releases return `DETACHED` at a short
 test bound while the cleanup thread still finishes the drop.
 
+The `real_processing_thread_detach` lifecycle tests keep Core's *real*
+workflow processing thread alive instead. A gRPC double hands a workflow
+worker one task, then fails every later workflow poll with gRPC's
+non-retryable "message larger than max" status. The workflow lane publishes
+that error and exits, and the run's activation, or the eviction that follows
+its failure, is never acknowledged. Core's default `ignore_evicts_on_shutdown`
+is false, so the thread never reaches its shutdown condition. The tests drive
+everything through the C ABI, for a worker with its own runtime and for one
+attached to a shared runtime. They show that this state cannot reach Core's
+finalizer through the bridge. Core reports `ShutDown` from a workflow poll
+only once the processing thread's stream has ended. The activity lane, which
+every workflow worker runs for local activities, sees `ShutDown` only after
+that. A drain that succeeds therefore means the thread is already exiting, so
+`finalize_bounded` never runs `finalize_shutdown` while the thread lives.
+Instead:
+
+- `worker_shutdown` times out at the drain bound (`WORKER`).
+- Disposal times out the same way, refuses finalization for the lost poll
+  lease, and drops the worker.
+- Dropping Core does not wait for the thread, which is a plain OS thread, not
+  blocking-pool work. `runtime_free` and `shared_runtime_free` therefore
+  return `OK` in well under a second once the shortened drain has elapsed.
+
+The `DETACHED` bounds stay as defence against any other blocking-pool work
+that outlives a release. In production the same scenario waits out the
+90-second drain bound twice: once in `Worker.shutdown`, whose teardown timeout
+then reports `Detached`, and once in disposal.
+
 The OCaml side adds a stricter, typed ordering rule on top of that memory
 safety. `Sdk_shared_runtime` (private) owns the `Native_bridge.shared_runtime`
 custom block, whose C owner has the same counted-borrow gate and malloc'd
@@ -1479,7 +1507,17 @@ and the Core runtime still returns. The
 `worker_shutdown_outcomes` ABI tests pin what each outcome becomes in
 `shutdown_worker`: a drain timeout or lane failure is `WORKER`, a panicked
 or detached finalizer is `WORKER` with its closed message, and abandoned
-leases are `OUTSTANDING_TASKS`. `worker_validation_cleanup` shows that
+leases are `OUTSTANDING_TASKS`. The `worker_shutdown_drain_timeout` test
+drives the same timeout end to end through the C ABI: a live worker
+connected to a gRPC double has its workflow lane replaced by one that never
+stops, so `worker_shutdown` returns `WORKER` with the drain-timeout message
+at the drain bound, keeps the worker in the graph with its ledger
+unfinalizable, and fails the same way when repeated; `runtime_free` then
+still returns `OK` through the last-resort path and releases Core. Both
+bounds are read from the worker (`PollLanes::shutdown_drain_bound` and
+`finalize_bound`), which is how that test shortens them; production always
+uses `WORKER_SHUTDOWN_DRAIN_TIMEOUT` and `WORKER_FINALIZE_TIMEOUT`.
+`worker_validation_cleanup` shows that
 releasing an unvalidated worker stops waiting at
 `UNVALIDATED_WORKER_RELEASE_TIMEOUT` (10 s) when the server never answers
 `ShutdownWorker`.

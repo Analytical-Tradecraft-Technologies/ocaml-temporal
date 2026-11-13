@@ -338,6 +338,8 @@ let _child_start :
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
     ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
@@ -355,6 +357,8 @@ let _child_start_handle :
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
     ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input -> 'output T.Child_workflow.handle =
@@ -387,6 +391,8 @@ let _child_execute :
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
     ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->

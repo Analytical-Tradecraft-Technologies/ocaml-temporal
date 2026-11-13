@@ -2781,9 +2781,12 @@ impl Runtime {
     /// 1. initiate Core shutdown, unless [`Self::initiate_worker_shutdown`]
     ///    already did when the run loop stopped (#1028; it is idempotent);
     /// 2. retire every outstanding task while joining both poll lanes, for at
-    ///    most [`WORKER_SHUTDOWN_DRAIN_TIMEOUT`];
+    ///    most the worker's drain bound ([`WORKER_SHUTDOWN_DRAIN_TIMEOUT`]);
     /// 3. run Core's finalizer in a task that owns the worker, waiting for at
-    ///    most [`WORKER_FINALIZE_TIMEOUT`].
+    ///    most its finalize bound ([`WORKER_FINALIZE_TIMEOUT`]).
+    ///
+    /// Both bounds are read from the worker (see
+    /// [`PollLanes::shutdown_drain_bound`]); only tests change them.
     ///
     /// Contract: tasks that never reached OCaml (queued handoffs, polls in
     /// flight at shutdown, Core's own cache evictions) are retired silently,
@@ -2804,14 +2807,16 @@ impl Runtime {
             let _runtime_guard = handle.enter();
             worker.initiate_shutdown();
         }
+        let drain_bound = worker.shutdown_drain_bound();
         let retirement = handle
-            .block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT))
+            .block_on(worker.drain_and_join_for_shutdown(drain_bound))
             .map_err(shutdown_drain_failure)?;
         let worker = self
             .worker
             .take()
             .expect("drained worker remains owned until terminal finalization");
-        let released = match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+        let finalize_bound = worker.finalize_bound();
+        let released = match handle.block_on(worker.finalize_bounded(finalize_bound)) {
             BoundedFinalize::Refused(worker, error) => {
                 // The bridge would not consume the worker (for example after a
                 // lost poll lease). Keep it owned by the graph so runtime close
@@ -3630,7 +3635,8 @@ fn drop_runtime_graph(
         // while the lanes stop, and is bounded so dispose cannot hang on a
         // debt Core keeps outstanding (issue #769). A timeout leaves the
         // worker unfinalizable, which the match below handles.
-        let _ = handle.block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT));
+        let drain_bound = worker.shutdown_drain_bound();
+        let _ = handle.block_on(worker.drain_and_join_for_shutdown(drain_bound));
         // An admitted workflow completion that outlived the bounded drain is
         // still awaiting Core and holds a worker reference. Abort it and wait
         // for the abort, so no task outlives the graph; its outcome is
@@ -3642,7 +3648,8 @@ fn drop_runtime_graph(
         // the only window in which a late task could otherwise be dropped with
         // an outstanding Core completion debt.
         handle.block_on(worker.force_complete_outstanding_for_dispose());
-        match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+        let finalize_bound = worker.finalize_bound();
+        match handle.block_on(worker.finalize_bounded(finalize_bound)) {
             BoundedFinalize::Refused(worker, _) => {
                 // Dispose cannot wait for OCaml. Dropping after force-complete
                 // is the last-resort reclaim path.
@@ -7348,6 +7355,20 @@ mod runtime_release_bound;
 #[cfg(test)]
 #[path = "../tests/support/worker_shutdown_outcomes.rs"]
 mod worker_shutdown_outcomes;
+
+/// gRPC double shared by the in-crate live-worker tests below; a file may
+/// be loaded as a module only once.
+#[cfg(test)]
+#[path = "../tests/support/grpc_double.rs"]
+mod grpc_double;
+
+#[cfg(test)]
+#[path = "../tests/support/worker_shutdown_drain_timeout.rs"]
+mod worker_shutdown_drain_timeout;
+
+#[cfg(test)]
+#[path = "../tests/support/real_processing_thread_detach.rs"]
+mod real_processing_thread_detach;
 
 /// SDK name reported to Temporal as the `client-name` RPC header and recorded
 /// in `WorkflowTaskCompleted.sdk_metadata`. Core would otherwise attribute

@@ -70,9 +70,11 @@ val implementation :
 
 (** Starts a durable Temporal timer and returns immediately. Starting several
     timers before awaiting one emits them in call order. A zero duration returns
-    a ready future without recording a timer. Outside workflow execution the
-    returned future is ready with a typed defect rather than touching global
-    time or creating an unowned timer.
+    a ready future without recording a timer. Outside workflow execution, and
+    in a read-only update validator or query handler (even for a zero
+    duration), the returned future is ready with a typed defect rather than
+    touching global time, creating an unowned timer, or recording a timer that
+    replay would not repeat.
 
     With [scope], cancelling the scope while the timer is pending records
     [TimerCanceled] in history (one [Cancel_timer] command, however often the
@@ -91,7 +93,8 @@ val start_sleep : ?scope:Scope.t -> Duration.t -> (unit, Error.t) Future.t
     the wait is [Scope.await scope (start_sleep ~scope duration)], so a scope
     cancelled by another fiber cancels the timer and returns [`Cancelled]. A
     zero duration returns immediately without recording a timer; outside
-    workflow execution it returns a typed defect. *)
+    workflow execution, and in a read-only update validator or query handler,
+    it returns {!start_sleep}'s typed defect without suspending. *)
 val sleep : ?scope:Scope.t -> Duration.t -> (unit, Error.t) result
 
 (** Sends a typed signal to another workflow execution. The operation is
@@ -99,7 +102,9 @@ val sleep : ?scope:Scope.t -> Duration.t -> (unit, Error.t) result
     activation. Omitting [run_id] lets the server resolve the current run for
     [workflow_id]; an explicit [run_id] targets that run and, like
     [workflow_id], must be non-empty, valid UTF-8, NUL-free, and at most
-    65,536 bytes, or the future resolves with a typed defect. *)
+    65,536 bytes, or the future resolves with a typed defect. A call from a
+    read-only update validator or query handler also returns a future ready
+    with a typed defect, before the input is encoded or a command recorded. *)
 val signal_external_workflow :
   workflow_id:string ->
   ?run_id:string ->
@@ -111,7 +116,9 @@ val signal_external_workflow :
 (** Requests cancellation of another workflow execution and returns a future
     resolved by Temporal's acknowledgement or structured failure. [run_id]
     follows {!signal_external_workflow}: omitted selects the current run, and
-    an explicit value must be a valid non-empty run ID. *)
+    an explicit value must be a valid non-empty run ID. Like a signal, a call
+    from a read-only update validator or query handler returns a future ready
+    with a typed defect and records nothing. *)
 val cancel_external_workflow :
   workflow_id:string ->
   ?run_id:string ->
@@ -129,14 +136,17 @@ val now : unit -> (Time.t, Error.t) result
 (** Returns a deterministic pseudo-random integer [n] with [0 <= n < bound].
     The stream is seeded by Temporal for the workflow run and replayed from
     the same initialization and reset metadata, so the result is stable for an
-    identical call sequence. [bound] must be positive; invalid bounds and calls
-    outside a workflow return a typed defect. *)
+    identical call sequence. [bound] must be positive; invalid bounds, calls
+    outside a workflow, and calls in a read-only update validator or query
+    handler (which would advance the stream on the live path only) return a
+    typed defect. *)
 val random_int : bound:int -> (int, Error.t) result
 
 (** Returns a deterministic pseudo-random float [x] with [0. <= x < 1.],
     from the same per-run stream as {!random_int} (#1155), so it is stable
     across replay and follows a reset's new seed. Calls outside a workflow,
-    or in a read-only update validator, return a typed defect. *)
+    or in a read-only update validator or query handler, return a typed
+    defect. *)
 val random_float : unit -> (float, Error.t) result
 
 (** Returns [length] deterministic pseudo-random bytes from the same stream
@@ -353,9 +363,12 @@ val is_replaying : unit -> bool
     [false], but Core needs the command to consume the recorded marker.
 
     Patch IDs must be non-empty, valid UTF-8, NUL-free, and at most 65,536
-    bytes. Invalid IDs or calls outside workflow execution raise
-    [Invalid_argument] as programmer misuse. IDs are durable history keys:
-    never reuse an ID for a different behavioral change. *)
+    bytes. Invalid IDs, calls outside workflow execution, and calls from a
+    read-only update validator or query handler raise [Invalid_argument] as
+    programmer misuse: the first call fixes the run's decision and may record
+    a marker, which replay of such a callback could not repeat. IDs are
+    durable history keys: never reuse an ID for a different behavioral
+    change. *)
 val patched : id:string -> bool
 
 (** Records that the behavioral change identified by [id] is being phased out.
@@ -366,7 +379,8 @@ val patched : id:string -> bool
 
     Patch IDs have the same validation and immutable-history requirements as
     [patched]. Invalid IDs, calls outside workflow execution, calls after that
-    execution ends, or mixed patch modes raise [Invalid_argument] as programmer
+    execution ends, calls from a read-only update validator or query handler,
+    or mixed patch modes raise [Invalid_argument] as programmer
     misuse. Replacing [patched] is safe only after marker-free executions that
     could take the old branch can no longer replay across that point. Removing
     the deprecation call is a later gate, safe only after incompatible

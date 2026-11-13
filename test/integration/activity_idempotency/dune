@@ -1,0 +1,8 @@
+; Live #504 regression: an activity's posting is committed in the example
+; ledger and its worker process is killed before the completion reaches
+; Temporal; a replacement worker's redelivered attempt is answered as a
+; duplicate. Run through make test-temporal-live-regressions, which also
+; supplies the official Temporal CLI used to read the run's history.
+(executable
+ (name regression)
+ (libraries temporal-sdk temporal_sdk_examples_idempotency unix yojson))

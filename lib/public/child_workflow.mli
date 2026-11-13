@@ -43,8 +43,9 @@ type 'output handle
     cancel the child when [cancel] is called; choose [Abandon] explicitly when
     the child should keep running. [retry_policy], when supplied, is handed to
     Temporal Core so retryable child failures are retried by the durable state
-    machine rather than by replay-sensitive OCaml code. Invalid input and
-    detached calls return ready failed handles, so no command or sequence
+    machine rather than by replay-sensitive OCaml code. Invalid input,
+    detached calls, and starts from a read-only update validator or query
+    handler return ready failed handles, so no command or sequence
     number is created. When [scope] is supplied, cancelling it emits the
     child's Core cancellation command with the stable default reason
     ["cancelled by workflow"]. [task_queue] routes the child to another worker;
@@ -69,7 +70,19 @@ type 'output handle
     parent observes as a failed {!future}; the child reads the values through
     {!Workflow.Info.execution_timeout}, {!Workflow.Info.run_timeout} and
     {!Workflow.Info.task_timeout}. [id_reuse_policy] is sent only when
-    supplied; omitted, Temporal's default ([`Allow_duplicate]) applies. *)
+    supplied; omitted, Temporal's default ([`Allow_duplicate]) applies.
+
+    [memo] attaches named payloads recorded on the child's start event and
+    shown when the child is described; [search_attributes] attaches indexed
+    values that visibility queries such as {!Client.list_visibility} filter
+    on (build typed values with {!Search_attribute.encode}; the server
+    rejects an attribute it does not know). The child reads both through
+    {!Workflow.val-start_metadata}. They follow the key rules of
+    {!Client.start}: a key must be non-empty, valid UTF-8, free of NUL, at
+    most 65,536 bytes, and unique within its map; a violation returns a
+    ready failed handle with a typed defect before any command is emitted.
+    Omitted or empty, the child starts with none and the command is the one
+    earlier releases emitted. *)
 val start_handle :
   ?scope:Scope.t ->
   ?cancellation_type:cancellation_type ->
@@ -80,6 +93,8 @@ val start_handle :
   ?run_timeout:Duration.t ->
   ?task_timeout:Duration.t ->
   ?id_reuse_policy:id_reuse_policy ->
+  ?memo:(string * Payload.t) list ->
+  ?search_attributes:(string * Payload.t) list ->
   id:string ->
   ('input, 'output) Workflow.t ->
   'input ->
@@ -111,7 +126,9 @@ val started : 'output handle -> (string, Error.t) Future.t
     default reason is stable and replay-safe. Repeated calls are idempotent;
     this includes a valid call that arrives after natural child completion or a
     start failure has retired the pending entry. Core determines when the
-    future receives the typed cancellation result. *)
+    future receives the typed cancellation result. A call from a read-only
+    update validator or query handler while the child is pending returns a
+    typed defect and emits nothing. *)
 val cancel :
   ?reason:string ->
   'output handle ->
@@ -125,8 +142,9 @@ val cancel :
     Starting several operations before awaiting them lets Temporal run them
     concurrently. The default cancellation policy is [Try_cancel]. A supplied
     [retry_policy] controls retries in Temporal Core. A supplied [scope]
-    attaches server-side child cancellation to the scope. The timeouts and
-    [id_reuse_policy] behave as for {!start_handle}. The returned future
+    attaches server-side child cancellation to the scope. The timeouts,
+    [id_reuse_policy], [memo] and [search_attributes] behave as for
+    {!start_handle}. The returned future
     resolves only when the child finishes; use {!start_handle} and {!started}
     to wait for the child to be started instead. *)
 val start :
@@ -139,6 +157,8 @@ val start :
   ?run_timeout:Duration.t ->
   ?task_timeout:Duration.t ->
   ?id_reuse_policy:id_reuse_policy ->
+  ?memo:(string * Payload.t) list ->
+  ?search_attributes:(string * Payload.t) list ->
   id:string ->
   ('input, 'output) Workflow.t ->
   'input ->
@@ -148,7 +168,8 @@ val start :
     [Future.await (start ~id definition input)]. Child, codec, cancellation,
     retry, and bridge failures are returned as structured values. The default
     cancellation policy is [Try_cancel]. A supplied [scope] also requests
-    server-side cancellation of the child. *)
+    server-side cancellation of the child. The other options behave as for
+    {!start_handle}. *)
 val execute :
   ?scope:Scope.t ->
   ?cancellation_type:cancellation_type ->
@@ -159,6 +180,8 @@ val execute :
   ?run_timeout:Duration.t ->
   ?task_timeout:Duration.t ->
   ?id_reuse_policy:id_reuse_policy ->
+  ?memo:(string * Payload.t) list ->
+  ?search_attributes:(string * Payload.t) list ->
   id:string ->
   ('input, 'output) Workflow.t ->
   'input ->
