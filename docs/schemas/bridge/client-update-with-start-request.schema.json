@@ -2,12 +2,17 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-update-with-start-request.schema.json",
   "title": "OCaml Temporal native client update-with-start request",
-  "description": "Closed JSON document used only by the private Rust client bridge, submitted with the UPDATE_WITH_START client call selector (#1151). The start document is embedded unchanged and every conflict policy is forwarded. The update never names a run: Temporal resolves the run the start creates or attaches to. The start's rpc_timeout_ms bounds the whole call, including re-issued attempts while the update is only admitted (default 30 seconds). The success value is client-update-with-start-outcome.schema.json. Runtime validators also reject duplicate keys, NUL bytes, and strings over the 65,536-byte safety limit.",
+  "description": "Closed JSON document used only by the private Rust client bridge, submitted with the UPDATE_WITH_START client call selector (#1151). The start document is embedded unchanged and every conflict policy is forwarded; it must not carry cron_schedule or start_delay_ms, which Temporal rejects for update-with-start (#1158). The update never names a run: Temporal resolves the run the start creates or attaches to. The start's rpc_timeout_ms bounds the whole call, including re-issued attempts while the update is only admitted (default 30 seconds). The success value is client-update-with-start-outcome.schema.json. Runtime validators also reject duplicate keys, NUL bytes, and strings over the 65,536-byte safety limit.",
   "type": "object",
   "additionalProperties": false,
   "required": ["start", "update_id", "update_name", "update_input"],
   "properties": {
-    "start": {"$ref": "client-start-request.schema.json"},
+    "start": {
+      "allOf": [
+        {"$ref": "client-start-request.schema.json"},
+        {"not": {"anyOf": [{"required": ["cron_schedule"]}, {"required": ["start_delay_ms"]}]}}
+      ]
+    },
     "update_id": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
     "update_name": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^[^\\u0000]+$"},
     "update_input": {"type": "array", "items": {"$ref": "temporal-payload.schema.json"}}

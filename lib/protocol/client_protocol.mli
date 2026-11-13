@@ -82,6 +82,8 @@ type start_request = {
   run_timeout_ms : int64 option;
   task_timeout_ms : int64 option;
   retry_policy : Workflow_protocol.retry_policy option;
+  cron_schedule : string option;
+  start_delay_ms : int64 option;
   rpc_deadline : rpc_deadline option;
 }
 (** Dynamic workflow-start request sent to the Rust client adapter. [request_id]
@@ -96,6 +98,10 @@ type start_request = {
     execution timeout, and a task timeout no larger than the run timeout (or
     the execution timeout when there is no run timeout). Every combination
     of the reuse and conflict policies is valid.
+    [cron_schedule] (a non-empty identifier that Temporal parses) and
+    [start_delay_ms] (positive, at most {!max_workflow_timeout_ms}) are
+    omitted when [None] and are mutually exclusive, as Temporal requires
+    (#1158); an update-with-start request carries neither.
     [rpc_deadline] bounds only this client call (default ten seconds) and
     never the workflow; its [timeout_ms] is sent as [rpc_timeout_ms] and must
     be between 1 and {!max_rpc_timeout_ms}. Every other request below that

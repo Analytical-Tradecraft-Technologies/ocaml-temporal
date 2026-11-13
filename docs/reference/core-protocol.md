@@ -248,8 +248,10 @@ integral JSON preserves every value exactly. Activation-wide internal flags, his
 suggestions, deployment identity, SDK version, and target-deployment change are
 also preserved. Optional `context` and `metadata` objects may be absent for
 older synthetic fixtures, but when present their nested shapes are closed.
-A cron schedule or a start delay, which OCaml workers do not support, is
-rejected as `unsupported`. The few Core 1.x fields the protocol does not
+The required-nullable `first_workflow_task_backoff` and `cron_schedule`
+members carry the server-applied first-task delay and the recorded cron
+schedule (#1158); `cron_schedule` is `null` rather than an empty string when
+the run has none. The few Core 1.x fields the protocol does not
 carry yet, such as `InitializeWorkflow.original_execution_run_id`, are
 dropped; [Core bridge](core-bridge.md) lists them.
 

@@ -687,6 +687,10 @@ let create_run ?(attempt = 1) ?delay_ms
                  run_timeout = Option.map protocol_duration chain.run_timeout;
                  task_timeout = Option.map protocol_duration chain.task_timeout;
                  retry_policy = Option.map protocol_retry_policy chain.retry_policy;
+                 (* The simulator has no cron schedules or start delays
+                    (#1158): every run's first task is dispatched at once. *)
+                 first_workflow_task_backoff = None;
+                 cron_schedule = None;
                  (* [chain.current] still names the predecessor here: it is
                     replaced only after this run is built. *)
                  continued_from =

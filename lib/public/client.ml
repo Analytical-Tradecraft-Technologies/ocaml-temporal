@@ -375,6 +375,36 @@ let validate_start_policies ~execution_timeout ~run_timeout ~task_timeout
       start_rpc_deadline;
     }
 
+(** Validates a start's cron schedule and first-task delay (#1158) and
+    converts the delay to exact milliseconds, mirroring the protocol encoder
+    and the Rust bridge so the mock rejects the same requests. The schedule
+    is checked like every other identifier; Temporal parses the expression
+    itself and reports an invalid one as an [`Invalid_argument] RPC error.
+    A zero delay is rejected because Temporal reads zero as "no delay", and
+    the two options are exclusive because Temporal refuses their
+    combination. *)
+let validate_start_schedule ~cron_schedule ~start_delay =
+  let ( let* ) = Result.bind in
+  let* () =
+    match cron_schedule with
+    | None -> Ok ()
+    | Some schedule -> validate_name "cron schedule" schedule
+  in
+  match start_delay with
+  | None -> Ok None
+  | Some delay ->
+      let milliseconds = Duration.to_ms delay in
+      if Int64.compare milliseconds 0L <= 0 then
+        Error (Error.defect ~message:"start_delay must be positive")
+      else if
+        Int64.compare milliseconds Client_protocol.max_workflow_timeout_ms > 0
+      then Error (Error.defect ~message:"start_delay exceeds its maximum")
+      else if Option.is_some cron_schedule then
+        Error
+          (Error.defect
+             ~message:"start_delay cannot be combined with cron_schedule")
+      else Ok (Some milliseconds)
+
 (** Encodes one typed workflow, signal, or update input as the argument list
     sent to Temporal, in the public payload and error vocabulary: zero payloads
     for [Codec.unit] and one payload for any other codec, so an option's [None]
@@ -391,7 +421,8 @@ let encode_arguments codec value =
 let build_start_request ~request_id ~memo ~search_attributes
     ~(id_conflict_policy : id_conflict_policy)
     ~(id_reuse_policy : id_reuse_policy) ~execution_timeout ~run_timeout
-    ~task_timeout ~retry_policy ~rpc_timeout ~workflow ~task_queue ~id ~input :
+    ~task_timeout ~retry_policy ~cron_schedule ~start_delay ~rpc_timeout
+    ~workflow ~task_queue ~id ~input :
     (Backend.start_request, Error.t) result =
     match
       validate_start_fields ~request_id ~workflow_name:(Workflow.name workflow)
@@ -402,11 +433,16 @@ let build_start_request ~request_id ~memo ~search_attributes
         match
           Result.bind (validate_start_metadata ~memo ~search_attributes)
             (fun () ->
-              validate_start_policies ~execution_timeout ~run_timeout
-                ~task_timeout ~rpc_timeout)
+              Result.bind
+                (validate_start_policies ~execution_timeout ~run_timeout
+                   ~task_timeout ~rpc_timeout)
+                (fun policies ->
+                  Result.map
+                    (fun start_delay_ms -> (policies, start_delay_ms))
+                    (validate_start_schedule ~cron_schedule ~start_delay)))
         with
         | Error error -> Error error
-        | Ok policies -> (
+        | Ok (policies, start_delay_ms) -> (
             match encode_arguments (Workflow.input workflow) input with
         | Error error -> Error error
         | Ok encoded_input ->
@@ -426,6 +462,8 @@ let build_start_request ~request_id ~memo ~search_attributes
                 task_timeout_ms = policies.task_timeout_ms;
                 retry_policy =
                   Option.map Retry_policy_private.to_runtime retry_policy;
+                cron_schedule;
+                start_delay_ms;
                 rpc_deadline = policies.start_rpc_deadline;
               }))
 
@@ -455,8 +493,8 @@ let started_handle client ~workflow ~id (response : Backend.start_response) =
 let start client ?request_id ?(memo = []) ?(search_attributes = [])
     ?(id_conflict_policy : id_conflict_policy = `Fail)
     ?(id_reuse_policy : id_reuse_policy = `Allow_duplicate) ?execution_timeout
-    ?run_timeout ?task_timeout ?retry_policy ?rpc_timeout ~workflow ~task_queue
-    ~id ~input () =
+    ?run_timeout ?task_timeout ?retry_policy ?cron_schedule ?start_delay
+    ?rpc_timeout ~workflow ~task_queue ~id ~input () =
   if Atomic.get client.closed then
     Error
       (Error.make ~category:`Bridge ~message:"client is shut down" ())
@@ -464,8 +502,8 @@ let start client ?request_id ?(memo = []) ?(search_attributes = [])
     Result.bind
       (build_start_request ~request_id ~memo ~search_attributes
          ~id_conflict_policy ~id_reuse_policy ~execution_timeout ~run_timeout
-         ~task_timeout ~retry_policy ~rpc_timeout ~workflow ~task_queue ~id
-         ~input)
+         ~task_timeout ~retry_policy ~cron_schedule ~start_delay ~rpc_timeout
+         ~workflow ~task_queue ~id ~input)
       (fun request ->
         Result.bind (Backend.client_start client.backend request)
           (started_handle client ~workflow ~id))
@@ -1193,8 +1231,9 @@ let wait_update ?timeout handle =
 let signal_with_start client ?request_id ?(memo = []) ?(search_attributes = [])
     ?(id_conflict_policy : [ `Use_existing | `Terminate_existing ] = `Use_existing)
     ?(id_reuse_policy : id_reuse_policy = `Allow_duplicate) ?execution_timeout
-    ?run_timeout ?task_timeout ?retry_policy ?rpc_timeout ~workflow ~task_queue
-    ~id ~input ~(signal : 'signal Signal.t) ~signal_input () =
+    ?run_timeout ?task_timeout ?retry_policy ?cron_schedule ?start_delay
+    ?rpc_timeout ~workflow ~task_queue ~id ~input ~(signal : 'signal Signal.t)
+    ~signal_input () =
   if Atomic.get client.closed then
     Error (Error.make ~category:`Bridge ~message:"client is shut down" ())
   else
@@ -1202,7 +1241,8 @@ let signal_with_start client ?request_id ?(memo = []) ?(search_attributes = [])
       build_start_request ~request_id ~memo ~search_attributes
         ~id_conflict_policy:(id_conflict_policy :> id_conflict_policy)
         ~id_reuse_policy ~execution_timeout ~run_timeout ~task_timeout
-        ~retry_policy ~rpc_timeout ~workflow ~task_queue ~id ~input
+        ~retry_policy ~cron_schedule ~start_delay ~rpc_timeout ~workflow
+        ~task_queue ~id ~input
     with
     | Error error -> Error error
     | Ok start -> (
@@ -1236,10 +1276,12 @@ let update_with_start client ?request_id ?(memo = []) ?(search_attributes = [])
     in
     match
       Result.bind (validate_name "update id" update_id) (fun () ->
+          (* Temporal refuses a cron schedule or start delay on
+             update-with-start, so the public signature offers neither. *)
           build_start_request ~request_id ~memo ~search_attributes
             ~id_conflict_policy ~id_reuse_policy ~execution_timeout ~run_timeout
-            ~task_timeout ~retry_policy ~rpc_timeout ~workflow ~task_queue ~id
-            ~input)
+            ~task_timeout ~retry_policy ~cron_schedule:None ~start_delay:None
+            ~rpc_timeout ~workflow ~task_queue ~id ~input)
     with
     | Error error -> Error error
     | Ok start -> (

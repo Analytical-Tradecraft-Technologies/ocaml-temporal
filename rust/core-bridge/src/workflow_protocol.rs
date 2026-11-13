@@ -241,9 +241,15 @@ pub struct InitializeContext {
     /// Server-enforced execution-chain deadline; zero remains a present timestamp.
     #[serde(deserialize_with = "required_nullable")]
     pub workflow_execution_expiration_time: Option<Timestamp>,
-    /// Server-applied delay before this run's first task, including continuation throttling.
+    /// Server-applied delay before this run's first task: a root start
+    /// delay, the wait for a cron schedule's next time, or continuation
+    /// throttling.
     #[serde(deserialize_with = "required_nullable")]
     pub first_workflow_task_backoff: Option<Duration>,
+    /// Cron schedule recorded on this run's start event (#1158), inherited
+    /// by every run of a cron chain; absent when Core reports none.
+    #[serde(deserialize_with = "required_nullable")]
+    pub cron_schedule: Option<String>,
     /// Identity of the client that started this execution.
     pub identity: String,
     /// Parent execution for a child workflow, otherwise absent.
@@ -1514,6 +1520,17 @@ fn validate_activation(value: &Activation) -> Result<(), ProtocolError> {
                             true,
                             "$.jobs.context.first_workflow_task_backoff",
                         )?;
+                    }
+                    // Absence is `null`, never an empty string, so a decoded
+                    // schedule always names one.
+                    if let Some(schedule) = &context.cron_schedule {
+                        if schedule.is_empty() {
+                            return Err(ProtocolError::invalid(
+                                "$.jobs.context.cron_schedule",
+                                "cron schedule must not be empty",
+                            ));
+                        }
+                        bounded_text(schedule, "$.jobs.context.cron_schedule")?;
                     }
                     bounded_text(&context.identity, "$.jobs.context.identity")?;
                     if let Some(parent) = &context.parent_workflow {
@@ -3310,39 +3327,6 @@ fn eviction_reason_from_core(value: i32) -> Result<EvictionReason, CoreConversio
     )
 }
 
-/// Rejects cron and root start-delay semantics. The server also inserts a
-/// first-task backoff for rapid continue-as-new and retry runs; that already
-/// applied duration is validated and retained rather than mistaken for cron.
-fn validate_initialize_subset(
-    value: &core_activation::InitializeWorkflow,
-    continuation: Option<&Continuation>,
-) -> Result<(), CoreConversionError> {
-    if !value.cron_schedule.is_empty()
-        || value.continued_initiator == i32::from(api_enums::ContinueAsNewInitiator::CronSchedule)
-    {
-        return Err(unsupported(
-            "cron schedules are not supported by the OCaml worker",
-        ));
-    }
-    let supported_continuation = continuation.is_some_and(|value| {
-        matches!(
-            value.initiator,
-            ContinueAsNewInitiator::Workflow | ContinueAsNewInitiator::Retry
-        )
-    });
-    if !supported_continuation
-        && value
-            .cron_schedule_to_schedule_interval
-            .as_ref()
-            .is_some_and(|duration| duration.seconds != 0 || duration.nanos != 0)
-    {
-        return Err(unsupported(
-            "root start delay is not supported by the OCaml worker",
-        ));
-    }
-    Ok(())
-}
-
 /// Maps one Core continue-as-new suggestion reason.
 ///
 /// Reasons are advisory, and Core copies the raw numbers from the latest
@@ -3387,8 +3371,12 @@ pub fn activation_from_core(
                 .ok_or_else(|| invalid_core("Core activation job variant is absent"))?
             {
                 Variant::InitializeWorkflow(value) => {
+                    // Cron schedules, cron-initiated runs and every first-task
+                    // backoff (a root start delay, the wait for the next cron
+                    // time, or continuation throttling) are carried as data
+                    // (#1158): the server has already applied the backoff
+                    // before the task was polled, so nothing is delayed again.
                     let continuation = continuation_from_core(value)?;
-                    validate_initialize_subset(value, continuation.as_ref())?;
                     Ok(ActivationJob::InitializeWorkflow {
                         workflow_id: value.workflow_id.clone(),
                         workflow_type: value.workflow_type.clone(),
@@ -3429,6 +3417,9 @@ pub fn activation_from_core(
                                     seconds: time.seconds,
                                     nanoseconds: time.nanos,
                                 }),
+                            // Core reports "no schedule" as an empty string.
+                            cron_schedule: (!value.cron_schedule.is_empty())
+                                .then(|| inbound_text(&value.cron_schedule)),
                             identity: inbound_text(&value.identity),
                             parent_workflow: value.parent_workflow_info.as_ref().map(|parent| {
                                 NamespacedWorkflowExecution {

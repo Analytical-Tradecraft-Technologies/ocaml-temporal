@@ -2052,6 +2052,81 @@ let test_client_execution_policy_validation () =
          (Temporal.Error.make ~category:`Bridge ~message:"other" ())));
   unwrap (Temporal.Client.shutdown client)
 
+(** A cron schedule and a start delay (#1158) are validated at the public
+    boundary exactly as the protocol encoder and Rust bridge validate them,
+    so the mock rejects a zero delay, an empty or NUL-bearing schedule, and
+    their combination before anything is started, on {!Temporal.Client.start}
+    and {!Temporal.Client.signal_with_start} alike. Accepted options start
+    normally (the mock does not schedule runs), and both take part in the
+    request-ID fingerprint. *)
+let test_client_start_schedule_validation () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let ms = Temporal.Duration.of_ms in
+  let start ?request_id ?cron_schedule ?start_delay id =
+    Temporal.Client.start client ?request_id ?cron_schedule ?start_delay
+      ~workflow:echo_workflow ~task_queue:"unit-test" ~id ~input:"x" ()
+  in
+  let signal_with_start ?cron_schedule ?start_delay id =
+    Temporal.Client.signal_with_start client ?cron_schedule ?start_delay
+      ~workflow:echo_workflow ~task_queue:"unit-test" ~id ~input:"x"
+      ~signal:add_document_signal ~signal_input:"document" ()
+  in
+  List.iter
+    (fun (label, fragment, cron_schedule, start_delay) ->
+      List.iter
+        (fun (operation, result) ->
+          match result with
+          | Ok _ -> failwith (operation ^ " accepted " ^ label)
+          | Error _ as error ->
+              expect_error_message_contains "defect" fragment error)
+        [
+          ("start", start ?cron_schedule ?start_delay "schedule-rejected");
+          ( "signal_with_start",
+            signal_with_start ?cron_schedule ?start_delay "schedule-rejected" );
+        ])
+    [
+      ("a zero delay", "start_delay must be positive", None, Some (ms 0L));
+      ( "a delay with a cron schedule",
+        "start_delay cannot be combined with cron_schedule",
+        Some "@every 5s",
+        Some (ms 1_000L) );
+      ("an empty schedule", "cron schedule must not be empty", Some "", None);
+      ( "a NUL in the schedule",
+        "cron schedule must not contain NUL",
+        Some "* *\000 * * *",
+        None );
+    ];
+  let page = unwrap (Temporal.Client.list_visibility client ~query:"" ()) in
+  assert (
+    List.for_all
+      (fun (execution : Temporal.Client.visibility_execution) ->
+        not (contains_substring execution.workflow_id "schedule-rejected"))
+      page.executions);
+  let cron =
+    unwrap
+      (start ~request_id:"schedule-fp" ~cron_schedule:"@every 5s"
+         "schedule-cron")
+  in
+  assert (Temporal.Client.started cron);
+  expect_error_message_contains "workflow" "different start data"
+    (start ~request_id:"schedule-fp" ~cron_schedule:"@every 6s"
+       "schedule-cron");
+  expect_error_message_contains "workflow" "different start data"
+    (start ~request_id:"schedule-fp" "schedule-cron");
+  let delayed =
+    unwrap (start ~start_delay:(ms 315_576_000_000_999L) "schedule-delayed")
+  in
+  assert (Temporal.Client.started delayed);
+  assert (
+    Temporal.Client.started
+      (unwrap
+         (signal_with_start ~start_delay:(ms 1L) "schedule-signal-delayed")));
+  unwrap (Temporal.Client.shutdown client)
+
 (** Runs all public worker and client regression assertions. *)
 let () =
   test_duplicate_workflows ();
@@ -2073,6 +2148,7 @@ let () =
   test_mock_update_with_start ();
   test_mock_start_id_reuse_policy ();
   test_client_execution_policy_validation ();
+  test_client_start_schedule_validation ();
   test_client_visibility_listing ();
   test_client_fetch_history_validation ();
   test_client_describe_and_count ();

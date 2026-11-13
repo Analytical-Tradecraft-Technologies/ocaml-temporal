@@ -223,6 +223,7 @@ let test_retained_payloads_are_copied () =
       search_attributes = Some [ ("CustomKeywordField", search) ];
       workflow_execution_expiration_time = None;
       first_workflow_task_backoff = None;
+      cron_schedule = None;
       first_execution_run_id = "first-run";
       start_time = None;
       root_workflow = None;
@@ -336,6 +337,7 @@ let test_start_metadata_snapshot () =
       search_attributes = Some [ ("CustomKeywordField", protocol_payload "search") ];
       workflow_execution_expiration_time = Some { seconds = 1_800_000_000L; nanoseconds = 123 };
       first_workflow_task_backoff = None;
+      cron_schedule = None;
       identity = "client"; parent_workflow = None;
       workflow_execution_timeout = None; workflow_run_timeout = None;
       workflow_task_timeout = None; first_execution_run_id = "first-run";

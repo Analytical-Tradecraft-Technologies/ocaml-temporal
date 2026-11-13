@@ -64,6 +64,7 @@ let initialize : Protocol.activation_job =
       search_attributes = None;
       workflow_execution_expiration_time = None;
       first_workflow_task_backoff = None;
+      cron_schedule = None;
       identity = "client";
       parent_workflow =
         Some { namespace = "parents"; workflow_id = "parent-1"; run_id = "parent-run" };
@@ -246,12 +247,15 @@ let test_unspecified_continue_as_new_reasons () =
 
 (** The start policy a client can set, as plain values read inside workflow
     code: execution, run, and task timeouts in milliseconds, the retry
-    policy's fields, and continuation provenance. *)
+    policy's fields, continuation provenance, and the cron schedule and
+    first-task backoff in milliseconds (#1158). *)
 type start_policy = {
   timeouts : int64 option * int64 option * int64 option;
   retry : (int64 * float * int64 * int * string list) option;
   continued_from_run_id : string option;
   initiator : Temporal.Workflow.Info.continuation_initiator option;
+  cron_schedule : string option;
+  backoff_ms : int64 option;
 }
 
 (** Reads every start-policy accessor of the current run. *)
@@ -278,12 +282,16 @@ let observe_start_policy () =
             (Info.retry_policy info);
         continued_from_run_id = Info.continued_from_run_id info;
         initiator = Info.continuation_initiator info;
+        cron_schedule = Info.cron_schedule info;
+        backoff_ms = ms (Info.first_workflow_task_backoff info);
       }
 
 (** An initialization job carrying every client start policy: timeouts with
     sub-millisecond remainders, a retry policy whose coefficient is stored as
-    raw IEEE-754 bits, and the supplied continuation provenance. *)
-let initialize_with_policy ~continuation : Protocol.activation_job =
+    raw IEEE-754 bits, the supplied continuation provenance, and the
+    optional cron schedule and server-applied first-task backoff. *)
+let initialize_with_policy ?cron_schedule ?first_workflow_task_backoff
+    ~continuation () : Protocol.activation_job =
   let duration seconds nanoseconds : Protocol.duration = { seconds; nanoseconds } in
   let context : Protocol.initialize_context =
     {
@@ -292,7 +300,8 @@ let initialize_with_policy ~continuation : Protocol.activation_job =
       search_attributes = None;
       workflow_execution_expiration_time =
         Some { seconds = 1_700_000_090L; nanoseconds = 0 };
-      first_workflow_task_backoff = None;
+      first_workflow_task_backoff;
+      cron_schedule;
       identity = "client";
       parent_workflow = None;
       workflow_execution_timeout = Some (duration 90L 0);
@@ -388,7 +397,7 @@ let test_workflow_start_policy () =
           let before, after =
             run_start_policy ~replaying
               (initialize_with_policy
-                 ~continuation:(Some (continuation initiator)))
+                 ~continuation:(Some (continuation initiator)) ())
           in
           List.iter
             (fun observed ->
@@ -407,7 +416,8 @@ let test_workflow_start_policy () =
       (Protocol.Continue_as_new_unspecified, None);
     ];
   let root, _ =
-    run_start_policy ~replaying:false (initialize_with_policy ~continuation:None)
+    run_start_policy ~replaying:false
+      (initialize_with_policy ~continuation:None ())
   in
   expect "root continued from" None root.continued_from_run_id;
   expect "root initiator" None root.initiator;
@@ -417,6 +427,67 @@ let test_workflow_start_policy () =
   expect "absent retry policy" None bare.retry;
   expect "absent continuation" None bare.continued_from_run_id
 
+(** A cron chain's schedule and every first-task backoff the server applied
+    (a start delay, the wait for the next cron time) reach workflow code from
+    the initialization job alone, identically live, under replay, and after a
+    later activation (#1158). The backoff rounds up to whole milliseconds; an
+    explicit zero, which Temporal records for an ordinary start, reads as no
+    backoff, like an absent one. *)
+let test_workflow_cron_and_backoff () =
+  let cron_successor : Protocol.continuation =
+    {
+      continued_from_execution_run_id = "previous-cron-run";
+      initiator = Protocol.Continue_as_new_cron_schedule;
+      continued_failure = None;
+      last_completion_result = Some [];
+    }
+  in
+  let backoff : Protocol.duration = { seconds = 4L; nanoseconds = 100 } in
+  List.iter
+    (fun (label, job, expected_cron, expected_backoff, expected_initiator) ->
+      List.iter
+        (fun replaying ->
+          let before, after = run_start_policy ~replaying job in
+          List.iter
+            (fun observed ->
+              expect (label ^ " cron schedule") expected_cron
+                observed.cron_schedule;
+              expect (label ^ " backoff") expected_backoff observed.backoff_ms;
+              expect (label ^ " initiator") expected_initiator
+                observed.initiator)
+            [ before; after ])
+        [ false; true ])
+    [
+      ( "first cron run",
+        initialize_with_policy ~cron_schedule:"@every 5s"
+          ~first_workflow_task_backoff:backoff ~continuation:None (),
+        Some "@every 5s",
+        Some 4_001L,
+        None );
+      ( "scheduled cron run",
+        initialize_with_policy ~cron_schedule:"@every 5s"
+          ~first_workflow_task_backoff:backoff
+          ~continuation:(Some cron_successor) (),
+        Some "@every 5s",
+        Some 4_001L,
+        Some `Cron_schedule );
+      ( "delayed start",
+        initialize_with_policy
+          ~first_workflow_task_backoff:{ seconds = 0L; nanoseconds = 1 }
+          ~continuation:None (),
+        None,
+        Some 1L,
+        None );
+      ( "ordinary start",
+        initialize_with_policy
+          ~first_workflow_task_backoff:{ seconds = 0L; nanoseconds = 0 }
+          ~continuation:None (),
+        None,
+        None,
+        None );
+      ("bare start", initialize, None, None, None);
+    ]
+
 (** The largest protobuf duration clamps to the public maximum instead of
     raising when workflow code reads it. *)
 let test_workflow_start_policy_clamps () =
@@ -424,7 +495,7 @@ let test_workflow_start_policy_clamps () =
     { seconds = 315_576_000_000L; nanoseconds = 999_999_999 }
   in
   let job =
-    match initialize_with_policy ~continuation:None with
+    match initialize_with_policy ~continuation:None () with
     | Protocol.Initialize_workflow ({ context = Some context; _ } as init) ->
         Protocol.Initialize_workflow
           {
@@ -456,7 +527,7 @@ let test_workflow_start_policy_inbound_shapes () =
     }
   in
   let job =
-    match initialize_with_policy ~continuation:(Some schedule) with
+    match initialize_with_policy ~continuation:(Some schedule) () with
     | Protocol.Initialize_workflow ({ context = Some context; _ } as init) ->
         Protocol.Initialize_workflow
           {
@@ -672,6 +743,7 @@ let () =
   test_workflow_info ();
   test_unspecified_continue_as_new_reasons ();
   test_workflow_start_policy ();
+  test_workflow_cron_and_backoff ();
   test_workflow_start_policy_clamps ();
   test_workflow_start_policy_inbound_shapes ();
   test_workflow_info_outside_workflow ();

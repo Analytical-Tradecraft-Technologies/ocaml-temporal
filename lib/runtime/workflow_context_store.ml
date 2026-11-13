@@ -21,6 +21,8 @@ type run_info = {
   run_timeout : Temporal_protocol.Workflow_protocol.duration option;
   task_timeout : Temporal_protocol.Workflow_protocol.duration option;
   retry_policy : Temporal_protocol.Workflow_protocol.retry_policy option;
+  first_workflow_task_backoff : Temporal_protocol.Workflow_protocol.duration option;
+  cron_schedule : string option;
   continued_from :
     (string * Temporal_protocol.Workflow_protocol.continue_as_new_initiator)
     option;
