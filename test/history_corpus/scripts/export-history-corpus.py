@@ -128,6 +128,22 @@ CASES = {
         "Successor started with those options; it reads them through "
         "Workflow.info and start_metadata.",
     ),
+    # corpus-v5-cron-start-delay (#1158).
+    "start-delay": (
+        ["start-delay"],
+        "Root run started with a two-second start delay; it reads the "
+        "first-task backoff through Workflow.info.",
+    ),
+    "cron-first": (
+        ["cron-schedule"],
+        "First run of an @every 2s cron chain, delayed to the first "
+        "scheduled time; completes with the next run as successor.",
+    ),
+    "cron-second": (
+        ["cron-schedule", "cron-successor"],
+        "Run started by the cron schedule; it reads the schedule and the "
+        "Cron_schedule initiator through Workflow.info.",
+    ),
 }
 
 # Patch lifecycle cases (issue #531). Each stage of the lifecycle captures the

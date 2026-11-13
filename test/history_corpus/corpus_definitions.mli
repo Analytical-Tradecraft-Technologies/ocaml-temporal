@@ -170,6 +170,15 @@ val random_child_workflow_type : string
     returns what it observes of them. *)
 val continue_as_new_options_workflow_type : string
 
+(** {1 Cron schedule and start delay workflow type (#1158)}
+
+    Captured by the [corpus-v5-cron-start-delay] generation. *)
+
+(** [corpus.cron_start_delay]: completes at once, reporting its recorded cron
+    schedule, whether Temporal delayed its first workflow task, and whether a
+    cron schedule started it. *)
+val cron_start_delay_workflow_type : string
+
 (** {1 Interaction handler names}
 
     Used by the capture driver to send the interactions recorded in history. *)
@@ -221,7 +230,9 @@ val definition_set_names : string list
       float first; replaying a [corpus-v3-random] parent history against it
       must report nondeterminism.
     - ["corpus-v4-continue-as-new-options"]: the continue-as-new options
-      workflow of #1153. *)
+      workflow of #1153.
+    - ["corpus-v5-cron-start-delay"]: the cron schedule and start delay
+      workflow of #1158. *)
 val definition_set : string -> workflow list option
 
 (** Activities registered by the live capture worker. Every activity used by a
