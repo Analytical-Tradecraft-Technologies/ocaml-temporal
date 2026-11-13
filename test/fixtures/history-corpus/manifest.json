@@ -122,6 +122,24 @@
         "descriptor_sha256": "8c92175f70af3c521cb8fedd9713fe928b64b386953345b87867768233b5947c",
         "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
       }
+    },
+    "live-2026-11-13-cron": {
+      "kind": "live",
+      "captured_on": "2026-11-13",
+      "sdk_commit": "4c0e03291b56f89c66821353905767d956186017",
+      "sdk_tree_dirty": false,
+      "core_revision": "8fe478ee179ed754614d230f39586f3edb57da71",
+      "temporal_server_image": "temporalio/server:1.32.2@sha256:7bf69188a6232fea14869b9cef3d94aa82a1601d99517f7e86c71f22da4e0670",
+      "temporal_cli_image": "temporalio/admin-tools:1.32.2@sha256:4a95866efba29d7e17ab012df5232795e8b0ad0f7d5f9d1ec4df321f7792a754",
+      "worker_toolchains": [
+        "OCaml 5.4.1 (Unix)"
+      ],
+      "capture_command": "make history-corpus-capture HISTORY_CORPUS_CAPTURE_ID=live-2026-11-13-cron HISTORY_CORPUS_GENERATIONS=corpus-v5-cron-start-delay",
+      "protobuf_export": {
+        "tool": "Python protobuf 6.33.6 json_format",
+        "descriptor_sha256": "8c92175f70af3c521cb8fedd9713fe928b64b386953345b87867768233b5947c",
+        "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
+      }
     }
   },
   "entries": [
@@ -2114,6 +2132,67 @@
         "json_sha256": "06c838e273d7d57c72844641aa93fd2360d4797d2462e5d09982e8d27a59f67a"
       },
       "replay_definitions": "corpus-v4-continue-as-new-options",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-11-13-cron-start-delay",
+      "purpose": "Root run started with a two-second start delay; it reads the first-task backoff through Workflow.info.",
+      "features": [
+        "start-delay"
+      ],
+      "workflow_type": "corpus.cron_start_delay",
+      "workflow_id": "history-corpus-start-delay",
+      "run_id": "01a1d3df-05c8-7f07-b17c-238ba689046c",
+      "capture": "live-2026-11-13-cron",
+      "generation": "corpus-v5-cron-start-delay",
+      "history": {
+        "protobuf": "histories/live-2026-11-13-cron-start-delay.pb",
+        "protobuf_sha256": "b78921f9f6aff2a87c833bdffc456053cd1ca3d9fb23b378f3d1e4099330fd0f",
+        "json": "histories/live-2026-11-13-cron-start-delay.json",
+        "json_sha256": "7a0419c6525c42a264dea70d97de460236fe7062715ea601059be5d5336e57d7"
+      },
+      "replay_definitions": "corpus-v5-cron-start-delay",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-11-13-cron-cron-first",
+      "purpose": "First run of an @every 2s cron chain, delayed to the first scheduled time; completes with the next run as successor.",
+      "features": [
+        "cron-schedule"
+      ],
+      "workflow_type": "corpus.cron_start_delay",
+      "workflow_id": "history-corpus-cron",
+      "run_id": "01a1d3df-0dc6-7300-8649-fadb8dca738a",
+      "capture": "live-2026-11-13-cron",
+      "generation": "corpus-v5-cron-start-delay",
+      "history": {
+        "protobuf": "histories/live-2026-11-13-cron-cron-first.pb",
+        "protobuf_sha256": "ff9a14887beb6dabb248a49e05f6fa4dc8b2d3c09535f7a464a062069a171bed",
+        "json": "histories/live-2026-11-13-cron-cron-first.json",
+        "json_sha256": "cbe9432cf2a14305e1633b5762065037ee00fdd4e33871de6b4b4296fd4d4b05"
+      },
+      "replay_definitions": "corpus-v5-cron-start-delay",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-11-13-cron-cron-second",
+      "purpose": "Run started by the cron schedule; it reads the schedule and the Cron_schedule initiator through Workflow.info.",
+      "features": [
+        "cron-schedule",
+        "cron-successor"
+      ],
+      "workflow_type": "corpus.cron_start_delay",
+      "workflow_id": "history-corpus-cron",
+      "run_id": "04a29d1b-0820-41b4-b0ab-0a5eff759a4f",
+      "capture": "live-2026-11-13-cron",
+      "generation": "corpus-v5-cron-start-delay",
+      "history": {
+        "protobuf": "histories/live-2026-11-13-cron-cron-second.pb",
+        "protobuf_sha256": "f6cdcc9f44ef017ade0ba64d74830aeb116629500e4dc1cdbe5a5d407593d1ad",
+        "json": "histories/live-2026-11-13-cron-cron-second.json",
+        "json_sha256": "f1d77c2e8ec456415c1662a48602f485eb8d0bf4a05965a5f19482a13a8b2441"
+      },
+      "replay_definitions": "corpus-v5-cron-start-delay",
       "expected": "replays_ok"
     }
   ]

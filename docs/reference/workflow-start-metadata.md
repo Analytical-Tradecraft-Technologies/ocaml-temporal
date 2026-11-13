@@ -190,4 +190,7 @@ live and under replay, client validation tests on both backends, and the
 a 3 s `start_delay` on `start` and on `signal_with_start`, a client and an
 official-CLI cron chain whose second run reports `` `Cron_schedule `` and its
 predecessor, a current-run wait that does not end, server rejection of an
-invalid expression, and replay of the recorded histories.
+invalid expression, and replay of the recorded histories. The
+[history corpus](history-corpus.md) replays the captured histories of a
+delayed root run and of the first two runs of a cron chain (capture
+`live-2026-11-13-cron`).
