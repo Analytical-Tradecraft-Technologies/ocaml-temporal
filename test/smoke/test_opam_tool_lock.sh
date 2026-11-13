@@ -6,7 +6,9 @@ set -eu
 # without network access or a real switch. The stub keeps its switch as
 # `name version` lines, answers `opam var`, `opam list` and `opam install`
 # from it, and can be told to add or move packages behind the caller's back,
-# as transitive dependencies or new upstream metadata would.
+# as transitive dependencies or new upstream metadata would. Its `opam list`
+# colours its output unless given --color=never, as opam does on the macOS CI
+# lane, so a parser that forgets to disable colour fails here.
 source_root=$(cd "${1:-.}" && pwd)
 script=$source_root/scripts/opam-tool-lock.sh
 # Keep the fixture below the workspace: native Windows tools under Cygwin
@@ -51,7 +53,18 @@ case "$1" in
     printf '%s\r\n' "$version"
     ;;
   list)
-    awk '{ printf "%-20s %s\r\n", $1, $2 }' "$OPAM_STUB_INSTALLED"
+    # Like opam in a colour-enabled CI environment, colour the listing
+    # unless the caller passes --color=never.
+    color=always
+    for arg in "$@"; do
+      [ "$arg" = --color=never ] && color=never
+    done
+    if [ "$color" = never ]; then
+      awk '{ printf "%-20s %s\r\n", $1, $2 }' "$OPAM_STUB_INSTALLED"
+    else
+      awk '{ printf "\033[01;04m%s\033[0m \033[01;35m%s\033[0m\r\n", $1, $2 }' \
+        "$OPAM_STUB_INSTALLED"
+    fi
     ;;
   install)
     shift

@@ -48,8 +48,11 @@ entries() {
 }
 
 # Print every installed package of the active switch as `name version`, sorted.
+# Colour is disabled explicitly: opam colours names and versions with ANSI
+# escapes whenever OPAMCOLOR or the CI environment asks for it (the macOS lane
+# does), and coloured pairs never compare equal to the lock's plain lines.
 installed() {
-  opam list --installed --short --columns=name,version | tr -d '\r' |
+  opam list --installed --short --columns=name,version --color=never | tr -d '\r' |
     awk '{ print $1 " " $2 }' | LC_ALL=C sort
 }
 
