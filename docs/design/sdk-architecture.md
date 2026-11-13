@@ -254,7 +254,7 @@ let add_tool = Update.define ~name:"add_tool"
     ~input:Tool.codec ~output:Unit.codec
 ```
 
-Handlers close over ordinary workflow state. Signal and update handlers may suspend where Temporal permits. Query handlers and update validators are enforced as non-suspending, read-only handler modes. The runtime rejects command-producing operations from those modes with structured errors.
+Handlers close over ordinary workflow state. Signal and update handlers may suspend where Temporal permits. Query handlers and update validators share one enforced non-suspending, read-only handler mode. The runtime rejects every SDK operation that would change replay-sensitive state, emit a command, or suspend from that mode, with a typed defect or, where the operation's contract raises for misuse, `Invalid_argument`; see [read-only enforcement](../reference/interactive-workflows.md#read-only-enforcement).
 
 ## 7. OCaml 5 Suspension Model
 

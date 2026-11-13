@@ -592,10 +592,11 @@ let process_job execution = function
                    needs the owning execution context so a handler can inspect
                    deterministic execution-local state established by the
                    workflow or an earlier signal.  The dynamic binding is
-                   restored before the QueryResult is emitted. Disabling the
-                   deterministic random stream also prevents this synchronous,
-                   non-replayed callback from advancing that replay-visible
-                   state. *)
+                   restored before the QueryResult is emitted. The shared
+                   read-only mode (#513) rejects every SDK operation that
+                   would change replay-visible state, emit a command, or
+                   suspend in this synchronous, non-replayed callback; a
+                   rejection it raises fails only this query below. *)
                 Workflow_context_store.with_read_only_query execution.context
                   (fun () -> handler.dispatch query)
               with

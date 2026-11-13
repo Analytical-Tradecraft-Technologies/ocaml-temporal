@@ -122,7 +122,7 @@ let test_float_and_bytes_bounds () =
     workflow, as for [random_int]. *)
 let test_lifecycle_errors () =
   with_seed "5" (fun context ->
-      Context.with_randomness_disabled context (fun () ->
+      Context.with_read_only context (fun () ->
           expect_defect "validator uuid" "read-only" (Temporal.Workflow.uuid4 ());
           expect_defect "validator float" "read-only" (Temporal.Workflow.random_float ());
           expect_defect "validator bytes" "read-only"

@@ -37,7 +37,10 @@ module Handler : sig
       validator may reject with a typed [Error.t] of any category, including
       [Error.defect]; an exception it raises also rejects the update. In both
       cases [run] is not called, no update-side state change can occur, and
-      the workflow task is unaffected.
+      the workflow task is unaffected. The validator runs in a read-only mode
+      (see {!dispatch}) in which SDK operations that would change workflow
+      state, emit a command, or suspend are rejected; it may read state, for
+      example through [Workflow_context.Local.get].
 
       [run] executes after the update is accepted. Its [Error] completes the
       update as failed for the caller, except a [`Defect] or [`Bridge] error
@@ -66,10 +69,20 @@ module Handler : sig
       is a live-request check and must not run against historical input. When
       supplied, [on_validated] runs once after successful validation and before
       the handler, allowing the native runtime to acknowledge a handler that
-      may suspend. Validators execute in a read-only mode: deterministic
-      helpers such as [Temporal.Workflow.random_int] return a typed defect and
-      cannot advance replay-sensitive workflow state. Application code normally
-      leaves this optional hook unset. *)
+      may suspend. Validators execute in the read-only mode shared with query
+      handlers: every SDK operation that would change replay-sensitive
+      workflow state, emit a command, or suspend is rejected before it
+      changes anything. Operations that return a result or future (random
+      draws, [Workflow_context.Local.set], [Workflow.sleep], activity and
+      child starts, external signals and cancellations, handle and scope
+      cancellation, [Scope.create], condition waits, and [Future.await] of a
+      pending future) return a typed defect; operations whose contract
+      raises for misuse ([Workflow.patched], [Workflow.deprecate_patch], the
+      upserts, [Workflow.continue_as_new], and future combinators) raise
+      [Invalid_argument], which the dispatcher turns into a typed rejection.
+      The mode ends before the implementation runs, which may then mutate
+      state normally. Application code normally leaves this optional hook
+      unset. *)
   val dispatch :
     ?run_validator:bool ->
     ?on_validated:(unit -> unit) ->

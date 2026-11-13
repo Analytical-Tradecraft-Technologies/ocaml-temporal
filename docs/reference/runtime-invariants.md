@@ -24,12 +24,43 @@ and bridge, read the [documentation guide](../README.md) first.
   activations on one Domain and checks isolation and cleanup (#765).
 - An inline query temporarily installs its owning execution context only for
   its synchronous handler, letting it inspect workflow-local state without
-  running scheduler fibers. Query dispatch disables deterministic randomness,
-  and the dynamic context binding is restored before its response is emitted.
-  The query may read its own live `Temporal.Scope.is_cancelled` and `check`
-  results through a separate thread-local read marker. It cannot cancel the
-  scope, await a future, read another execution's scope, or use a scope after
-  shutdown.
+  running scheduler fibers. The dynamic context binding is restored before
+  its response is emitted. The query may read its own live
+  `Temporal.Scope.is_cancelled` and `check` results through a separate
+  thread-local read marker. It cannot cancel the scope, await a future, read
+  another execution's scope, or use a scope after shutdown.
+- Query handlers and live update validators share one read-only mode
+  (`Workflow_context_store.with_read_only`, #513). Replay skips validators
+  and never sees queries, so while the mode is active every SDK-managed
+  mutation of the execution is rejected before it changes anything:
+  workflow-local writes, random draws, patch decisions, sequence allocation,
+  command emission (only the runtime's own query response or update response,
+  emitted after the callback returns, is allowed), memo and search-attribute
+  upserts, terminal commands, handle and scope cancellation, condition waits,
+  suspension on any future, and new scheduler work, pending futures, or
+  future observers. Operations whose public contract returns a result or a
+  future fail with a typed defect; those whose contract raises for misuse
+  (patching, upserts, continue-as-new, future combinators) raise
+  `Invalid_argument`, which fails only that query or rejects only that
+  update. `emit`, `allocate_sequence`, `set_local`, `terminate`, and the
+  scheduler's enqueue and promise allocation keep a raising backstop, so a
+  missed public check still cannot change state. The mode sets a flag on
+  the execution context, the read marker above (so the callback can read
+  its own scopes' status but `in_owner_turn` fails), and a thread-keyed
+  future marker with the scheduler owner id cleared; all three are restored
+  on return or exception, and nested extents restore in LIFO order. A
+  validator that accepts leaves the mode before the update implementation
+  runs, so the implementation may mutate state and suspend as usual. The
+  mode guards SDK state only: OCaml references, objects, I/O and foreign
+  calls a callback reaches are not intercepted, so application authors
+  still owe read-only, deterministic callbacks; the SDK does not provide a
+  language sandbox. `test/runtime/test_read_only_mode.ml` drives one
+  workflow live with interleaved queries and rejected, raising and accepted
+  updates, live without them, after an eviction, and as a full replay with
+  validation skipped, and requires identical durable commands while every
+  mutating operation in each callback is rejected; it also checks exception
+  and nesting restoration and that an accepted update can then mutate and
+  suspend.
 - Futures from different schedulers cannot be combined.
 - Terminal completion, failure, cancellation, eviction, and shutdown dispose
   all pending callbacks and captured continuations.

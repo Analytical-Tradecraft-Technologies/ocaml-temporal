@@ -172,12 +172,16 @@ let check_scope = function
 
 (** Validates routing, timeouts, start metadata, durable identity, and input
     encoding before allocating a private sequence number. Consequently invalid
-    requests cannot change command order or appear in replay history. *)
+    requests cannot change command order or appear in replay history. A start
+    from a read-only callback (an update validator or a query handler) is
+    rejected first, with a failed handle. *)
 let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy
     ?task_queue ?parent_close_policy ?execution_timeout ?run_timeout
     ?task_timeout ?id_reuse_policy ?memo ?search_attributes ~id definition
     input =
   match
+    (* A read-only callback is rejected before anything else (#513). *)
+    Result.bind (Error_private.check_writable ~what:"child workflow start") (fun () ->
     Result.bind (validate_task_queue task_queue) (fun () ->
         Result.bind
           (Workflow_timeouts_private.validate ~execution_timeout ~run_timeout
@@ -185,7 +189,7 @@ let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy
           (fun timeouts ->
             Result.bind (start_metadata ~memo ~search_attributes)
               (fun metadata ->
-                Result.map (fun () -> (timeouts, metadata)) (check_scope scope))))
+                Result.map (fun () -> (timeouts, metadata)) (check_scope scope)))))
   with
   | Error error -> failed_handle error
   | Ok ((execution_timeout, run_timeout, task_timeout), (memo, search_attributes)) ->

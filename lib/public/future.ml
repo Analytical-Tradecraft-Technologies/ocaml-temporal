@@ -85,7 +85,14 @@ let make_derived ~parent ~outside_error =
               if callbacks_live () then
                 Option.iter (fun action -> action value) action);
           None
-      | None -> Some (Temporal_base.Ordered_registry.add observers token)
+      | None ->
+          (* A pending registration would run its callback in a later drain
+             on the live path only, so a read-only callback cannot make one
+             (#513); a ready one is queued through the owner, which performs
+             the same check for a workflow scheduler. *)
+          Temporal_sdk_kernel.Future_store.reject_in_read_only
+            ~operation:"future combinator";
+          Some (Temporal_base.Ordered_registry.add observers token)
     in
     fun () ->
       token := None;

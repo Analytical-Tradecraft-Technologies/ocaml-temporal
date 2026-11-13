@@ -23,6 +23,9 @@ module Local : sig
   (** Reads the current run's value, or [None] when that run has not set it. *)
   val get : 'a t -> ('a option, Error.t) result
 
-  (** Sets the current run's value. *)
+  (** Sets the current run's value. Outside workflow execution, and in a
+      read-only update validator or query handler, it returns a typed defect
+      and leaves the value unchanged: replay skips validators and never runs
+      queries, so a write there would exist on the live path only. *)
   val set : 'a t -> 'a -> (unit, Error.t) result
 end

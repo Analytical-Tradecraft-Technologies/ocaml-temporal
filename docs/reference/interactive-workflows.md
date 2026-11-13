@@ -261,14 +261,14 @@ worker. The execution mode depends on the interaction kind:
 - A query handler is invoked synchronously on the execution owner Domain with
   that execution's context installed, so it can read execution-local state
   through `Temporal.Workflow_context.Local.get`. It does not enter the
-  workflow scheduler, and its temporary mode disables the deterministic random
-  stream; handlers must remain read-only and non-suspending. They cannot await
-  a future, schedule an activity, or mutate durable workflow state. Their
-  encoded result is returned as the query response rather than as a
-  workflow-task command.
+  workflow scheduler and runs in the SDK's read-only mode (see
+  [Read-only enforcement](#read-only-enforcement)): it cannot await a
+  pending future, schedule an activity or timer, or change SDK-managed
+  workflow state. Its encoded result is returned as the query response
+  rather than as a workflow-task command.
 - An update handler currently has one input. Its validator runs before the
-  implementation for a live request and is skipped when Core replays an
-  already-validated update. The runtime emits acceptance before a handler can
+  implementation for a live request, in the same read-only mode as a query,
+  and is skipped when Core replays an already-validated update. The runtime emits acceptance before a handler can
   suspend, then retains only the suspended continuation keyed by Core's
   `protocol_instance_id` until a later activation completes it.
 
@@ -318,9 +318,46 @@ scheduler ownership:
 An update validator runs after input decoding and before the implementation. A
 validator that returns `Error` prevents the implementation from running, so
 the rejected request cannot perform an update-side state change. Validators
-are intended to be read-only and non-suspending. Query callbacks have the same
+must be read-only and non-suspending. Query callbacks have the same
 read-only, non-suspending contract. The dispatcher cannot make a callback safe
-by blocking an OS thread or by silently moving it to another scheduler.
+by blocking an OS thread or by silently moving it to another scheduler; a
+native worker instead runs both callbacks in the read-only mode described
+next.
+
+### Read-only enforcement
+
+Replay never runs a query and skips every validator, so any state a query
+handler or validator changed would exist on the live path only, and a later
+command would then differ from the one replay produces. A native worker
+therefore runs both callbacks in one read-only mode (#513) that rejects
+every SDK operation that would change replay-sensitive state, emit a
+command, or suspend, before it changes anything:
+
+| Operation in a query handler or validator | Result |
+| --- | --- |
+| `Workflow_context.Local.set`, `Workflow.random_int`, `random_float`, `random_bytes`, `uuid4` | Typed defect; the value and the random stream are unchanged |
+| `Workflow.start_sleep` and `sleep` (scoped or not, zero duration included), `Activity.start`/`start_handle`/`start_local`, `Child_workflow.start`/`start_handle`, `Workflow.signal_external_workflow`, `Workflow.cancel_external_workflow` | Ready future or handle holding a typed defect; no command and no sequence number |
+| `Activity.cancel`, `Child_workflow.cancel` of a pending operation, `Scope.create`, `Scope.cancel`, `Scope.on_cancel`, `Scope.await`, `Condition.wait_until` | Typed defect; nothing is cancelled, created, or waited on |
+| `Future.await` of a pending future | The future's outside-scheduler error; the callback never suspends |
+| `Workflow.patched`, `deprecate_patch`, `upsert_search_attributes`, `upsert_typed_search_attributes`, `upsert_memo`, `continue_as_new` | `Invalid_argument`, as for their other programmer misuse; no decision, marker, or command |
+| `Future.map`, `map_error`, `both`, `all`, `race`, `first` over a workflow future | `Invalid_argument`; no callback is registered or queued |
+
+A raised rejection is caught at the callback boundary: the query fails or
+the update is rejected, and the workflow task is unaffected. Reads keep
+working: `Local.get`, a ready future's result, `Future.peek`,
+`Scope.is_cancelled` and `Scope.check` on the execution's own scopes,
+`Workflow.info`, `now`, `start_metadata`, and `is_replaying`. The mode ends
+when the callback returns or raises, so an accepted update's implementation
+runs normally and may mutate state, emit commands, and suspend.
+
+The boundary is the SDK's own state. The SDK cannot intercept an OCaml
+`ref`, a mutable record or object, a module-level value, I/O, or a foreign
+call made by the callback, so application authors still owe read-only,
+deterministic handlers; this is not a language sandbox. Keep replay-relevant
+state in `Workflow_context.Local`, which the mode protects.
+`test/runtime/test_read_only_mode.ml` checks that queries and rejected or
+raising validators leave the durable commands of a run unchanged, live,
+after eviction, and on replay with validation skipped.
 
 Expected operational failures are returned as `Error error` values. Callback
 exceptions are caught at the handler boundary and converted to a non-retryable

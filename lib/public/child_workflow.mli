@@ -43,8 +43,9 @@ type 'output handle
     cancel the child when [cancel] is called; choose [Abandon] explicitly when
     the child should keep running. [retry_policy], when supplied, is handed to
     Temporal Core so retryable child failures are retried by the durable state
-    machine rather than by replay-sensitive OCaml code. Invalid input and
-    detached calls return ready failed handles, so no command or sequence
+    machine rather than by replay-sensitive OCaml code. Invalid input,
+    detached calls, and starts from a read-only update validator or query
+    handler return ready failed handles, so no command or sequence
     number is created. When [scope] is supplied, cancelling it emits the
     child's Core cancellation command with the stable default reason
     ["cancelled by workflow"]. [task_queue] routes the child to another worker;
@@ -125,7 +126,9 @@ val started : 'output handle -> (string, Error.t) Future.t
     default reason is stable and replay-safe. Repeated calls are idempotent;
     this includes a valid call that arrives after natural child completion or a
     start failure has retired the pending entry. Core determines when the
-    future receives the typed cancellation result. *)
+    future receives the typed cancellation result. A call from a read-only
+    update validator or query handler while the child is pending returns a
+    typed defect and emits nothing. *)
 val cancel :
   ?reason:string ->
   'output handle ->

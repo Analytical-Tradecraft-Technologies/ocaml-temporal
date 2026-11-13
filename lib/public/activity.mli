@@ -561,7 +561,9 @@ type 'output handle
 (** Schedules an activity and retains a handle for explicit cancellation. The
     command is emitted immediately and [future] remains pending until Core
     reports a terminal result. Invalid options or input encoding return a ready
-    failed handle without emitting a command or consuming a sequence. The
+    failed handle without emitting a command or consuming a sequence, and so
+    does a start from a read-only update validator or query handler, checked
+    before the options or the input codec. The
     default policy is [Try_cancel]. When [scope] is supplied, cancellation of
     that scope emits the activity's Core cancellation command exactly once;
     the scope must belong to the same workflow execution. *)
@@ -586,8 +588,9 @@ val future : 'output handle -> ('output, Error.t) Future.t
 
 (** Requests cancellation of the exact activity represented by [handle].
     Repeated calls are idempotent, including a call after natural completion
-    or activity-start failure. Calls made outside the owning workflow return a
-    typed lifecycle error and emit no command. The underlying Temporal Core
+    or activity-start failure. Calls made outside the owning workflow, and
+    calls from a read-only update validator or query handler while the
+    activity is pending, return a typed lifecycle error and emit no command. The underlying Temporal Core
     command identifies the activity by its private sequence and carries no
     user-supplied reason. *)
 val cancel : 'output handle -> (unit, Error.t) result

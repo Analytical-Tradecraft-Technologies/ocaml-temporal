@@ -7032,3 +7032,31 @@ reports both. Capture `live-2026-11-13-child-metadata` adds the parent and
 child histories to the corpus. With the child timeouts, reuse policy and
 typed timeout origin already merged, this completes the #1135 scope. Child
 cron schedules and headers stay out of scope.
+
+## 2026-11-14: Enforced read-only mode for queries and update validators
+
+Query handlers and live update validators now run in one read-only mode
+(#513), `Workflow_context_store.with_read_only`. Replay never runs a query
+and skips every validator, so the mode rejects each SDK operation that would
+change replay-sensitive state, emit a command, or suspend before it changes
+anything. Operations that return a result or future fail with a typed
+defect: `Workflow_context.Local.set`, random draws, `Workflow.sleep` and
+`start_sleep` (unscoped and zero-duration included), activity, local activity
+and child starts, external signals and cancellations, handle and scope
+cancellation, `Scope.create`, condition waits, and `Future.await` of a pending
+future. Operations that already raise for misuse raise `Invalid_argument`:
+`patched`, `deprecate_patch`, the upserts, `continue_as_new`, and future
+combinators over a workflow future. The dispatcher turns a raised rejection
+into a failed query or a rejected update. `emit`, sequence allocation,
+`set_local`, `terminate`, and scheduler enqueue and promise allocation keep
+raising backstops. The mode clears the scheduler owner id, so a validator can
+no longer suspend, and it restores every binding on return, exception, and
+nesting. Validators may now read their own scopes' status, as queries could.
+`test/runtime/test_read_only_mode.ml` runs one workflow live with interleaved
+queries and rejected, raising and accepted updates that try every mutating
+operation, live without them, after an eviction, and as a full replay with
+validation skipped, and requires identical durable commands. It also checks
+restoration and that an accepted update can then mutate and suspend. The
+guard covers SDK state only, not OCaml references, I/O, or foreign calls; the
+v1 policy keeps queries and updates Experimental pending the #489 decision
+and the live update qualification of #505.
