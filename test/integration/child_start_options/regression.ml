@@ -369,9 +369,9 @@ let ensure_search_attribute cli address =
 (** A child started with a memo and the keyword (#1135) reports both through
     [Workflow.start_metadata], before and after the parent is replayed by a
     fresh worker. A visibility query on the keyword finds exactly that
-    child, and describing the child returns the memo and the keyword. A
-    freshly registered attribute can briefly fail the parent's workflow
-    task; the server retries that task, which the outcome poll absorbs. *)
+    child, and describing the child returns the memo and the keyword. The
+    outcome poll allows 60 s, which also covers a workflow task the server
+    refuses while a freshly registered attribute propagates. *)
 let check_metadata context =
   let child_id = workflow_id context "metadata-child" in
   let reported =

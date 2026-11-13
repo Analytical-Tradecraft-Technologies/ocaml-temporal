@@ -1179,15 +1179,15 @@ fn child_workflow_timeout_rules_are_enforced() {
     }
 }
 
+/// A semantic memo or search-attribute map.
+type PayloadMap = BTreeMap<String, workflow_protocol::Payload>;
+
 /// Returns `completion`'s only command, which must be a child start, so a
 /// test can set the memo and search attributes (#1135) on a command built by
 /// [`child_start_with_options`].
 fn child_start_metadata(
     completion: &mut workflow_protocol::Completion,
-) -> (
-    &mut Option<BTreeMap<String, workflow_protocol::Payload>>,
-    &mut Option<BTreeMap<String, workflow_protocol::Payload>>,
-) {
+) -> (&mut Option<PayloadMap>, &mut Option<PayloadMap>) {
     let Some(workflow_protocol::CompletionCommand::StartChildWorkflow {
         memo,
         search_attributes,

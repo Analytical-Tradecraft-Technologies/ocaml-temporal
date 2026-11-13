@@ -169,8 +169,28 @@ and their recorded histories are unchanged. The
 checks the timeouts, a run timeout ending a child as `Timed_out`, and both
 reuse outcomes against a live server. The child reads its timeouts
 through `Workflow.Info`. `Temporal.Testing` records but does not enforce child
-timeouts or reuse policies. Memo and search attributes for children remain
-open under #1135 (blocked by #512).
+timeouts or reuse policies.
+
+### Child memo and search attributes
+
+`Child_workflow.start`, `start_handle`, and `execute` also accept `~memo` and
+`~search_attributes` (#1135), the same raw `(string * Payload.t)` lists as
+`Client.start`; build typed search attributes with
+`Temporal.Search_attribute.encode`. Keys follow the rules shared with
+`Workflow.upsert_memo` and the continue-as-new options: non-empty, valid
+UTF-8, free of NUL, at most 65,536 bytes, and unique within a map. A
+violation is a typed defect returned as a ready failed handle before input
+encoding or any command; the OCaml protocol encoder and the Rust bridge check
+the keys again. An omitted or empty map is left out of the command, so existing
+child starts are unchanged. Temporal records both maps on the child's start
+event: the child reads them through `Workflow.start_metadata`, `Client.describe`
+reports them, and visibility queries such as `Client.list_visibility` filter
+on the search attributes, which must be registered in the namespace, since
+Temporal refuses an attribute it does not know.
+`Temporal.Testing` passes both maps to the child's start metadata. The
+[child start options regression](../../test/integration/child_start_options/README.md)
+checks the child's view across worker replacement, a visibility query by a
+registered keyword, and `describe`.
 
 Temporal Server does not start a child whose parent has already closed, even
 under `Abandon`: the start-child transfer task finds the parent closed and
