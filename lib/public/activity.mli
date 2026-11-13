@@ -287,9 +287,14 @@ end
 (** Read-only identity and scheduling facts for one activity attempt, copied
     from the task Temporal delivered. The type is abstract so later releases
     can add fields compatibly. A common use is an idempotency key for
-    at-least-once side effects, for example combining {!Info.val-workflow},
-    {!Info.activity_id}, and, when each retry must be distinct,
-    {!Info.attempt}. *)
+    at-least-once side effects: the run ID from {!Info.val-workflow} with
+    {!Info.activity_id} names one scheduled activity of one run, which every
+    retry and redelivery shares. A key that must survive workflow retries and
+    continue-as-new belongs in the activity input instead, as in the
+    idempotent side-effect example (examples/idempotency). {!Info.attempt}
+    tells retries apart, so it must not be part of a deduplication key; use
+    it only where each retry must be distinct, such as a per-attempt log
+    line. *)
 module Info : sig
   (** Metadata for one activity attempt. *)
   type t

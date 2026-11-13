@@ -1,0 +1,20 @@
+; The idempotent side-effect example (#504). The library holds the ledger
+; and the Temporal definitions, so the activity idempotency live regression
+; under test/integration and the unit tests under test/idempotency exercise
+; exactly the code the example ships. One process runs the worker and the
+; checking driver, so the driver can read the ledger directory afterwards.
+
+(library
+ (name temporal_sdk_examples_idempotency)
+ (wrapped false)
+ (modules payment_ledger idempotent_payments)
+ (libraries temporal-sdk unix yojson))
+
+(executable
+ (name idempotency)
+ (modules idempotency)
+ (libraries
+  temporal-sdk
+  temporal_sdk_examples_common
+  temporal_sdk_examples_idempotency
+  unix))

@@ -61,7 +61,7 @@ All live controllers use a real Temporal Server and own fixture cleanup.
 | `test-temporal-parent-child-failure-replay` | Both runs replay before the child fails non-retryably; child and parent failure events retain exact linkage; parent returns `SMOKE:PARENT:CHILD:FAILURE_RECOVERED` | [failure controller][failure-controller], [failure contract][failure-contract], [definitions][definitions] |
 | `test-temporal-start-metadata-live` | Five exact active runs carry memo, search-attribute, combined, continued and official-CLI start metadata; workflow snapshots match before and after worker replacement. Three more runs on a one-slot-cache worker are each evicted with reason `cache_full` and replayed; snapshots, exact expirations and results match | [start metadata controller][metadata-controller], [start metadata](workflow-start-metadata.md) |
 | `test-temporal-task-failure-live` | Body, encoder and missing-registration defects leave exact runs with durable workflow-task failures; a corrected worker replays and completes them, and typed business failures keep their retryability flags | [task-failure controller][task-failure-controller], [workflow failures](workflow-failures.md) |
-| `test-temporal-examples-live` | The shipped example's split activity and workflow workers serve a valid name with the documented two-line result and fail a blank name with the typed business failure; both workers stop cleanly on `SIGTERM`; the cooperative cancellation example prints its exact documented report | [examples controller][examples-controller], [examples](../../examples/README.md) |
+| `test-temporal-examples-live` | The shipped example's split activity and workflow workers serve a valid name with the documented two-line result and fail a blank name with the typed business failure; both workers stop cleanly on `SIGTERM`; the cooperative cancellation example and the idempotent side-effect example (#504) print their exact documented reports | [examples controller][examples-controller], [examples](../../examples/README.md) |
 | `test-temporal-live-regressions` | Each of the 24 regression executables in `LIVE_REGRESSION_EXECUTABLES` runs once, bounded, against a fresh stack: cooperative activity cancellation and the worker-shutdown signal (#494); abrupt worker death during a running activity, recovered on the server's heartbeat timeout (#519); bounded shutdown of a worker whose activity never heartbeats, with the attempt retried on a second worker (#495); child start options (#1135); client start policies and RPC deadlines (#499); client request IDs (#545); completed-workflow queries (#548); concurrent calls on one client (#807); `Client.describe` and `Client.count` (#1152); `Client.fetch_history` replay (#1137); query and suspended-update recovery after sticky-cache eviction and worker replacement (#530); local activity retry cancellation (#567); detection, task failure and bounded shutdown of a worker whose workflow code stops yielding, with the run recovered on a corrected worker (#493); official-SDK interoperability (#517), where the pinned official Python SDK client and activity worker drive an OCaml workflow and both clients decode the same exact runs; split workflow/activity workers (#805, #1211); durable timer cancellation (#1134); transport interruption and uncertain outcomes (#504); update admission outcomes (#546); update callers when the run closes (#520); `Client.signal_with_start` and `Client.update_with_start` (#1151); Prometheus worker metrics and log correlation (#500); worker resource and shutdown options under saturation (#498); per-workflow worker versioning (#1159); and workflow start info (#512). The run fails if any suite fails; a Docker-free contract requires every `test/integration/*/regression.exe` to be in the smoke artifact and run by CI (#795) | [regression runner][regressions-controller]; each suite's `README.md` or module comment under `test/integration/` |
 
 The [generated inventory](live-acceptance-inventory.md) tracks the membership of
@@ -85,6 +85,7 @@ Temporal/PostgreSQL job through `make test-temporal-live-ci`.
 | Worker removal during pending work | `test-temporal-worker-crash-recovery` | `docker kill --signal KILL` on generation one once the exact run's history shows its pending timer; exit 137, no graceful-stop marker | Generation two replays (`is_replaying=true`) and the same run completes |
 | Worker removal during pending work | `test-temporal-parent-child-restart` | Graceful `Worker.shutdown` of generation one while a parent and its long-running child are both suspended | Both exact runs replay on generation two and complete with exact parent/child linkage |
 | Worker removal during a running activity callback | `activity_worker_crash` (#519) | `SIGKILL` to the worker process (hosting the workflow and the activity) after the callback's marker file and `workflow describe` both show attempt 1 started and heartbeating on it; the process must die of that signal | With no worker polling, the server alone fails attempt 1 on its three-second heartbeat timeout and schedules attempt 2. A replacement process completes attempt 2 (`Activity.Info.attempt`), reads attempt 1's last heartbeat detail, and the run returns the exact expected result; history has one scheduled, started (attempt 2, replacement identity, heartbeat-timeout last failure) and completed activity event and no activity failure or timeout |
+| Worker removal after an external side effect, before its completion | `activity_idempotency` (#504) | The activity callback posts line 1 to the example's file-backed ledger, whose hard-link publication deduplicates by idempotency key atomically, then sends `SIGKILL` to its own worker process before returning; the process must die of that signal with exactly that record in the ledger | Temporal times attempt 1 out and schedules attempt 2 (`Client.describe`). A replacement process's attempt 2 sends the same key and is answered as a duplicate; line 2, with an identical posting, is posted under its own key. The run returns both exact receipts; the ledger holds two records and a three-request journal correlated to the exact workflow, run, activity, attempt and generation; history has two scheduled, started and completed activities (line 1 started as attempt 2 on the replacement, timeout last failure) and no activity failure or timeout |
 | Worker removal during pending work | `interaction_recovery` (#530) | `SIGTERM` to the worker process that accepted a suspended update | The replacement answers queries from replayed state; history has one acceptance and one completion of the original update ID, attributed to the original and replacement workers |
 | Shutdown with outstanding work | `bounded_shutdown` (#495) | `Worker.shutdown_with_report` with a two-second grace period while an activity callback ignores cancellation and the shutdown flag | Shutdown returns within its bound and reports one abandoned callback; Temporal retries the attempt and a second worker completes attempt 2 |
 | Eviction followed by continued progress | `test-temporal-worker-cache-eviction` | One-slot cache; a second parked run forces Core `RemoveFromCache` (`cache_full`) of the first | Empty eviction acknowledgement; evicted run A resumes on its signal and completes, then B is cancelled with a typed terminal outcome (see the [#519 matrix](#issue-519-worker-recovery-regression-matrix)) |
@@ -98,13 +99,15 @@ make test-temporal-worker-crash-recovery
 make test-temporal-worker-cache-eviction
 make test-temporal-parent-child-restart
 # All LIVE_REGRESSION_EXECUTABLES, including interaction_recovery,
-# bounded_shutdown and activity_worker_crash, against one fresh stack; logs
+# bounded_shutdown, activity_worker_crash and activity_idempotency, against
+# one fresh stack; logs
 # land in _build/live-regressions/.
 make test-temporal-live-regressions
 ```
 
 To run one regression suite against an already running disposable server, use
-its focused target. `interaction_recovery` and `activity_worker_crash` need a
+its focused target. `interaction_recovery`, `activity_worker_crash` and
+`activity_idempotency` need a
 `default` namespace and the official Temporal CLI; `bounded_shutdown` defaults
 to `temporal-sdk-test`:
 
@@ -116,6 +119,10 @@ make test-activity-worker-crash-live RUN='opam exec --' \
   TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233 \
   TEMPORAL_TEST_CLI=/absolute/path/to/temporal \
   ACTIVITY_WORKER_CRASH_EVIDENCE=$PWD/_build/activity-worker-crash
+make test-activity-idempotency-live RUN='opam exec --' \
+  TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233 \
+  TEMPORAL_TEST_CLI=/absolute/path/to/temporal \
+  ACTIVITY_IDEMPOTENCY_EVIDENCE=$PWD/_build/activity-idempotency
 make test-bounded-shutdown-live RUN='opam exec --' \
   TEMPORAL_CLIENT_TEST_URL=http://127.0.0.1:7233
 ```
@@ -126,8 +133,10 @@ regression suite's log, plus the official-SDK interoperability evidence, is in
 `live-regressions-<run>-<attempt>`. That artifact also holds
 `activity_worker_crash/`: the suite's `describe` snapshots before and after the
 kill, the raw exact-run history, and each worker generation's log (the logs are
-copied into the suite log too). Both artifacts are uploaded even when the step
-fails and kept for seven days.
+copied into the suite log too), and `activity_idempotency/`: the suite's
+ledger directory, its `correlation.json` summary, `describe` snapshots, the raw
+exact-run history and both worker generations' logs. Both artifacts are
+uploaded even when the step fails and kept for seven days.
 
 The `activity_worker_crash` suite covers the case the other suites leave open:
 an abrupt process death while an activity callback is running. The crash

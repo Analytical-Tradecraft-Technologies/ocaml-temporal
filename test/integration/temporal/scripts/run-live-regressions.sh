@@ -158,6 +158,11 @@ for executable in "$@"; do
     test/integration/with_start/regression.exe|\
     test/integration/worker_versioning/regression.exe)
       cli_argument=$container_cli ;;
+    test/integration/activity_idempotency/regression.exe)
+      # The CLI path, then the suite's evidence directory (#504) for its
+      # ledger, correlation summary, describe snapshots, exact-run history
+      # and worker generation logs.
+      cli_argument="$container_cli /workspace/_build/live-regressions/activity_idempotency" ;;
     test/integration/activity_worker_crash/regression.exe)
       # The CLI path, then the suite's evidence directory (#519) for its
       # describe snapshots, exact-run history and worker generation logs.

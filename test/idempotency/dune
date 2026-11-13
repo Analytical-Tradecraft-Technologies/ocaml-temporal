@@ -1,0 +1,15 @@
+; Server-free tests for the idempotent side-effect example (#504): the
+; ledger's atomic idempotency contract, and the example workflow under
+; Temporal.Testing, including an attempt lost after its posting committed.
+; The live redelivery across a worker restart is
+; test/integration/activity_idempotency.
+
+(test
+ (name test_payment_ledger)
+ (modules test_payment_ledger)
+ (libraries temporal_sdk_examples_idempotency unix))
+
+(test
+ (name test_idempotent_payments)
+ (modules test_idempotent_payments)
+ (libraries temporal-sdk temporal_sdk_examples_idempotency unix))
