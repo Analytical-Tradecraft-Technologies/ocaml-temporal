@@ -326,7 +326,11 @@ val client_wait_workflow_json : runtime -> bytes -> (bytes, error) result
     message holding every page of the run's history. [Call_describe] and
     [Call_count] (#1152) have no synchronous operation either: they take a
     describe or count request document and succeed with the reduced describe
-    document or the [{"count":n}] document. *)
+    document or the [{"count":n}] document. [Call_signal_with_start]
+    and [Call_update_with_start] (#1151) have no synchronous operation
+    either: each takes a document embedding a start request under [start];
+    the first succeeds with the start outcome document and the second with
+    the update-with-start outcome document. *)
 type client_call_kind =
   | Call_start
   | Call_wait
@@ -343,6 +347,8 @@ type client_call_kind =
   | Call_history
   | Call_describe
   | Call_count
+  | Call_signal_with_start
+  | Call_update_with_start
 
 (** Handle of one submitted client call: the identity of the runtime graph
     that submitted it plus the call identifier. It names a Rust-owned

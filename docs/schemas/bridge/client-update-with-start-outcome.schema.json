@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/docs/schemas/bridge/client-update-with-start-outcome.schema.json",
+  "title": "OCaml Temporal native client update-with-start outcome",
+  "description": "Success value of the UPDATE_WITH_START client call selector (#1151). The rejected and unknown forms are exactly those of client-start-outcome.schema.json. The accepted form proves the start was applied and adds the update half: Temporal's response for the update (accepted, or with the outcome of a completed or validator-rejected update), or the error that ended the wait for acceptance, which is never already_started or query_failed.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "execution", "started", "update"],
+      "properties": {
+        "kind": {"const": "accepted"},
+        "execution": {"$ref": "client-execution-ref.schema.json"},
+        "started": {
+          "type": "boolean",
+          "description": "False only when a use_existing start attached to the open run created by another request."
+        },
+        "update": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "update_id", "execution", "outcome"],
+              "properties": {
+                "kind": {"const": "response"},
+                "update_id": {"type": "string", "minLength": 1, "maxLength": 65536},
+                "execution": {"$ref": "client-execution-ref.schema.json", "description": "The run that accepted the update."},
+                "outcome": {"anyOf": [{"$ref": "client-update-outcome.schema.json"}, {"type": "null"}]}
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "error"],
+              "properties": {
+                "kind": {"const": "error"},
+                "error": {"$ref": "client-error.schema.json"}
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "error"],
+      "properties": {
+        "kind": {"const": "rejected"},
+        "error": {"$ref": "client-error.schema.json"}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "request_id", "workflow_id"],
+      "properties": {
+        "kind": {"const": "unknown"},
+        "request_id": {"type": "string", "minLength": 1},
+        "workflow_id": {"type": "string", "minLength": 1}
+      }
+    }
+  ]
+}
