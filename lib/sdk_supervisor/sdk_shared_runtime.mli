@@ -49,9 +49,10 @@ val create :
   unit ->
   (t, Temporal_core_bridge.Native_bridge.error) result
 
-(** The socket address the runtime's metrics endpoint is bound to, or
-    [None] when no exporter was configured. Constant for the value's
-    lifetime; the endpoint itself stops when Core is destroyed. *)
+(** The socket address the runtime's Prometheus endpoint is bound to, or
+    [None] when no exporter or an OTLP exporter (#1161) was configured.
+    Constant for the value's lifetime; the endpoint itself stops when Core
+    is destroyed. *)
 val metrics_address : t -> string option
 
 (** The SDK-side metrics recorder over the runtime's exporter (#500), or

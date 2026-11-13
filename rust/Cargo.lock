@@ -1213,6 +1213,8 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.5",
  "thiserror",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -2140,7 +2142,9 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "opentelemetry",
  "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "parking_lot",
  "prometheus",
  "prost",
