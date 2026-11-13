@@ -498,6 +498,15 @@ val fire_timer : t -> seq:int64 -> (unit, Temporal_base.Error.t) result
     only query responses can be appended; durable commands remain suppressed. *)
 val emit : t -> Activation.command -> unit
 
+(** Raises [Invalid_argument] naming [what] when [context] is running a
+    read-only callback (a live update validator or a query handler, see
+    {!with_randomness_disabled}), and returns otherwise. A terminal public
+    operation calls it before any validation or encoding whose failure would
+    call {!terminate}: terminating there would seal the context and fail the
+    whole workflow task from a path that replay skips, instead of rejecting
+    only the query or update. *)
+val reject_in_read_only_callback : t -> what:string -> unit
+
 (** Buffers a terminal command and stops the current workflow fiber. This is a
     package-private control boundary used by terminal workflow operations. *)
 val terminate : t -> Activation.command -> 'value

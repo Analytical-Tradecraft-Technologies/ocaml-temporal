@@ -735,13 +735,21 @@ let continue_as_new_options ~run_info ?task_queue ?run_timeout ?task_timeout
     {!continue_as_new_encode_error} ensures the runtime classifies it as a
     workflow-task failure, and an invalid setting is a [Defect], which the
     runtime also treats as one: the task fails with no commands and the run
-    stays open for a corrected worker to replay. *)
+    stays open for a corrected worker to replay. Inside a read-only callback
+    it raises [Invalid_argument] before validating or encoding anything, so
+    neither failure path can seal the context from a query or validator. *)
 let continue_as_new ?task_queue ?run_timeout ?task_timeout ?retry_policy ?memo
     ?search_attributes ?initial_versioning_behavior definition next_input =
   match Temporal_sdk_kernel.Workflow_context_store.current () with
   | None ->
       invalid_arg "Temporal.Workflow.continue_as_new used outside a workflow execution"
   | Some context -> (
+      (* The read-only guard must come first: an invalid option or encoder
+         failure below terminates the context, which inside a query handler
+         or update validator would fail the whole workflow task from a path
+         replay skips, instead of rejecting only that callback. *)
+      Temporal_sdk_kernel.Workflow_context_store.reject_in_read_only_callback context
+        ~what:"run (continue-as-new)";
       let fail error =
         Temporal_sdk_kernel.Workflow_context_store.terminate context
           (Temporal_sdk_kernel.Activation.Fail_workflow error)

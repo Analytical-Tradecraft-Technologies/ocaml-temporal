@@ -208,21 +208,51 @@ let test_invalid_options_fail_task () =
 
 (** Continue-as-new is rejected inside a query handler, which records no
     commands, before anything is buffered: the successor command and the
-    memo it carries would otherwise reach history on the live path only. *)
+    memo it carries would otherwise reach history on the live path only.
+    The rejection also precedes option validation and input encoding, whose
+    failures terminate the context: an invalid option or a failing encoder
+    in a query handler must still only raise [Invalid_argument] naming the
+    read-only callback, never buffer [Fail_workflow] or seal the run. *)
 let test_rejected_in_read_only_callback () =
-  let context =
-    Workflow_context_store.create ~randomness_seed:"1153" (Scheduler.create ())
+  let failing_encoder =
+    Temporal.Codec.make ~encoding:"json/plain"
+      ~encode:(fun () -> Error (Temporal.Error.codec ~message:"encoder failed"))
+      ~decode:(fun _ -> Error (Temporal.Error.codec ~message:"unused"))
   in
-  let rejected =
-    Workflow_context_store.with_read_only_query context (fun () ->
-        match (Temporal.Workflow.continue_as_new successor () : unit) with
-        | () -> false
-        | exception Invalid_argument _ -> true)
+  let unencodable_successor =
+    Temporal.Workflow.remote ~name:"can_options_unencodable" ~input:failing_encoder
+      ~output:Temporal.Codec.unit
   in
-  if not rejected then failwith "continue-as-new was accepted in a query handler";
-  match Workflow_context_store.take_commands context with
-  | [] -> ()
-  | _ :: _ -> failwith "a read-only continue-as-new buffered a command"
+  let cases =
+    [ ("valid options", fun () -> Temporal.Workflow.continue_as_new successor ());
+      ("invalid option", fun () -> Temporal.Workflow.continue_as_new ~task_queue:"" successor ());
+      ("failing encoder", fun () -> Temporal.Workflow.continue_as_new unencodable_successor ()) ]
+  in
+  let read_only_message message =
+    let needle = "read-only" in
+    let rec scan index =
+      index + String.length needle <= String.length message
+      && (String.sub message index (String.length needle) = needle || scan (index + 1))
+    in
+    scan 0
+  in
+  List.iter
+    (fun (label, body) ->
+      let context =
+        Workflow_context_store.create ~randomness_seed:"1153" (Scheduler.create ())
+      in
+      let rejected =
+        Workflow_context_store.with_read_only_query context (fun () ->
+            match (body () : unit) with
+            | () -> false
+            | exception Invalid_argument message -> read_only_message message)
+      in
+      if not rejected then
+        failwith (label ^ ": continue-as-new was not rejected as a read-only callback");
+      match Workflow_context_store.take_commands context with
+      | [] -> ()
+      | _ :: _ -> failwith (label ^ ": a read-only continue-as-new buffered a command"))
+    cases
 
 (** Runs every #1153 runtime check; any failure raises and fails the alias. *)
 let () =
