@@ -501,10 +501,15 @@ val terminate : t -> Activation.command -> 'value
 
 (** Buffers a continue-as-new command and stops the current workflow fiber.
     The successor input is encoded into its argument list before it reaches
-    this private operation. The command carries the current memo after an
-    {!upsert_memo}, and an empty memo (Core reuses the start memo)
-    otherwise. *)
+    this private operation. A non-empty [memo] (#1153) becomes the
+    successor's memo and is copied; otherwise the command carries the current
+    memo after an {!upsert_memo}, and an empty memo (Core reuses the start
+    memo) when there was none. [options] (default
+    {!Activation.Continue_as_new_options.none}) holds the other successor
+    settings, already validated by the public API. *)
 val continue_as_new :
+  ?memo:(string * Temporal_base.Codec.payload) list ->
+  ?options:Activation.Continue_as_new_options.t ->
   t -> workflow_type:string -> input:Temporal_base.Codec.payload list -> 'value
 
 (** True when the pending command buffer already holds a terminal workflow

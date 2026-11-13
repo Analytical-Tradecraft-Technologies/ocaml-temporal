@@ -840,6 +840,39 @@ let protocol_failure path (error : Temporal_base.Error.t) =
         info = failure_info;
       }
 
+(** Converts an optional runtime retry policy at ["$.command.retry_policy"]
+    for an activity, child, or continue-as-new command, rebuilding the exact
+    protocol durations and checking the result with the protocol's strict
+    retry-policy validator, so a policy the bridge would reject never leaves
+    the runtime. *)
+let optional_protocol_retry_policy (retry_policy : Activation.retry_policy option) =
+  match retry_policy with
+  | None -> Ok None
+  | Some value ->
+      let* initial_interval =
+        duration_of_milliseconds "$.command.retry_policy.initial_interval"
+          value.initial_interval
+      in
+      let* maximum_interval =
+        duration_of_milliseconds "$.command.retry_policy.maximum_interval"
+          value.maximum_interval
+      in
+      let policy =
+        Protocol.
+          {
+            initial_interval;
+            backoff_coefficient_bits = value.backoff_coefficient_bits;
+            maximum_interval;
+            maximum_attempts = value.maximum_attempts;
+            non_retryable_error_types =
+              List.map Fun.id value.non_retryable_error_types;
+          }
+      in
+      let* () =
+        Protocol.validate_retry_policy policy |> Result.map_error protocol_error
+      in
+      Ok (Some policy)
+
 (** Converts a search-attribute or memo map to protocol payloads, in order,
     after checking every key with the strict identifier rule and rejecting a
     repeated key, which the protocol's JSON object could not represent.
@@ -856,6 +889,43 @@ let protocol_payload_map ~path ~label values =
           convert (key :: seen) ((key, payload) :: reversed) rest
   in
   convert [] [] values
+
+(** Converts continue-as-new successor settings (#1153) without inventing
+    values: every [None] stays [None], so a command without options encodes
+    exactly as before. Timeouts become exact protocol durations, and the
+    search-attribute map gets the same key checks as an upsert. *)
+let protocol_continue_as_new_options (options : Activation.Continue_as_new_options.t) =
+  let* () =
+    match options.task_queue with
+    | None -> Ok ()
+    | Some queue -> validate_identifier "$.command.task_queue" queue
+  in
+  let* run_timeout =
+    optional_duration_of_milliseconds "$.command.run_timeout" options.run_timeout
+  in
+  let* task_timeout =
+    optional_duration_of_milliseconds "$.command.task_timeout" options.task_timeout
+  in
+  let* retry_policy = optional_protocol_retry_policy options.retry_policy in
+  let* search_attributes =
+    match options.search_attributes with
+    | None -> Ok None
+    | Some values ->
+        let* values =
+          protocol_payload_map ~path:"$.command.search_attributes"
+            ~label:"search-attribute" values
+        in
+        Ok (Some values)
+  in
+  Ok
+    {
+      Protocol.Continue_as_new_options.task_queue = options.task_queue;
+      run_timeout;
+      task_timeout;
+      retry_policy;
+      search_attributes;
+      initial_versioning_behavior = options.initial_versioning_behavior;
+    }
 
 (** Converts one command without fabricating fields. Activity commands already
     carry all Core-required identifiers, arguments, timeout policies, and
@@ -910,37 +980,7 @@ let command_to_protocol command =
         optional_duration_of_milliseconds "$.command.heartbeat_timeout"
           heartbeat_timeout
       in
-      let* retry_policy =
-        match retry_policy with
-        | None -> Ok None
-        | Some value ->
-            let* initial_interval =
-              duration_of_milliseconds
-                "$.command.retry_policy.initial_interval"
-                value.initial_interval
-            in
-            let* maximum_interval =
-              duration_of_milliseconds
-                "$.command.retry_policy.maximum_interval"
-                value.maximum_interval
-            in
-            let policy =
-              Protocol.
-                {
-                  initial_interval;
-                  backoff_coefficient_bits = value.backoff_coefficient_bits;
-                  maximum_interval;
-                  maximum_attempts = value.maximum_attempts;
-                  non_retryable_error_types =
-                    List.map Fun.id value.non_retryable_error_types;
-                }
-            in
-            let* () =
-              Protocol.validate_retry_policy policy
-              |> Result.map_error protocol_error
-            in
-            Ok (Some policy)
-      in
+      let* retry_policy = optional_protocol_retry_policy retry_policy in
       let priority =
         Option.map
           (fun value ->
@@ -1025,31 +1065,7 @@ let command_to_protocol command =
         optional_duration_of_milliseconds
           "$.command.local_retry_threshold" local_retry_threshold
       in
-      let* retry_policy =
-        match retry_policy with
-        | None -> Ok None
-        | Some value ->
-            let* initial_interval =
-              duration_of_milliseconds
-                "$.command.retry_policy.initial_interval" value.initial_interval
-            in
-            let* maximum_interval =
-              duration_of_milliseconds
-                "$.command.retry_policy.maximum_interval" value.maximum_interval
-            in
-            let policy =
-              Protocol.
-                {
-                  initial_interval;
-                  backoff_coefficient_bits = value.backoff_coefficient_bits;
-                  maximum_interval;
-                  maximum_attempts = value.maximum_attempts;
-                  non_retryable_error_types = List.map Fun.id value.non_retryable_error_types;
-                }
-            in
-            let* () = Protocol.validate_retry_policy policy |> Result.map_error protocol_error in
-            Ok (Some policy)
-      in
+      let* retry_policy = optional_protocol_retry_policy retry_policy in
       let original_schedule_time =
         match original_schedule_time with
         | None -> None
@@ -1096,37 +1112,7 @@ let command_to_protocol command =
         | Activation.Parent_abandon -> Protocol.Parent_abandon
         | Activation.Parent_request_cancel -> Protocol.Parent_request_cancel) parent_close_policy in
       let* input = protocol_input "$.command.input" input in
-      let* retry_policy =
-        match retry_policy with
-        | None -> Ok None
-        | Some value ->
-            let* initial_interval =
-              duration_of_milliseconds
-                "$.command.retry_policy.initial_interval"
-                value.initial_interval
-            in
-            let* maximum_interval =
-              duration_of_milliseconds
-                "$.command.retry_policy.maximum_interval"
-                value.maximum_interval
-            in
-            let policy =
-              Protocol.
-                {
-                  initial_interval;
-                  backoff_coefficient_bits = value.backoff_coefficient_bits;
-                  maximum_interval;
-                  maximum_attempts = value.maximum_attempts;
-                  non_retryable_error_types =
-                    List.map Fun.id value.non_retryable_error_types;
-                }
-            in
-            let* () =
-              Protocol.validate_retry_policy policy
-              |> Result.map_error protocol_error
-            in
-            Ok (Some policy)
-      in
+      let* retry_policy = optional_protocol_retry_policy retry_policy in
       let* execution_timeout =
         optional_duration_of_milliseconds "$.command.execution_timeout"
           execution_timeout
@@ -1267,11 +1253,12 @@ let command_to_protocol command =
   | Activation.Fail_workflow error ->
       let* failure = protocol_failure "$.command.failure" error in
       Ok (Protocol.Fail_workflow { failure })
-  | Activation.Continue_as_new { workflow_type; input; memo } ->
+  | Activation.Continue_as_new { workflow_type; input; memo; options } ->
       let* () = validate_identifier "$.command.workflow_type" workflow_type in
       let* input = protocol_input "$.command.input" input in
       let* memo = protocol_payload_map ~path:"$.command.memo" ~label:"memo" memo in
-      Ok (Protocol.Continue_as_new { workflow_type; input; memo })
+      let* options = protocol_continue_as_new_options options in
+      Ok (Protocol.Continue_as_new { workflow_type; input; memo; options })
   | Activation.Cancel_workflow_execution ->
       Ok Protocol.Cancel_workflow_execution
 

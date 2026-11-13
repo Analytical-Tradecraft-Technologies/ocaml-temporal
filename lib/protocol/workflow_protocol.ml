@@ -382,6 +382,35 @@ type update_response =
   | Update_rejected of failure
   | Update_completed of payload
 
+(** Routing of a continue-as-new successor's first workflow task (#1153). *)
+type continue_as_new_versioning_behavior =
+  | Successor_auto_upgrade
+  | Successor_use_ramping_version
+
+(** Optional continue-as-new successor settings; see the interface for what
+    each omitted member means to Core and the server. *)
+module Continue_as_new_options = struct
+  type t = {
+    task_queue : string option;
+    run_timeout : duration option;
+    task_timeout : duration option;
+    retry_policy : retry_policy option;
+    search_attributes : (string * payload) list option;
+    initial_versioning_behavior : continue_as_new_versioning_behavior option;
+  }
+
+  (** Every setting unset: the command earlier releases emitted. *)
+  let none =
+    {
+      task_queue = None;
+      run_timeout = None;
+      task_timeout = None;
+      retry_policy = None;
+      search_attributes = None;
+      initial_versioning_behavior = None;
+    }
+end
+
 type completion_command =
   | Schedule_activity of {
       seq : int64;
@@ -484,6 +513,7 @@ type completion_command =
       workflow_type : string;
       input : payload list;
       memo : (string * payload) list;
+      options : Continue_as_new_options.t;
     }
   | Cancel_workflow_execution
 
@@ -2701,6 +2731,111 @@ let validate_child_timeouts path ~execution_timeout ~run_timeout ~task_timeout =
            "task timeout exceeds the run (or execution) timeout")
   | _ -> Ok ()
 
+(** The optional members of a continue-as-new command (#1153), in the order
+    the encoder writes them. Each is omitted when unset, so a command without
+    options keeps the exact document of earlier releases. *)
+let continue_as_new_option_members =
+  [ "task_queue"; "run_timeout"; "task_timeout"; "retry_policy";
+    "search_attributes"; "initial_versioning_behavior" ]
+
+(** Returns the subset of [names] present in the JSON object [json], so the
+    closed-object check accepts exactly the optional members supplied. *)
+let present_members json names =
+  match json with
+  | `Assoc entries -> List.filter (fun name -> List.mem_assoc name entries) names
+  | _ -> []
+
+(** Maps a successor versioning behavior to its stable JSON spelling. *)
+let continue_as_new_versioning_behavior_string = function
+  | Successor_auto_upgrade -> "auto_upgrade"
+  | Successor_use_ramping_version -> "use_ramping_version"
+
+(** Decodes the spelling produced by
+    [continue_as_new_versioning_behavior_string]. *)
+let continue_as_new_versioning_behavior path = function
+  | `String "auto_upgrade" -> Ok Successor_auto_upgrade
+  | `String "use_ramping_version" -> Ok Successor_use_ramping_version
+  | _ -> Error (invalid path "unknown continue-as-new versioning behavior")
+
+(** Decodes the optional successor settings of a continue-as-new command from
+    its already closed-checked [entries]. An absent member is [None]; unlike
+    a child start, [null] is not accepted because the encoder never writes it
+    and a present member must carry a value. The timeouts obey the
+    [Client.start] rules that apply without an execution timeout: Rust and the
+    OCaml encoder enforce the same ones. *)
+let continue_as_new_options path entries =
+  let optional name decode =
+    match List.assoc_opt name entries with
+    | None -> Ok None
+    | Some json ->
+        let* value = decode (path ^ "." ^ name) json in
+        Ok (Some value)
+  in
+  let* task_queue = optional "task_queue" identifier in
+  let* run_timeout = optional "run_timeout" duration in
+  let* task_timeout = optional "task_timeout" duration in
+  let* retry_policy = optional "retry_policy" retry_policy in
+  let* search_attributes = optional "search_attributes" payload_map in
+  let* initial_versioning_behavior =
+    optional "initial_versioning_behavior" continue_as_new_versioning_behavior
+  in
+  let* () =
+    validate_child_timeouts path ~execution_timeout:None ~run_timeout
+      ~task_timeout
+  in
+  Ok
+    {
+      Continue_as_new_options.task_queue;
+      run_timeout;
+      task_timeout;
+      retry_policy;
+      search_attributes;
+      initial_versioning_behavior;
+    }
+
+(** Encodes the present successor settings of a continue-as-new command as
+    JSON members, in [continue_as_new_option_members] order, after applying
+    the decoder's checks so an invalid command is never written. *)
+let continue_as_new_options_json (options : Continue_as_new_options.t) =
+  let path = "$.commands" in
+  let* () =
+    validate_child_timeouts path ~execution_timeout:None
+      ~run_timeout:options.run_timeout ~task_timeout:options.task_timeout
+  in
+  let member name encode = function
+    | None -> Ok []
+    | Some value ->
+        let* json = encode value in
+        Ok [ (name, json) ]
+  in
+  let* task_queue =
+    member "task_queue"
+      (fun queue ->
+        let* queue = identifier (path ^ ".task_queue") (`String queue) in
+        Ok (`String queue))
+      options.task_queue
+  in
+  let duration_json (value : duration) =
+    Ok (time_json value.seconds value.nanoseconds)
+  in
+  let* run_timeout = member "run_timeout" duration_json options.run_timeout in
+  let* task_timeout = member "task_timeout" duration_json options.task_timeout in
+  let* retry_policy = member "retry_policy" retry_policy_json options.retry_policy in
+  let* search_attributes =
+    member "search_attributes"
+      (payload_map_json (path ^ ".search_attributes"))
+      options.search_attributes
+  in
+  let* initial_versioning_behavior =
+    member "initial_versioning_behavior"
+      (fun value -> Ok (`String (continue_as_new_versioning_behavior_string value)))
+      options.initial_versioning_behavior
+  in
+  Ok
+    (List.concat
+       [ task_queue; run_timeout; task_timeout; retry_policy; search_attributes;
+         initial_versioning_behavior ])
+
 (** Encodes a nullable duration. *)
 let optional_duration_json = function
   | None -> `Null
@@ -2989,7 +3124,10 @@ let completion_command path json =
       Ok (Request_cancel_external_workflow { seq; workflow_id; run_id; reason })
   | "continue_as_new" ->
       let* entries =
-        exact_object path [ "kind"; "workflow_type"; "input"; "memo" ] json
+        exact_object path
+          ([ "kind"; "workflow_type"; "input"; "memo" ]
+          @ present_members json continue_as_new_option_members)
+          json
       in
       let* workflow_type_json = field path "workflow_type" entries in
       let* workflow_type =
@@ -2999,7 +3137,8 @@ let completion_command path json =
       let* input = list (path ^ ".input") payload input_json in
       let* memo_json = field path "memo" entries in
       let* memo = payload_map (path ^ ".memo") memo_json in
-      Ok (Continue_as_new { workflow_type; input; memo })
+      let* options = continue_as_new_options path entries in
+      Ok (Continue_as_new { workflow_type; input; memo; options })
   | "request_cancel_activity" ->
       let* entries = exact_object path [ "kind"; "seq" ] json in
       let* seq_json = field path "seq" entries in
@@ -3228,17 +3367,19 @@ let completion_command_json = function
             ("run_id", `String run_id);
             ("reason", `String reason);
           ])
-  | Continue_as_new { workflow_type; input; memo } ->
+  | Continue_as_new { workflow_type; input; memo; options } ->
       let* input = payloads_json input in
       let* memo = payload_map_json "$.commands.memo" memo in
+      let* options = continue_as_new_options_json options in
       Ok
         (`Assoc
-          [
-            ("kind", `String "continue_as_new");
-            ("workflow_type", `String workflow_type);
-            ("input", input);
-            ("memo", memo);
-          ])
+          ([
+             ("kind", `String "continue_as_new");
+             ("workflow_type", `String workflow_type);
+             ("input", input);
+             ("memo", memo);
+           ]
+          @ options))
   | Start_timer { seq; start_to_fire_timeout } ->
       Ok
         (`Assoc

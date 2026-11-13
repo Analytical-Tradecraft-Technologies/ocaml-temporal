@@ -848,13 +848,27 @@ let terminate context command =
 
 (** Records the successor command before aborting the current scheduler. The
     command must be visible even though the terminal effect never resumes its
-    caller. After a memo upsert the successor receives the merged memo;
-    otherwise the memo is left empty so Core reuses the start memo. The
-    payloads are shared with [current_memo], which nothing mutates once the
-    run has ended. *)
-let continue_as_new context ~workflow_type ~input =
-  let memo = Option.value context.current_memo ~default:[] in
-  terminate context (Activation.Continue_as_new { workflow_type; input; memo })
+    caller. A non-empty explicit [memo] (#1153) replaces the successor's memo
+    and is copied here. Otherwise, after a memo upsert the successor receives
+    the merged memo, and without one the memo is left empty so Core reuses
+    the start memo; those payloads are shared with [current_memo], which
+    nothing mutates once the run has ended. [options] are already validated
+    and owned by the caller. *)
+let continue_as_new ?memo ?(options = Activation.Continue_as_new_options.none)
+    context ~workflow_type ~input =
+  let memo =
+    match memo with
+    | Some (_ :: _ as memo) ->
+        List.map
+          (fun (key, { Temporal_base.Payload.metadata; data }) ->
+            (snapshot_identifier key,
+             { Temporal_base.Payload.metadata = List.map Fun.id metadata;
+               data = Bytes.copy data }))
+          memo
+    | Some [] | None -> Option.value context.current_memo ~default:[]
+  in
+  terminate context
+    (Activation.Continue_as_new { workflow_type; input; memo; options })
 
 (** Builds an error indicating that Core and the OCaml runtime disagree about
     which operation sequence is pending or that a bridge lifecycle rule was
