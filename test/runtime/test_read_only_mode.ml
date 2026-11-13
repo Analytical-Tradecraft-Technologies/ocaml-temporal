@@ -135,6 +135,13 @@ let probe stash : probe list =
     ready "scoped activity start" (T.Activity.start ~scope activity "x");
     ready "local activity start" (T.Activity.start_local activity "x");
     ready "child start" (T.Child_workflow.start ~id:"read-only-child" child ());
+    ready "child start with metadata"
+      (T.Child_workflow.start ~memo:[ ("key", value) ] ~search_attributes:[ ("Key", value) ]
+         ~id:"read-only-child" child ());
+    (* The guard precedes metadata validation, so even a bad key reports the
+       read-only rejection rather than a key defect. *)
+    ready "child start with invalid metadata"
+      (T.Child_workflow.start ~memo:[ ("", value) ] ~id:"read-only-child" child ());
     ready "external signal"
       (T.Workflow.signal_external_workflow ~workflow_id:"other" ~signal ~input:() ());
     ready "external cancellation"
@@ -146,6 +153,14 @@ let probe stash : probe list =
         T.Workflow.upsert_search_attributes [ ("Key", value) ]);
     raises "upsert_memo" (fun () -> T.Workflow.upsert_memo [ ("key", value) ]);
     raises "continue_as_new" (fun () -> T.Workflow.continue_as_new successor ());
+    raises "continue_as_new with options" (fun () ->
+        T.Workflow.continue_as_new ~task_queue:"other" ~memo:[ ("key", value) ]
+          ~search_attributes:[ ("Key", value) ] successor ());
+    raises "continue_as_new with invalid option" (fun () ->
+        T.Workflow.continue_as_new ~task_queue:"" successor ());
+    raises "upsert_typed_search_attributes" (fun () ->
+        T.Workflow.upsert_typed_search_attributes
+          [ T.Search_attribute.set (T.Search_attribute.keyword "Status") "probe" ]);
     typed ~fragment:"read-only" "Scope.create" (T.Scope.create ());
     typed "Scope.cancel" (T.Scope.cancel scope);
     typed "Condition.wait_until" (T.Condition.wait_until (fun () -> true));
