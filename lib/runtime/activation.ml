@@ -205,6 +205,12 @@ type command =
           (** Child workflow-task timeout in milliseconds, or [None] for
               Temporal's 10-second default. *)
       id_reuse_policy : child_workflow_id_reuse_policy option;
+      memo : (string * Temporal_base.Codec.payload) list option;
+          (** The child's start memo (#1135), or [None] for none. Keys were
+              validated by the public layer. *)
+      search_attributes : (string * Temporal_base.Codec.payload) list option;
+          (** The child's indexed search attributes (#1135), or [None] for
+              none. *)
     }
   (** Requests cancellation of the child identified by the start command's
       sequence.  Core owns the race between this command and the start

@@ -747,9 +747,10 @@ let find_open_chain environment ~workflow_id ~run_id =
   | Some _ | None -> None
 
 (** Creates and registers a chain whose first run is [workflow_type].
-    [task_queue] defaults to the environment's queue. *)
-let new_chain ?retry_policy ?task_queue environment ~workflow_id
-    ~workflow_type ~input ~parent ~parent_close_policy =
+    [task_queue] defaults to the environment's queue; [memo] and
+    [search_attributes] are the first run's start maps. *)
+let new_chain ?retry_policy ?task_queue ?memo ?search_attributes environment
+    ~workflow_id ~workflow_type ~input ~parent ~parent_close_policy =
   let chain =
     {
       workflow_id;
@@ -764,7 +765,9 @@ let new_chain ?retry_policy ?task_queue environment ~workflow_id
       task_timeout = None;
     }
   in
-  let* _run = create_run environment chain ~workflow_type ~input in
+  let* _run =
+    create_run ?memo ?search_attributes environment chain ~workflow_type ~input
+  in
   Hashtbl.replace environment.chains workflow_id chain;
   Ok chain
 
@@ -1228,9 +1231,11 @@ let workflow_input_of_arguments = function
     input the child cannot decode fails the start instead. The child's
     [retry_policy] governs its runs as on a server, and [task_queue] is
     reported by its [Workflow.info]; every registered workflow runs
-    regardless of the queue, as if a worker polled each one. *)
+    regardless of the queue, as if a worker polled each one. [memo] and
+    [search_attributes] (#1135) become the child's start maps, read back by
+    its [Workflow.start_metadata] as on a server. *)
 let start_child environment run ~seq ~id ~name ~input ~parent_close_policy
-    ~retry_policy ~task_queue =
+    ~retry_policy ~task_queue ~memo ~search_attributes =
   let start_failed cause =
     push_job environment run
       (Activation.Resolve_child_workflow_start
@@ -1251,8 +1256,9 @@ let start_child environment run ~seq ~id ~name ~input ~parent_close_policy
   else
     match
       Result.bind (workflow_input_of_arguments input) (fun input ->
-          new_chain ?retry_policy ?task_queue environment ~workflow_id:id
-            ~workflow_type:name ~input ~parent:(Some (run, seq))
+          new_chain ?retry_policy ?task_queue ?memo ?search_attributes
+            environment ~workflow_id:id ~workflow_type:name ~input
+            ~parent:(Some (run, seq))
             ~parent_close_policy)
     with
     | Error error -> start_failed (Error.message error)
@@ -1370,13 +1376,14 @@ let rec apply_command environment run command =
           Hashtbl.remove run.timers seq
       | None -> ())
   | Start_child_workflow
-      { seq; id; name; input; parent_close_policy; retry_policy; task_queue; _ }
+      { seq; id; name; input; parent_close_policy; retry_policy; task_queue;
+        memo; search_attributes; _ }
     ->
       (* Child timeouts and the ID reuse policy are deliberately ignored: the
          simulator neither enforces workflow timeouts nor keeps closed runs
          to reuse, as [Temporal.Testing] documents. *)
       start_child environment run ~seq ~id ~name ~input ~parent_close_policy
-        ~retry_policy ~task_queue
+        ~retry_policy ~task_queue ~memo ~search_attributes
   | Cancel_child_workflow { seq; _ } -> (
       match Hashtbl.find_opt run.children seq with
       | Some child ->

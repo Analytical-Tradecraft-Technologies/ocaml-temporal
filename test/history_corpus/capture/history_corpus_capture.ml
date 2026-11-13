@@ -321,6 +321,30 @@ let corpus_v5_cron_start_delay client =
     record ~case:"cron-second" ~workflow_type second;
   ]
 
+(** Scenarios captured by the [corpus-v6-child-start-metadata] generation
+    (#1135): a parent that starts its child with a memo and a keyword search
+    attribute, and that child, which must report both. The child's run ID is
+    resolved by the export script from its derived workflow ID. *)
+let corpus_v6_child_start_metadata client =
+  let workflow_type = Defs.child_metadata_parent_workflow_type in
+  let handle =
+    start client
+      ~workflow:(remote workflow_type Temporal.Codec.unit Temporal.Codec.string)
+      ~id:"history-corpus-child-metadata-parent" ~input:()
+  in
+  let observed = expect_completed "child-metadata-parent" handle in
+  if observed <> "METADATA:child-memo/corpus" then
+    failwith ("child metadata parent observed " ^ observed);
+  [
+    record ~case:"child-metadata-parent" ~workflow_type handle;
+    {
+      case = "child-metadata-child";
+      workflow_id = "history-corpus-child-metadata-parent-child";
+      run_id = None;
+      workflow_type = Defs.child_metadata_child_workflow_type;
+    };
+  ]
+
 (** Captures one [corpus.patch] run under the current generation. *)
 let patch client ~case =
   let workflow_type = Defs.patch_workflow_type in
@@ -451,6 +475,7 @@ let scenarios generation client =
   | "corpus-v3-random" -> corpus_v3_random client
   | "corpus-v4-continue-as-new-options" -> corpus_v4_continue_as_new_options client
   | "corpus-v5-cron-start-delay" -> corpus_v5_cron_start_delay client
+  | "corpus-v6-child-start-metadata" -> corpus_v6_child_start_metadata client
   | other -> failwith ("generation has no capture scenarios: " ^ other)
 
 (** Converts a definition-set entry to a live worker registration. *)

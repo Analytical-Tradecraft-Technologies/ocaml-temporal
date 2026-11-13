@@ -133,7 +133,6 @@ for executable in "$@"; do
   case "$executable" in
     test/integration/activity_cancellation/regression.exe|\
     test/integration/bounded_shutdown/regression.exe|\
-    test/integration/child_start_options/regression.exe|\
     test/integration/client_request_ids/regression.exe|\
     test/integration/completed_queries/regression.exe|\
     test/integration/concurrent_client/regression.exe|\
@@ -143,6 +142,7 @@ for executable in "$@"; do
     test/integration/worker_resource_options/regression.exe|\
     test/integration/workflow_start_info/regression.exe)
       cli_argument='' ;;
+    test/integration/child_start_options/regression.exe|\
     test/integration/client_policies/regression.exe|\
     test/integration/continue_as_new_options/regression.exe|\
     test/integration/cron_start_delay/regression.exe|\

@@ -198,6 +198,12 @@ type command =
           (** Child workflow-task timeout in milliseconds, or [None] for
               Temporal's 10-second default. *)
       id_reuse_policy : child_workflow_id_reuse_policy option;
+      memo : (string * Temporal_base.Codec.payload) list option;
+          (** The child's start memo (#1135), or [None] for none. Keys were
+              validated by the public layer. *)
+      search_attributes : (string * Temporal_base.Codec.payload) list option;
+          (** The child's indexed search attributes (#1135), or [None] for
+              none. *)
     }
   (** Requests cancellation of a pending child workflow. *)
   | Cancel_child_workflow of { seq : int64; reason : string }

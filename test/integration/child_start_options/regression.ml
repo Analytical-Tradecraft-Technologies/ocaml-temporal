@@ -14,9 +14,14 @@
     - Reusing a closed child's workflow ID is refused under
       [`Reject_duplicate] (the parent's [started] future fails) and allowed
       under [`Allow_duplicate].
+    - A child started with a memo and a typed keyword search attribute reads
+      both through [Workflow.start_metadata], is found by a
+      [Client.list_visibility] query on the keyword, and [Client.describe]
+      reports both values.
 
     The parent owns and reaps its worker, uses a unique task queue, and
-    terminates every execution it starts. *)
+    terminates every execution it starts. The keyword is registered through
+    the official CLI passed on the command line. *)
 open Temporal
 
 (** Keeps setup failures readable at the public error boundary. *)
@@ -46,13 +51,20 @@ let is_finished () =
   | Ok (Some true) -> true
   | Ok _ | Error _ -> false
 
+(** The keyword search attribute a parent sets on its child (#1135). *)
+let keyword = Search_attribute.keyword "ChildStartOptionsKeyword"
+
+(** The memo value a parent sets on its child under the key [note]. *)
+let memo_note = "child memo"
+
 (** Formats an optional duration as milliseconds, or [-] when absent. *)
 let show_duration =
   Option.fold ~none:"-" ~some:(fun value -> Int64.to_string (Duration.to_ms value))
 
 (** The child. Mode ["report"] returns the timeouts Temporal recorded for
     it; mode ["stall"] waits for a condition that never holds, so only its
-    run timeout can end it. *)
+    run timeout can end it; mode ["metadata"] returns the memo [note] and
+    the keyword it reads through [Workflow.start_metadata]. *)
 let child =
   Workflow.define ~name:"child-options-child" ~input:Codec.string
     ~output:Codec.string (fun mode ->
@@ -61,6 +73,20 @@ let child =
       | "stall" ->
           let* () = Condition.wait_until (fun () -> false) in
           Ok "unreachable"
+      | "metadata" ->
+          let* metadata = Workflow.start_metadata () in
+          let* note =
+            match Option.bind metadata.memo (List.assoc_opt "note") with
+            | None -> Ok "-"
+            | Some payload -> Codec.decode Codec.string payload
+          in
+          let* value =
+            Search_attribute.decode keyword
+              (Option.value metadata.search_attributes ~default:[])
+          in
+          Ok
+            (Printf.sprintf "memo=%s keyword=%s" note
+               (Option.value value ~default:"-"))
       | _ ->
           let* info = Workflow.info () in
           let module Info = Workflow.Info in
@@ -101,7 +127,9 @@ let show_error_origin error =
       records the error it observes;
     - ["reuse"] runs a child to completion, then starts the same child ID
       again under [`Reject_duplicate] and under [`Allow_duplicate],
-      recording whether each start was refused.
+      recording whether each start was refused;
+    - ["metadata"] runs the child with the memo [note] and the keyword set
+      to the child's workflow ID, and records the child's report.
     Every mode then waits for [finish] so the test can query the recorded
     outcome before and after a worker replacement. *)
 let parent =
@@ -145,6 +173,13 @@ let parent =
             let rejected = attempt `Reject_duplicate in
             let allowed = attempt `Allow_duplicate in
             Ok (Printf.sprintf "reject=%s allow=%s" rejected allowed)
+        | "metadata" ->
+            let* search_attributes =
+              Search_attribute.encode [ Search_attribute.set keyword child_id ]
+            in
+            let* memo = Codec.encode Codec.string memo_note in
+            Child_workflow.execute ~id:child_id ~memo:[ ("note", memo) ]
+              ~search_attributes child "metadata"
         | _ -> Error (Error.defect ~message:("unknown mode " ^ mode))
       in
       let* () = Workflow_context.Local.set outcome recorded in
@@ -281,9 +316,90 @@ let check_reuse context =
   ignore
     (check_parent context "reuse" "reuse" "reject=error:child_workflow allow=started")
 
+(** Runs the official CLI against the server and returns its standard output
+    and whether it exited successfully. *)
+let cli_run cli address args =
+  let address = String.sub address 7 (String.length address - 7) in
+  let argv = Array.of_list (cli :: "--address" :: address :: args) in
+  let channel = Unix.open_process_args_in cli argv in
+  let output = In_channel.input_all channel in
+  (output, Unix.close_process_in channel = Unix.WEXITED 0)
+
+(** Reports whether [needle] occurs in [haystack]. *)
+let contains haystack needle =
+  let length = String.length needle in
+  let rec search index =
+    index + length <= String.length haystack
+    && (String.sub haystack index length = needle || search (index + 1))
+  in
+  search 0
+
+(** Retries [attempt] for up to 30 s, for state that appears asynchronously
+    (search-attribute registration and visibility). *)
+let await label attempt =
+  let deadline = Unix.gettimeofday () +. 30. in
+  let rec poll () =
+    if attempt () then ()
+    else if Unix.gettimeofday () < deadline then (
+      Unix.sleepf 0.25;
+      poll ())
+    else fail ("timed out waiting for " ^ label)
+  in
+  poll ()
+
+(** Registers the keyword in the [default] namespace unless it is listed.
+    Another run may register it concurrently, so a failed create is accepted
+    when the attribute is listed afterwards. *)
+let ensure_search_attribute cli address =
+  let name = Search_attribute.name keyword in
+  let listed () =
+    let output, ok =
+      cli_run cli address
+        [ "operator"; "search-attribute"; "list"; "--namespace"; "default"; "--output"; "json" ]
+    in
+    ok && contains output ("\"" ^ name ^ "\"")
+  in
+  if not (listed ()) then (
+    ignore
+      (cli_run cli address
+         [ "operator"; "search-attribute"; "create"; "--namespace"; "default"; "--name"; name;
+           "--type"; "Keyword" ]);
+    await "the search attribute to be registered" listed)
+
+(** A child started with a memo and the keyword (#1135) reports both through
+    [Workflow.start_metadata], before and after the parent is replayed by a
+    fresh worker. A visibility query on the keyword finds exactly that
+    child, and describing the child returns the memo and the keyword. A
+    freshly registered attribute can briefly fail the parent's workflow
+    task; the server retries that task, which the outcome poll absorbs. *)
+let check_metadata context =
+  let child_id = workflow_id context "metadata-child" in
+  let reported =
+    check_parent context "metadata" "metadata"
+      (Printf.sprintf "memo=%s keyword=%s" memo_note child_id)
+  in
+  if reported <> child_id then fail "metadata child ID changed";
+  let query = Printf.sprintf "%s = '%s'" (Search_attribute.name keyword) child_id in
+  await "a visibility query by the child's keyword to find it" (fun () ->
+      match Client.list_visibility context.client ~query () with
+      | Ok { executions = [ row ]; _ } -> row.workflow_id = child_id
+      | Ok _ -> false
+      | Error error -> fail ("list_visibility failed: " ^ Error.message error));
+  let handle = get (Client.get_handle context.client ~workflow:child ~id:child_id ()) in
+  let described = get (Client.describe handle) in
+  (match List.assoc_opt "note" described.memo with
+  | Some payload when get (Codec.decode Codec.string payload) = memo_note -> ()
+  | Some _ | None -> fail "describe did not report the child's memo");
+  match Search_attribute.decode keyword described.search_attributes with
+  | Ok (Some value) when value = child_id -> ()
+  | Ok _ -> fail "describe did not report the child's keyword"
+  | Error error -> fail ("the child's keyword did not decode: " ^ Error.message error)
+
 (** Starts the worker process, runs every check, and terminates all fixture
-    executions and the worker even when a check fails. *)
-let check address =
+    executions and the worker even when a check fails. [cli] registers the
+    keyword search attribute. *)
+let check address cli =
+  ensure_search_attribute cli address;
   let queue = "child-options-" ^ Temporal_base.Client_request_id.create () in
   let client = get (Client.create ~target_url:address ~namespace:"default" ()) in
   let context =
@@ -298,11 +414,12 @@ let check address =
       check_report context;
       check_timeout context;
       check_reuse context;
+      check_metadata context;
       print_endline "child start options live regression: ok")
 
 (** The supplied URL must identify a disposable test namespace/server. *)
 let () =
   match Array.to_list Sys.argv with
-  | [ _; "check"; address ] -> check address
+  | [ _; "check"; address; cli ] -> check address cli
   | [ _; "worker"; address; queue ] -> worker address queue
-  | _ -> failwith "usage: regression check http://localhost:7233"
+  | _ -> failwith "usage: regression check http://localhost:7233 TEMPORAL_CLI"

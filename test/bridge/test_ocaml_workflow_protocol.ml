@@ -617,6 +617,7 @@ let test_start_child_workflow_command () =
               retry_policy = None;
               cancellation_type = Child_try_cancel;
               execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
             };
         ];
     }
@@ -706,6 +707,7 @@ let test_all_child_cancellation_policies () =
                   retry_policy = None;
                   cancellation_type;
                   execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
                 };
             ];
         }
@@ -799,6 +801,7 @@ let test_child_cancellation_validation () =
               retry_policy = None;
               cancellation_type = Child_try_cancel;
               execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
             };
         ];
     }
@@ -1862,6 +1865,7 @@ let test_child_routing_options () =
       retry_policy = None; cancellation_type = Protocol.Child_try_cancel;
       task_queue = Some "go-llm-worker"; parent_close_policy = policy;
       execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
     }] } in
     if unwrap (Protocol.decode_completion (unwrap (Protocol.encode_completion completion))) <> completion then
       failwith "child options did not round trip")
@@ -1899,7 +1903,8 @@ let test_child_timeout_options () =
                 input = []; retry_policy = None;
                 cancellation_type = Child_try_cancel; task_queue = None;
                 parent_close_policy = None; execution_timeout; run_timeout;
-                task_timeout; id_reuse_policy;
+                task_timeout; id_reuse_policy; memo = None;
+                search_attributes = None;
               };
           ];
       }
@@ -2114,10 +2119,100 @@ let test_inbound_truncated_eviction_message () =
    | _ -> failwith "truncated eviction job changed shape");
   require_error (Protocol.decode_activation (eviction ("x" ^ truncated)))
 
+(** Child memo and search attributes (#1135). The document is the exact one
+    the Rust test [child_workflow_memo_and_search_attributes_round_trip]
+    pins, so both sides agree on the member names and payload-map shape; the
+    OCaml encoder's output must decode to the same value, unset maps must be
+    omitted, and malformed keys are rejected by encoder and decoder alike. *)
+let test_child_start_metadata () =
+  let rust_document =
+    {|{"commands":[{"cancellation_type":"try_cancel","input":[],"kind":"start_child_workflow","memo":{"note":{"data":{"data":"ImhlbGxvIg==","encoding":"base64"},"metadata":{"encoding":{"data":"anNvbi9wbGFpbg==","encoding":"base64"}}}},"retry_policy":null,"search_attributes":{"CustomKeywordField":{"data":{"data":"ImNoaWxkIg==","encoding":"base64"},"metadata":{"encoding":{"data":"anNvbi9wbGFpbg==","encoding":"base64"}}}},"seq":2,"workflow_id":"child/1","workflow_type":"child"}],"run_id":"parent-run"}|}
+  in
+  let json_string text : Protocol.payload =
+    {
+      metadata = [ ("encoding", Bytes.of_string "json/plain") ];
+      data = Bytes.of_string ("\"" ^ text ^ "\"");
+    }
+  in
+  let child ?memo ?search_attributes () =
+    Protocol.
+      {
+        run_id = "parent-run";
+        versioning_behavior = None; task_failure = None;
+        commands =
+          [
+            Start_child_workflow
+              {
+                seq = 2L; workflow_id = "child/1"; workflow_type = "child";
+                input = []; retry_policy = None;
+                cancellation_type = Child_try_cancel; task_queue = None;
+                parent_close_policy = None; execution_timeout = None;
+                run_timeout = None; task_timeout = None; id_reuse_policy = None;
+                memo; search_attributes;
+              };
+          ];
+      }
+  in
+  let expected =
+    child ~memo:[ ("note", json_string "hello") ]
+      ~search_attributes:[ ("CustomKeywordField", json_string "child") ] ()
+  in
+  if unwrap (Protocol.decode_completion rust_document) <> expected then
+    failwith "Rust child-metadata document decoded to a different value";
+  List.iter
+    (fun value ->
+      if unwrap (Protocol.decode_completion (unwrap (Protocol.encode_completion value)))
+         <> value
+      then failwith "child start metadata did not round trip")
+    [ expected; child ~memo:[] ~search_attributes:[] () ];
+  let unset = unwrap (Protocol.encode_completion (child ())) in
+  List.iter
+    (fun key ->
+      let needle = "\"" ^ key ^ "\"" in
+      let rec contains index =
+        index + String.length needle <= String.length unset
+        && (String.sub unset index (String.length needle) = needle
+           || contains (index + 1))
+      in
+      if contains 0 then failwith ("unset child map was encoded: " ^ key))
+    [ "memo"; "search_attributes" ];
+  (* A malformed key fails in both directions: the encoder refuses the value
+     and the decoder refuses the equivalent document. *)
+  List.iter
+    (fun (name, key) ->
+      let value =
+        if name = "memo" then child ~memo:[ (key, json_string "v") ] ()
+        else child ~search_attributes:[ (key, json_string "v") ] ()
+      in
+      (match Protocol.encode_completion value with
+      | Ok _ -> failwith ("encoder accepted an invalid child " ^ name ^ " key")
+      | Error _ -> ());
+      let document =
+        Printf.sprintf
+          {|{"run_id":"parent-run","commands":[{"kind":"start_child_workflow","seq":2,"workflow_id":"child/1","workflow_type":"child","input":[],"retry_policy":null,"cancellation_type":"try_cancel","%s":{%S:{"metadata":{},"data":{"encoding":"base64","data":""}}}}]}|}
+          name key
+      in
+      match Protocol.decode_completion document with
+      | Ok _ -> failwith ("decoder accepted an invalid child " ^ name ^ " key")
+      | Error _ -> ())
+    [ ("memo", ""); ("search_attributes", "") ];
+  List.iter
+    (fun field ->
+      let malformed =
+        {|{"run_id":"run","commands":[{|} ^ field
+        ^ {|"kind":"start_child_workflow","seq":1,"workflow_id":"child","workflow_type":"child","input":[],"retry_policy":null,"cancellation_type":"try_cancel"}]}|}
+      in
+      match Protocol.decode_completion malformed with
+      | Error _ -> ()
+      | Ok _ -> failwith "invalid child start metadata accepted")
+    [ {|"memo":[],|}; {|"search_attributes":"x",|};
+      {|"memo":{"k":{"metadata":{}}},|} ]
+
 let () =
   test_completion_versioning_behavior ();
   test_child_routing_options ();
   test_child_timeout_options ();
+  test_child_start_metadata ();
   run "inbound degraded activation" test_inbound_degraded_activation;
   run "inbound truncated eviction message" test_inbound_truncated_eviction_message;
   run "terminated failure info" test_terminated_failure_info;

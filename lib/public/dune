@@ -7,6 +7,7 @@
   codec_private
   error_private
   future_private
+  metadata_keys_private
   native_worker
   payload_private
   retry_policy_private
