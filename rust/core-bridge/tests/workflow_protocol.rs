@@ -272,6 +272,165 @@ fn converts_patch_markers_losslessly() {
     );
 }
 
+/// Builds one `json/plain` string payload for memo tests.
+fn json_string_payload(value: &str) -> workflow_protocol::Payload {
+    workflow_protocol::Payload {
+        metadata: [("encoding".to_owned(), b"json/plain".to_vec())]
+            .into_iter()
+            .collect(),
+        data: format!("\"{value}\"").into_bytes(),
+    }
+}
+
+/// Proves a memo upsert (#1154) maps to Core's `ModifyWorkflowProperties`
+/// command with every key and payload byte, round-trips through the
+/// semantic JSON and back from Core, and keeps the `binary/null` removal
+/// payload exactly as the server compares it.
+#[test]
+fn converts_memo_upserts_losslessly() {
+    let mut memo = BTreeMap::new();
+    memo.insert("note".to_owned(), json_string_payload("ready"));
+    memo.insert(
+        "removed".to_owned(),
+        workflow_protocol::Payload {
+            metadata: [("encoding".to_owned(), b"binary/null".to_vec())].into(),
+            data: Vec::new(),
+        },
+    );
+    let completion = workflow_protocol::Completion {
+        versioning_behavior: None,
+        task_failure: None,
+        run_id: "memo-run".to_owned(),
+        commands: vec![
+            workflow_protocol::CompletionCommand::ModifyWorkflowProperties {
+                upserted_memo: memo.clone(),
+            },
+        ],
+    };
+    let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+    assert!(encoded.contains("\"kind\":\"modify_workflow_properties\""));
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        completion
+    );
+    let core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_ref()
+    else {
+        panic!("memo completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::ModifyWorkflowProperties(command)) =
+        success.commands[0].variant.as_ref()
+    else {
+        panic!("memo upsert did not map to Core's ModifyWorkflowProperties");
+    };
+    let fields = &command.upserted_memo.as_ref().unwrap().fields;
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields["note"].data, br#""ready""#.to_vec());
+    assert!(fields["removed"].data.is_empty());
+    assert_eq!(
+        fields["removed"].metadata["encoding"],
+        b"binary/null".to_vec()
+    );
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        completion
+    );
+}
+
+/// Rejects a memo upsert whose key is not a protocol identifier and a Core
+/// memo command without a memo, so neither direction fabricates a value.
+#[test]
+fn rejects_malformed_memo_upserts() {
+    let mut memo = BTreeMap::new();
+    memo.insert(String::new(), json_string_payload("orphan"));
+    let completion = workflow_protocol::Completion {
+        versioning_behavior: None,
+        task_failure: None,
+        run_id: "memo-run".to_owned(),
+        commands: vec![
+            workflow_protocol::CompletionCommand::ModifyWorkflowProperties {
+                upserted_memo: memo,
+            },
+        ],
+    };
+    assert!(workflow_protocol::encode_completion(&completion).is_err());
+    let mut valid = BTreeMap::new();
+    valid.insert("note".to_owned(), json_string_payload("ready"));
+    let mut core = workflow_protocol::completion_to_core(&workflow_protocol::Completion {
+        versioning_behavior: None,
+        task_failure: None,
+        run_id: "memo-run".to_owned(),
+        commands: vec![
+            workflow_protocol::CompletionCommand::ModifyWorkflowProperties {
+                upserted_memo: valid,
+            },
+        ],
+    })
+    .unwrap();
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_mut()
+    else {
+        panic!("memo completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::ModifyWorkflowProperties(command)) =
+        success.commands[0].variant.as_mut()
+    else {
+        panic!("memo upsert did not map to Core's ModifyWorkflowProperties");
+    };
+    command.upserted_memo = None;
+    assert!(workflow_protocol::completion_from_core(&core).is_err());
+}
+
+/// Proves the continue-as-new memo (#1154) reaches Core's command field, so
+/// an upserted memo survives continue-as-new, and that a completion written
+/// without the member decodes with an empty memo, which Core treats as
+/// "reuse the start memo".
+#[test]
+fn converts_continue_as_new_memo() {
+    let mut memo = BTreeMap::new();
+    memo.insert("note".to_owned(), json_string_payload("carried"));
+    let completion = workflow_protocol::Completion {
+        versioning_behavior: None,
+        task_failure: None,
+        run_id: "current-run".to_owned(),
+        commands: vec![workflow_protocol::CompletionCommand::ContinueAsNew {
+            workflow_type: "counter".to_owned(),
+            input: Vec::new(),
+            memo,
+        }],
+    };
+    let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        completion
+    );
+    let core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_ref()
+    else {
+        panic!("continue-as-new completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::ContinueAsNewWorkflowExecution(command)) =
+        success.commands[0].variant.as_ref()
+    else {
+        panic!("continue-as-new must map to Core's continue-as-new variant");
+    };
+    assert_eq!(command.memo["note"].data, br#""carried""#.to_vec());
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        completion
+    );
+    let without_memo = r#"{"run_id":"current-run","commands":[{"kind":"continue_as_new","workflow_type":"counter","input":[]}]}"#;
+    let decoded = workflow_protocol::decode_completion(without_memo).unwrap();
+    let [workflow_protocol::CompletionCommand::ContinueAsNew { memo, .. }] =
+        decoded.commands.as_slice()
+    else {
+        panic!("continue-as-new must decode");
+    };
+    assert!(memo.is_empty());
+}
+
 /// Proves search-attribute upserts retain sorted map keys, payload bytes, and
 /// the corresponding official Core command on both conversion directions.
 #[test]
@@ -1200,6 +1359,7 @@ fn converts_continue_as_new_command() {
         commands: vec![workflow_protocol::CompletionCommand::ContinueAsNew {
             workflow_type: "counter".to_owned(),
             input: vec![input],
+            memo: BTreeMap::new(),
         }],
     };
     let encoded = workflow_protocol::encode_completion(&completion).unwrap();
@@ -1259,6 +1419,7 @@ fn rejects_continue_as_new_with_follow_up_command() {
             workflow_protocol::CompletionCommand::ContinueAsNew {
                 workflow_type: "counter".to_owned(),
                 input: Vec::new(),
+                memo: BTreeMap::new(),
             },
             workflow_protocol::CompletionCommand::StartTimer {
                 seq: 1,

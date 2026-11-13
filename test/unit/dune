@@ -51,6 +51,11 @@
  (name test_testing_timeouts)
  (libraries temporal-sdk))
 
+; Typed search attributes, memo upserts and their Testing simulation (#1154).
+(test
+ (name test_search_attributes)
+ (libraries temporal-sdk))
+
 ; Metrics-export option validation and bridge document encoding (#500).
 (test
  (name test_metrics_config)

@@ -500,12 +500,22 @@ type completion_command =
   | Set_patch_marker of { patch_id : string; deprecated : bool }
   (** Merges payload values into Temporal's indexed search-attribute map. *)
   | Upsert_search_attributes of { search_attributes : (string * payload) list }
+  (** Merges payload values into the workflow memo through Core's
+      [ModifyWorkflowProperties] command (#1154). Keys are unique protocol
+      identifiers; a [binary/null] value asks the server to remove its key. *)
+  | Modify_workflow_properties of { upserted_memo : (string * payload) list }
   | Complete_workflow of { result : payload option }
   | Fail_workflow of { failure : failure }
   (** Ends this run and starts a successor run of [workflow_type] with the
       supplied argument payloads. The current SDK emits one argument; the
-      list mirrors Core's repeated payload field for forward compatibility. *)
-  | Continue_as_new of { workflow_type : string; input : payload list }
+      list mirrors Core's repeated payload field for forward compatibility.
+      [memo] is the successor's memo; an empty map asks Core to reuse the
+      memo the current run started with (#1154). *)
+  | Continue_as_new of {
+      workflow_type : string;
+      input : payload list;
+      memo : (string * payload) list;
+    }
   | Cancel_workflow_execution
 
 (** A workflow type's versioning behavior on a deployment-versioned worker
