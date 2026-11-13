@@ -97,17 +97,20 @@ in_dev 60 "$container_cli" --version
 # status in driver-exit (through a rename, so it is never read half-written),
 # after which the OCaml process checks the reported exact runs through its own
 # client. Both statuses must be zero. The driver's container is bounded by the
-# ordinary per-suite limit; the OCaml process gets one more minute because it
-# outlives the driver to verify its report.
+# ordinary per-suite limit plus one minute, because its bound also covers the
+# hash-locked pip install of the official SDK and the activity-timeout case
+# (#1143) pushed the cases alone close to the plain limit; the OCaml process
+# gets one more minute again because it outlives the driver to verify its
+# report.
 run_sdk_interop() {
   interop_evidence="$evidence/sdk_interop"
   mkdir -p "$interop_evidence"
-  in_dev "$((limit + 60))" "/workspace/_build/default/$1" check "$address" \
+  in_dev "$((limit + 120))" "/workspace/_build/default/$1" check "$address" \
     /workspace/_build/live-regressions/sdk_interop </dev/null &
   ocaml_pid=$!
   # Interpolated by compose.yaml into the driver's environment and timeout.
   OCAML_SDK_VERSION=$ocaml_sdk_version
-  SDK_INTEROP_TIMEOUT_SECONDS=$limit
+  SDK_INTEROP_TIMEOUT_SECONDS=$((limit + 60))
   export OCAML_SDK_VERSION SDK_INTEROP_TIMEOUT_SECONDS
   driver_status=0
   compose run --rm --no-deps -T sdk-interop-python </dev/null || driver_status=$?
