@@ -4,14 +4,24 @@
     official SDK's worker.
 
     One OCaml process plays two roles. [worker] runs a public
-    [Temporal.Worker] for the ["interop-order"] workflow on a unique task
-    queue. [check] spawns and reaps that worker, publishes the queue names in
-    [ready.json] inside the shared evidence directory, and then waits for the
-    host controller to write [driver-exit] after the Python container has run
-    [python/driver.py]. The Python driver performs the cross-SDK interactions
-    and asserts their results and durable history; [check] afterwards opens
-    the exact runs it reported through the OCaml client, so both SDKs must
-    decode the same terminal results, failure types and failure details.
+    [Temporal.Worker] for the ["interop-order"] and ["interop-entity"]
+    workflows on a unique task queue. [check] spawns and reaps that worker,
+    publishes the queue names in [ready.json] inside the shared evidence
+    directory, and then waits for the host controller to write [driver-exit]
+    after the Python container has run [python/driver.py]. The Python driver
+    performs the cross-SDK interactions and asserts their results and durable
+    history; [check] afterwards opens the exact runs it reported through the
+    OCaml client, so both SDKs must decode the same terminal results, failure
+    types and failure details.
+
+    Signal-with-start and update-with-start (#1151) are checked in both
+    directions. The driver's client uses them against the OCaml entity, and
+    the driver hosts a Python entity with the same protocol: once it
+    publishes [python-ready], [check] drives that entity with
+    [Client.signal_with_start] and [Client.update_with_start] while the
+    driver runs its own cases, and publishes the runs in
+    [ocaml-with-start.json], whose histories and results the driver then
+    checks from its side.
 
     Every payload uses the default [json/plain] converter on both sides.
     Prices are integer cents and the structured signal carries a 2{^53}+1
@@ -259,13 +269,97 @@ let on_add_item item =
   let* value = current () in
   Ok (List.length value.items)
 
+(** {1 Signal-with-start and update-with-start (#1151)}
+
+    Both SDKs implement the same small entity workflow: it records every
+    [deliver] signal and accepted [apply] update in arrival order, waits for
+    [finish], and completes with a JSON object naming its input label, the
+    received items, its own run ID and the implementing SDK. The OCaml one is
+    ["interop-entity"]; the Python one, ["interop-py-entity"], is hosted by
+    the driver on the [python_workflow_task_queue] published in [ready.json].
+    Each SDK's client uses signal-with-start and update-with-start against the
+    other SDK's entity, so the operations are checked in both directions. *)
+
+(** Items an entity run received from signals and accepted updates, newest
+    first. *)
+let entity_items = Workflow_context.Local.create ()
+
+(** Set by [finish]; an unset flag is false. *)
+let entity_finished = Workflow_context.Local.create ()
+
+(** Reads the received items, newest first. *)
+let entity_received () =
+  let* items = Workflow_context.Local.get entity_items in
+  Ok (Option.value items ~default:[])
+
+(** True once [finish] has been delivered. *)
+let entity_done () =
+  match Workflow_context.Local.get entity_finished with
+  | Ok (Some finished) -> finished
+  | Ok None | Error _ -> false
+
+(** Records one received item. *)
+let entity_add item =
+  let* items = entity_received () in
+  Workflow_context.Local.set entity_items (item :: items)
+
+(** Appends its string input to the run's items. *)
+let deliver = Signal.define ~name:"deliver" ~input:Codec.string
+
+(** Lets an entity run complete. [Codec.unit] sends no payload, matching the
+    Python handler's empty parameter list. *)
+let finish = Signal.define ~name:"finish" ~input:Codec.unit
+
+(** Appends its input to the run's items and returns how many it now has. *)
+let apply = Update.define ~name:"apply" ~input:Codec.string ~output:Codec.int
+
+(** Rejects the input ["reject"] before the handler runs, with the typed,
+    non-retryable failure the Python validator also raises: type
+    ["Rejected"], message ["REJECTED"] and one JSON detail. *)
+let validate_apply item =
+  if not (String.equal item "reject") then Ok ()
+  else
+    let* detail = Codec.encode Codec.json (`Assoc [ ("item", `String item) ]) in
+    Error (Error.make ~category:`Update ~non_retryable:true ~error_type:"Rejected"
+      ~details:[ detail ] ~message:"REJECTED" ())
+
+(** Records an accepted update and returns the new item count. *)
+let on_apply item =
+  let* () = entity_add item in
+  let* items = entity_received () in
+  Ok (List.length items)
+
+(** The OCaml entity: waits for [finish] and reports what it received. *)
+let entity = Workflow.define ~name:"interop-entity" ~input:Codec.string ~output:Codec.json
+  (fun label ->
+    let* info = Workflow.info () in
+    let* () = Condition.wait_until entity_done in
+    let* items = entity_received () in
+    Ok (`Assoc [
+      ("label", `String label);
+      ("items", `List (List.rev_map (fun item -> `String item) items));
+      ("run_id", `String (Workflow.Info.run_id info));
+      ("sdk", `String "temporal-ocaml") ]))
+
+(** Typed reference to the Python driver's entity; it has the same signals,
+    update and output document as {!entity}. *)
+let python_entity =
+  Workflow.remote ~name:"interop-py-entity" ~input:Codec.string ~output:Codec.json
+
 (** Runs the OCaml workflow worker on the fixture's unique task queue. *)
 let worker address queue =
   let worker = get (Worker.create ~target_url:address ~namespace:"default"
-    ~task_queue:queue ~activities:[] ~workflows:[Worker.workflow workflow
-      ~queries:[Query.Handler.make status_query status]
-      ~signals:[Signal.Handler.make approve on_approve]
-      ~updates:[Update.Handler.make ~validator:validate_item add_item on_add_item]] ()) in
+    ~task_queue:queue ~activities:[] ~workflows:[
+      Worker.workflow workflow
+        ~queries:[Query.Handler.make status_query status]
+        ~signals:[Signal.Handler.make approve on_approve]
+        ~updates:[Update.Handler.make ~validator:validate_item add_item on_add_item];
+      Worker.workflow entity
+        ~signals:[
+          Signal.Handler.make deliver entity_add;
+          Signal.Handler.make finish (fun () ->
+            Workflow_context.Local.set entity_finished true) ]
+        ~updates:[Update.Handler.make ~validator:validate_apply apply on_apply]] ()) in
   get (Worker.run worker)
 
 (** Writes [contents] to [path] through a rename, so the Python driver never
@@ -275,19 +369,166 @@ let write_atomically path contents =
   Out_channel.with_open_text partial (fun channel -> output_string channel contents);
   Sys.rename partial path
 
-(** Waits for the controller's [driver-exit] file and returns its trimmed
-    status. The bound only prevents a lost driver from hanging this process
-    until the controller's own outer timeout. *)
-let await_driver_exit path =
+(** Waits until one of [paths] exists and returns the first that does, in
+    list order. The 600-second bound only prevents a lost driver from hanging
+    this process until the controller's own outer timeout. *)
+let await_any paths =
   let deadline = Unix.gettimeofday () +. 600. in
   let rec loop () =
-    if Sys.file_exists path then
-      String.trim (In_channel.with_open_text path In_channel.input_all)
-    else if Unix.gettimeofday () > deadline then
-      failwith "the official SDK driver did not finish within 600 seconds"
-    else (Unix.sleepf 0.2; loop ())
+    match List.find_opt Sys.file_exists paths with
+    | Some path -> path
+    | None when Unix.gettimeofday () > deadline ->
+        failwith "the official SDK driver did not finish within 600 seconds"
+    | None -> Unix.sleepf 0.2; loop ()
   in
   loop ()
+
+(** Waits for the controller's [driver-exit] file and returns its trimmed
+    status. *)
+let await_driver_exit path =
+  ignore (await_any [ path ]);
+  String.trim (In_channel.with_open_text path In_channel.input_all)
+
+(** Fails a with-start case against the Python entity with a labelled
+    message. *)
+let fail_with_start label message =
+  failwith (Printf.sprintf "OCaml with-start against Python, %s: %s" label message)
+
+(** Returns the exact run ID of a handle from a start operation, which always
+    pins one. *)
+let exact_run handle = Option.get (Client.run_id handle)
+
+(** Requires [handle] to name exactly [run_id] with the given [started]. *)
+let expect_run label ~run_id ~started handle =
+  if Client.run_id handle <> Some run_id then
+    fail_with_start label "another run was addressed";
+  if Client.started handle <> started then
+    fail_with_start label (Printf.sprintf "started was %b" (Client.started handle))
+
+(** Finishes the Python entity run [handle] and requires it to complete with
+    exactly [items], naming its own run and the Python SDK. Returns the
+    decoded output for the driver to compare with what it decodes itself. *)
+let finish_python_entity label handle items =
+  get (Client.signal handle ~signal:finish ~input:());
+  match Client.wait ~timeout:(Duration.of_seconds 30L) handle with
+  | Ok (Client.Completed { output; _ }) ->
+      let field name = Yojson.Safe.Util.member name output in
+      if field "items" <> `List (List.map (fun item -> `String item) items) then
+        fail_with_start label ("the run received " ^ Yojson.Safe.to_string (field "items"));
+      if field "run_id" <> `String (exact_run handle) then
+        fail_with_start label "the output names another run";
+      if field "sdk" <> `String "temporalio-python" then
+        fail_with_start label "the run was not completed by the Python entity";
+      output
+  | Ok _ -> fail_with_start label "the run did not complete"
+  | Error error -> fail_with_start label ("waiting failed: " ^ Error.message error)
+
+(** Requires an update result to be the Python validator's typed rejection:
+    type ["Rejected"], non-retryable, with its JSON detail. *)
+let expect_python_rejection label = function
+  | Ok _ -> fail_with_start label "the rejected update was accepted"
+  | Error error ->
+      let view = Error.view error in
+      if Error.error_type error <> Some "Rejected" || not view.non_retryable then
+        fail_with_start label ("wrong update error: " ^ Error.message error);
+      (match view.details with
+      | [ detail ] when Yojson.Safe.equal (get (Codec.decode Codec.json detail))
+          (`Assoc [ ("item", `String "reject") ]) -> ()
+      | _ -> fail_with_start label "the rejection lost its detail")
+
+(** The identity and decoded output of one run, as the report records it. *)
+let run_report ?output handle =
+  `Assoc ([
+    ("workflow_id", `String (Client.workflow_id handle));
+    ("run_id", `String (exact_run handle)) ]
+    @ match output with Some output -> [ ("result", output) ] | None -> [])
+
+(** Drives the Python entity on [task_queue] through the OCaml client's
+    [signal_with_start] and [update_with_start] (#1151), asserting what the
+    OCaml client observes: exact run IDs and [started] for an absent, open,
+    replaced and closed workflow; accepted update results; a Python validator
+    rejection reported beside the run, on an open run and on a run the call
+    started; and the typed already-started error of a [`Fail] conflict.
+    Returns the runs for the Python driver to check from its side. Every run
+    is terminated if a check fails. *)
+let with_start_against_python client queue task_queue =
+  let tracked = ref [] in
+  let track handle =
+    tracked := handle :: !tracked;
+    handle
+  in
+  let terminate_tracked () =
+    List.iter (fun handle -> ignore (Client.terminate handle)) !tracked
+  in
+  let execution_timeout = Duration.of_minutes 5L in
+  match
+    let id = queue ^ "-ocaml-signal-with-start" in
+    let signal_with_start ?id_conflict_policy item =
+      track (get (Client.signal_with_start client ?id_conflict_policy ~execution_timeout
+        ~workflow:python_entity ~task_queue ~id ~input:"ocaml" ~signal:deliver
+        ~signal_input:item ()))
+    in
+    let first = signal_with_start "first" in
+    expect_run "absent workflow" ~run_id:(exact_run first) ~started:true first;
+    expect_run "open run" ~run_id:(exact_run first) ~started:false
+      (signal_with_start "second");
+    let replaced = signal_with_start ~id_conflict_policy:`Terminate_existing "third" in
+    if String.equal (exact_run replaced) (exact_run first) then
+      fail_with_start "terminate_existing" "the open run was kept";
+    expect_run "terminate_existing" ~run_id:(exact_run replaced) ~started:true replaced;
+    (match Client.wait ~timeout:(Duration.of_seconds 30L) first with
+    | Ok (Client.Terminated _) -> ()
+    | Ok _ | Error _ -> fail_with_start "terminate_existing" "the open run was not terminated");
+    let replaced_output = finish_python_entity "replacement run" replaced [ "third" ] in
+    let restarted = signal_with_start "fourth" in
+    if String.equal (exact_run restarted) (exact_run replaced) then
+      fail_with_start "closed workflow" "the closed run was signalled";
+    expect_run "closed workflow" ~run_id:(exact_run restarted) ~started:true restarted;
+    let restarted_output = finish_python_entity "restarted run" restarted [ "fourth" ] in
+    let id = queue ^ "-ocaml-update-with-start" in
+    let update_with_start ?(id = id) ~id_conflict_policy item =
+      Client.update_with_start client ~id_conflict_policy ~execution_timeout
+        ~workflow:python_entity ~task_queue ~id ~input:"ocaml" ~update:apply
+        ~update_input:item ()
+    in
+    let updated, accepted = get (update_with_start ~id_conflict_policy:`Use_existing "one") in
+    let updated = track updated in
+    expect_run "update-with-start" ~run_id:(exact_run updated) ~started:true updated;
+    if get (Client.wait_update (get accepted)) <> 1 then
+      fail_with_start "update-with-start" "the first update was lost";
+    let attached, accepted = get (update_with_start ~id_conflict_policy:`Use_existing "two") in
+    expect_run "update on the open run" ~run_id:(exact_run updated) ~started:false attached;
+    if get (Client.wait_update (get accepted)) <> 2 then
+      fail_with_start "update on the open run" "the second update was lost";
+    let rejected_on_open, rejection =
+      get (update_with_start ~id_conflict_policy:`Use_existing "reject")
+    in
+    expect_run "rejection on the open run" ~run_id:(exact_run updated) ~started:false
+      rejected_on_open;
+    expect_python_rejection "rejection on the open run" rejection;
+    (match update_with_start ~id_conflict_policy:`Fail "three" with
+    | Ok _ -> fail_with_start "fail policy" "the open run was used"
+    | Error error -> (
+        match Client.already_started error with
+        | Some { run_id; _ } when String.equal run_id (exact_run updated) -> ()
+        | Some _ | None -> fail_with_start "fail policy" ("wrong error: " ^ Error.message error)));
+    let updated_output = finish_python_entity "updated run" updated [ "one"; "two" ] in
+    let fresh, rejection =
+      get (update_with_start ~id:(id ^ "-rejected") ~id_conflict_policy:`Use_existing "reject")
+    in
+    let fresh = track fresh in
+    expect_run "rejection on a new run" ~run_id:(exact_run fresh) ~started:true fresh;
+    expect_python_rejection "rejection on a new run" rejection;
+    let fresh_output = finish_python_entity "rejected update's run" fresh [] in
+    `Assoc [
+      ("signal_with_start_terminated", run_report first);
+      ("signal_with_start_replacement", run_report ~output:replaced_output replaced);
+      ("signal_with_start_restarted", run_report ~output:restarted_output restarted);
+      ("update_with_start", run_report ~output:updated_output updated);
+      ("update_with_start_rejected", run_report ~output:fresh_output fresh) ]
+  with
+  | runs -> runs
+  | exception failure -> terminate_tracked (); raise failure
 
 (** Extracts a required field from the Python driver's JSON report. *)
 let member name json =
@@ -368,17 +609,77 @@ let verify_report address queue report =
     | Client.Terminated _ -> ()
     | _ -> failwith "incompatible-input run was not left open for termination");
     Printf.printf "incompatible input run: %s/%s\n" id run_id;
+    (* The OCaml entity runs the Python client signal-/update-with-started:
+       one replaced under TERMINATE_EXISTING, the rest completed with the
+       result Python decoded. *)
+    let with_start = member "with_start" runs in
+    let entity_run name =
+      let run = member name with_start in
+      let id = string_member "workflow_id" run and run_id = string_member "run_id" run in
+      if not (String.starts_with ~prefix:queue id) then
+        failwith ("official SDK report names a foreign workflow ID: " ^ id);
+      (run, get (Client.get_handle client ~run_id ~workflow:entity ~id ()), id, run_id)
+    in
+    let _, handle, id, run_id = entity_run "signal_with_start_terminated" in
+    (match get (Client.wait handle) with
+    | Client.Terminated _ -> ()
+    | _ -> failwith "the run replaced by Python's signal-with-start was not terminated");
+    Printf.printf "Python signal-with-start replaced run: %s/%s\n" id run_id;
+    List.iter (fun name ->
+      let run, handle, id, run_id = entity_run name in
+      (match get (Client.wait handle) with
+      | Client.Completed { output; _ }
+        when Yojson.Safe.equal (Yojson.Safe.sort output)
+               (Yojson.Safe.sort (member "result" run)) -> ()
+      | Client.Completed { output; _ } ->
+          failwith (Printf.sprintf "OCaml client decoded a different %s result: %s"
+            name (Yojson.Safe.to_string output))
+      | _ -> failwith ("OCaml client did not observe the completed " ^ name ^ " run"));
+      Printf.printf "Python %s run: %s/%s\n" name id run_id)
+      [ "signal_with_start_replacement"; "signal_with_start_restarted";
+        "update_with_start"; "update_with_start_rejected" ];
     Printf.printf
       "official SDK interoperability live regression: ok \
        (python temporalio %s, temporal-ocaml %s, server %s)\n%!"
       python_sdk ocaml_sdk server)
 
-(** Hosts the OCaml worker while the official SDK driver runs, then checks the
-    driver's report through the OCaml client. [evidence] is the directory the
-    controller shares with the Python container. *)
+(** Once the driver publishes [python-ready] (its entity worker is polling),
+    runs {!with_start_against_python} and publishes the outcome in
+    [ocaml-with-start.json] for the driver to check: [{"ok": true, "runs":
+    ...}] or [{"ok": false, "error": ...}], so a failure here never leaves the
+    driver waiting. Returns the failure message, if any. If the driver exits
+    first it never hosted the entity, and its own status reports why. *)
+let run_with_start_cases address evidence queue entity_queue =
+  let ready = Filename.concat evidence "python-ready" in
+  if String.equal (await_any [ ready; Filename.concat evidence "driver-exit" ]) ready then begin
+    let client = get (Client.create ~target_url:address ~namespace:"default" ()) in
+    let outcome =
+      Fun.protect ~finally:(fun () -> ignore (Client.shutdown client)) (fun () ->
+        match with_start_against_python client queue entity_queue with
+        | runs -> Ok runs
+        | exception Failure message -> Error message
+        | exception failure -> Error (Printexc.to_string failure))
+    in
+    write_atomically (Filename.concat evidence "ocaml-with-start.json")
+      (Yojson.Safe.to_string (match outcome with
+        | Ok runs -> `Assoc [ ("ok", `Bool true); ("runs", runs) ]
+        | Error message -> `Assoc [ ("ok", `Bool false); ("error", `String message) ]));
+    match outcome with
+    | Ok _ ->
+        print_endline "OCaml signal-/update-with-start against the Python entity: ok";
+        None
+    | Error message -> Some message
+  end
+  else None
+
+(** Hosts the OCaml worker while the official SDK driver runs, drives the
+    driver's entity with the OCaml client's with-start operations, then checks
+    the driver's report through the OCaml client. [evidence] is the directory
+    the controller shares with the Python container. *)
 let check address evidence =
   let queue = Printf.sprintf "sdk-interop-%d-%d" (Unix.getpid ())
     (Random.State.bits (Random.State.make_self_init ())) in
+  let entity_queue = queue ^ "-python-entity" in
   let pid = Unix.create_process Sys.executable_name
     [| Sys.executable_name; "worker"; address; queue |]
     Unix.stdin Unix.stdout Unix.stderr in
@@ -388,12 +689,15 @@ let check address evidence =
         (Yojson.Safe.to_string (`Assoc [
           ("namespace", `String "default");
           ("workflow_task_queue", `String queue);
-          ("pricing_task_queue", `String (queue ^ "-python")) ]));
-      match await_driver_exit (Filename.concat evidence "driver-exit") with
-      | "0" ->
+          ("pricing_task_queue", `String (queue ^ "-python"));
+          ("python_workflow_task_queue", `String entity_queue) ]));
+      let with_start_failure = run_with_start_cases address evidence queue entity_queue in
+      match await_driver_exit (Filename.concat evidence "driver-exit"), with_start_failure with
+      | "0", None ->
           verify_report address queue
             (Yojson.Safe.from_file (Filename.concat evidence "python-report.json"))
-      | status -> failwith ("the official SDK driver failed with status " ^ status))
+      | _, Some message -> failwith message
+      | status, None -> failwith ("the official SDK driver failed with status " ^ status))
 
 (** [check] is the controller entry point; [worker] is its child process. *)
 let () = match Array.to_list Sys.argv with
