@@ -94,6 +94,9 @@ let table =
     (* Deterministic uuid4, random_bytes and random_float draws (#1155),
        captured by corpus-v3-random. *)
     replayed "deterministic-randomness";
+    (* Continue-as-new successor options (#1153), captured by
+       corpus-v4-continue-as-new-options. *)
+    replayed "continue-as-new-options";
     (* Remote activities. *)
     replayed "activity";
     replayed "activity-retry";

@@ -160,6 +160,16 @@ val random_parent_workflow_type : string
 (** [corpus.random_child]: completes at once. *)
 val random_child_workflow_type : string
 
+(** {1 Continue-as-new options workflow type (#1153)}
+
+    Captured by the [corpus-v4-continue-as-new-options] generation. *)
+
+(** [corpus.continue_as_new_options]: ["first"] continues as new with
+    ["second"] and an explicit task queue, run and task timeouts, retry
+    policy, replacement memo and empty search-attribute map; ["second"]
+    returns what it observes of them. *)
+val continue_as_new_options_workflow_type : string
+
 (** {1 Interaction handler names}
 
     Used by the capture driver to send the interactions recorded in history. *)
@@ -209,7 +219,9 @@ val definition_set_names : string list
     - ["corpus-v3-random"]: the deterministic randomness workflows of #1155.
     - ["negative-random-reordered"]: [corpus.random_parent] drawing its
       float first; replaying a [corpus-v3-random] parent history against it
-      must report nondeterminism. *)
+      must report nondeterminism.
+    - ["corpus-v4-continue-as-new-options"]: the continue-as-new options
+      workflow of #1153. *)
 val definition_set : string -> workflow list option
 
 (** Activities registered by the live capture worker. Every activity used by a

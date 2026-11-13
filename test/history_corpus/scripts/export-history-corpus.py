@@ -117,6 +117,17 @@ CASES = {
         ["child-workflow", "child-side"],
         "Child run started under the drawn ID.",
     ),
+    # corpus-v4-continue-as-new-options (#1153).
+    "continue-as-new-options-first": (
+        ["continue-as-new", "continue-as-new-options"],
+        "Continues as new with an explicit task queue, run and task timeouts, "
+        "retry policy, replacement memo and empty search-attribute map.",
+    ),
+    "continue-as-new-options-second": (
+        ["continue-as-new-successor", "continue-as-new-options"],
+        "Successor started with those options; it reads them through "
+        "Workflow.info and start_metadata.",
+    ),
 }
 
 # Patch lifecycle cases (issue #531). Each stage of the lifecycle captures the

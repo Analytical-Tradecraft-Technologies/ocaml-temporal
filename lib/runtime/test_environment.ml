@@ -105,10 +105,15 @@ type activity_request = {
     first run is being constructed. [outcome] is set exactly once, when the
     last run closes; continue-as-new and a retry replace [current] without
     setting it. [parent] identifies the parent run and the child command
-    sequence to resolve when the chain closes. [retry_policy] is the child
-    command's workflow retry policy, which the server applies to every run
-    of the chain; top-level starts have none. [task_queue] is the queue
-    reported by [Workflow.info] for every run of the chain. *)
+    sequence to resolve when the chain closes. [retry_policy] is the
+    workflow retry policy the server applies to the current run (a child
+    command's policy; top-level starts have none). [task_queue] is the queue
+    [Workflow.info] reports for the current run, and [run_timeout] and
+    [task_timeout] the recorded run and workflow-task timeouts in
+    milliseconds, which the environment reports but does not enforce. A
+    continue-as-new command that sets any of them (#1153) replaces it for
+    the successor and later runs, as the server does; an unset one is
+    inherited. *)
 type chain = {
   workflow_id : string;
   mutable current : run option;
@@ -116,8 +121,10 @@ type chain = {
   mutable outcome : (Codec.payload, Error.t) result option;
   parent : (run * int64) option;
   parent_close_policy : Activation.child_workflow_parent_close_policy option;
-  retry_policy : Activation.retry_policy option;
-  task_queue : string;
+  mutable retry_policy : Activation.retry_policy option;
+  mutable task_queue : string;
+  mutable run_timeout : int64 option;
+  mutable task_timeout : int64 option;
 }
 
 (** One workflow run and the engine-side state of its outstanding commands.
@@ -129,7 +136,10 @@ type chain = {
     run can be retried with the same input. A retry run waits out its
     backoff before its first activation: until [started] is set its jobs
     accumulate without queueing the run, and [start_event] is the pending
-    virtual-time event that starts it. *)
+    virtual-time event that starts it. [start_memo] and
+    [start_search_attributes] are the maps the run started with, and [memo]
+    and [search_attributes] their current values after the run's upserts,
+    merged as the server merges them (#1154). *)
 and run = {
   run_id : string;
   workflow_type : string;
@@ -137,6 +147,10 @@ and run = {
   execution : execution;
   attempt : int;
   input : Codec.payload;
+  start_memo : (string * Codec.payload) list;
+  start_search_attributes : (string * Codec.payload) list;
+  mutable memo : (string * Codec.payload) list;
+  mutable search_attributes : (string * Codec.payload) list;
   mutable started : bool;
   mutable start_event : event option;
   mutable jobs : Activation.job list;
@@ -602,10 +616,12 @@ let protocol_retry_policy (policy : Activation.retry_policy) :
     previous run is the chain's current run) and [attempt] is the run's
     retry attempt. With [delay_ms] the initialization activation waits for
     that much virtual time, as the server delays a retry run's first
-    workflow task by the retry backoff. *)
+    workflow task by the retry backoff. [memo] and [search_attributes] (both
+    empty by default) are the maps the run starts with; [Workflow.start_metadata]
+    reports an empty one as absent, as for a start that sets none. *)
 let create_run ?(attempt = 1) ?delay_ms
-    ?(initiator = Protocol.Continue_as_new_workflow) environment (chain : chain)
-    ~workflow_type ~input =
+    ?(initiator = Protocol.Continue_as_new_workflow) ?(memo = [])
+    ?(search_attributes = []) environment (chain : chain) ~workflow_type ~input =
   match Name_map.find_opt workflow_type environment.workflows with
   | None ->
       Error
@@ -637,8 +653,12 @@ let create_run ?(attempt = 1) ?delay_ms
           Execution.set_start_metadata execution
             (Some
                {
-                 Workflow_context_store.memo = None;
-                 search_attributes = None;
+                 Workflow_context_store.memo =
+                   (match memo with [] -> None | _ :: _ -> Some memo);
+                 search_attributes =
+                   (match search_attributes with
+                   | [] -> None
+                   | _ :: _ -> Some search_attributes);
                  execution_expiration_time = None;
                });
           Execution.set_run_info execution
@@ -659,12 +679,13 @@ let create_run ?(attempt = 1) ?delay_ms
                        })
                      chain.parent;
                  start_time = Some (protocol_timestamp environment.now_ms);
-                 (* The environment records no workflow timeouts, matching a
-                    server start without those options. Only a child command
-                    supplies a retry policy. *)
+                 (* The environment records no execution timeout, and run
+                    and task timeouts only once a continue-as-new set them,
+                    matching a server start without those options. A child
+                    command or a continue-as-new supplies a retry policy. *)
                  execution_timeout = None;
-                 run_timeout = None;
-                 task_timeout = None;
+                 run_timeout = Option.map protocol_duration chain.run_timeout;
+                 task_timeout = Option.map protocol_duration chain.task_timeout;
                  retry_policy = Option.map protocol_retry_policy chain.retry_policy;
                  (* [chain.current] still names the predecessor here: it is
                     replaced only after this run is built. *)
@@ -681,6 +702,10 @@ let create_run ?(attempt = 1) ?delay_ms
               execution = Execution execution;
               attempt;
               input;
+              start_memo = memo;
+              start_search_attributes = search_attributes;
+              memo;
+              search_attributes;
               started = Option.is_none delay_ms;
               start_event = None;
               jobs = [];
@@ -731,6 +756,8 @@ let new_chain ?retry_policy ?task_queue environment ~workflow_id
       parent_close_policy;
       retry_policy;
       task_queue = Option.value task_queue ~default:environment.task_queue;
+      run_timeout = None;
+      task_timeout = None;
     }
   in
   let* _run = create_run environment chain ~workflow_type ~input in
@@ -829,8 +856,11 @@ let finish environment run closure outcome =
         match retry_delay environment policy ~attempt:run.attempt error with
         | Some delay_ms -> (
             match
+              (* A retry run starts from the original start request, so it
+                 gets the start maps, not the failed run's upserts. *)
               create_run ~attempt:(run.attempt + 1) ~delay_ms
-                ~initiator:Protocol.Continue_as_new_retry environment chain
+                ~initiator:Protocol.Continue_as_new_retry ~memo:run.start_memo
+                ~search_attributes:run.start_search_attributes environment chain
                 ~workflow_type:run.workflow_type ~input:run.input
             with
             | Ok _ -> ()
@@ -1361,17 +1391,37 @@ let rec apply_command environment run command =
         ~job:Activation.Cancel_workflow
         ~resolve:(fun result ->
           Activation.Resolve_request_cancel_external_workflow { seq; result })
-  | Set_patch_marker _ | Upsert_search_attributes _ -> ()
+  | Set_patch_marker _ -> ()
+  | Upsert_search_attributes { search_attributes } ->
+      run.search_attributes <-
+        Workflow_context_store.merge_upsert run.search_attributes search_attributes
+  | Modify_workflow_properties { upserted_memo } ->
+      run.memo <- Workflow_context_store.merge_upsert run.memo upserted_memo
   | Complete_workflow payload -> finish environment run Run_completed (Ok payload)
   | Fail_workflow error -> finish environment run Run_failed (Error error)
   | Cancel_workflow_execution ->
       finish environment run Run_cancelled
         (Error (cancelled "workflow cancelled"))
-  | Continue_as_new { workflow_type; input } -> (
+  | Continue_as_new { workflow_type; input; memo; options } -> (
       close_run environment run;
+      (* As Core does, an empty command memo reuses the start memo, and the
+         successor inherits the current search attributes unless the command
+         replaces them. Set routing, timeout and retry options replace the
+         chain's for the successor and later runs; unset ones are inherited
+         (#1153). The versioning behavior has no effect without deployments. *)
+      let memo = match memo with [] -> run.start_memo | _ :: _ -> memo in
+      let search_attributes =
+        Option.value options.search_attributes ~default:run.search_attributes
+      in
+      let chain = run.chain in
+      Option.iter (fun queue -> chain.task_queue <- queue) options.task_queue;
+      Option.iter (fun timeout -> chain.run_timeout <- Some timeout) options.run_timeout;
+      Option.iter (fun timeout -> chain.task_timeout <- Some timeout) options.task_timeout;
+      Option.iter (fun policy -> chain.retry_policy <- Some policy) options.retry_policy;
       match
         Result.bind (workflow_input_of_arguments input) (fun input ->
-            create_run environment run.chain ~workflow_type ~input)
+            create_run ~memo ~search_attributes environment chain
+              ~workflow_type ~input)
       with
       | Ok _ -> ()
       | Error error -> close_chain environment run.chain (Error error))
@@ -1386,7 +1436,7 @@ and is_terminal_command : Activation.command -> bool = function
   | Request_cancel_external_workflow _ | Request_cancel_activity _
   | Request_cancel_local_activity _ | Start_timer _ | Cancel_timer _
   | Query_result _ | Update_response _ | Set_patch_marker _
-  | Upsert_search_attributes _ ->
+  | Upsert_search_attributes _ | Modify_workflow_properties _ ->
       false
 
 (** Reports whether [command] asks the server to act outside the emitting
@@ -1403,8 +1453,9 @@ and is_dispatched_by_server : Activation.command -> bool = function
       true
   | Request_cancel_activity _ | Request_cancel_local_activity _
   | Start_timer _ | Cancel_timer _ | Query_result _ | Update_response _
-  | Set_patch_marker _ | Upsert_search_attributes _ | Complete_workflow _
-  | Fail_workflow _ | Cancel_workflow_execution | Continue_as_new _ ->
+  | Set_patch_marker _ | Upsert_search_attributes _
+  | Modify_workflow_properties _ | Complete_workflow _ | Fail_workflow _
+  | Cancel_workflow_execution | Continue_as_new _ ->
       false
 
 (** Delivers [jobs] to [run] in one activation stamped with the current
@@ -1598,6 +1649,17 @@ let start ?workflow_id environment ~workflow_type ~input =
 
 let workflow_id handle = handle.target.workflow_id
 let run_id handle = (current handle.target).run_id
+
+(** Sorts a map by key, the order [Client.describe] reports, on a copy. *)
+let sorted_by_key values =
+  List.sort (fun (left, _) (right, _) -> String.compare left right)
+    (List.map
+       (fun (key, (payload : Codec.payload)) ->
+         (key, { payload with data = Bytes.copy payload.data }))
+       values)
+
+let memo handle = sorted_by_key (current handle.target).memo
+let search_attributes handle = sorted_by_key (current handle.target).search_attributes
 
 let result ?timeout_ms { environment; target = chain } =
   let* () = ensure_open environment in

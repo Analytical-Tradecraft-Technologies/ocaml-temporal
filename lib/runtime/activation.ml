@@ -126,6 +126,31 @@ type retry_policy = {
     reinterprets a public priority through a lossy float conversion. *)
 type priority = Temporal_base.Priority.t
 
+(** Optional continue-as-new successor settings; see the interface. *)
+module Continue_as_new_options = struct
+  type t = {
+    task_queue : string option;
+    run_timeout : int64 option;
+    task_timeout : int64 option;
+    retry_policy : retry_policy option;
+    search_attributes : (string * Temporal_base.Codec.payload) list option;
+    initial_versioning_behavior :
+      Temporal_protocol.Workflow_protocol.continue_as_new_versioning_behavior
+      option;
+  }
+
+  (** Every setting unset: the command earlier releases emitted. *)
+  let none =
+    {
+      task_queue = None;
+      run_timeout = None;
+      task_timeout = None;
+      retry_policy = None;
+      search_attributes = None;
+      initial_versioning_behavior = None;
+    }
+end
+
 (** Commands contain only immutable data needed by the semantic JSON
     translator; they never expose the runtime's mutable execution state.  The
     activity record carries every field Core needs to schedule a task, rather
@@ -230,6 +255,12 @@ type command =
   | Upsert_search_attributes of {
       search_attributes : (string * Temporal_base.Codec.payload) list;
     }
+  (** Merges encoded values into the workflow's memo through Core's
+      [ModifyWorkflowProperties] command (#1154); a [binary/null] value
+      removes its key. Core records the merge in history and replays it. *)
+  | Modify_workflow_properties of {
+      upserted_memo : (string * Temporal_base.Codec.payload) list;
+    }
   | Complete_workflow of Temporal_base.Codec.payload
   | Fail_workflow of Temporal_base.Error.t
   (** Ends this run and asks Temporal to start the same workflow type with a
@@ -238,5 +269,9 @@ type command =
       workflow_type : string;
       input : Temporal_base.Codec.payload list;
           (** Exact argument payloads, as for [Start_child_workflow]. *)
+      memo : (string * Temporal_base.Codec.payload) list;
+          (** The successor's memo; empty reuses the run's start memo. *)
+      options : Continue_as_new_options.t;
+          (** The other successor settings (#1153). *)
     }
   | Cancel_workflow_execution

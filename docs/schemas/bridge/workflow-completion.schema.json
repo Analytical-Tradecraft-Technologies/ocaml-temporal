@@ -243,7 +243,14 @@
           "properties": {
             "kind": {"const": "continue_as_new"},
             "workflow_type": {"$ref": "#/$defs/identifier"},
-            "input": {"type": "array", "maxItems": 201326592, "items": {"$ref": "#/$defs/payload"}}
+            "input": {"type": "array", "maxItems": 201326592, "items": {"$ref": "#/$defs/payload"}},
+            "memo": {"$ref": "#/$defs/payload_map", "description": "The successor's memo (#1154). OCaml always writes it; an empty map makes Core reuse the current run's start memo, and Rust reads an absent member as empty."},
+            "task_queue": {"oneOf": [{"$ref": "#/$defs/identifier"}, {"type": "null"}], "description": "Successor task queue (#1153); absent or null keeps the current queue."},
+            "run_timeout": {"oneOf": [{"$ref": "#/$defs/duration"}, {"type": "null"}], "description": "Positive successor run timeout (#1153); absent or null inherits the current run's."},
+            "task_timeout": {"oneOf": [{"$ref": "#/$defs/duration"}, {"type": "null"}], "description": "Positive successor workflow-task timeout of at most 120 seconds and no larger than a present run_timeout (#1153); absent or null inherits the current one."},
+            "retry_policy": {"oneOf": [{"$ref": "#/$defs/retry_policy"}, {"type": "null"}], "description": "Successor retry policy (#1153); absent or null makes Core reuse the chain's policy."},
+            "search_attributes": {"oneOf": [{"$ref": "#/$defs/payload_map"}, {"type": "null"}], "description": "Successor search attributes (#1153), replacing the current ones; an empty map clears them, and absent or null makes Core carry the current values."},
+            "initial_versioning_behavior": {"enum": ["auto_upgrade", "use_ramping_version", null], "description": "Experimental deployment version for the successor's first workflow task (#1153); absent or null inherits the current run's versioning."}
           }
         },
         {
@@ -294,6 +301,15 @@
             "search_attributes": {"$ref": "#/$defs/payload_map"}
           },
           "description": "Merges encoded values into Temporal's indexed workflow search attributes. Keys are unique protocol identifiers and values are ordinary Temporal payloads."
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "upserted_memo"],
+          "properties": {
+            "kind": {"const": "modify_workflow_properties"},
+            "upserted_memo": {"$ref": "#/$defs/payload_map"}
+          },
+          "description": "Merges encoded values into the workflow memo through Core's ModifyWorkflowProperties command (#1154). A key whose value is exactly the canonical binary/null payload is removed by the server."
         },
         {
           "type": "object", "additionalProperties": false,

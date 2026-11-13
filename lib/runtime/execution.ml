@@ -325,7 +325,7 @@ let emit_terminal execution command =
     | Cancel_child_workflow _ | Signal_external_workflow _
     | Request_cancel_external_workflow _ | Start_timer _ | Cancel_timer _
     | Query_result _ | Update_response _ | Set_patch_marker _
-    | Upsert_search_attributes _
+    | Upsert_search_attributes _ | Modify_workflow_properties _
     | Continue_as_new _ -> ())
 
 (** Categories that describe incompatible code or SDK state rather than a

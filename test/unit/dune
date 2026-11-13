@@ -46,9 +46,19 @@
  (name test_testing)
  (libraries temporal-sdk unix))
 
+; Continue-as-new successor options carried by Temporal.Testing (#1153).
+(test
+ (name test_continue_as_new_options)
+ (libraries temporal-sdk))
+
 ; Activity timeouts in virtual time in Temporal.Testing (#1160).
 (test
  (name test_testing_timeouts)
+ (libraries temporal-sdk))
+
+; Typed search attributes, memo upserts and their Testing simulation (#1154).
+(test
+ (name test_search_attributes)
  (libraries temporal-sdk))
 
 ; Metrics-export option validation and bridge document encoding (#500).

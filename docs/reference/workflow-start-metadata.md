@@ -13,7 +13,13 @@ match Option.bind metadata.memo (List.assoc_opt "note") with
 ```
 
 The snapshot describes this run's start event. Later
-`Workflow.upsert_search_attributes` commands do not change it. Every access
+`Workflow.upsert_search_attributes` and `Workflow.upsert_memo` commands do
+not change it; `Temporal.Search_attribute.decode` reads a typed search
+attribute from it (#1154). A continue-as-new successor starts with its
+predecessor's current search attributes and, once the predecessor upserted
+its memo, with the merged memo, unless `Workflow.continue_as_new` replaces
+them with `~memo` or `~search_attributes` (#1153; `~search_attributes:[]`
+starts the successor with none). Every access
 copies payload bodies; mutating returned bytes cannot change a later
 observation. Replay reconstructs the snapshot from history, and a successor
 run receives its own inherited metadata. `None` preserves an absent protobuf
@@ -63,9 +69,13 @@ before workflow code runs, and is unchanged by later activations, so a
 replaying worker observes the same values. The predecessor's failure and
 completion payloads are retained by the private protocol but are not yet
 public. `Temporal.Testing` reports the predecessor and `` `Continue_as_new ``
-for its continue-as-new successors. It records no workflow timeouts (all
-three are `None`) and records a retry policy only for a child started with
-one.
+for its continue-as-new successors. It records no execution timeout, and
+run and task timeouts only once a continue-as-new set them (#1153); it
+records a retry policy for a child started with one and for a successor
+given one by `continue_as_new ~retry_policy`. A successor reports the task
+queue, timeouts and retry policy its predecessor set or inherited, as the
+server does, but the environment does not enforce the timeouts or route by
+task queue.
 
 Cron schedules and cron-initiated runs remain unsupported. Nonzero root
 start delay also remains unsupported, while absent and explicit-zero backoff

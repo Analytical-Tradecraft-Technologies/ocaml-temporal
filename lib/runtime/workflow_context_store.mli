@@ -230,9 +230,32 @@ val with_randomness_disabled : t -> (unit -> 'value) -> 'value
     protocol encoder before Core receives the completion. An empty list emits
     no command, because Temporal Server rejects an empty upsert and replay
     would repeat the rejection on every task retry. Raises [Invalid_argument]
-    after the execution has ended, even for an empty list. *)
+    after the execution has ended or inside a read-only callback (an update
+    validator or query handler, see {!with_randomness_disabled}), even for an
+    empty list, before any state changes. *)
 val upsert_search_attributes :
    t -> (string * Temporal_base.Codec.payload) list -> unit
+
+(** Emits one durable [ModifyWorkflowProperties] command that merges encoded
+    values into the workflow memo (#1154), and folds them into the run's
+    current memo, seeded from the start snapshot: an exact [binary/null]
+    value removes its key. {!continue_as_new} passes that current memo to the
+    successor once any memo upsert has run. Payloads are copied. An empty
+    list emits no command and leaves the current memo unchanged. Raises
+    [Invalid_argument] after the execution has ended or inside a read-only
+    callback (an update validator or query handler), even for an empty list,
+    before the current memo or command buffer changes. *)
+val upsert_memo : t -> (string * Temporal_base.Codec.payload) list -> unit
+
+(** [merge_upsert current upserted] applies one memo or search-attribute
+    upsert as Temporal Server merges it: a value that is exactly the
+    canonical [binary/null] payload removes its key, and any other value
+    replaces an existing key in place or is appended. Neither list is
+    mutated. The test environment uses it to simulate both maps. *)
+val merge_upsert :
+  (string * Temporal_base.Codec.payload) list ->
+  (string * Temporal_base.Codec.payload) list ->
+  (string * Temporal_base.Codec.payload) list
 
 (** Runs [action] with [t] installed for the calling system thread and restores the previous
     context even if [action] raises. Nested calls are supported. *)
@@ -481,8 +504,17 @@ val terminate : t -> Activation.command -> 'value
 
 (** Buffers a continue-as-new command and stops the current workflow fiber.
     The successor input is encoded into its argument list before it reaches
-    this private operation. *)
+    this private operation. A non-empty [memo] (#1153) becomes the
+    successor's memo and is copied; otherwise the command carries the current
+    memo after an {!upsert_memo}, and an empty memo (Core reuses the start
+    memo) when there was none. [options] (default
+    {!Activation.Continue_as_new_options.none}) holds the other successor
+    settings, already validated by the public API. Raises [Invalid_argument]
+    inside a read-only callback (see {!with_randomness_disabled}) before
+    anything is buffered, as {!upsert_memo} does. *)
 val continue_as_new :
+  ?memo:(string * Temporal_base.Codec.payload) list ->
+  ?options:Activation.Continue_as_new_options.t ->
   t -> workflow_type:string -> input:Temporal_base.Codec.payload list -> 'value
 
 (** True when the pending command buffer already holds a terminal workflow

@@ -144,10 +144,12 @@ for executable in "$@"; do
     test/integration/workflow_start_info/regression.exe)
       cli_argument='' ;;
     test/integration/client_policies/regression.exe|\
+    test/integration/continue_as_new_options/regression.exe|\
     test/integration/describe_count/regression.exe|\
     test/integration/interaction_recovery/regression.exe|\
     test/integration/local_activity_cancellation/regression.exe|\
     test/integration/non_yielding_workflow/regression.exe|\
+    test/integration/search_attributes/regression.exe|\
     test/integration/timer_cancellation/regression.exe|\
     test/integration/transport_interruption/regression.exe|\
     test/integration/update_outcomes/regression.exe|\

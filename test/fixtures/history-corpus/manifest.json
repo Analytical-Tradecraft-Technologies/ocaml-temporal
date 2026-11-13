@@ -104,6 +104,24 @@
         "descriptor_sha256": "8c92175f70af3c521cb8fedd9713fe928b64b386953345b87867768233b5947c",
         "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
       }
+    },
+    "live-2026-11-13-can-options": {
+      "kind": "live",
+      "captured_on": "2026-11-13",
+      "sdk_commit": "2fefb8bf0bbbed89fa8a0166aacdf98328664f0e",
+      "sdk_tree_dirty": false,
+      "core_revision": "8fe478ee179ed754614d230f39586f3edb57da71",
+      "temporal_server_image": "temporalio/server:1.32.2@sha256:7bf69188a6232fea14869b9cef3d94aa82a1601d99517f7e86c71f22da4e0670",
+      "temporal_cli_image": "temporalio/admin-tools:1.32.2@sha256:4a95866efba29d7e17ab012df5232795e8b0ad0f7d5f9d1ec4df321f7792a754",
+      "worker_toolchains": [
+        "OCaml 5.4.1 (Unix)"
+      ],
+      "capture_command": "make history-corpus-capture HISTORY_CORPUS_CAPTURE_ID=live-2026-11-13-can-options HISTORY_CORPUS_GENERATIONS=corpus-v4-continue-as-new-options",
+      "protobuf_export": {
+        "tool": "Python protobuf 6.33.6 json_format",
+        "descriptor_sha256": "8c92175f70af3c521cb8fedd9713fe928b64b386953345b87867768233b5947c",
+        "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
+      }
     }
   },
   "entries": [
@@ -2055,6 +2073,48 @@
       "replay_definitions": "negative-random-reordered",
       "expected": "nondeterminism",
       "negative_control_of": "live-2026-10-24-random-random-parent"
+    },
+    {
+      "id": "live-2026-11-13-can-options-continue-as-new-options-first",
+      "purpose": "Continues as new with an explicit task queue, run and task timeouts, retry policy, replacement memo and empty search-attribute map.",
+      "features": [
+        "continue-as-new",
+        "continue-as-new-options"
+      ],
+      "workflow_type": "corpus.continue_as_new_options",
+      "workflow_id": "history-corpus-continue-as-new-options",
+      "run_id": "01a1d3b8-4c7a-7c10-ac64-781f5e7e2cd1",
+      "capture": "live-2026-11-13-can-options",
+      "generation": "corpus-v4-continue-as-new-options",
+      "history": {
+        "protobuf": "histories/live-2026-11-13-can-options-continue-as-new-options-first.pb",
+        "protobuf_sha256": "470d423014e43c51db78f48f9cbb66d1ffa48241f8e5a93ccabf3e4411ff0083",
+        "json": "histories/live-2026-11-13-can-options-continue-as-new-options-first.json",
+        "json_sha256": "a5013d2dfc4eaa90bb4ee17953dd4edc09246609a45e5e71d82493f349c9237d"
+      },
+      "replay_definitions": "corpus-v4-continue-as-new-options",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-11-13-can-options-continue-as-new-options-second",
+      "purpose": "Successor started with those options; it reads them through Workflow.info and start_metadata.",
+      "features": [
+        "continue-as-new-successor",
+        "continue-as-new-options"
+      ],
+      "workflow_type": "corpus.continue_as_new_options",
+      "workflow_id": "history-corpus-continue-as-new-options",
+      "run_id": "e903615f-165e-4f39-8346-1e0cbae8b087",
+      "capture": "live-2026-11-13-can-options",
+      "generation": "corpus-v4-continue-as-new-options",
+      "history": {
+        "protobuf": "histories/live-2026-11-13-can-options-continue-as-new-options-second.pb",
+        "protobuf_sha256": "47a3e456d0b664f1a757fb5b2df96da5b3b8c7fc728314e24452635428d603e3",
+        "json": "histories/live-2026-11-13-can-options-continue-as-new-options-second.json",
+        "json_sha256": "06c838e273d7d57c72844641aa93fd2360d4797d2462e5d09982e8d27a59f67a"
+      },
+      "replay_definitions": "corpus-v4-continue-as-new-options",
+      "expected": "replays_ok"
     }
   ]
 }

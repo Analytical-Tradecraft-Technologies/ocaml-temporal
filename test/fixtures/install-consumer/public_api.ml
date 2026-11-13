@@ -26,6 +26,7 @@ module Result_syntax = T.Result_syntax
 module Runtime = T.Runtime
 module Runtime_info = T.Runtime_info
 module Scope = T.Scope
+module Search_attribute = T.Search_attribute
 module Signal = T.Signal
 module Testing = T.Testing
 module Time = T.Time
@@ -581,8 +582,21 @@ let _workflow_random_bytes : length:int -> (string, T.Error.t) result =
 let _workflow_uuid4 : unit -> (string, T.Error.t) result = T.Workflow.uuid4
 let _workflow_continue_as_new :
     'input 'output 'value.
+    ?task_queue:string ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
+    ?initial_versioning_behavior:[ `Auto_upgrade | `Use_ramping_version ] ->
     ('input, 'output) T.Workflow.t -> 'input -> 'value =
   T.Workflow.continue_as_new
+
+(* Omitting every continue-as-new option keeps the earlier two-argument
+   call shape (#1153). *)
+let _workflow_continue_as_new_without_options :
+    'input 'output 'value. ('input, 'output) T.Workflow.t -> 'input -> 'value =
+ fun definition input -> T.Workflow.continue_as_new definition input
 
 let _signal_define :
     'input.
@@ -1509,6 +1523,73 @@ let _workflow_upsert_search_attributes :
     (string * T.Payload.t) list -> unit =
   T.Workflow.upsert_search_attributes
 
+let _workflow_upsert_typed_search_attributes :
+    T.Search_attribute.update list -> unit =
+  T.Workflow.upsert_typed_search_attributes
+
+let _workflow_upsert_memo : (string * T.Payload.t) list -> unit =
+  T.Workflow.upsert_memo
+
+(* Typed search-attribute keys (#1154). The kind match names every
+   constructor so a removed or renamed indexed type fails compilation. *)
+let _search_attribute_kind_name : T.Search_attribute.kind -> string = function
+  | `Text -> "Text"
+  | `Keyword -> "Keyword"
+  | `Int -> "Int"
+  | `Double -> "Double"
+  | `Bool -> "Bool"
+  | `Datetime -> "Datetime"
+  | `Keyword_list -> "KeywordList"
+
+let _search_attribute_text : string -> string T.Search_attribute.key =
+  T.Search_attribute.text
+
+let _search_attribute_keyword : string -> string T.Search_attribute.key =
+  T.Search_attribute.keyword
+
+let _search_attribute_int64 : string -> int64 T.Search_attribute.key =
+  T.Search_attribute.int64
+
+let _search_attribute_double : string -> float T.Search_attribute.key =
+  T.Search_attribute.double
+
+let _search_attribute_bool : string -> bool T.Search_attribute.key =
+  T.Search_attribute.bool
+
+let _search_attribute_datetime : string -> T.Time.t T.Search_attribute.key =
+  T.Search_attribute.datetime
+
+let _search_attribute_keyword_list :
+    string -> string list T.Search_attribute.key =
+  T.Search_attribute.keyword_list
+
+let _search_attribute_name : 'value. 'value T.Search_attribute.key -> string =
+  T.Search_attribute.name
+
+let _search_attribute_kind :
+    'value. 'value T.Search_attribute.key -> T.Search_attribute.kind =
+  T.Search_attribute.kind
+
+let _search_attribute_set :
+    'value. 'value T.Search_attribute.key -> 'value -> T.Search_attribute.update =
+  T.Search_attribute.set
+
+let _search_attribute_unset :
+    'value. 'value T.Search_attribute.key -> T.Search_attribute.update =
+  T.Search_attribute.unset
+
+let _search_attribute_encode :
+    T.Search_attribute.update list ->
+    ((string * T.Payload.t) list, T.Error.t) result =
+  T.Search_attribute.encode
+
+let _search_attribute_decode :
+    'value.
+    'value T.Search_attribute.key ->
+    (string * T.Payload.t) list ->
+    ('value option, T.Error.t) result =
+  T.Search_attribute.decode
+
 (* In-process, time-skipping workflow test environment. *)
 let _testing_workflow :
     'input 'output.
@@ -1618,6 +1699,14 @@ let _testing_workflow_id : 'input 'output. ('input, 'output) T.Testing.handle ->
 
 let _testing_run_id : 'input 'output. ('input, 'output) T.Testing.handle -> string =
   T.Testing.run_id
+
+let _testing_memo :
+    'input 'output. ('input, 'output) T.Testing.handle -> (string * T.Payload.t) list =
+  T.Testing.memo
+
+let _testing_search_attributes :
+    'input 'output. ('input, 'output) T.Testing.handle -> (string * T.Payload.t) list =
+  T.Testing.search_attributes
 
 (* Offline history replay against registered workflow definitions. The
    failure match names every constructor so a removed or renamed verdict

@@ -12,7 +12,7 @@ where application code normally uses them.
 | --- | --- | --- |
 | Workflow code | `Temporal.Workflow`, `Temporal.Activity`, `Temporal.Child_workflow`, `Temporal.Future`, `Temporal.Condition`, `Temporal.Scope`, `Temporal.Workflow_context`, `Temporal.Time`, `Temporal.Duration` | Defining deterministic work, making replay-safe time and pseudo-random choices, scheduling Temporal operations, waiting for results, and keeping execution-local state |
 | Application startup and shutdown | `Temporal.Client`, `Temporal.Worker`, `Temporal.Runtime`, `Temporal.Runtime_info` | Connecting to Temporal, registering executable definitions, running the worker, optionally sharing background I/O threads, and checking the linked bridge |
-| Values crossing a Temporal boundary | `Temporal.Codec`, `Temporal.Payload`, `Temporal.Error`, `Temporal.Result_syntax` | Encoding typed values, inspecting opaque payloads, representing expected failures, and composing `result` values |
+| Values crossing a Temporal boundary | `Temporal.Codec`, `Temporal.Payload`, `Temporal.Search_attribute`, `Temporal.Error`, `Temporal.Result_syntax` | Encoding typed values and search attributes, inspecting opaque payloads, representing expected failures, and composing `result` values |
 | Operation policies | `Temporal.Retry_policy` | Validating the retry policy passed to activities, child workflows and client starts, and reading the effective policy a run reports |
 | Signals, queries, and updates | `Temporal.Signal`, `Temporal.Query`, `Temporal.Update`, `Temporal.Interaction` | Defining typed interactions, registering handlers, and testing deterministic local dispatch |
 | Application tests | `Temporal.Testing` | Running registered workflows and activities in-process with a time-skipping virtual clock, stubbing activities and child workflows, and driving signals, queries, updates, and cancellation without a Temporal Server |
@@ -51,8 +51,14 @@ for those rules.
   expiration. `is_replaying ()` is the shorthand for replay-aware logging.
   `upsert_search_attributes` merges encoded values into the
   execution's indexed search attributes; the update becomes visible after the
-  workflow task is accepted. `continue_as_new` ends the current run and starts
-  a successor. `patched ~id`
+  workflow task is accepted. `upsert_typed_search_attributes` does the same
+  from typed `Temporal.Search_attribute` updates, and `upsert_memo` merges
+  values into the run's memo, which a later `continue_as_new` carries to the
+  successor (#1154). `continue_as_new` ends the current run and starts
+  a successor; its optional `?task_queue`, `?run_timeout`, `?task_timeout`,
+  `?retry_policy`, `?memo`, `?search_attributes` and
+  `?initial_versioning_behavior` change the successor, and omitting them all
+  emits the command earlier releases emitted (#1153). `patched ~id`
   introduces a new deterministic branch while allowing histories created
   before that marker to replay the old branch. `deprecate_patch ~id` is the
   later unit-returning lifecycle marker used while phasing that branch gate
@@ -112,6 +118,15 @@ for those rules.
 - `Temporal.Codec` pairs an OCaml type with a payload encoding. The standard
   codecs are convenient defaults, not a requirement that all payloads be
   JSON; `Temporal.Payload` remains opaque bytes plus encoding metadata.
+- `Temporal.Search_attribute` (#1154) names a registered search attribute
+  with its indexed type (`text`, `keyword`, `int64`, `double`, `bool`,
+  `datetime`, `keyword_list`), so `encode` writes the `json/plain` payload
+  and `type` metadata Temporal Server decodes for that type, and `decode`
+  reads a value back from `Workflow.start_metadata` or
+  `Client.describe`. `set` and `unset` build the updates that
+  `Workflow.upsert_typed_search_attributes` applies; for `Client.start`,
+  pass the encoded list as `~search_attributes`. The raw
+  `(string * Payload.t) list` parameters remain the escape hatch.
 - `Temporal.Error.t` is the typed failure channel for expected operational
   failures. Use `Error.view`, `Error.kind`, and `Error.message` for stable
   inspection, and `Error.origin` (with `Error.timeout_type` and

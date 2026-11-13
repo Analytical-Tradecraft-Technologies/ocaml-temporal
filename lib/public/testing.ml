@@ -209,3 +209,10 @@ let cancel handle =
 
 let workflow_id handle = Engine.workflow_id handle.engine
 let run_id handle = Engine.run_id handle.engine
+
+(** Converts the engine's sorted, copied map to public payloads. *)
+let public_map values =
+  List.map (fun (key, payload) -> (key, Payload_private.of_base payload)) values
+
+let memo handle = public_map (Engine.memo handle.engine)
+let search_attributes handle = public_map (Engine.search_attributes handle.engine)

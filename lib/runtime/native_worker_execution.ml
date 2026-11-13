@@ -528,7 +528,8 @@ let is_terminal completion =
       | Protocol.Query_result _
       | Protocol.Update_response _
       | Protocol.Set_patch_marker _
-      | Protocol.Upsert_search_attributes _ -> false)
+      | Protocol.Upsert_search_attributes _
+      | Protocol.Modify_workflow_properties _ -> false)
     completion.Protocol.commands
 
 (** Reports one bounded lifecycle message without allowing a reporter defect to

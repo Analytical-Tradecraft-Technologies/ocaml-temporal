@@ -399,6 +399,52 @@ type update_response =
   | Update_rejected of failure
   | Update_completed of payload
 
+(** How the first workflow task of a continue-as-new successor is routed on a
+    deployment-versioned worker (#1153), mirroring Temporal's experimental
+    [ContinueAsNewVersioningBehavior]. [Successor_auto_upgrade] starts the
+    successor on its task queue's current (target) deployment version;
+    [Successor_use_ramping_version] starts it on the ramping version. After
+    that first task the successor follows its own declared versioning
+    behavior. A pinned versioning override on the execution takes precedence
+    over either choice. *)
+type continue_as_new_versioning_behavior =
+  | Successor_auto_upgrade
+  | Successor_use_ramping_version
+
+(** Optional successor settings carried by a continue-as-new command (#1153).
+    Every [None] member is omitted from the JSON document, so a command
+    without options stays byte-identical to the one earlier releases emitted
+    and existing histories replay unchanged. What an omitted member means is
+    decided by Core and the server, not by this protocol:
+
+    - [task_queue] [None] keeps the current run's task queue;
+    - [run_timeout] and [task_timeout] [None] inherit the current run's
+      values;
+    - [retry_policy] [None] makes Core reuse the policy the chain started
+      with;
+    - [search_attributes] [None] makes Core carry the current search
+      attributes, including upserts; [Some values] replaces them, and
+      [Some []] starts the successor with none;
+    - [initial_versioning_behavior] [None] lets the successor inherit the
+      current run's versioning.
+
+    A present timeout must be positive and the task timeout at most 120
+    seconds and no larger than a present run timeout; the encoder and
+    decoder reject other values. *)
+module Continue_as_new_options : sig
+  type t = {
+    task_queue : string option;
+    run_timeout : duration option;
+    task_timeout : duration option;
+    retry_policy : retry_policy option;
+    search_attributes : (string * payload) list option;
+    initial_versioning_behavior : continue_as_new_versioning_behavior option;
+  }
+
+  (** Every member [None]: the command earlier releases emitted. *)
+  val none : t
+end
+
 (** Supported workflow commands in scheduler emission order. *)
 type completion_command =
   | Schedule_activity of {
@@ -500,12 +546,25 @@ type completion_command =
   | Set_patch_marker of { patch_id : string; deprecated : bool }
   (** Merges payload values into Temporal's indexed search-attribute map. *)
   | Upsert_search_attributes of { search_attributes : (string * payload) list }
+  (** Merges payload values into the workflow memo through Core's
+      [ModifyWorkflowProperties] command (#1154). Keys are unique protocol
+      identifiers; a [binary/null] value asks the server to remove its key. *)
+  | Modify_workflow_properties of { upserted_memo : (string * payload) list }
   | Complete_workflow of { result : payload option }
   | Fail_workflow of { failure : failure }
   (** Ends this run and starts a successor run of [workflow_type] with the
       supplied argument payloads. The current SDK emits one argument; the
-      list mirrors Core's repeated payload field for forward compatibility. *)
-  | Continue_as_new of { workflow_type : string; input : payload list }
+      list mirrors Core's repeated payload field for forward compatibility.
+      [memo] is the successor's memo; an empty map asks Core to reuse the
+      memo the current run started with (#1154). [options] holds the other
+      successor settings (#1153); {!Continue_as_new_options.none} leaves
+      them to Core and the server. *)
+  | Continue_as_new of {
+      workflow_type : string;
+      input : payload list;
+      memo : (string * payload) list;
+      options : Continue_as_new_options.t;
+    }
   | Cancel_workflow_execution
 
 (** A workflow type's versioning behavior on a deployment-versioned worker
