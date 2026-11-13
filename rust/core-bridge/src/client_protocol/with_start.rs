@@ -496,7 +496,7 @@ fn map_multi_operation_status(workflow_id: &str, status: Status) -> ClientOperat
         .into_iter()
         .enumerate()
         .find(|(_, operation)| {
-            operation.code != Code::Ok as i32
+            Code::from(operation.code) != Code::Ok
                 && !operation
                     .details
                     .iter()
