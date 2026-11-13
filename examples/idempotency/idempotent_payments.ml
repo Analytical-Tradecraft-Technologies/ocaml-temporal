@@ -46,8 +46,43 @@ type posting_request = {
     shape. *)
 let shape_error what = Error (Error.codec ~message:("expected " ^ what))
 
-(** JSON codec for {!order}: [{"order_id": ..., "account": ..., "lines":
-    [...]}]. *)
+(** [object_fields ~what ~names json] checks that [json] is an object with
+    exactly the fields [names], each once and in any order, and returns its
+    fields. JSON does not order object members, so a payload re-encoded by
+    another SDK or tool may list them differently; a missing, duplicate or
+    unknown field is a typed codec error naming [what], rather than a
+    silently dropped or misread value. *)
+let object_fields ~what ~names = function
+  | `Assoc fields ->
+      let keys = List.map fst fields in
+      let count name = List.length (List.filter (String.equal name) keys) in
+      let missing = List.filter (fun name -> count name = 0) names in
+      let duplicate = List.filter (fun name -> count name > 1) names in
+      let unknown = List.filter (fun key -> not (List.mem key names)) keys in
+      if missing <> [] then
+        shape_error (what ^ " with field " ^ String.concat ", " missing)
+      else if duplicate <> [] then
+        shape_error
+          (what ^ " with field " ^ String.concat ", " duplicate ^ " only once")
+      else if unknown <> [] then
+        shape_error (what ^ " without field " ^ String.concat ", " unknown)
+      else Ok fields
+  | _ -> shape_error what
+
+(** Reads the string field [name] of fields checked by {!object_fields}. *)
+let string_field ~what fields name =
+  match List.assoc name fields with
+  | `String value -> Ok value
+  | _ -> shape_error (what ^ " whose " ^ name ^ " is a string")
+
+(** Reads the integer field [name] of fields checked by {!object_fields}. *)
+let int_field ~what fields name =
+  match List.assoc name fields with
+  | `Int value -> Ok value
+  | _ -> shape_error (what ^ " whose " ^ name ^ " is an integer")
+
+(** JSON codec for {!order}: an object with the fields [order_id], [account]
+    and [lines] (an array of integer amounts), in any order. *)
 let order_codec =
   Codec.json_conv
     ~to_json:(fun { order_id; account; lines } ->
@@ -57,23 +92,30 @@ let order_codec =
           ("account", `String account);
           ("lines", `List (List.map (fun amount -> `Int amount) lines));
         ])
-    ~of_json:(function
-      | `Assoc
-          [
-            ("order_id", `String order_id);
-            ("account", `String account);
-            ("lines", `List lines);
-          ] -> (
-          match
-            List.map
-              (function `Int amount -> amount | _ -> raise Exit)
-              lines
-          with
-          | lines -> Ok { order_id; account; lines }
-          | exception Exit -> shape_error "integer order line amounts")
-      | _ -> shape_error "an order object")
+    ~of_json:(fun json ->
+      let open Result_syntax in
+      let what = "an order object" in
+      let* fields =
+        object_fields ~what ~names:[ "order_id"; "account"; "lines" ] json
+      in
+      let* order_id = string_field ~what fields "order_id" in
+      let* account = string_field ~what fields "account" in
+      let* lines =
+        match List.assoc "lines" fields with
+        | `List amounts ->
+            List.fold_right
+              (fun amount accumulated ->
+                let* lines = accumulated in
+                match amount with
+                | `Int amount -> Ok (amount :: lines)
+                | _ -> shape_error "integer order line amounts")
+              amounts (Ok [])
+        | _ -> shape_error (what ^ " whose lines is an array")
+      in
+      Ok { order_id; account; lines })
 
-(** JSON codec for {!posting_request}. *)
+(** JSON codec for {!posting_request}: an object with the fields
+    [idempotency_key], [account] and [amount_cents], in any order. *)
 let posting_request_codec =
   Codec.json_conv
     ~to_json:(fun { idempotency_key; account; amount_cents } ->
@@ -83,15 +125,18 @@ let posting_request_codec =
           ("account", `String account);
           ("amount_cents", `Int amount_cents);
         ])
-    ~of_json:(function
-      | `Assoc
-          [
-            ("idempotency_key", `String idempotency_key);
-            ("account", `String account);
-            ("amount_cents", `Int amount_cents);
-          ] ->
-          Ok { idempotency_key; account; amount_cents }
-      | _ -> shape_error "a posting request object")
+    ~of_json:(fun json ->
+      let open Result_syntax in
+      let what = "a posting request object" in
+      let* fields =
+        object_fields ~what
+          ~names:[ "idempotency_key"; "account"; "amount_cents" ]
+          json
+      in
+      let* idempotency_key = string_field ~what fields "idempotency_key" in
+      let* account = string_field ~what fields "account" in
+      let* amount_cents = int_field ~what fields "amount_cents" in
+      Ok { idempotency_key; account; amount_cents })
 
 (** Longest accepted order ID, in bytes, so every line key stays within the
     ledger's key limit. *)

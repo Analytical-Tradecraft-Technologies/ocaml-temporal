@@ -169,7 +169,79 @@ let test_conflict () =
       | ("order-c/line-1", _, 1, Payment_ledger.Conflict_kind) :: _ -> ()
       | _ -> failwith "the conflicting request was not answered as a conflict")
 
+(** Decodes [json] with [codec], as a payload another SDK or tool produced
+    would be decoded. *)
+let decode codec json =
+  Codec.decode codec (ok "encode" (Codec.encode Codec.json json))
+
+(** The JSON codecs look fields up by name: members in another order decode
+    to the same value, and a missing, duplicate, unknown or mistyped field is
+    a typed error rather than a misread value. Each codec also round-trips
+    its own encoding. *)
+let test_codecs () =
+  let order : Idempotent_payments.order =
+    { order_id = "order-r"; account = "acct-ada"; lines = [ 2500; 2500 ] }
+  in
+  check
+    (decode Idempotent_payments.order_codec
+       (`Assoc
+         [
+           ("lines", `List [ `Int 2500; `Int 2500 ]);
+           ("account", `String "acct-ada");
+           ("order_id", `String "order-r");
+         ])
+    = Ok order)
+    "a reordered order was not decoded by field name";
+  let request : Idempotent_payments.posting_request =
+    { idempotency_key = "order-r/line-1"; account = "acct-ada"; amount_cents = 2500 }
+  in
+  check
+    (decode Idempotent_payments.posting_request_codec
+       (`Assoc
+         [
+           ("amount_cents", `Int 2500);
+           ("idempotency_key", `String "order-r/line-1");
+           ("account", `String "acct-ada");
+         ])
+    = Ok request)
+    "a reordered posting request was not decoded by field name";
+  let round_trip codec value =
+    Codec.decode codec (ok "encode" (Codec.encode codec value)) = Ok value
+  in
+  check (round_trip Idempotent_payments.order_codec order) "an order did not round-trip";
+  check
+    (round_trip Idempotent_payments.posting_request_codec request)
+    "a posting request did not round-trip";
+  let key = ("idempotency_key", `String "order-r/line-1") in
+  let account = ("account", `String "acct-ada") in
+  let amount = ("amount_cents", `Int 2500) in
+  List.iter
+    (fun (label, fields) ->
+      match decode Idempotent_payments.posting_request_codec (`Assoc fields) with
+      | Ok _ -> failwith ("a posting request with " ^ label ^ " was accepted")
+      | Error error ->
+          check
+            ((Error.view error).category = `Codec)
+            ("a posting request with " ^ label ^ " was not a codec error"))
+    [
+      ("a missing field", [ key; account ]);
+      ("a duplicate field", [ key; account; amount; ("account", `String "acct-eve") ]);
+      ("an unknown field", [ key; account; amount; ("currency", `String "EUR") ]);
+      ("a mistyped field", [ key; account; ("amount_cents", `String "2500") ]);
+    ];
+  check
+    (Result.is_error
+       (decode Idempotent_payments.order_codec
+          (`Assoc
+            [
+              ("order_id", `String "order-r");
+              ("account", `String "acct-ada");
+              ("lines", `List [ `Int 2500; `String "2500" ]);
+            ])))
+    "an order with a non-integer line was accepted"
+
 let () =
   test_key_scope ();
+  test_codecs ();
   test_lost_completion ();
   test_conflict ()
