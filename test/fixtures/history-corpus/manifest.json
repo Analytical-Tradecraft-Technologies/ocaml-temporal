@@ -140,6 +140,24 @@
         "descriptor_sha256": "8c92175f70af3c521cb8fedd9713fe928b64b386953345b87867768233b5947c",
         "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
       }
+    },
+    "live-2026-11-13-child-metadata": {
+      "kind": "live",
+      "captured_on": "2026-11-13",
+      "sdk_commit": "5240baf9dad32987b114da8277ca53902fb07fe4",
+      "sdk_tree_dirty": false,
+      "core_revision": "8fe478ee179ed754614d230f39586f3edb57da71",
+      "temporal_server_image": "temporalio/server:1.32.2@sha256:7bf69188a6232fea14869b9cef3d94aa82a1601d99517f7e86c71f22da4e0670",
+      "temporal_cli_image": "temporalio/admin-tools:1.32.2@sha256:4a95866efba29d7e17ab012df5232795e8b0ad0f7d5f9d1ec4df321f7792a754",
+      "worker_toolchains": [
+        "OCaml 5.4.1 (Unix)"
+      ],
+      "capture_command": "make history-corpus-capture HISTORY_CORPUS_CAPTURE_ID=live-2026-11-13-child-metadata HISTORY_CORPUS_GENERATIONS=corpus-v6-child-start-metadata",
+      "protobuf_export": {
+        "tool": "Python protobuf 6.33.6 json_format",
+        "descriptor_sha256": "8c92175f70af3c521cb8fedd9713fe928b64b386953345b87867768233b5947c",
+        "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
+      }
     }
   },
   "entries": [
@@ -2193,6 +2211,49 @@
         "json_sha256": "f1d77c2e8ec456415c1662a48602f485eb8d0bf4a05965a5f19482a13a8b2441"
       },
       "replay_definitions": "corpus-v5-cron-start-delay",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-11-13-child-metadata-child-metadata-parent",
+      "purpose": "Parent starts a child with a memo and a keyword search attribute.",
+      "features": [
+        "child-workflow",
+        "child-start-metadata"
+      ],
+      "workflow_type": "corpus.child_metadata_parent",
+      "workflow_id": "history-corpus-child-metadata-parent",
+      "run_id": "01a1d4cf-83db-74ac-ac5e-6053fb167e25",
+      "capture": "live-2026-11-13-child-metadata",
+      "generation": "corpus-v6-child-start-metadata",
+      "history": {
+        "protobuf": "histories/live-2026-11-13-child-metadata-child-metadata-parent.pb",
+        "protobuf_sha256": "17870230a6143db7dfeb5b08e9d504683dbd210edcdeff075c706871fceb3965",
+        "json": "histories/live-2026-11-13-child-metadata-child-metadata-parent.json",
+        "json_sha256": "9b97cf5b2d5da405f96b823ab8ae4844b625cceda51d7fa995a14fedd922cae9"
+      },
+      "replay_definitions": "corpus-v6-child-start-metadata",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-11-13-child-metadata-child-metadata-child",
+      "purpose": "Child run started with that memo and search attribute; it reads both through Workflow.start_metadata.",
+      "features": [
+        "child-workflow",
+        "child-side",
+        "child-start-metadata"
+      ],
+      "workflow_type": "corpus.child_metadata_child",
+      "workflow_id": "history-corpus-child-metadata-parent-child",
+      "run_id": "01a1d4cf-83ef-74f5-9cb3-68107bfde635",
+      "capture": "live-2026-11-13-child-metadata",
+      "generation": "corpus-v6-child-start-metadata",
+      "history": {
+        "protobuf": "histories/live-2026-11-13-child-metadata-child-metadata-child.pb",
+        "protobuf_sha256": "39520650972b23031c7eb56602804619fa1d758cc7618d5575e3883e4715e340",
+        "json": "histories/live-2026-11-13-child-metadata-child-metadata-child.json",
+        "json_sha256": "93d833798f0eb3066198f4e1e9a97362374d4f85fdff8f030728a23e99c5dad4"
+      },
+      "replay_definitions": "corpus-v6-child-start-metadata",
       "expected": "replays_ok"
     }
   ]

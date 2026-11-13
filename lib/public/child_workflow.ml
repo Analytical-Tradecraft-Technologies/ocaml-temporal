@@ -123,6 +123,28 @@ let validate_task_queue = function
              ~message:"child workflow task queue must be a non-empty UTF-8 identifier of at most 65536 bytes without NUL")
       else Ok ()
 
+(** Validates the optional memo and search-attribute maps (#1135) with the
+    key rules shared with [Workflow.upsert_memo] and continue-as-new, and
+    copies the payloads into private values. An omitted or empty map becomes
+    [None] so the command stays the one earlier releases emitted. *)
+let start_metadata ~memo ~search_attributes =
+  let convert ~label = function
+    | None | Some [] -> Ok None
+    | Some values -> (
+        match Metadata_keys_private.keys_problem ~label values with
+        | Some problem -> Error (Error.defect ~message:problem)
+        | None ->
+            Ok
+              (Some
+                 (List.map
+                    (fun (key, payload) -> (key, Payload_private.to_base payload))
+                    values)))
+  in
+  Result.bind (convert ~label:"memo" memo) (fun memo ->
+      Result.map
+        (fun search_attributes -> (memo, search_attributes))
+        (convert ~label:"search-attribute" search_attributes))
+
 (** Builds a handle for a request that failed before a child command could be
     emitted. The future is ready and cancellation returns the same typed
     defect, so invalid lifecycle requests cannot leave hidden state. *)
@@ -148,21 +170,25 @@ let check_scope = function
             (Error.defect
                ~message:"scoped child start used outside a workflow scheduler turn"))
 
-(** Validates routing, timeouts, durable identity, and input encoding before
-    allocating a private sequence number. Consequently invalid requests cannot change command order
-    or appear in replay history. *)
+(** Validates routing, timeouts, start metadata, durable identity, and input
+    encoding before allocating a private sequence number. Consequently invalid
+    requests cannot change command order or appear in replay history. *)
 let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy
     ?task_queue ?parent_close_policy ?execution_timeout ?run_timeout
-    ?task_timeout ?id_reuse_policy ~id definition input =
+    ?task_timeout ?id_reuse_policy ?memo ?search_attributes ~id definition
+    input =
   match
     Result.bind (validate_task_queue task_queue) (fun () ->
         Result.bind
           (Workflow_timeouts_private.validate ~execution_timeout ~run_timeout
              ~task_timeout)
-          (fun timeouts -> Result.map (fun () -> timeouts) (check_scope scope)))
+          (fun timeouts ->
+            Result.bind (start_metadata ~memo ~search_attributes)
+              (fun metadata ->
+                Result.map (fun () -> (timeouts, metadata)) (check_scope scope))))
   with
   | Error error -> failed_handle error
-  | Ok (execution_timeout, run_timeout, task_timeout) ->
+  | Ok ((execution_timeout, run_timeout, task_timeout), (memo, search_attributes)) ->
       match validate_id id with
       | Error error -> failed_handle error
       | Ok () ->
@@ -184,6 +210,7 @@ let start_handle ?scope ?(cancellation_type = Try_cancel) ?retry_policy
                       ?execution_timeout ?run_timeout ?task_timeout
                       ?id_reuse_policy:
                         (Option.map runtime_id_reuse_policy id_reuse_policy)
+                      ?memo ?search_attributes
                       ?retry_policy:
                         (Option.map Retry_policy_private.to_runtime retry_policy)
                       ~cancellation_type:
@@ -230,19 +257,19 @@ let cancel ?(reason = "cancelled by workflow") handle = handle.cancel ~reason
 (** Starts a child workflow and returns only its future. Callers that need to
     cancel explicitly should retain the handle returned by [start_handle]. *)
 let start ?scope ?cancellation_type ?retry_policy ?task_queue ?parent_close_policy
-    ?execution_timeout ?run_timeout ?task_timeout ?id_reuse_policy ~id
-    definition input =
+    ?execution_timeout ?run_timeout ?task_timeout ?id_reuse_policy ?memo
+    ?search_attributes ~id definition input =
   future
     (start_handle ?scope ?cancellation_type ?retry_policy ?task_queue
        ?parent_close_policy ?execution_timeout ?run_timeout ?task_timeout
-       ?id_reuse_policy ~id definition input)
+       ?id_reuse_policy ?memo ?search_attributes ~id definition input)
 
 (** Implements the direct-style child call as start followed by an effect-backed
     wait. Expected child and codec failures remain explicit [result] values. *)
 let execute ?scope ?cancellation_type ?retry_policy ?task_queue ?parent_close_policy
-    ?execution_timeout ?run_timeout ?task_timeout ?id_reuse_policy ~id
-    definition input =
+    ?execution_timeout ?run_timeout ?task_timeout ?id_reuse_policy ?memo
+    ?search_attributes ~id definition input =
   Future.await
     (start ?scope ?cancellation_type ?retry_policy ?task_queue
        ?parent_close_policy ?execution_timeout ?run_timeout ?task_timeout
-       ?id_reuse_policy ~id definition input)
+       ?id_reuse_policy ?memo ?search_attributes ~id definition input)

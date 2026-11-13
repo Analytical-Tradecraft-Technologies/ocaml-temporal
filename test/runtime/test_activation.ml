@@ -225,6 +225,7 @@ let test_child_workflow_cancellation () =
           retry_policy = None;
           cancellation_type = Activation.Child_wait_cancellation_requested;
           execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
         };
       Activation.Cancel_child_workflow { seq = 1L; reason = "no longer needed" };
     ]
@@ -318,6 +319,7 @@ let test_default_child_workflow_cancellation_policy () =
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
           execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
         };
       Activation.Cancel_child_workflow
         { seq = 1L; reason = "cancelled by workflow" };
@@ -706,6 +708,7 @@ let test_child_workflow_completion () =
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
           execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
         };
     ]
     (Execution.activate execution [ Activation.Start_workflow ]);
@@ -742,6 +745,7 @@ let test_child_workflow_retry_policy () =
               };
           cancellation_type = Activation.Child_try_cancel;
           execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
         };
     ]
     (Execution.activate execution [ Activation.Start_workflow ])
@@ -774,6 +778,7 @@ let test_child_workflow_concurrency_and_decoding () =
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
           execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
         };
       Activation.Schedule_activity
         {
@@ -937,6 +942,7 @@ let test_child_workflow_id_boundary () =
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
           execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
         };
     ]
     (Execution.activate execution [ Activation.Start_workflow ]);
@@ -1048,6 +1054,7 @@ let test_child_cancelled_before_start_acknowledgment () =
         retry_policy = None;
         cancellation_type = Activation.Child_try_cancel;
         execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
       }
   in
   let cancel_command =
@@ -1372,6 +1379,7 @@ let test_child_cancel_after_natural_completion_is_noop () =
           retry_policy = None;
           cancellation_type = Activation.Child_try_cancel;
           execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
         };
     ]
     (Workflow_context_store.take_commands context);

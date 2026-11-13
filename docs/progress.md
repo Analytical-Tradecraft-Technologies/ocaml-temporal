@@ -7010,3 +7010,25 @@ beside the run, the typed already-started refusal, and only accepted updates
 in history. The two processes coordinate through `python-ready` and
 `ocaml-with-start.json` in the shared evidence directory. The whole suite
 took 24 seconds locally against Temporal Server 1.32.2.
+
+## 2026-11-14: Child memo and search attributes
+
+`Child_workflow.start`, `start_handle` and `execute` take `?memo` and
+`?search_attributes` (#1135), as raw `(string * Payload.t)` lists like
+`Client.start`; typed values come from `Search_attribute.encode`. Their keys
+are checked by the rules `Workflow.upsert_memo` and continue-as-new already
+use, now in one private module. A bad key returns a ready typed defect before
+any command. An omitted or empty map leaves the start command byte-identical
+to earlier releases. The maps travel through the runtime command, the OCaml
+protocol, the completion schema and the Rust `StartChildWorkflow` decoder,
+which re-checks the keys and fills Core's `memo` and `search_attributes`
+fields instead of leaving them at their defaults. `Temporal.Testing` passes
+both maps to the child's start metadata. Bilateral exact-document tests pin
+the protocol. The `child_start_options` live regression now registers a
+keyword and starts a child with a memo and that keyword. The child reads both
+through `Workflow.start_metadata` before and after worker replacement,
+`Client.list_visibility` finds it by the keyword, and `Client.describe`
+reports both. Capture `live-2026-11-13-child-metadata` adds the parent and
+child histories to the corpus. With the child timeouts, reuse policy and
+typed timeout origin already merged, this completes the #1135 scope. Child
+cron schedules and headers stay out of scope.

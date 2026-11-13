@@ -890,6 +890,57 @@ let cron_start_delay_workflow =
            | Some (`Continue_as_new | `Retry) -> "other"
            | None -> "-")))
 
+(** {1 Child start metadata workflows (#1135)}
+
+    Frozen with the [corpus-v6-child-start-metadata] capture. *)
+
+let child_metadata_parent_workflow_type = "corpus.child_metadata_parent"
+let child_metadata_child_workflow_type = "corpus.child_metadata_child"
+
+(** The keyword search attribute the parent sets on its child. The capture
+    script registers it in the capture namespace before this generation
+    runs, because Temporal rejects an unknown attribute. *)
+let child_metadata_keyword = Temporal.Search_attribute.keyword "CorpusChildKeyword"
+
+(** [corpus.child_metadata_child]: returns
+    ["METADATA:<memo>/<keyword>"], the memo [corpus] value and the keyword it
+    reads through [Workflow.start_metadata], each ["-"] when absent. The
+    output depends only on its start event, so it is identical under
+    replay. *)
+let child_metadata_child_workflow =
+  Temporal.Workflow.define ~name:child_metadata_child_workflow_type
+    ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+      let open Temporal.Result_syntax in
+      let* metadata = Temporal.Workflow.start_metadata () in
+      let* memo =
+        match Option.bind metadata.memo (List.assoc_opt "corpus") with
+        | None -> Ok "-"
+        | Some payload -> Temporal.Codec.decode Temporal.Codec.string payload
+      in
+      let* keyword =
+        Temporal.Search_attribute.decode child_metadata_keyword
+          (Option.value metadata.search_attributes ~default:[])
+      in
+      Ok (Printf.sprintf "METADATA:%s/%s" memo (Option.value keyword ~default:"-")))
+
+(** [corpus.child_metadata_parent]: runs [corpus.child_metadata_child] with
+    the memo [corpus = "child-memo"] and [CorpusChildKeyword = "corpus"],
+    under a child ID derived from the parent's own workflow ID, and returns
+    the child's report. *)
+let child_metadata_parent_workflow =
+  Temporal.Workflow.define ~name:child_metadata_parent_workflow_type
+    ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+      let open Temporal.Result_syntax in
+      let* info = Temporal.Workflow.info () in
+      let* memo = Temporal.Codec.encode Temporal.Codec.string "child-memo" in
+      let* search_attributes =
+        Temporal.Search_attribute.encode
+          [ Temporal.Search_attribute.set child_metadata_keyword "corpus" ]
+      in
+      Temporal.Child_workflow.execute
+        ~id:(Temporal.Workflow.Info.workflow_id info ^ "-child")
+        ~memo:[ ("corpus", memo) ] ~search_attributes child_metadata_child_workflow ())
+
 (** {1 Reused fixture definitions} *)
 
 (** The corrected generation of [test/integration/temporal/task_failure]. The
@@ -967,6 +1018,8 @@ let definition_sets =
       [ plain (random_parent ~reordered:true); plain random_child_workflow ] );
     ("corpus-v4-continue-as-new-options", [ plain continue_as_new_options_workflow ]);
     ("corpus-v5-cron-start-delay", [ plain cron_start_delay_workflow ]);
+    ( "corpus-v6-child-start-metadata",
+      [ plain child_metadata_parent_workflow; plain child_metadata_child_workflow ] );
   ]
 
 (** Set names in declaration order. *)

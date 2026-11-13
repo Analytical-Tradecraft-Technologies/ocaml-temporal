@@ -1102,7 +1102,7 @@ let command_to_protocol command =
   | Activation.Start_child_workflow
       { seq; id; name; input; retry_policy; cancellation_type; task_queue;
         parent_close_policy; execution_timeout; run_timeout; task_timeout;
-        id_reuse_policy } ->
+        id_reuse_policy; memo; search_attributes } ->
       let* () = validate_sequence "$.command.seq" seq in
       let* () = validate_identifier "$.command.id" id in
       let* () = validate_identifier "$.command.name" name in
@@ -1132,6 +1132,18 @@ let command_to_protocol command =
             | Activation.Reuse_reject_duplicate -> Protocol.Reuse_reject_duplicate)
           id_reuse_policy
       in
+      (* An unset map stays [None] so the command encodes as before. *)
+      let optional_map ~path ~label = function
+        | None -> Ok None
+        | Some values ->
+            let* values = protocol_payload_map ~path ~label values in
+            Ok (Some values)
+      in
+      let* memo = optional_map ~path:"$.command.memo" ~label:"memo" memo in
+      let* search_attributes =
+        optional_map ~path:"$.command.search_attributes"
+          ~label:"search-attribute" search_attributes
+      in
       Ok
         (Protocol.Start_child_workflow
            {
@@ -1146,6 +1158,8 @@ let command_to_protocol command =
              run_timeout;
              task_timeout;
              id_reuse_policy;
+             memo;
+             search_attributes;
            })
   | Activation.Cancel_child_workflow { seq; reason } ->
       let* () = validate_sequence "$.command.seq" seq in
