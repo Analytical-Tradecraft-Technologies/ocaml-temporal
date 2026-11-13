@@ -88,6 +88,42 @@ let current_owner_matches id =
     tests to prove that drains leave no binding behind. *)
 let bound_owner_count () = Thread_binding.bound_count current_owner_id
 
+(** Marks the calling system thread as running a read-only callback: an
+    update validator or a query handler (#513). The marker is thread-keyed
+    for the same reason as {!current_owner_id}, and holds no value because
+    it only records the extent. Scheduler-owned futures consult it before
+    they would queue work, allocate a pending future, or register an
+    observer, so a callback that replay skips cannot leave scheduler state
+    behind for a later drain to act on. *)
+let read_only_marker = Thread_binding.create ()
+
+(** True inside a {!with_read_only} extent on the calling system thread. *)
+let in_read_only () = Option.is_some (Thread_binding.get read_only_marker)
+
+(** Raises [Invalid_argument] naming [operation] inside a read-only extent.
+    Reaching it is a programmer error: the public operations that can be
+    misused there either check first and return their own typed defect, or
+    document this exception, and nothing has been mutated when it is raised. *)
+let reject_in_read_only ~operation =
+  if in_read_only () then
+    invalid_arg
+      ("Temporal " ^ operation
+     ^ " cannot be used in a read-only update validator or query handler")
+
+(** Runs [action] as a read-only callback: the marker is set and the
+    scheduler owner id is cleared, so {!await} cannot suspend on any pending
+    future (it returns the future's outside error, as for a query) and owner
+    checks such as scope cancellation and condition waits fail closed. Both
+    bindings are restored when [action] returns or raises; nesting restores
+    them in LIFO order. *)
+let with_read_only action =
+  Thread_binding.with_value read_only_marker (Some ()) (fun () ->
+      with_current_owner_id None action)
+
+(** Number of threads on the calling Domain inside a read-only extent; tests
+    use it to prove every extent removed its marker. *)
+let bound_read_only_count () = Thread_binding.bound_count read_only_marker
+
 (** Internal exception used only to release a paused fiber during shutdown. It
     is caught inside this module and never becomes a workflow error. *)
 exception Scheduler_shutdown
@@ -248,6 +284,10 @@ let subscribe promise observer =
   let registration =
     match promise.state with
     | Pending pending ->
+        (* A pending observer would run in a later drain on the live path
+           only; a ready one is queued through the owner, which performs the
+           same read-only check for a scheduler owner. *)
+        reject_in_read_only ~operation:"future observer registration";
         Some (Temporal_base.Ordered_registry.add pending.observers token)
     | Ready result ->
         promise.owner.enqueue (deliver result);

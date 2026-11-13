@@ -7356,9 +7356,19 @@ mod runtime_release_bound;
 #[path = "../tests/support/worker_shutdown_outcomes.rs"]
 mod worker_shutdown_outcomes;
 
+/// gRPC double shared by the in-crate live-worker tests below; a file may
+/// be loaded as a module only once.
+#[cfg(test)]
+#[path = "../tests/support/grpc_double.rs"]
+mod grpc_double;
+
 #[cfg(test)]
 #[path = "../tests/support/worker_shutdown_drain_timeout.rs"]
 mod worker_shutdown_drain_timeout;
+
+#[cfg(test)]
+#[path = "../tests/support/real_processing_thread_detach.rs"]
+mod real_processing_thread_detach;
 
 /// SDK name reported to Temporal as the `client-name` RPC header and recorded
 /// in `WorkflowTaskCompleted.sdk_metadata`. Core would otherwise attribute
