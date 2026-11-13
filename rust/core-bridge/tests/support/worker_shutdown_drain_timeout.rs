@@ -22,10 +22,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[path = "grpc_double.rs"]
-mod grpc_double;
-
-use grpc_double::Reply;
+use super::grpc_double::{self, Reply};
 
 /// Drain bound installed on the worker in place of the 90-second production
 /// bound.

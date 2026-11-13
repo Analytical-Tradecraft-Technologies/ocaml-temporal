@@ -448,7 +448,11 @@ pub enum BoundedFinalize {
     /// it only while it awaits asynchronously: Core's `finalize_shutdown`
     /// joins its workflow processing thread in `spawn_blocking`, and a Tokio
     /// runtime's drop waits for blocking-pool closures without a bound, so
-    /// that drop waits for the thread to exit (#1149).
+    /// that drop waits for the thread to exit (#1149). The bridge's own
+    /// paths finalize only after a drain that observed the workflow poll's
+    /// `ShutDown`, which Core reports once that thread's stream has ended,
+    /// so the explicit releases bound this wait defensively (see
+    /// `real_processing_thread_detach.rs`).
     Detached,
 }
 
