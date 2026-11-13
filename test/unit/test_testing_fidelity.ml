@@ -174,6 +174,57 @@ let test_task_failure_retry () =
         (expect_error "closed run" `Defect
            (T.Testing.signal handle note_signal "late")))
 
+(** Whether [patched_workflow] and [mutating_workflow] still fail their
+    second workflow task (deliberate process state, as for [broken]). *)
+let replay_broken = ref true
+
+(** Takes the patched branch in its first task, then fails its second task
+    while [replay_broken] is set and reports which branch the first task
+    took. The retry replays the first task, which must take the same
+    branch. *)
+let patched_workflow =
+  T.Workflow.define ~name:"patched_retry" ~input:T.Codec.unit
+    ~output:T.Codec.string (fun () ->
+      let branch = if T.Workflow.patched ~id:"v2" then "new" else "old" in
+      let* () = T.Workflow.sleep (minutes 1L) in
+      if !replay_broken then failwith "patched bug";
+      Ok branch)
+
+(** Records its input, then mutates the decoded bytes in place before
+    failing its second task while [replay_broken] is set. A rebuild must
+    decode a fresh input, so the replayed first task records the original. *)
+let mutating_workflow =
+  T.Workflow.define ~name:"mutating_retry" ~input:T.Codec.bytes
+    ~output:T.Codec.string (fun input ->
+      let seen = Bytes.to_string input in
+      Bytes.set input 0 'X';
+      let* () = T.Workflow.sleep (minutes 1L) in
+      if !replay_broken then failwith "mutating bug";
+      Ok seen)
+
+(** A retried run replays with the patch markers it recorded, so
+    [Workflow.patched] keeps its answer, and with a freshly decoded input,
+    so a run-local mutation does not leak into the rebuild (#1347). *)
+let test_retry_replay_fidelity () =
+  replay_broken := true;
+  with_environment ~workflow_task_failure:`Retry
+    ~workflows:
+      [ T.Testing.workflow patched_workflow; T.Testing.workflow mutating_workflow ]
+    ~activities:[] (fun environment ->
+      let patched = ok "start patched" (T.Testing.start environment patched_workflow ()) in
+      let mutating =
+        ok "start mutating"
+          (T.Testing.start environment mutating_workflow (Bytes.of_string "abc"))
+      in
+      ignore (expect_error "patched stuck" `Defect (T.Testing.result patched));
+      ignore (expect_error "mutating stuck" `Defect (T.Testing.result mutating));
+      replay_broken := false;
+      ok "retry" (T.Testing.retry_workflow_tasks environment);
+      expect_string "patched branch survives replay" "new"
+        (ok "patched result" (T.Testing.result patched));
+      expect_string "replay sees the original input" "abc"
+        (ok "mutating result" (T.Testing.result mutating)))
+
 (* --- Start memo and search attributes ----------------------------------- *)
 
 (** Upserts one memo key and reports the memo keys the run started with. *)
@@ -528,6 +579,7 @@ let test_workflow_timeouts () =
 
 let () =
   test_task_failure_retry ();
+  test_retry_replay_fidelity ();
   test_start_metadata ();
   test_id_policies ();
   test_child_reuse_policy ();

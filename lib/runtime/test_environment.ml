@@ -178,7 +178,9 @@ type chain = {
 
     [execution] is replaced when a failed workflow task is retried
     (#1160): [make_execution] builds a fresh execution with the run's
-    original identity, seed and start snapshot, and [history] (newest
+    original identity, seed and start snapshot from a freshly decoded copy
+    of its start input (so a run-local mutation of the decoded input never
+    reaches a rebuild), or returns the decoder's error, and [history] (newest
     first) holds the activations it has completed, which a rebuild replays
     before delivering the failed task again. [history] is recorded only in
     {!Retry_task} mode. [stuck] holds the failure and jobs of a workflow
@@ -192,7 +194,7 @@ and run = {
   workflow_type : string;
   chain : chain;
   mutable execution : execution;
-  make_execution : unit -> execution;
+  make_execution : unit -> (execution, Error.t) result;
   mutable history : recorded_activation list;
   mutable stuck : (Error.t * Activation.job list) option;
   mutable run_timeout_event : event option;
@@ -220,10 +222,12 @@ and run = {
 
 (** One completed activation kept for replay: its jobs (with rejected
     updates removed and accepted ones marked as not needing validation, as
-    Core replays them from history), the virtual time it was stamped with,
-    and the history length it reported. *)
+    Core replays them from history), the patch IDs whose markers its
+    commands recorded, the virtual time it was stamped with, and the history
+    length it reported. *)
 and recorded_activation = {
   recorded_jobs : Activation.job list;
+  recorded_patches : string list;
   recorded_at_ms : int64;
   recorded_history_length : int;
 }
@@ -740,8 +744,10 @@ let protocol_retry_policy (policy : Activation.retry_policy) :
     reports an empty one as absent, as for a start that sets none.
 
     The execution is built by [make_execution], which captures the run's
-    identity, seed and start snapshot once, so a retried workflow task
-    (#1160) rebuilds an identical execution. A chain run timeout starts the
+    identity, seed and start snapshot once and decodes a fresh copy of the
+    start input on every call, so a retried workflow task (#1160) rebuilds
+    an identical execution that never sees a mutation an earlier execution
+    made to its decoded input. A chain run timeout starts the
     run's [Run_timeout] event, measured, as the server measures it, from the
     run's creation plus its first-task delay. *)
 let create_run ?(attempt = 1) ?delay_ms
@@ -819,7 +825,7 @@ let create_run ?(attempt = 1) ?delay_ms
             }
           in
           let task_queue = chain.task_queue in
-          let make_execution () =
+          let build decoded =
             let execution =
               Execution.start ~task_queue ~namespace:environment.namespace
                 ~randomness_seed ~signal_handlers ~query_handlers
@@ -829,12 +835,26 @@ let create_run ?(attempt = 1) ?delay_ms
             Execution.set_run_info execution (Some run_info);
             Execution execution
           in
+          (* Decodes a copy of the payload, so even a codec that aliases the
+             payload bytes yields an input no earlier execution has seen. *)
+          let make_execution () =
+            match
+              Codec.decode (Definition.input definition)
+                { input with data = Bytes.copy input.data }
+            with
+            | Ok decoded -> Ok (build decoded)
+            | Error error -> Error error
+            | exception exn ->
+                Error
+                  (defect
+                     ("workflow input decoder raised: " ^ Printexc.to_string exn))
+          in
           let run =
             {
               run_id;
               workflow_type;
               chain;
-              execution = make_execution ();
+              execution = build decoded;
               make_execution;
               history = [];
               stuck = None;
@@ -1982,13 +2002,14 @@ and activate ?(counts_toward_history = true) environment run jobs =
       if
         counts_toward_history && Option.is_none failure
         && environment.task_failure_mode = Retry_task
-      then record_activation environment run jobs
+      then record_activation environment run jobs commands
 
 (** Appends a completed activation to [run]'s replay history, shaped as
     Core replays it: an update the validator rejected leaves no history and
-    is dropped, and an accepted one is replayed without running its
-    validator again. *)
-and record_activation environment run jobs =
+    is dropped, an accepted one is replayed without running its validator
+    again, and the patch markers the activation's [commands] recorded are
+    kept so the replay can announce them. *)
+and record_activation environment run jobs commands =
   let replayable =
     List.filter_map
       (function
@@ -2003,6 +2024,12 @@ and record_activation environment run jobs =
   run.history <-
     {
       recorded_jobs = replayable;
+      recorded_patches =
+        List.filter_map
+          (function
+            | Activation.Set_patch_marker { patch_id; _ } -> Some patch_id
+            | _ -> None)
+          commands;
       recorded_at_ms = environment.now_ms;
       recorded_history_length = run.history_length;
     }
@@ -2013,20 +2040,35 @@ and record_activation environment run jobs =
     recorded activation is delivered again with its original timestamp and
     history length while the execution reports that it is replaying, and
     the commands it emits are discarded because they were already applied.
-    The replay does not compare those commands with the recorded ones, so
-    nondeterminism is not detected here. Returns the task failure when the
-    replay itself fails, leaving the rebuilt execution in place. *)
+    An activation whose commands recorded patch markers is preceded by a
+    [Notify_has_patch] job for each, placed after initialization as Core
+    orders them, so [Workflow.patched] answers [true] on replay exactly as
+    when the marker was recorded. The replay does not compare commands with
+    the recorded ones, so nondeterminism is not detected here. Returns the
+    task failure when the replay itself fails, leaving the rebuilt execution
+    in place, or the input decoder's error, leaving the previous one. *)
 and rebuild run =
+  let* fresh = run.make_execution () in
   let (Execution previous) = run.execution in
   Execution.shutdown previous;
-  run.execution <- run.make_execution ();
+  run.execution <- fresh;
   let (Execution execution) = run.execution in
+  let with_patches record =
+    let notifications =
+      List.map
+        (fun patch_id -> Activation.Notify_has_patch { patch_id })
+        record.recorded_patches
+    in
+    match record.recorded_jobs with
+    | (Activation.Start_workflow as start) :: rest -> start :: (notifications @ rest)
+    | jobs -> notifications @ jobs
+  in
   let rec replay = function
     | [] -> Ok ()
     | record :: rest -> (
         stamp_activation execution ~at_ms:record.recorded_at_ms ~replaying:true
           ~history_length:record.recorded_history_length;
-        ignore (Execution.activate execution record.recorded_jobs);
+        ignore (Execution.activate execution (with_patches record));
         match Execution.task_failure execution with
         | Some error -> Error error
         | None -> replay rest)
