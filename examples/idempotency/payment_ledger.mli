@@ -18,8 +18,9 @@
     so that worker processes, a replacement worker after a crash, and a
     checking driver can share the ledger across process boundaries without
     any other dependency. It is an example, not a production store: it
-    assumes a local file system with POSIX hard-link semantics, and it is
-    not designed for many concurrent writers or very many keys. *)
+    assumes a local file system with hard links that fail atomically when
+    the target exists (POSIX file systems and NTFS), and it is not designed
+    for many concurrent writers or very many keys. *)
 
 (** A ledger rooted at one directory. The value holds only the path; every
     operation reads or writes the directory, so separate processes that open
@@ -95,7 +96,10 @@ val directory : t -> string
     After answering, the request is appended to the ledger's journal. The
     journal is an audit trail for diagnosis and tests, not part of the
     contract: a process that dies between publishing a record and appending
-    its journal line leaves the record without that line.
+    its journal line leaves the record without that line. Appends from
+    concurrent Domains and processes never lose or interleave lines; on
+    Windows, where OCaml's [O_APPEND] is not atomic, they are made under an
+    exclusive file lock.
 
     [key] must be non-empty. An [Error] reports an invalid key or a
     file-system failure; the request may then be retried with the same key,

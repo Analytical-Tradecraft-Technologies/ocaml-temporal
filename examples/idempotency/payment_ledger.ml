@@ -161,9 +161,29 @@ let sync_directory ledger =
         ~finally:(fun () -> Unix.close descriptor)
         (fun () -> try Unix.fsync descriptor with Unix.Unix_error _ -> ())
 
-(** Removes a temporary file, ignoring a file that is already gone. *)
+(** Removes a temporary file, ignoring a file that is already gone. It never
+    raises, because it runs in a cleanup handler after the outcome is
+    decided: a temporary file it cannot remove is harmless, since nothing
+    reads [partial-] files.
+
+    On Windows, a published record and its temporary file are two names of
+    one file, and a file opened by OCaml's channels does not allow deletion
+    while open. Removing the temporary name therefore fails with [EACCES]
+    while another Domain or process is reading the record; the removal is
+    retried for up to about a second, which covers any read of a small
+    record. *)
 let remove_quietly path =
-  try Unix.unlink path with Unix.Unix_error (Unix.ENOENT, _, _) -> ()
+  let rec attempt remaining =
+    match Unix.unlink path with
+    | () -> ()
+    | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ()
+    | exception Unix.Unix_error ((Unix.EACCES | Unix.EBUSY), _, _)
+      when Sys.win32 && remaining > 0 ->
+        Unix.sleepf 0.005;
+        attempt (remaining - 1)
+    | exception Unix.Unix_error _ -> ()
+  in
+  attempt 200
 
 let string_of_outcome_kind = function
   | Committed_kind -> "committed"
@@ -185,9 +205,39 @@ let outcome_kind = function
   | Duplicate _ -> Duplicate_kind
   | Conflict _ -> Conflict_kind
 
-(** Appends one journal line in a single [write] and syncs it. Each line is
-    written whole by one call on a file opened for appending, so lines from
-    concurrent requests do not interleave on a local file system. *)
+(** Serializes journal appends made by this process's Domains. Windows needs
+    it (see {!append_journal}); on POSIX systems [O_APPEND] already makes
+    each [write] land whole at the end, and the lock only orders this
+    process's appends. *)
+let journal_mutex = Mutex.create ()
+
+(** Runs [f] holding an exclusive lock on the whole of the journal file
+    open as [descriptor], so appends from separate processes cannot
+    overwrite each other. The lock spans offset 0 to the end of any
+    possible file ([lockf] with length 0 from offset 0), so every process
+    locks the same region whatever its file position, and it is released
+    explicitly before the descriptor is closed. *)
+let with_journal_file_lock descriptor f =
+  ignore (Unix.lseek descriptor 0 Unix.SEEK_SET);
+  Unix.lockf descriptor Unix.F_LOCK 0;
+  Fun.protect
+    ~finally:(fun () ->
+      ignore (Unix.lseek descriptor 0 Unix.SEEK_SET);
+      Unix.lockf descriptor Unix.F_ULOCK 0)
+    f
+
+(** Appends one journal line and syncs it, so concurrent requests from any
+    Domain or process never lose or interleave lines.
+
+    On POSIX systems the file is opened with [O_APPEND], which makes the
+    single [write] of a line land whole at the end of the file. OCaml's
+    Windows [Unix] library opens an [O_APPEND] file with write access and
+    only moves the file position to the end at open time, so two handles
+    writing at once overwrite each other's lines. On Windows the write is
+    therefore made under an exclusive [lockf] lock (a [LockFileEx] lock,
+    which excludes other handles in this and other processes) after seeking
+    to the current end. {!journal_mutex} orders this process's own Domains
+    on every platform. *)
 let append_journal ledger ~key correlation kind =
   let { workflow_id; run_id; activity_id; attempt; worker } = correlation in
   let line =
@@ -195,17 +245,25 @@ let append_journal ledger ~key correlation kind =
       attempt worker
       (string_of_outcome_kind kind)
   in
-  let descriptor =
-    Unix.openfile
-      (Filename.concat ledger.directory journal_name)
-      [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_APPEND; Unix.O_CLOEXEC ]
-      0o644
-  in
-  Fun.protect
-    ~finally:(fun () -> Unix.close descriptor)
-    (fun () ->
-      write_all descriptor line;
-      Unix.fsync descriptor)
+  Mutex.protect journal_mutex (fun () ->
+      let descriptor =
+        Unix.openfile
+          (Filename.concat ledger.directory journal_name)
+          [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_APPEND; Unix.O_CLOEXEC ]
+          0o644
+      in
+      Fun.protect
+        ~finally:(fun () -> Unix.close descriptor)
+        (fun () ->
+          let append () =
+            write_all descriptor line;
+            Unix.fsync descriptor
+          in
+          if Sys.win32 then
+            with_journal_file_lock descriptor (fun () ->
+                ignore (Unix.lseek descriptor 0 Unix.SEEK_END);
+                append ())
+          else append ()))
 
 (** Validates a key before any file is touched. *)
 let check_key key =

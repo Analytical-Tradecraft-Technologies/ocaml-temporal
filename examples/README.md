@@ -240,7 +240,11 @@ request for K therefore performs the posting, and every later request gets
 the original record back as a `Duplicate`. A later request for K with a
 different posting is a `Conflict`, an application defect. Real payment APIs,
 a unique constraint written in the same transaction as the effect, or a
-conditional write provide the same contract.
+conditional write provide the same contract. The ledger works on Linux,
+macOS and Windows (NTFS hard links fail atomically too). Its request journal,
+a diagnostic audit trail, is appended under a process-wide mutex and, on
+Windows, where OCaml's `O_APPEND` is not atomic, under an exclusive file
+lock, so concurrent Domains and processes never lose a line.
 
 [`idempotent_payments.ml`](idempotency/idempotent_payments.ml) holds the
 Temporal side:
