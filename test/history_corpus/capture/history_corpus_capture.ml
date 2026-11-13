@@ -278,6 +278,49 @@ let corpus_v4_continue_as_new_options client =
     record ~case:"continue-as-new-options-second" ~workflow_type second;
   ]
 
+(** Scenarios captured by the [corpus-v5-cron-start-delay] generation
+    (#1158): a root run started with a start delay, and the first two runs of
+    a cron chain. The chain is terminated once its second run has closed, so
+    no scheduled run outlives the capture. *)
+let corpus_v5_cron_start_delay client =
+  let workflow_type = Defs.cron_start_delay_workflow_type in
+  let workflow = remote workflow_type Temporal.Codec.string Temporal.Codec.string in
+  let delayed =
+    require "start delayed"
+      (Temporal.Client.start client ~workflow ~task_queue:Defs.task_queue
+         ~id:"history-corpus-start-delay" ~start_delay:(Temporal.Duration.of_seconds 2L)
+         ~input:"delayed" ())
+  in
+  let observed = expect_completed "start delay" delayed in
+  if observed <> "CRON:-/delayed/-" then failwith ("delayed run observed " ^ observed);
+  let schedule = "@every 2s" in
+  let first =
+    require "start cron"
+      (Temporal.Client.start client ~workflow ~task_queue:Defs.task_queue
+         ~id:"history-corpus-cron" ~cron_schedule:schedule ~input:"cron" ())
+  in
+  let successor =
+    match require "cron first wait" (Temporal.Client.wait first) with
+    | Temporal.Client.Completed { output; successor = Some successor }
+      when output = "CRON:" ^ schedule ^ "/delayed/-" ->
+        successor
+    | Temporal.Client.Completed { output; _ } -> failwith ("cron first run observed " ^ output)
+    | _ -> failwith "cron first run did not complete"
+  in
+  let second = require "follow cron successor" (Temporal.Client.follow client ~workflow successor) in
+  let observed = expect_completed "cron second run" second in
+  if observed <> "CRON:" ^ schedule ^ "/delayed/cron" then
+    failwith ("cron second run observed " ^ observed);
+  require "terminate cron chain"
+    (Result.bind
+       (Temporal.Client.get_handle client ~workflow ~id:"history-corpus-cron" ())
+       (Temporal.Client.terminate ~reason:"history corpus capture complete"));
+  [
+    record ~case:"start-delay" ~workflow_type delayed;
+    record ~case:"cron-first" ~workflow_type first;
+    record ~case:"cron-second" ~workflow_type second;
+  ]
+
 (** Captures one [corpus.patch] run under the current generation. *)
 let patch client ~case =
   let workflow_type = Defs.patch_workflow_type in
@@ -407,6 +450,7 @@ let scenarios generation client =
   | "corpus-v2-cancellation" -> corpus_v2_cancellation client
   | "corpus-v3-random" -> corpus_v3_random client
   | "corpus-v4-continue-as-new-options" -> corpus_v4_continue_as_new_options client
+  | "corpus-v5-cron-start-delay" -> corpus_v5_cron_start_delay client
   | other -> failwith ("generation has no capture scenarios: " ^ other)
 
 (** Converts a definition-set entry to a live worker registration. *)

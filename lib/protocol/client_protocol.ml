@@ -63,6 +63,8 @@ type start_request = {
   run_timeout_ms : int64 option;
   task_timeout_ms : int64 option;
   retry_policy : Workflow.retry_policy option;
+  cron_schedule : string option;
+  start_delay_ms : int64 option;
   rpc_deadline : rpc_deadline option;
 }
 
@@ -431,6 +433,36 @@ let rpc_timeout_member = function
   | Some { timeout_ms = milliseconds; _ } ->
       Ok [ ("rpc_timeout_ms", `Intlit (Int64.to_string milliseconds)) ]
 
+(** Validates the cron schedule and start delay of a start request (#1158)
+    and returns their JSON members, mirroring Rust's
+    [validate_start_schedule]: a schedule is a bounded identifier (Temporal
+    parses the expression itself), a delay is positive and no longer than a
+    workflow timeout, and the two are never combined, which Temporal
+    refuses. Absent options are omitted. *)
+let start_schedule_members (value : start_request) =
+  let* cron =
+    match value.cron_schedule with
+    | None -> Ok []
+    | Some schedule ->
+        let* () = validate_identifier "$.cron_schedule" schedule in
+        Ok [ ("cron_schedule", json_string schedule) ]
+  in
+  let* delay =
+    match value.start_delay_ms with
+    | None -> Ok []
+    | Some milliseconds when Int64.compare milliseconds 0L <= 0 ->
+        Error (invalid ~path:"$.start_delay_ms" "start delay must be positive")
+    | Some milliseconds when Int64.compare milliseconds max_workflow_timeout_ms > 0 ->
+        Error (invalid ~path:"$.start_delay_ms" "start delay exceeds its maximum")
+    | Some _ when Option.is_some value.cron_schedule ->
+        Error
+          (invalid ~path:"$.start_delay_ms"
+             "start delay cannot be combined with a cron schedule")
+    | Some milliseconds ->
+        Ok [ ("start_delay_ms", `Intlit (Int64.to_string milliseconds)) ]
+  in
+  Ok (cron @ delay)
+
 (** Validates the workflow execution policies of a start request and returns
     their JSON members, mirroring Rust's [validate_start_policies]: every
     timeout is positive and bounded, the run timeout does not exceed the
@@ -488,10 +520,11 @@ let start_policy_members (value : start_request) =
     | Allow_duplicate_failed_only -> "allow_duplicate_failed_only"
     | Reject_duplicate -> "reject_duplicate"
   in
+  let* schedule = start_schedule_members value in
   let* rpc = rpc_timeout_member value.rpc_deadline in
   Ok
     ((("id_reuse_policy", json_string reuse) :: execution)
-    @ run @ task @ retry @ rpc)
+    @ run @ task @ retry @ schedule @ rpc)
 
 (** Validates one start request and builds its closed JSON object without
     serializing it, so signal-with-start and update-with-start (#1151) can
@@ -1760,8 +1793,22 @@ let encode_signal_with_start_request (value : signal_with_start_request) =
 
 (** Serializes one update-with-start request (#1151): the start document
     under ["start"], plus the update. The update never names a run: Temporal
-    resolves the run the start creates or attaches to. *)
+    resolves the run the start creates or attaches to. Temporal refuses a
+    cron schedule or start delay on this operation's start, so both are
+    rejected here before anything crosses the bridge (#1158). *)
 let encode_update_with_start_request (value : update_with_start_request) =
+  let* () =
+    match (value.start.cron_schedule, value.start.start_delay_ms) with
+    | Some _, _ ->
+        Error
+          (invalid ~path:"$.start.cron_schedule"
+             "update-with-start does not accept a cron schedule")
+    | None, Some _ ->
+        Error
+          (invalid ~path:"$.start.start_delay_ms"
+             "update-with-start does not accept a start delay")
+    | None, None -> Ok ()
+  in
   let* start = start_request_json value.start in
   let* () = validate_identifier "$.update_id" value.update_id in
   let* () = validate_identifier "$.update_name" value.update_name in

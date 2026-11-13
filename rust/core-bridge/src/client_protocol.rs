@@ -264,6 +264,16 @@ pub struct StartWorkflowRequest {
     /// Temporal's default for workflows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_policy: Option<workflow_protocol::RetryPolicy>,
+    /// Cron schedule of the workflow chain (#1158). Absent means no cron
+    /// schedule. Temporal parses the expression and rejects an invalid one;
+    /// the bridge only bounds it like every other identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_schedule: Option<String>,
+    /// Delay before Temporal dispatches the run's first workflow task, in
+    /// milliseconds (#1158). Absent means no delay. It cannot be combined
+    /// with [`StartWorkflowRequest::cron_schedule`], which Temporal rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_delay_ms: Option<u64>,
     /// Caller-selected total budget of this start RPC in milliseconds,
     /// replacing [`START_RPC_TIMEOUT`]. It bounds only the client call, never
     /// the workflow, so it is excluded from [`same_start_request`].
@@ -2491,8 +2501,10 @@ fn start_execution_request(
         workflow_run_timeout: optional_milliseconds_to_core(request.run_timeout_ms)?,
         workflow_task_timeout: optional_milliseconds_to_core(request.task_timeout_ms)?,
         retry_policy,
-        // Cron schedules and start delays are deliberately not sent:
-        // OCaml workers reject them (#499 keeps them deferred).
+        // An absent schedule is Temporal's empty string; validation already
+        // refused an explicit empty one and its combination with a delay.
+        cron_schedule: request.cron_schedule.clone().unwrap_or_default(),
+        workflow_start_delay: optional_milliseconds_to_core(request.start_delay_ms)?,
         ..Default::default()
     })
 }
@@ -2974,6 +2986,40 @@ fn validate_start_policies(value: &StartWorkflowRequest) -> Result<(), protocol:
     }
     if let Some(policy) = &value.retry_policy {
         workflow_protocol::validate_retry_policy(policy, "$.retry_policy")?;
+    }
+    validate_start_schedule(value)
+}
+
+/// Validates the cron schedule and start delay of a start request (#1158).
+///
+/// A schedule is bounded like every identifier; Temporal parses the cron
+/// expression itself and answers an invalid one with `invalid_argument`. A
+/// delay must be positive, because Temporal reads zero as "no delay", and no
+/// longer than a workflow timeout. Temporal refuses a request carrying both,
+/// so the bridge rejects that combination before any RPC.
+fn validate_start_schedule(value: &StartWorkflowRequest) -> Result<(), protocol::ProtocolError> {
+    if let Some(schedule) = &value.cron_schedule {
+        validate_identifier(schedule, "$.cron_schedule")?;
+    }
+    if let Some(milliseconds) = value.start_delay_ms {
+        if milliseconds == 0 {
+            return Err(protocol::ProtocolError::invalid(
+                "$.start_delay_ms",
+                "start delay must be positive",
+            ));
+        }
+        if milliseconds > MAX_WORKFLOW_TIMEOUT_MS {
+            return Err(protocol::ProtocolError::invalid(
+                "$.start_delay_ms",
+                "start delay exceeds its maximum",
+            ));
+        }
+        if value.cron_schedule.is_some() {
+            return Err(protocol::ProtocolError::invalid(
+                "$.start_delay_ms",
+                "start delay cannot be combined with a cron schedule",
+            ));
+        }
     }
     Ok(())
 }
@@ -4942,3 +4988,7 @@ mod client_error_tests;
 #[cfg(test)]
 #[path = "../tests/support/client_current_run.rs"]
 mod current_run_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/client_start_schedule.rs"]
+mod start_schedule_tests;

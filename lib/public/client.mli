@@ -382,9 +382,36 @@ val create :
     namespace with matching server types. Workers
     can read the recorded values through {!Workflow.val-start_metadata}.
 
-    This client does not expose cron schedules or delayed starts. OCaml
-    workers reject cron and nonzero root start delay; do not start those
-    policies from another SDK on a queue served by this worker.
+    [start_delay] asks Temporal to wait that long before dispatching the
+    run's first workflow task (#1158). The run and its handle exist at once,
+    so signals, cancellation and termination can address it during the
+    delay. Temporal may dispatch the first task early when the run is
+    signalled during the delay (its rules differ between {!signal} and
+    {!signal_with_start} and between server versions), so do not treat the
+    delay as an exact lower bound for a signalled run. The delay must be
+    positive and no longer than a workflow timeout. Workflow code reads it through
+    {!Workflow.Info.first_workflow_task_backoff}; {!Workflow.Info.start_time}
+    remains the time Temporal accepted the start, so the first activation's
+    {!Workflow.now} is at least the delay later.
+
+    [cron_schedule] makes this a cron workflow chain (#1158): Temporal
+    delays the first run to the next scheduled time and, whenever a run
+    closes, starts the next one on schedule with the same workflow ID,
+    input, and options, until the chain is terminated, cancelled, or reaches
+    its [execution_timeout]. The expression uses Temporal's cron syntax
+    (five standard fields, or a descriptor such as ["@every 30s"]); Temporal
+    validates it and answers an invalid one with an error whose
+    {!val-rpc_status} is [Some `Invalid_argument]. Each run after the first
+    reports [`Cron_schedule] from {!Workflow.Info.val-continuation_initiator}, and
+    every run reads the schedule from {!Workflow.Info.cron_schedule}. A
+    current-run {!wait} never ends while the schedule keeps starting runs;
+    an exact-run {!wait} reports a run's own close, with the next scheduled
+    run as its successor. [cron_schedule] and [start_delay] are mutually
+    exclusive, as in Temporal, and an empty or malformed schedule string or
+    a zero delay is a typed defect returned before anything is sent.
+    Temporal Schedules, the newer replacement for cron workflows, are not
+    exposed by this client.
+
     Server-applied workflow/retry continuation backoff, timeouts, and
     execution expiration metadata are preserved.
 
@@ -406,6 +433,8 @@ val start :
   ?run_timeout:Duration.t ->
   ?task_timeout:Duration.t ->
   ?retry_policy:Retry_policy.t ->
+  ?cron_schedule:string ->
+  ?start_delay:Duration.t ->
   ?rpc_timeout:Duration.t ->
   workflow:('input, 'output) Workflow.t ->
   task_queue:string ->
@@ -445,6 +474,10 @@ val start :
     recognized by {!is_start_outcome_uncertain}, and in-flight calls count
     against [max_pending_starts] like starts.
 
+    [start_delay] and [cron_schedule] apply only to a run this call starts;
+    the signal is delivered with that run's first workflow task, after the
+    delay or at the first scheduled time.
+
     The deterministic [mock://] client applies the start as {!start} does and
     records the signal on the resulting run. Older Temporal servers that do
     not report whether the run was created make {!val-started} [false] under
@@ -460,6 +493,8 @@ val signal_with_start :
   ?run_timeout:Duration.t ->
   ?task_timeout:Duration.t ->
   ?retry_policy:Retry_policy.t ->
+  ?cron_schedule:string ->
+  ?start_delay:Duration.t ->
   ?rpc_timeout:Duration.t ->
   workflow:('input, 'output) Workflow.t ->
   task_queue:string ->
@@ -478,7 +513,8 @@ val signal_with_start :
     [`Terminate_existing] replaces an open run first, and [`Fail] refuses an
     open run with the error described at {!val-already_started}. Every other
     start option means what it means for {!start}, and [update_id] and the
-    update input mean what they mean for {!start_update}.
+    update input mean what they mean for {!start_update}. Temporal refuses a
+    cron schedule or start delay on this operation, so neither is offered.
 
     The outer result is the start's outcome. [Error] means the start was not
     applied (for example the typed already-started error), or, when

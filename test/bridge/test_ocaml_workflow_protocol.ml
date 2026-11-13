@@ -1572,7 +1572,7 @@ let test_required_nullable_fields () =
     in
     require_error (Protocol.decode_activation (Yojson.Safe.to_string without_field)))
     [ "memo"; "search_attributes"; "workflow_execution_expiration_time";
-      "first_workflow_task_backoff" ];
+      "first_workflow_task_backoff"; "cron_schedule" ];
   require_error
     (Protocol.decode_completion
        {|{"run_id":"run-required-null","commands":[{"kind":"complete_workflow"}]}|});
@@ -2060,7 +2060,7 @@ let test_inbound_degraded_activation () =
   let capped = chain (max_layers - 1) synthetic in
   let continuation =
     Printf.sprintf
-      {|{"kind":"initialize_workflow","workflow_id":"w","workflow_type":"t","arguments":[],"randomness_seed":"1","attempt":1,"context":{"headers":{},"memo":null,"search_attributes":null,"workflow_execution_expiration_time":null,"first_workflow_task_backoff":null,"identity":"","parent_workflow":null,"workflow_execution_timeout":null,"workflow_run_timeout":null,"workflow_task_timeout":null,"first_execution_run_id":"first-run","start_time":null,"root_workflow":null,"priority":null,"retry_policy":null,"continuation":{"continued_from_execution_run_id":"previous-run","initiator":"workflow","continued_failure":%s,"last_completion_result":null}}}|}
+      {|{"kind":"initialize_workflow","workflow_id":"w","workflow_type":"t","arguments":[],"randomness_seed":"1","attempt":1,"context":{"headers":{},"memo":null,"search_attributes":null,"workflow_execution_expiration_time":null,"first_workflow_task_backoff":null,"cron_schedule":null,"identity":"","parent_workflow":null,"workflow_execution_timeout":null,"workflow_run_timeout":null,"workflow_task_timeout":null,"first_execution_run_id":"first-run","start_time":null,"root_workflow":null,"priority":null,"retry_policy":null,"continuation":{"continued_from_execution_run_id":"previous-run","initiator":"workflow","continued_failure":%s,"last_completion_result":null}}}|}
       capped
   in
   let rec depth (failure : Protocol.failure) =

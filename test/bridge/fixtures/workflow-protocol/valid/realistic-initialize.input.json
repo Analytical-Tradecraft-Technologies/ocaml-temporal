@@ -20,7 +20,7 @@
       "start_time": {"seconds": 1720000000, "nanoseconds": 123},
       "memo": null,
         "search_attributes": null,
-        "first_workflow_task_backoff": null,
+        "first_workflow_task_backoff": null, "cron_schedule": null,
         "workflow_execution_expiration_time": null,
         "identity": "starter",
       "parent_workflow": null,

@@ -75,6 +75,10 @@
       are always [None], whereas a native worker normally reports the 10 s
       task timeout Temporal records by default. [Workflow.Info.retry_policy]
       is recorded only for a child started with one.
+    - Cron schedules and start delays are not simulated (#1158): {!start}
+      takes neither, every run's first task runs at once, and
+      [Workflow.Info.cron_schedule] and
+      [Workflow.Info.first_workflow_task_backoff] are always [None].
     - An activity's {!Activity.Info.scheduled_time} is the virtual time at
       which it was scheduled, and its {!Activity.Info.started_time} and
       {!Activity.Info.current_attempt_scheduled_time} are the virtual time at

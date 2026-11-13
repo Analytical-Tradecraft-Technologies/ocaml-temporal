@@ -1065,7 +1065,12 @@ carries the start policy the client recorded: `Info.execution_timeout`,
 `Info.run_timeout`, `Info.task_timeout`, and `Info.retry_policy`. A successor
 run names its predecessor through `Info.continued_from_run_id`, and
 `Info.continuation_initiator` tells a `` `Retry `` apart from a
-`` `Continue_as_new ``. Start memo and search attributes come from
+`` `Continue_as_new `` or a `` `Cron_schedule `` run. A run started with
+`Client.start ~cron_schedule` reads the schedule through
+`Info.cron_schedule`, and a run whose first task Temporal held (a
+`~start_delay`, or a cron run waiting for its scheduled time) reads that
+delay through `Info.first_workflow_task_backoff`; it has already elapsed when
+workflow code runs (#1158). Start memo and search attributes come from
 `Temporal.Workflow.start_metadata` ([start metadata](../reference/workflow-start-metadata.md)).
 `Temporal.Workflow.is_replaying ()` is the shorthand for side effects outside
 workflow state, such as suppressing duplicate log lines during replay. Never

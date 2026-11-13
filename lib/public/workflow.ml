@@ -391,6 +391,19 @@ module Info = struct
   (** Returns the recorded execution timeout. *)
   let execution_timeout info = Option.map duration info.run.execution_timeout
 
+  (** Returns the recorded cron schedule. The protocol never carries
+      [Some ""], so a [Some] always names a schedule. *)
+  let cron_schedule info = info.run.cron_schedule
+
+  (** Returns the server-applied first-task backoff. Temporal records an
+      explicit zero for an ordinary start, which is not a delay and reads as
+      [None], like an absent value. *)
+  let first_workflow_task_backoff info =
+    Option.bind info.run.first_workflow_task_backoff
+      (fun (value : Temporal_sdk_kernel.Workflow_protocol.duration) ->
+        if Int64.equal value.seconds 0L && value.nanoseconds = 0 then None
+        else Some (duration value))
+
   (** Returns the recorded run timeout. *)
   let run_timeout info = Option.map duration info.run.run_timeout
 

@@ -98,6 +98,8 @@ let start_request : Protocol.start_request =
     run_timeout_ms = None;
     task_timeout_ms = None;
     retry_policy = None;
+    cron_schedule = None;
+    start_delay_ms = None;
     rpc_deadline = None;
   }
 
@@ -983,6 +985,8 @@ let test_start_execution_policy_protocol () =
       run_timeout_ms = Some 180_000L;
       task_timeout_ms = Some Protocol.max_workflow_task_timeout_ms;
       retry_policy = Some retry_policy;
+      cron_schedule = None;
+      start_delay_ms = None;
       rpc_deadline = deadline Protocol.max_rpc_timeout_ms;
     }
   in
@@ -1064,6 +1068,67 @@ let test_start_execution_policy_protocol () =
                initial_interval = { seconds = 0L; nanoseconds = 0 };
              };
        })
+
+(** Checks the cron schedule and start delay of a start request (#1158):
+    both are omitted unless supplied, a delay crosses as exact milliseconds,
+    a signal-with-start forwards both, and the encoder rejects a zero or
+    overlong delay, an empty schedule, their combination, and either one on
+    update-with-start, at the member Rust would also reject. *)
+let test_start_schedule_protocol () =
+  let default = unwrap (Protocol.encode_start_request start_request) in
+  List.iter
+    (fun member ->
+      if contains_fragment default member then
+        failwith (member ^ " was sent although it was not supplied"))
+    [ "cron_schedule"; "start_delay_ms" ];
+  let cron = { start_request with cron_schedule = Some "@every 5s" } in
+  require_fragment "cron schedule" {|"cron_schedule":"@every 5s"|}
+    (unwrap (Protocol.encode_start_request cron));
+  let delayed =
+    { start_request with start_delay_ms = Some Protocol.max_workflow_timeout_ms }
+  in
+  require_fragment "start delay" {|"start_delay_ms":315576000000999|}
+    (unwrap (Protocol.encode_start_request delayed));
+  List.iter
+    (fun (label, path, request) ->
+      check_error_path label path (Protocol.encode_start_request request))
+    [
+      ("zero delay", "$.start_delay_ms", { start_request with start_delay_ms = Some 0L });
+      ( "negative delay",
+        "$.start_delay_ms",
+        { start_request with start_delay_ms = Some (-1L) } );
+      ( "overlong delay",
+        "$.start_delay_ms",
+        {
+          start_request with
+          start_delay_ms = Some (Int64.succ Protocol.max_workflow_timeout_ms);
+        } );
+      ( "delay with cron",
+        "$.start_delay_ms",
+        { cron with start_delay_ms = Some 1_000L } );
+      ("empty cron", "$.cron_schedule", { start_request with cron_schedule = Some "" });
+      ( "NUL in cron",
+        "$.cron_schedule",
+        { start_request with cron_schedule = Some "* *\000 * * *" } );
+    ];
+  let signal start : Protocol.signal_with_start_request =
+    {
+      start = { start with id_conflict_policy = Protocol.Use_existing };
+      signal_name = "deliver";
+      signal_input = [];
+    }
+  in
+  require_fragment "signal-with-start cron" {|"cron_schedule":"@every 5s"|}
+    (unwrap (Protocol.encode_signal_with_start_request (signal cron)));
+  require_fragment "signal-with-start delay" {|"start_delay_ms":315576000000999|}
+    (unwrap (Protocol.encode_signal_with_start_request (signal delayed)));
+  let update start : Protocol.update_with_start_request =
+    { start; update_id = "update-1"; update_name = "apply"; update_input = [] }
+  in
+  check_error_path "update-with-start cron" "$.start.cron_schedule"
+    (Protocol.encode_update_with_start_request (update cron));
+  check_error_path "update-with-start delay" "$.start.start_delay_ms"
+    (Protocol.encode_update_with_start_request (update delayed))
 
 (** A caller deadline resolved at dispatch sends only the budget that
     remains (#499): rounded up to whole milliseconds, never above the
@@ -1287,6 +1352,7 @@ let () =
   run "client id conflict policy" test_id_conflict_policy_protocol;
   run "client signal and update with start" test_with_start_protocol;
   run "client start execution policies" test_start_execution_policy_protocol;
+  run "client start schedule options" test_start_schedule_protocol;
   run "client rpc timeouts" test_rpc_timeout_protocol;
   run "client rpc deadline remaining budget" test_rpc_deadline_remaining;
   run "client closed response shape" test_closed_response_shape;

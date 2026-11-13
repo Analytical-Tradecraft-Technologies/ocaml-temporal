@@ -76,6 +76,8 @@ let run_info ?execution_ms ?run_ms () =
     run_timeout = Option.map duration run_ms;
     task_timeout = None;
     retry_policy = None;
+    first_workflow_task_backoff = None;
+    cron_schedule = None;
     continued_from = None;
   }
 

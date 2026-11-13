@@ -34,9 +34,8 @@ the policies `Client.start` exposes for #499:
   successor, and the retry run's own timeout ends the chain.
 - An explicit continue-as-new is still reported as `Continued_as_new`, and
   the successor run completes with the input it was continued with.
-- Cron schedules cannot be started through this client, so a cron
-  `Completed` successor is covered by the Rust and OCaml unit tests rather
-  than here.
+- A cron run's `Completed` successor is covered live by the
+  [cron/start delay regression](../cron_start_delay/README.md) (#1158).
 - A start with a 1 ms `?rpc_timeout` is accepted, reported as uncertain
   (`Client.is_start_outcome_uncertain`) when it expired after being sent, or
   rejected with `` `Deadline_exceeded `` when it expired before being sent.

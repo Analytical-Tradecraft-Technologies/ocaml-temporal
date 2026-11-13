@@ -119,6 +119,8 @@ omitted when absent, so Temporal applies its defaults:
 | `run_timeout_ms` | `?run_timeout` | as above, and at most `execution_timeout_ms` | the execution timeout |
 | `task_timeout_ms` | `?task_timeout` | 1 ms to 120,000 ms, and at most the run (or execution) timeout | 10 seconds |
 | `retry_policy` | `?retry_policy` | the activity retry-policy shape and invariants | no retry |
+| `cron_schedule` | `?cron_schedule` | a non-empty, NUL-free identifier of at most 65,536 bytes; Temporal parses the expression | no cron schedule |
+| `start_delay_ms` | `?start_delay` | 1 ms to 315,576,000,000,999 ms, and never beside `cron_schedule` | no delay |
 
 Temporal reads a zero timeout as "unset" and silently lowers a task timeout
 above 120 seconds or above the run timeout, and a run timeout above the
@@ -128,6 +130,14 @@ never believes a bound is in force that the server does not apply. Rust
 converts each millisecond count into a protobuf `Duration` with checked
 `try_from` conversions and copies the retry policy through the same
 lossless converter as activity and child-workflow commands.
+
+`cron_schedule` and `start_delay_ms` (#1158) become Temporal's
+`cron_schedule` and `workflow_start_delay`. Temporal refuses the two
+together and reads a zero delay as no delay, so both are rejected; an
+invalid cron expression is left to Temporal, which answers it with
+`invalid_argument`. Signal-with-start forwards both; update-with-start
+rejects both before any RPC, because Temporal refuses them on the start
+operation of `ExecuteMultiOperation`.
 
 The policies and both workflow ID policies are part of the pending-request
 equality check, so retrying a pending `request_id` with a different policy is
