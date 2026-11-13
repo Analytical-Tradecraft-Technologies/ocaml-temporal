@@ -134,6 +134,10 @@ val attached : t -> int
     Core's workflow processing thread was still running. In that case
     [shutdown] returns a [`Bridge] error saying the release continues in the
     background, and the bridge's cleanup thread finishes it once that thread
-    exits. A native release failure is likewise a [`Bridge] error, and the
+    exits. The same [`Bridge] error is returned when an attached client's or
+    worker's own native graph close outlived its bound (150 seconds) and
+    detached: the attachment is returned so [shutdown] can proceed, but that
+    graph's cleanup thread may still hold Core, so destruction is not
+    reported as success. A native release failure is likewise a [`Bridge] error, and the
     runtime is nevertheless closed. *)
 val shutdown : t -> (unit, Error.t) result

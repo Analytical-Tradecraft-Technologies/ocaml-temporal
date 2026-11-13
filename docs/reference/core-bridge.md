@@ -993,7 +993,18 @@ thread exits. Nothing is leaked or dropped twice.
 
 On the OCaml side the status is `Native_bridge.Detached`.
 `Runtime.shutdown` reports it as a `` `Bridge `` error that says the release
-continues in the background, and the runtime counts as shut down. The
+continues in the background, and the runtime counts as shut down.
+
+An attached graph's own `runtime_free` can also return `DETACHED`, when its
+cleanup (for example a drain of outstanding tasks) outlives the 150 s bound
+while it still holds its Core reference. The supervisor then returns its
+shared-runtime lease with `Sdk_shared_runtime.release_detached` rather than
+`release`. Nothing reports when that cleanup ends, so the attachment does not
+keep blocking `Runtime.shutdown`. Instead the runtime records it, and
+`Sdk_shared_runtime.shutdown` still releases the shared handle but returns
+the `Detached` status instead of `Ok ()`. Destroying the shared handle no
+longer proves Core is gone, so `Runtime.shutdown` reports the same
+`` `Bridge `` error rather than success. The
 `runtime_release_bound` tests reproduce the hazard directly: a closure that
 holds Core's blocking pool makes both releases return `DETACHED` at a short
 test bound while the cleanup thread still finishes the drop.
