@@ -6919,3 +6919,48 @@ typed keyword and int, decodes every type from `describe`, replays the
 recorded upserts, and checks the merged memo across continue-as-new. Child
 starts (#1135) and continue-as-new options (#1153) do not take memo or search
 attributes yet.
+
+## 2026-11-13: Continue-as-new successor options
+
+`Workflow.continue_as_new` takes optional `?task_queue`, `?run_timeout`,
+`?task_timeout`, `?retry_policy`, `?memo`, `?search_attributes` and the
+experimental `?initial_versioning_behavior` (#1153). Each crosses the
+activation command, the semantic protocol and the Rust conversion to the
+matching Core `ContinueAsNewWorkflowExecution` field. An unset option is left
+out of the JSON document and unset in Core, so a call without options emits
+the exact command of earlier releases and existing histories replay
+unchanged. The public layer applies the `Client.start` timeout rules, also
+checking the run timeout against the chain's recorded execution timeout. An
+invalid option fails only the workflow task with a typed `Defect`. An
+explicit `~memo` replaces the merged memo of #1154, and `~search_attributes:[]`
+clears the successor's search attributes. Continue-as-new is rejected inside
+update validators and query handlers. `Temporal.Testing` carries set options
+to the successor and later runs. The `continue_as_new_options` live
+regression routes a successor to another task queue with new timeouts, retry
+policy, memo and search attributes, checks that the next run inherits them
+and that a short run timeout ends the last run as `Timed_out`, and replays
+the histories. Capture `live-2026-11-13-can-options` adds the history corpus
+entries. Child starts (#1135) still take no memo or search attributes.
+
+## 2026-11-13: Cron schedules and delayed starts
+
+`Client.start` and `Client.signal_with_start` take `?cron_schedule` and
+`?start_delay` (#1158). The public client, the OCaml protocol encoder and
+Rust validate them identically: the delay must be positive, the schedule must
+be a non-empty identifier, and the two cannot be combined. They become
+Temporal's `cron_schedule` and `workflow_start_delay`, and Temporal parses
+the cron expression. `Client.update_with_start` offers neither, because
+Temporal refuses both on `ExecuteMultiOperation`. OCaml workers no longer
+reject cron schedules, cron-initiated runs or a non-zero root first-task
+backoff. The activation protocol now carries the recorded `cron_schedule`
+beside the exact `first_workflow_task_backoff`, and workflow code reads them
+through `Workflow.Info.cron_schedule` and
+`Workflow.Info.first_workflow_task_backoff`. `` `Cron_schedule `` is now an
+initiator that workflows observe. `Temporal.Testing` simulates neither. The
+`cron_start_delay` live regression covers delayed `start` and
+`signal_with_start`, client-started and official-CLI cron chains whose second
+run reports `` `Cron_schedule `` and its predecessor, a current-run wait that
+does not end on a chain, server rejection of an invalid expression, and
+replay. Capture `live-2026-11-13-cron` adds a delayed run and two cron runs
+to the history corpus. Child cron schedules, Temporal Schedules and access to
+a cron run's previous result remain unimplemented.
