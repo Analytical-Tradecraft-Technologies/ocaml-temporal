@@ -864,8 +864,12 @@ one seam: Core moves out of the per-instance graph into a reference-counted
   fallback. Both clear the slot first and are idempotent on a null slot.
 - `ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(worker_threads,
   input, input_len, &shared, out)` (#500) is `shared_runtime_new` plus a
-  strict telemetry document of at most 16 KiB; the plain constructor now
-  delegates to it with `{}`. The only member today is optional
+  strict telemetry document of at most 256 KiB (large enough for sixteen
+  maximal OTLP headers); the plain constructor now
+  delegates to it with `{}`. It is described by
+  [`runtime-telemetry.schema.json`](../schemas/bridge/runtime-telemetry.schema.json)
+  and has two optional members, of which at most one may be present: `otlp`
+  (see below) and
   `prometheus`: `{"bind_address": "<ip>:<port>", "global_tags":
   [{"name": ..., "value": ...}], "counters_total_suffix": bool,
   "unit_suffix": bool, "durations_as_seconds": bool}` (the tag list and the
@@ -962,6 +966,54 @@ one seam: Core moves out of the per-instance graph into a reference-counted
   Tokio threads and never call OCaml. Enabling it requires
   `temporalio-common`'s `prometheus` feature, which adds only the
   Apache-2.0 `prometheus` crate (see [dependencies](../dependencies.md)).
+
+  OTLP push export (#1161). The `otlp` member is `{"endpoint": URL,
+  "protocol": "grpc" | "http_protobuf", "headers": [{"name": ...,
+  "value": ...}], "period_ms": N, "temporality": "cumulative" | "delta",
+  "global_tags": [...], "durations_as_seconds": bool}`; every member but
+  `endpoint` defaults to Core's default (gRPC, no headers, 1000 ms,
+  cumulative, no tags, `false`), and the OCaml encoder writes them all.
+  `src/otlp.rs` validates it with the same rules as
+  `Temporal_base.Metrics_config.otlp`: the endpoint grammar (lowercase
+  `http://` or `https://`, a DNS, canonical dotted-quad IPv4 or bracketed
+  IPv6 host whose last DNS label is not all digits, optional port 1..65535,
+  no user information, fragment, or byte outside `!`..`~`, at most 2048
+  bytes), at most 16 headers with lowercase `[a-z0-9_.-]` names up to 64
+  bytes that are unique, not `-bin`, not `grpc-*` and not a
+  transport-owned name, values of 1..4096 printable ASCII bytes without
+  outer spaces, and a period of 100 ms to 1 hour; global tags follow the
+  Prometheus rules. Messages name only the violated rule, never the
+  endpoint or a header value, and `OtlpHeader`'s `Debug` prints
+  `<redacted>` for the value. After Core is built, `start_otlp` calls
+  Core's `build_otlp_metric_exporter` inside Core's Tokio context (tonic
+  spawns its lazily connecting channel worker there) and with Core's log
+  subscriber as the thread's default (Core captures it to log failed
+  exports); any builder error or panic becomes the constant
+  `CONFIGURATION` message "could not start the OTLP metrics exporter". No
+  connection is made, and the bound address reported is empty.
+
+  Exporter ownership. Core's meter owns its OpenTelemetry meter provider,
+  whose periodic-reader thread exports until the provider is dropped, and
+  dropping it makes one final export. Core, every client and worker, and
+  every SDK `MetricMeter` (freed only by OCaml's GC) clone the meter they
+  are given, so the bridge keeps the only strong reference in the
+  `OtlpExporter` guard (the `Otlp` variant of `MetricsExporter`, the first
+  field of `SharedCore`) and hands out `DetachableMeter`s that borrow it
+  under an `RwLock` for each instrument creation. Dropping the guard empties
+  the slot under the write lock and drops the meter outside it, on the
+  thread releasing Core and before Core's Tokio runtime, which the gRPC
+  final export needs. OpenTelemetry waits at most 5 s for that export; one
+  still running ends with the exporter's timeout (10 s by default) on the
+  reader thread, or for gRPC as soon as Core's runtime is dropped next. A
+  panic in that shutdown is contained and logged through Core's log
+  pipeline. Instruments created before release keep recording into the
+  detached pipeline; instruments created afterwards are Core's no-op
+  instruments, and `extend_attributes` then returns the existing
+  attributes unchanged rather than letting the no-op meter assert on
+  OpenTelemetry attributes. Recording goes straight to the instruments and
+  never takes the lock. `rust/core-bridge/tests/otlp_exporter.rs` checks
+  both transports against loopback collector doubles, the final export,
+  the failure log, and header redaction.
 
 Ownership rules. Each graph still has exactly one owner (its supervisor's
 owner Domain) and one release path; supervisors never share mutable native

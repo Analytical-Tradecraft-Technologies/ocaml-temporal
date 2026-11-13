@@ -6964,3 +6964,31 @@ does not end on a chain, server rejection of an invalid expression, and
 replay. Capture `live-2026-11-13-cron` adds a delayed run and two cron runs
 to the history corpus. Child cron schedules, Temporal Schedules and access to
 a cron run's previous result remain unimplemented.
+
+## 2026-11-13: OTLP metrics export and the tracing decision
+
+`Runtime.Metrics.otlp ~endpoint ?headers ?period ?protocol ?temporality
+?global_tags ?durations_as_seconds ()` pushes Temporal Core's worker and
+client metrics, and the SDK's `temporal_ocaml_` series, to an OTLP collector
+over gRPC or HTTP/protobuf (#1161). It enables only `temporalio-common`'s
+`otel` feature at the existing Core pin; the lock gains two dependency edges
+and no package, every newly compiled crate is permissive, and the Cargo
+licence scanner and the dependency inventory pass. The options are validated
+with the same grammar in OCaml and Rust, header values never appear in a
+message, a log record or `Debug` output, and the bridge owns the exporter: a
+detachable meter keeps clients, workers and the GC-released SDK recorder from
+extending its life, and runtime release makes one final export before Core's
+Tokio runtime stops. Rust tests run against loopback OTLP/gRPC and OTLP/HTTP
+collector doubles; the `worker_metrics` live regression repeats its scenario
+on an OTLP runtime with an in-process collector stub and requires the same
+families as the Prometheus path. Tracing is not exported, by recorded
+decision, until headers (#1139) and interceptors (#1162) make context
+propagation possible.
+
+## 2026-11-13: `Temporal.Testing` fidelity (#1160)
+
+- The opt-in `` `Retry `` workflow-task-failure mode keeps a failing run open, answers queries from its last completed task, and retries it with `Testing.retry_workflow_tasks` by replaying the completed activations.
+- `Testing.start`/`execute` take memo, search attributes, ID conflict and reuse policies (refused starts return the client's already-started error), timeouts and a retry policy. Child starts apply their reuse policy.
+- Workflow execution and run timeouts, top-level and child, expire in virtual time.
+- Asynchronous activities wait for their real `Activity.Async_handle`, with heartbeats, cancellation and timeouts (`Testing.mock_async_activity`).
+- Covered by `test/unit/test_testing_fidelity.ml`. Schedule-to-start timeouts and visibility queries remain deliberately unsimulated.

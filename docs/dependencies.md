@@ -394,12 +394,43 @@ Some crates are locked at more than one version because different packages in
 the graph require incompatible releases. The client, common, and SDK-Core
 dependencies disable their default features: `temporalio-client` enables
 `core-based-sdk` and `tls-ring`, `temporalio-sdk-core` enables `tls-ring`, and
-`temporalio-common` enables only `prometheus`. That feature backs the opt-in
-Prometheus metrics endpoint of a shared `Temporal.Runtime` (#500). It adds one
-package, `prometheus` 0.14.0 (Apache-2.0, default features off), and activates
-Core's existing `hyper`, `hyper-util`, and `http-body-util` dependencies for
-the scrape server; all three were already locked through Core's gRPC
-transport. Core's `otel` feature (OTLP export) stays disabled. `temporalio-protos` uses its
+`temporalio-common` enables `otel` and `prometheus`. `prometheus` backs the
+opt-in Prometheus metrics endpoint of a shared `Temporal.Runtime` (#500). It
+adds one package, `prometheus` 0.14.0 (Apache-2.0, default features off), and
+activates Core's existing `hyper`, `hyper-util`, and `http-body-util`
+dependencies for the scrape server; all three were already locked through
+Core's gRPC transport.
+
+`otel` backs the opt-in OTLP metrics exporter (#1161); only the
+`temporalio-common` feature is enabled, not `temporalio-sdk-core`'s, which
+adds nothing the bridge uses. It adds no package to `rust/Cargo.lock`: the
+OpenTelemetry crates, `reqwest` and their dependencies were already locked
+(and therefore already licence-audited), because Cargo's lock records the
+optional dependencies of locked packages whether or not a feature enables
+them, and the lock diff is two dependency edges
+(`opentelemetry_sdk` on the already-locked `tokio` and `tokio-stream`,
+`temporalio-common` on `opentelemetry` and `opentelemetry_sdk`). It does
+enlarge what is compiled and linked. On the macOS host build, 16 locked
+crates become compiled: `opentelemetry`, `opentelemetry_sdk`,
+`opentelemetry-otlp`, `opentelemetry-proto`, `opentelemetry-http` (all
+Apache-2.0), `reqwest` and `rustls-platform-verifier` (MIT OR Apache-2.0),
+`hyper-rustls` (Apache-2.0 OR ISC OR MIT), `tower-http` and `tonic-types`
+(MIT), `ipnet`, `rand` 0.9, `rand_chacha` 0.9, `rand_core` 0.9 and
+`ppv-lite86` (MIT OR Apache-2.0), and `zerocopy` (BSD-2-Clause OR Apache-2.0
+OR MIT). Across all targets (`cargo tree --target all`) the set is 38 crates;
+the others are platform-specific dependencies of the platform certificate
+verifier and `reqwest` (`jni*`, `wasm-bindgen*`, `js-sys`, `web-sys`,
+`webpki-root-certs` under CDLA-Permissive-2.0, `walkdir`, `same-file` and
+`winapi-util` under Unlicense OR MIT, `bumpalo`, `combine`, `simd_cesu8`,
+`simdutf8`, `portable-atomic`, `rustls-platform-verifier-android`, and
+`zerocopy-derive`), every one permissive and already in the audited lock.
+On macOS arm64 the release-profile bridge `cdylib`, a proxy for the code a
+linked executable keeps, grew from 20.0 MiB to 22.4 MiB (about 12%) when the
+feature was enabled (#1161); the `staticlib` archive, which also carries
+code the linker later drops, grew from 175 MiB to 192 MiB.
+`opentelemetry` is compiled without its `internal-logs` feature, so
+OpenTelemetry's internal diagnostics, which can print request metadata, are
+not compiled in. `temporalio-protos` uses its
 default feature set. The project bridge is Apache-2.0 and
 emits `staticlib` and `cdylib` artifacts for the native boundary plus an
 internal `rlib` for Rust integration tests.

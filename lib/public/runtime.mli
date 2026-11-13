@@ -55,11 +55,23 @@ type t = Temporal_sdk_kernel.Shared_runtime.t
     payloads, and credentials are never metric labels.
 
     Metrics are configured on a shared {!t}: every client and worker created
-    with [~runtime] on it reports to the same endpoint. Clients and workers
-    that own their own runtime do not export metrics. *)
+    with [~runtime] on it reports to the same exporter. Clients and workers
+    that own their own runtime do not export metrics. A runtime has at most
+    one exporter: a Prometheus scrape endpoint ({!Metrics.prometheus}) or
+    an OTLP push exporter ({!Metrics.otlp}); both export the same metrics
+    under the same names. *)
 module Metrics : sig
   (** One validated exporter configuration. *)
   type t
+
+  (** OTLP transport: OTLP/gRPC, or OTLP/HTTP with protobuf bodies. *)
+  type otlp_protocol = [ `Grpc | `Http_protobuf ]
+
+  (** Aggregation temporality of exported counters and histograms:
+      [`Cumulative] points cover the time since the exporter started (what
+      Prometheus-style backends expect), [`Delta] points the time since the
+      previous export. *)
+  type temporality = [ `Cumulative | `Delta ]
 
   (** [prometheus ~bind_address ()] serves metrics for Prometheus to scrape
       at [http://<bind_address>/metrics].
@@ -88,6 +100,48 @@ module Metrics : sig
     bind_address:string ->
     unit ->
     (t, Error.t) result
+
+  (** [otlp ~endpoint ()] pushes metrics to an OpenTelemetry (OTLP)
+      collector every [period] (default 1 second, as in the official SDKs;
+      100 ms to 1 hour accepted).
+
+      [endpoint] is an [http://] or [https://] URL such as
+      ["http://127.0.0.1:4317"] or ["https://otlp.example.com"]. With
+      [~protocol:`Grpc] (the default) it is the collector's gRPC address;
+      with [~protocol:`Http_protobuf] it is the complete metrics URL, which
+      for a standard collector ends in [/v1/metrics] (no path is appended).
+      The host is a DNS name, a dotted-quad IPv4 address, or a bracketed
+      IPv6 address, with an optional port 1 to 65535; user information
+      ([user:password@]), fragments, spaces, and control characters are
+      rejected. [https://] uses TLS verified against the operating system's
+      root certificates; a custom CA or client certificate is not supported.
+
+      [headers] are sent with every export, typically a credential such as
+      [("authorization", "Bearer ...")] or [("api-key", ...)]: at most 16,
+      names of lowercase letters, digits, [-], [_] and [.] (at most 64
+      bytes, unique, not ending in [-bin], not starting with [grpc-], and not
+      a header the transport sets, such as [content-type] or [host]), and
+      values of 1 to 4,096 bytes of printable ASCII without leading or
+      trailing spaces. Header values are never written to a log or an error
+      message.
+
+      [temporality] defaults to [`Cumulative]. [global_tags] and
+      [durations_as_seconds] are as in {!prometheus}; global tags are
+      exported as OTLP resource attributes. An invalid option returns a
+      typed defect whose message names only the violated rule. The collector
+      is first contacted at the first export, so an unreachable collector
+      does not fail {!create}: failed exports are logged by Temporal Core
+      and retried at the next period. *)
+  val otlp :
+    ?headers:(string * string) list ->
+    ?period:Duration.t ->
+    ?protocol:otlp_protocol ->
+    ?temporality:temporality ->
+    ?global_tags:(string * string) list ->
+    ?durations_as_seconds:bool ->
+    endpoint:string ->
+    unit ->
+    (t, Error.t) result
 end
 
 (** Creates a runtime and starts its background threads. [io_threads] is an
@@ -110,14 +164,22 @@ end
     scrapes receive [503 Service Unavailable] until the runtime is
     recreated.
 
+    With an OTLP [metrics] exporter, nothing listens and no connection is
+    made by [create]. Exports run on a background thread of the exporter
+    and never run OCaml code, so a slow, failing or unreachable collector
+    cannot block or fail workflow and activity execution. {!shutdown}
+    makes one final export of the last interval before the runtime is
+    destroyed, waiting at most 5 seconds for it.
+
     Creating a runtime needs no Temporal Server. *)
 val create :
   ?io_threads:int -> ?metrics:Metrics.t -> unit -> (t, Error.t) result
 
-(** The socket address the metrics endpoint is listening on, such as
-    ["127.0.0.1:9464"], with a requested port [0] resolved; [None] when the
-    runtime was created without [metrics]. The value does not change after
-    {!shutdown}, but the endpoint is then closed. *)
+(** The socket address the Prometheus metrics endpoint is listening on,
+    such as ["127.0.0.1:9464"], with a requested port [0] resolved; [None]
+    when the runtime was created without [metrics] or with an OTLP exporter,
+    which listens on nothing. The value does not change after {!shutdown},
+    but the endpoint is then closed. *)
 val metrics_address : t -> string option
 
 (** Number of clients and workers currently attached. *)

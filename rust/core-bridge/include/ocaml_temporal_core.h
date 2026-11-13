@@ -140,12 +140,16 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_new(
 
 /*
  * shared_runtime_new plus an opt-in telemetry document (#500). `input` is a
- * strict UTF-8 JSON object of at most 16 KiB; `{}` configures no exporter and
+ * strict UTF-8 JSON object of at most 256 KiB; `{}` configures no exporter,
  * `{"prometheus":{"bind_address":"127.0.0.1:9464",...}}` serves Core's
- * metrics for scraping until Core is destroyed. Invalid input or an unusable
- * address returns OCAML_TEMPORAL_CORE_STATUS_CONFIGURATION and leaves
- * `*shared` NULL. On success the result value is the bound socket address as
- * UTF-8 text (empty without an exporter).
+ * metrics for scraping until Core is destroyed, and
+ * `{"otlp":{"endpoint":"http://127.0.0.1:4317",...}}` pushes them to an OTLP
+ * collector until Core is destroyed, with one final export then (#1161). At
+ * most one exporter may be configured. Invalid input or an unusable address
+ * returns OCAML_TEMPORAL_CORE_STATUS_CONFIGURATION and leaves `*shared` NULL;
+ * no message echoes an OTLP header value. On success the result value is the
+ * bound Prometheus socket address as UTF-8 text (empty without an exporter
+ * and for OTLP).
  */
 ocaml_temporal_core_status
 ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(

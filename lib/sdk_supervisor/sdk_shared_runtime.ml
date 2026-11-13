@@ -10,10 +10,11 @@ module Bridge = Temporal_core_bridge.Native_bridge
     cannot deadlock: no lease is outstanding, so no [release] waits on it,
     and the C close never calls back into OCaml. [native] and
     [metrics_address] are immutable; the latter is the bound address of the
-    opt-in metrics endpoint (#500), recorded once at creation. [meter] is the
-    SDK-side recorder over the same exporter, present exactly when
-    [metrics_address] is; it is released only by the GC, so it stays safe
-    to record into after [shutdown]. *)
+    opt-in Prometheus endpoint (#500), recorded once at creation, and [None]
+    for an OTLP exporter (#1161), which listens on nothing. [meter] is the
+    SDK-side recorder over the runtime's exporter, present exactly when the
+    runtime has one (Prometheus or OTLP); it is released only by the GC, so
+    it stays safe to record into after [shutdown]. *)
 type t = {
   native : Bridge.shared_runtime;
   metrics_address : string option;
@@ -61,14 +62,17 @@ let create ?worker_threads ?telemetry () =
           ()
       with
       | Error _ as error -> error
-      | Ok (native, "") -> Ok (make native None None)
       | Ok (native, address) -> (
-          (* The recorder is created here, once, so every worker attached to
-             this runtime shares one registry of SDK series. A failure here
-             is a bridge defect; the fresh runtime is released before it is
+          (* Only a Prometheus endpoint reports an address; an OTLP exporter
+             (#1161) and an empty document report [""]. The recorder is
+             created here, once, so every worker attached to this runtime
+             shares one registry of SDK series; the bridge returns [None]
+             when the document configured no exporter. A failure here is a
+             bridge defect; the fresh runtime is released before it is
              reported so nothing keeps running. *)
+          let metrics_address = if address = "" then None else Some address in
           match Bridge.shared_runtime_metric_meter native with
-          | Ok meter -> Ok (make native (Some address) meter)
+          | Ok meter -> Ok (make native metrics_address meter)
           | Error error ->
               ignore (Bridge.shared_runtime_close native);
               Error error))

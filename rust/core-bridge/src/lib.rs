@@ -10,6 +10,7 @@ mod client_protocol;
 #[doc(hidden)]
 pub mod diagnostics;
 mod heartbeat_throttle;
+mod otlp;
 pub mod protocol;
 mod replay_bridge;
 #[doc(hidden)]

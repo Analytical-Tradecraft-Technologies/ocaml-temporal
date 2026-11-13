@@ -599,9 +599,13 @@ let test_registration_rules () =
   with_environment ~workflows:[ cart_registration ] ~activities:[]
     (fun environment ->
       ignore (ok "start" (T.Testing.start ~id:"same" environment cart_workflow ()));
-      ignore
-        (expect_error "duplicate workflow ID" `Defect
-           (T.Testing.start ~id:"same" environment cart_workflow ()));
+      (* A running ID refuses the start with the client's typed error. *)
+      let error =
+        expect_error "duplicate workflow ID" `Workflow
+          (T.Testing.start ~id:"same" environment cart_workflow ())
+      in
+      expect "already-started type" (Some "WorkflowExecutionAlreadyStarted")
+        (T.Error.error_type error);
       ignore
         (expect_error "unregistered workflow" `Defect
            (T.Testing.start environment greeting_workflow "x")));

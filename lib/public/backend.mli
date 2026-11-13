@@ -462,6 +462,14 @@ val client_at_capacity_error_type : string
     run with the same workflow ID. *)
 val already_started_error_type : string
 
+(** Builds that already-started error for [workflow_id], attaching the
+    conflicting run as the JSON detail {!already_started_execution} decodes
+    when [existing_run_id] is known. [Client] reports it for a refused
+    start, and [Testing] for a start its simulated ID policies refuse
+    (#1160), so [Client.already_started] recognizes both. *)
+val already_started_error :
+  namespace:string -> workflow_id:string -> existing_run_id:string option -> Error.t
+
 (** The [Error.error_type] (["StartOutcomeUncertain"]) of the non-retryable
     [`Bridge] error returned when Temporal did not prove whether a native
     start was accepted, for example because the start's RPC deadline expired
