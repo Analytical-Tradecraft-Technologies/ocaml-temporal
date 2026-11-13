@@ -160,7 +160,12 @@ for those rules.
   that successor. The client also sends typed signals and output-only or
   exactly-one-input queries. `Client.query_with_input` encodes the typed query
   argument before transport; the client lists bounded visibility results and
-  waits for typed terminal outcomes. `Client.start_update` waits until Temporal
+  waits for typed terminal outcomes. `Client.describe handle` returns a
+  snapshot of one run without waiting for it (#1152): identity, type, task
+  queue, the same `Client.execution_status` a visibility row carries, start
+  and close times, history length, memo, search attributes, and pending
+  activities and child workflows; `Client.count client ~query ()` counts the
+  executions a visibility query matches. `Client.start_update` waits until Temporal
   accepts one typed workflow update and returns an opaque handle;
   `Client.wait_update` polls that
   exact update until it has a typed outcome, while `Client.update_id` exposes

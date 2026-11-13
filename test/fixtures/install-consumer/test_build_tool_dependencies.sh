@@ -104,6 +104,12 @@ fi
 compilers=$(tr -d '\r' <"$root/scripts/ci-matrix.py" |
   sed -n 's/^COMPILERS = (\(.*\))$/\1/p' | tr -d '",')
 [ -n "$compilers" ] || fail "could not read compiler series from scripts/ci-matrix.py"
+# The non-blocking next-compiler readiness lane (#1164) builds from a pinned
+# image too, so its series gets the same pin and Dependabot checks.
+next_series=$(tr -d '\r' <"$root/scripts/ci-matrix.py" |
+  sed -n 's/^NEXT_SERIES = "\(.*\)"$/\1/p')
+[ -n "$next_series" ] || fail "could not read NEXT_SERIES from scripts/ci-matrix.py"
+compilers="$compilers $next_series.0"
 tr -d '\r' <"$root/.github/dependabot.yml" >"$metadata_dir/dependabot.yml"
 expected_series=
 for compiler in $compilers; do

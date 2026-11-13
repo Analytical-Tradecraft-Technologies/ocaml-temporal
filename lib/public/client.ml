@@ -123,6 +123,48 @@ type visibility_page = {
   next_page_token : string option;
 }
 
+(** Pending-activity state; the same closed polymorphic variant as the
+    private protocol's, so states pass through without conversion. *)
+type pending_activity_state =
+  [ `Scheduled
+  | `Started
+  | `Cancel_requested
+  | `Paused
+  | `Pause_requested
+  | `Unknown of int ]
+
+(** One activity a described run has scheduled and not yet resolved. *)
+type pending_activity = {
+  activity_id : string;
+  activity_type : string;
+  state : pending_activity_state;
+  attempt : int;
+}
+
+(** One child workflow a described run has started and not yet seen close.
+    The fields are prefixed so they do not shadow the identity fields of
+    {!execution} and {!visibility_execution}. *)
+type pending_child = {
+  child_workflow_id : string;
+  child_run_id : string option;
+  child_workflow_type : string;
+}
+
+(** A snapshot of one run returned by [describe]. *)
+type execution_description = {
+  execution : execution;
+  workflow_type : string;
+  task_queue : string;
+  status : execution_status;
+  start_time : Time.t;
+  close_time : Time.t option;
+  history_length : int64;
+  memo : (string * Payload.t) list;
+  search_attributes : (string * Payload.t) list;
+  pending_activities : pending_activity list;
+  pending_children : pending_child list;
+}
+
 (** Rejects empty, oversized, malformed UTF-8, or NUL-containing identifiers
     before they can enter a backend request. The UTF-8 and 65,536-byte bounds
     are shared by the JSON protocol and native bridge, so mock and native
@@ -903,6 +945,79 @@ let list_visibility ?(page_size = 100) ?page_token ?rpc_timeout client ~query
                   next_page_token = page.next_page_token;
                 })
               (Backend.client_list_visibility client.backend request))
+
+(** Describes the run [handle] addresses through the client's backend
+    (#1152). The deadline is validated before the closed flag, as for
+    [list_visibility]; the backend's description is copied into the public
+    record under the client's namespace. *)
+let describe ?rpc_timeout (handle : ('workflow_input, 'workflow_output) handle) =
+  match rpc_deadline rpc_timeout with
+  | Error error -> Error error
+  | Ok rpc_deadline ->
+      if Atomic.get handle.client.closed then
+        Error (Error.make ~category:`Bridge ~message:"client is shut down" ())
+      else
+        let request : Backend.describe_request =
+          {
+            workflow_id = handle.workflow_id;
+            run_id = run_selector handle;
+            rpc_deadline;
+          }
+        in
+        Result.map
+          (fun (described : Backend.description) ->
+            {
+              execution =
+                {
+                  namespace = handle.client.namespace;
+                  workflow_id = described.workflow_id;
+                  run_id = described.run_id;
+                };
+              workflow_type = described.workflow_type;
+              task_queue = described.task_queue;
+              status = described.status;
+              start_time = described.start_time;
+              close_time = described.close_time;
+              history_length = described.history_length;
+              memo = described.memo;
+              search_attributes = described.search_attributes;
+              pending_activities =
+                List.map
+                  (fun (activity : Backend.pending_activity) ->
+                    {
+                      activity_id = activity.activity_id;
+                      activity_type = activity.activity_type;
+                      state = activity.state;
+                      attempt = activity.attempt;
+                    })
+                  described.pending_activities;
+              pending_children =
+                List.map
+                  (fun (child : Backend.pending_child) ->
+                    {
+                      child_workflow_id = child.workflow_id;
+                      child_run_id = child.run_id;
+                      child_workflow_type = child.workflow_type;
+                    })
+                  described.pending_children;
+            })
+          (Backend.client_describe handle.client.backend request)
+
+(** Counts the executions a visibility query matches through the client's
+    backend (#1152). The query is validated like [list_visibility]'s before
+    either backend sees it. *)
+let count ?rpc_timeout client ~query () =
+  match rpc_deadline rpc_timeout with
+  | Error error -> Error error
+  | Ok rpc_deadline -> (
+      if Atomic.get client.closed then
+        Error (Error.make ~category:`Bridge ~message:"client is shut down" ())
+      else
+        match validate_text "visibility query" query with
+        | Error _ as error -> error
+        | Ok () ->
+            let request : Backend.count_request = { query; rpc_deadline } in
+            Backend.client_count client.backend request)
 
 (** Executes a one-input typed query against the run [handle] addresses. Encoding happens before transport, so invalid input cannot
     consume a native request or become an ambiguous empty query. *)

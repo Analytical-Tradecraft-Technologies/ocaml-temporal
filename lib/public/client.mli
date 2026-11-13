@@ -17,8 +17,8 @@
       and {!wait} reports [Timed_out].
     - An RPC deadline ([?rpc_timeout] on {!start}, {!signal}, {!query},
       {!query_with_input}, {!start_update}, {!cancel}, {!terminate},
-      {!reset}, {!list_visibility}, and {!fetch_history}) bounds one client
-      call and never
+      {!reset}, {!list_visibility}, {!fetch_history}, {!describe}, and
+      {!count}) bounds one client call and never
       affects the workflow. The deadline is fixed on a monotonic clock when
       the call begins, so it covers the time the request waits to be
       submitted, the RPC, and the transport retries the SDK performs inside
@@ -26,8 +26,8 @@
       whose deadline expires while it waits is never sent. It must be
       between 1 ms and 60 seconds; other values are
       typed defects returned before any request is sent. When omitted, each
-      operation keeps its built-in budget: 10 seconds for {!start} and
-      {!list_visibility}, 3 seconds for {!signal}, {!cancel}, {!terminate},
+      operation keeps its built-in budget: 10 seconds for {!start},
+      {!list_visibility}, {!describe}, and {!count}, 3 seconds for {!signal}, {!cancel}, {!terminate},
       and {!reset}, and 30 seconds for queries, for each {!fetch_history}
       page, and for {!start_update}'s acceptance wait. {!wait} and {!wait_update} have no RPC deadline: they
       wait for the workflow or update, with bounded internal polls. Their
@@ -177,6 +177,64 @@ type visibility_execution = {
 type visibility_page = {
   executions : visibility_execution list;
   next_page_token : string option;
+}
+
+(** State of an activity a described run has scheduled and not yet resolved,
+    as Temporal reports it: waiting for a worker ([`Scheduled]), running on
+    one ([`Started]), asked to cancel ([`Cancel_requested]), or paused on
+    the server ([`Paused], or [`Pause_requested] while an attempt still
+    runs). [`Unknown n] carries the wire value of a state this SDK does not
+    name, such as one a newer server adds, so a description never fails
+    because of it. *)
+type pending_activity_state =
+  [ `Scheduled
+  | `Started
+  | `Cancel_requested
+  | `Paused
+  | `Pause_requested
+  | `Unknown of int ]
+
+(** One activity a described run has scheduled and not yet resolved. *)
+type pending_activity = {
+  activity_id : string;  (** Workflow-scoped activity ID. *)
+  activity_type : string;  (** Registered activity type name. *)
+  state : pending_activity_state;
+  attempt : int;
+      (** Current attempt, starting at 1 (0 only if the server omitted it). *)
+}
+
+(** One child workflow a described run has started and not yet seen close. *)
+type pending_child = {
+  child_workflow_id : string;  (** The child's workflow ID. *)
+  child_run_id : string option;
+      (** The child's run, or [None] while its start is still being
+          initiated. *)
+  child_workflow_type : string;  (** The child's registered workflow type. *)
+}
+
+(** A snapshot of one run returned by {!describe} (#1152). *)
+type execution_description = {
+  execution : execution;
+      (** The described run. For a current-run handle this is the run that
+          was current when Temporal answered. *)
+  workflow_type : string;  (** Registered workflow type. *)
+  task_queue : string;  (** Task queue the run was started on. *)
+  status : execution_status;
+      (** The run's status, in the same type as a visibility row's. *)
+  start_time : Time.t;  (** When the run started, as recorded by Temporal. *)
+  close_time : Time.t option;  (** When the run closed; [None] while open. *)
+  history_length : int64;  (** Number of events in the run's history. *)
+  memo : (string * Payload.t) list;
+      (** The memo the run was started with, sorted by key. *)
+  search_attributes : (string * Payload.t) list;
+      (** The run's search attributes, sorted by key. Temporal Server adds a
+          [type] metadata entry (for example ["Keyword"]) to each payload, so
+          compare their data rather than the whole payload with the value
+          passed to {!start}. *)
+  pending_activities : pending_activity list;
+      (** Activities scheduled and not yet resolved, in server order. *)
+  pending_children : pending_child list;
+      (** Child workflows started and not yet closed, in server order. *)
 }
 
 (** Connects to the configured Temporal endpoint. [target_url] is copied into
@@ -599,6 +657,39 @@ val list_visibility :
   query:string ->
   unit ->
   (visibility_page, Error.t) result
+
+(** Describes the run [handle] addresses (#1152): its identity, type, task
+    queue, status, start and close times, history length, memo, search
+    attributes, and pending activities and child workflows. It never waits
+    for the run, so it is the non-blocking way to learn whether a run is
+    still open, unlike {!wait}. A current-run handle from {!get_handle}
+    describes the run that is current when Temporal handles the request, and
+    the returned [execution] names it.
+
+    An unknown workflow or run is an error with {!val-rpc_status}
+    [Some `Not_found], on every backend. [rpc_timeout] bounds this call
+    (default 10 seconds); see {{!section-rpc_deadlines} RPC deadlines}. The
+    deterministic [mock://] client describes its ledger: the memo and search
+    attributes passed to {!start} unchanged, ledger start and close times,
+    no pending activities or children, and a [history_length] of [0],
+    because it records no history. *)
+val describe :
+  ?rpc_timeout:Duration.t ->
+  ('workflow_input, 'workflow_output) handle ->
+  (execution_description, Error.t) result
+
+(** Counts the workflow executions a visibility query matches (#1152), with
+    the same query language and rules as {!list_visibility}: [query] may be
+    empty, which counts every execution, but must be valid UTF-8, NUL-free,
+    and no more than 65,536 bytes, or a typed defect is returned. For a
+    [GROUP BY] query the result is the total over every group. Visibility is
+    eventually consistent, so a run started a moment ago may not be counted
+    yet. [rpc_timeout] bounds this call (default 10 seconds); see
+    {{!section-rpc_deadlines} RPC deadlines}. The deterministic [mock://]
+    client accepts only an empty query and counts every run an empty
+    {!list_visibility} returns. *)
+val count :
+  ?rpc_timeout:Duration.t -> t -> query:string -> unit -> (int64, Error.t) result
 
 (** Executes a typed one-input query against the run [handle] addresses. The input is encoded with [query]'s codec before transport and
     the result is decoded with its output codec. Query handlers remain

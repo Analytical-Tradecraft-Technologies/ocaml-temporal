@@ -23,7 +23,17 @@
     The seed ([LIFECYCLE_STRESS_SEED]) fixes each Domain's choices, but the
     interleaving between Domains is not reproducible. [CONCURRENT_STRESS_OCAML_ROUNDS]
     (1–10,000, default 6) and [CONCURRENT_STRESS_OCAML_DOMAINS] (2–32,
-    default 4) set the budget; see [docs/reference/bridge-lifecycle-stress.md]. *)
+    default 4) set the budget; see [docs/reference/bridge-lifecycle-stress.md].
+
+    A crash inside the C stubs or the OCaml runtime kills the process
+    before it can report anything (#1214). Every Domain therefore writes the
+    seed, round, step and the operation it is about to perform to its own
+    trace file under [concurrent-stress-trace/] in the working directory
+    (Dune runs the test in [_build/default/test/bridge]), flushing each line
+    to the kernel before the operation starts. A [SIGSEGV] leaves the last
+    line of each file naming the phase each Domain was in. Files are
+    truncated at the start of every round, so they hold only the current
+    round and stay small at any budget. *)
 
 module Bridge = Temporal_core_bridge.Native_bridge
 
@@ -75,6 +85,38 @@ let rng seed round domain =
       domain;
     |]
 
+(** Directory, relative to the working directory, that holds one trace file
+    per Domain (#1214). *)
+let trace_directory = "concurrent-stress-trace"
+
+(** Creates [trace_directory] if needed. Called on the main Domain before any
+    worker Domain starts, so the Domains never race to create it. *)
+let prepare_trace_directory () =
+  try Sys.mkdir trace_directory 0o755 with Sys_error _ when Sys.is_directory trace_directory -> ()
+
+(** A per-Domain crash trace. Only the Domain that opened it writes to it. *)
+type trace = { channel : out_channel; prefix : string }
+
+(** Opens [name] in [trace_directory], truncating the previous round's
+    lines, and records which seed and round the file describes. [prefix]
+    starts every later line, so a line identifies its Domain on its own. *)
+let open_trace ~seed ~round name =
+  let path = Filename.concat trace_directory name in
+  let channel = open_out_gen [ Open_wronly; Open_creat; Open_trunc; Open_text ] 0o644 path in
+  let prefix = Printf.sprintf "seed=0x%Lx round=%d %s" seed round name in
+  Printf.fprintf channel "%s begin\n%!" prefix;
+  { channel; prefix }
+
+(** Records [phase] before it runs. The flush hands the line to the kernel,
+    so it survives a crash of this process; it is not an fsync, which a
+    process crash does not need. *)
+let trace_phase trace phase = Printf.fprintf trace.channel "%s %s\n%!" trace.prefix phase
+
+(** Records the end of the round and closes the file. *)
+let close_trace trace =
+  Printf.fprintf trace.channel "%s end\n%!" trace.prefix;
+  close_out trace.channel
+
 (** Statuses that indicate a bridge defect wherever they appear. *)
 let forbidden = function
   | Bridge.Panic | Bridge.Internal | Bridge.Abi_mismatch | Bridge.Unknown _ -> true
@@ -119,12 +161,19 @@ let replay_config =
   | Error error -> failwith ("replay worker config: " ^ error.message)
 
 (** Applies one seeded collection so custom blocks move and dropped runtimes
-    are finalized while other Domains are inside native calls. *)
-let collect state =
+    are finalized while other Domains are inside native calls. The chosen
+    collection is traced first, because a finalizer may run inside it. *)
+let collect trace state =
   match Random.State.int state 6 with
-  | 0 -> Gc.minor ()
-  | 1 -> Gc.full_major ()
-  | 2 -> Gc.compact ()
+  | 0 ->
+      trace_phase trace "gc minor";
+      Gc.minor ()
+  | 1 ->
+      trace_phase trace "gc full_major";
+      Gc.full_major ()
+  | 2 ->
+      trace_phase trace "gc compact";
+      Gc.compact ()
   | _ -> ignore (Sys.opaque_identity (Bytes.create 4096))
 
 (** One runtime owned by a worker Domain. [closed] is set once this Domain
@@ -140,14 +189,17 @@ type round = {
   finalizer_drops : int Atomic.t;
 }
 
-(** Runs one ordinary operation on a runtime this Domain owns. *)
-let operate state label owned =
+(** Runs one ordinary operation on a runtime this Domain owns, tracing the
+    operation and the runtime's slot ([slot]) before the native call. *)
+let operate trace state label slot owned =
   match owned.runtime with
   | None -> ()
   | Some runtime -> (
       let refused status = owned.closed && not (released status) in
-      let observe label allowed result =
-        match check label allowed result with
+      let observe operation allowed call =
+        let label = label ^ " " ^ operation in
+        trace_phase trace (Printf.sprintf "%s runtime=%d closed=%b" label slot owned.closed);
+        match check label allowed (call ()) with
         | Some status when refused status ->
             failwith (label ^ " on a released runtime was not refused as Invalid_argument")
         | Some Bridge.Invalid_argument -> owned.closed <- true
@@ -155,28 +207,32 @@ let operate state label owned =
       in
       match Random.State.int state 6 with
       | 0 ->
-          observe (label ^ " start") replay_call
-            (Bridge.replay_worker_start runtime replay_config)
-      | 1 -> observe (label ^ " finish") replay_call (Bridge.replay_worker_finish_input runtime)
-      | 2 -> observe (label ^ " wait") replay_call (Bridge.replay_worker_wait_workflow runtime)
-      | 3 ->
-          observe (label ^ " poll") replay_call (Bridge.replay_worker_try_poll_workflow runtime)
-      | 4 -> observe (label ^ " dispose") replay_dispose (Bridge.replay_worker_dispose runtime)
+          observe "start" replay_call (fun () -> Bridge.replay_worker_start runtime replay_config)
+      | 1 -> observe "finish" replay_call (fun () -> Bridge.replay_worker_finish_input runtime)
+      | 2 -> observe "wait" replay_call (fun () -> Bridge.replay_worker_wait_workflow runtime)
+      | 3 -> observe "poll" replay_call (fun () -> Bridge.replay_worker_try_poll_workflow runtime)
+      | 4 -> observe "dispose" replay_dispose (fun () -> Bridge.replay_worker_dispose runtime)
       | _ ->
+          trace_phase trace (Printf.sprintf "%s close runtime=%d" label slot);
           ignore (check (label ^ " close") (fun _ -> false) (Bridge.runtime_close runtime));
           owned.closed <- true)
 
-(** Body of one worker Domain for one round. *)
+(** Body of one worker Domain for one round. It owns and closes its own
+    trace file, [domain-<index>.trace]. *)
 let worker seed round_number index round shared domains =
+  let trace = open_trace ~seed ~round:round_number (Printf.sprintf "domain-%d.trace" index) in
   let state = rng seed round_number index in
   (* One graph in three builds its own Core; the rest attach to the shared
      runtime, racing the main Domain's close of it. *)
   let attach_or_create () =
-    if Random.State.int state 3 = 0 then
+    if Random.State.int state 3 = 0 then begin
+      trace_phase trace "runtime_create";
       match Bridge.runtime_create () with
       | Ok runtime -> Some runtime
       | Error error -> failwith ("runtime create: " ^ error.message)
+    end
     else
+      let () = trace_phase trace "runtime_attach shared" in
       let result = Bridge.runtime_attach shared in
       match check "attach" attach_race result with
       | None -> Result.to_option result
@@ -191,20 +247,24 @@ let worker seed round_number index round shared domains =
   Atomic.set round.published.(index) runtimes.(0).runtime;
   let neighbour = (index + 1) mod domains in
   for step = 1 to operations_per_round do
-    let owned = runtimes.(Random.State.int state runtimes_per_domain) in
-    operate state (Printf.sprintf "round %d domain %d step %d" round_number index step) owned;
+    let slot = Random.State.int state runtimes_per_domain in
+    let owned = runtimes.(slot) in
+    operate trace state
+      (Printf.sprintf "round %d domain %d step %d" round_number index step)
+      slot owned;
     (match Random.State.int state 8 with
     | 0 -> (
         (* Close the neighbour's published runtime from this Domain while
            its owner may be inside a blocking call on it. *)
         match Atomic.get round.published.(neighbour) with
         | Some runtime ->
+            trace_phase trace (Printf.sprintf "step %d cross-domain close of domain %d" step neighbour);
             ignore (check "cross-domain close" (fun _ -> false) (Bridge.runtime_close runtime));
             Atomic.incr round.cross_closes
         | None -> ())
-    | 1 -> collect state
+    | 1 -> collect trace state
     | _ -> ());
-    collect state
+    collect trace state
   done;
   (* The published runtime may have been closed by the neighbour without
      this Domain observing it yet; the next call must still be refused or
@@ -217,16 +277,23 @@ let worker seed round_number index round shared domains =
           if position > 0 && Random.State.bool state then begin
             (* Drop for the custom-block finalizer; a later collection on any
                Domain releases it with the non-blocking dispose. *)
+            trace_phase trace (Printf.sprintf "finalizer drop runtime=%d" position);
             owned.runtime <- None;
             Atomic.incr round.finalizer_drops
           end
-          else ignore (check "final close" (fun _ -> false) (Bridge.runtime_close runtime)))
+          else begin
+            trace_phase trace (Printf.sprintf "final close runtime=%d" position);
+            ignore (check "final close" (fun _ -> false) (Bridge.runtime_close runtime))
+          end)
     runtimes;
-  collect state
+  collect trace state;
+  close_trace trace
 
 (** Runs one round: worker Domains attach and operate while the main Domain
-    closes the shared runtime at a seeded moment. *)
-let run_round seed domains round_number =
+    closes the shared runtime at a seeded moment. The main Domain's phases go
+    to [trace], which the caller owns. *)
+let run_round trace seed domains round_number =
+  trace_phase trace "shared_runtime_create";
   let shared =
     match Bridge.shared_runtime_create ~worker_threads:2 () with
     | Ok shared -> shared
@@ -240,6 +307,7 @@ let run_round seed domains round_number =
       finalizer_drops = Atomic.make 0;
     }
   in
+  trace_phase trace (Printf.sprintf "spawn %d worker domains" domains);
   let workers =
     List.init domains (fun index ->
         Domain.spawn (fun () -> worker seed round_number index round shared domains))
@@ -248,12 +316,16 @@ let run_round seed domains round_number =
   for _ = 1 to Random.State.int state 2_000 do
     Domain.cpu_relax ()
   done;
+  trace_phase trace "shared close";
   ignore (check "shared close" (fun _ -> false) (Bridge.shared_runtime_close shared));
+  trace_phase trace "repeated shared close";
   ignore (check "repeated shared close" (fun _ -> false) (Bridge.shared_runtime_close shared));
+  trace_phase trace "attach after shared close";
   (match Bridge.runtime_attach shared with
   | Error { Bridge.status = Bridge.Invalid_argument | Bridge.Invalid_state; _ } -> ()
   | Error error -> failwith ("attach after shared close: " ^ error.message)
   | Ok _ -> failwith "attach after shared close succeeded");
+  trace_phase trace "join worker domains";
   List.iter Domain.join workers;
   ( Atomic.get round.cross_closes,
     Atomic.get round.attach_refusals,
@@ -264,17 +336,30 @@ let () =
   let seed = env_seed () in
   let rounds = env_int "CONCURRENT_STRESS_OCAML_ROUNDS" default_rounds 1 10_000 in
   let domains = env_int "CONCURRENT_STRESS_OCAML_DOMAINS" default_domains 2 32 in
+  prepare_trace_directory ();
+  (* Printed before any native call so a crash still shows the budget in the
+     Dune output; the trace files hold the per-Domain detail. *)
+  Printf.printf "concurrent OCaml stress: starting seed=0x%Lx rounds=%d domains=%d trace=%s\n%!"
+    seed rounds domains
+    (Filename.concat (Sys.getcwd ()) trace_directory);
   let cross = ref 0 and refusals = ref 0 and drops = ref 0 in
   for round_number = 1 to rounds do
-    let c, r, d = run_round seed domains round_number in
+    let trace = open_trace ~seed ~round:round_number "main.trace" in
+    let c, r, d = run_round trace seed domains round_number in
     cross := !cross + c;
     refusals := !refusals + r;
     drops := !drops + d;
-    Gc.full_major ()
+    trace_phase trace "gc full_major after join";
+    Gc.full_major ();
+    close_trace trace
   done;
+  (* The last finalizers run here; round [rounds + 1] marks this phase. *)
+  let trace = open_trace ~seed ~round:(rounds + 1) "main.trace" in
+  trace_phase trace "final gc full_major, compact, full_major";
   Gc.full_major ();
   Gc.compact ();
   Gc.full_major ();
+  close_trace trace;
   Printf.printf
     "concurrent OCaml stress: seed=0x%Lx rounds=%d domains=%d cross_closes=%d \
      attach_refusals=%d finalizer_drops=%d\n%!"

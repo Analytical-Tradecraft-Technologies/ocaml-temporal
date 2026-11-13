@@ -987,6 +987,8 @@ type client_call_kind =
   | Call_async_activity_completion
   | Call_async_activity_heartbeat
   | Call_history
+  | Call_describe
+  | Call_count
 
 (** Handle of one submitted call: the random identity of the runtime graph
     that submitted it and the call identifier, both issued by Rust and
@@ -1010,6 +1012,8 @@ let client_call_selector = function
   | Call_async_activity_completion -> 11
   | Call_async_activity_heartbeat -> 12
   | Call_history -> 13
+  | Call_describe -> 14
+  | Call_count -> 15
 
 (** Longest single native wait accepted by Rust for one await. *)
 let max_client_await_ms = 60_000
@@ -1518,3 +1522,12 @@ let metric_register meter ~kind ~name ~description ~labels =
   | Error _ as error -> error
 
 let metric_record meter id value = metric_record_raw meter id value = 0
+
+(** Gives back one registration of a series (#1212); allocation-free and
+    keeps the runtime lock, like {!metric_record_raw}. Returns the bridge
+    status code. *)
+external metric_release_raw : metric_meter -> int -> int
+  = "ocaml_temporal_metric_meter_release"
+[@@noalloc]
+
+let metric_release meter id = metric_release_raw meter id = 0

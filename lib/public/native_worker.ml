@@ -1084,7 +1084,11 @@ let report_shutdown ?failure worker (shutdown_report : Bounded_shutdown.report)
       report Logs.Info ~operation:"worker_shutdown" ()
   | Bounded_shutdown.Detached ->
       report Logs.Warning ~operation:"worker_shutdown_teardown_detached" ());
-  Metrics.record_shutdown worker.metrics ?failure shutdown_report
+  Metrics.record_shutdown worker.metrics ?failure shutdown_report;
+  (* The shutdown outcome is the worker's last own recording, so its series
+     registrations go back to the runtime here (#1212). A late recording by
+     an abandoned callback still succeeds. *)
+  Metrics.release worker.metrics
 
 (** Closes admission, then runs the bounded shutdown sequence (#495): wait
     until the lanes deadline for the run loop to stop, drain retained

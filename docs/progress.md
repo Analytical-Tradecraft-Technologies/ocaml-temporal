@@ -6849,3 +6849,22 @@ with only the final stdout written. Mutating calls stay single-attempt.
 task-failure command tests cover retry, bound, pass-through of fatal errors and
 shell/Python classifier agreement. See the [local stack
 reference](reference/local-temporal-stack.md#operator-commands).
+
+## 2026-11-13: SDK metric series released at worker shutdown
+
+The per-runtime cap of 1,024 SDK metric series counted every namespace and
+task-queue pair a runtime had ever seen, so a long-lived runtime hosting
+short-lived workers on distinct queues ran out after about 50 pairs, and the
+worker that hit the cap exported a partial set stuck at zero (#1212). The
+Rust registry now reference-counts registrations and the cap counts only
+live series; the new `ocaml_temporal_core_v4_metric_meter_release` gives one
+registration back, and `Native_worker_metrics.release` returns a worker's
+series when its bounded shutdown is reported. Registration is all or
+nothing: a refused worker releases what it registered and records nothing.
+A released series keeps its identifier and its last value in the scrape,
+because Core's Prometheus registry has no removal. The scrape relay now
+bounds its reserve wait and its connect to Core by the same
+`RELAY_MAX_LIFETIME` deadline as the rest of the relay. `tests/sdk_metrics.rs`
+and `test/runtime/test_native_worker_metrics.ml` cover release, reactivation,
+refusals and the all-or-nothing rollback against a real scrape. See
+[SDK metric registration limits](reference/observability.md#sdk-metric-registration-limits).
