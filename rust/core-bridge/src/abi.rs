@@ -107,6 +107,38 @@ pub const STATUS_ASYNC_HEARTBEAT_REJECTED: Status = 14;
 /// `MAX_PENDING_CALLS` (#796).
 pub const STATUS_RESOURCE_EXHAUSTED: Status = 15;
 
+/// An explicit runtime or shared-runtime release did not finish within its
+/// bound (#1149). Ownership was already transferred: the dedicated cleanup
+/// thread still owns the graph or Core reference and finishes the release in
+/// the background. The usual cause is Core's final drop waiting for its
+/// workflow processing thread in Tokio's blocking pool after a worker
+/// finalizer was detached. The handle is closed either way.
+pub const STATUS_DETACHED: Status = 16;
+
+/// Bound on an explicit [`Runtime`] close, which disposes the whole graph on
+/// its cleanup thread: the worker drain ([`WORKER_SHUTDOWN_DRAIN_TIMEOUT`]),
+/// its finalization ([`WORKER_FINALIZE_TIMEOUT`]), and the final release of
+/// this graph's Core reference, with 30 s of headroom (#1149).
+const RUNTIME_CLOSE_TIMEOUT: Duration = Duration::from_secs(
+    WORKER_SHUTDOWN_DRAIN_TIMEOUT.as_secs() + WORKER_FINALIZE_TIMEOUT.as_secs() + 30,
+);
+
+/// Bound on an explicit [`SharedRuntime`] release (#1149). Attached graphs
+/// have already released their references, so this normally covers only the
+/// drop of Core itself.
+const SHARED_RUNTIME_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Waits for a cleanup thread's completion report for at most `bound`. A
+/// report that does not arrive in time is [`STATUS_DETACHED`]; a cleanup
+/// thread that ended without reporting is [`STATUS_INTERNAL`].
+fn await_cleanup(receiver: &Receiver<Status>, bound: Duration) -> Status {
+    match receiver.recv_timeout(bound) {
+        Ok(status) => status,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => STATUS_DETACHED,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => STATUS_INTERNAL,
+    }
+}
+
 /// Private transport-safety ceiling for one string crossing the bridge.
 ///
 /// This is deliberately not a claim about Temporal Server identifier limits,
@@ -1428,10 +1460,19 @@ impl SharedRuntime {
     }
 
     /// Transfers this handle's Core reference to the cleanup thread and
-    /// optionally waits until it has been dropped. A release with attached
-    /// graphs still alive only decrements the count; Core then outlives this
-    /// handle until the last graph is closed.
+    /// optionally waits, at most [`SHARED_RUNTIME_RELEASE_TIMEOUT`], until it
+    /// has been dropped. A release with attached graphs still alive only
+    /// decrements the count; Core then outlives this handle until the last
+    /// graph is closed.
     fn release(self, wait: bool) -> Status {
+        self.release_within(wait.then_some(SHARED_RUNTIME_RELEASE_TIMEOUT))
+    }
+
+    /// [`Self::release`] with an explicit wait bound; `None` does not wait.
+    /// A wait that outlives `bound` returns [`STATUS_DETACHED`] while the
+    /// cleanup thread keeps the reference and finishes the drop (#1149).
+    fn release_within(self, bound: Option<Duration>) -> Status {
+        let wait = bound.is_some();
         let Self { core, cleanup } = self;
         let (completed, receiver) = if wait {
             let (sender, receiver) = sync_channel(1);
@@ -1446,9 +1487,9 @@ impl SharedRuntime {
             drop(error.0.core);
             return STATUS_INTERNAL;
         }
-        match receiver {
-            Some(receiver) => receiver.recv().unwrap_or(STATUS_INTERNAL),
-            None => STATUS_OK,
+        match (receiver, bound) {
+            (Some(receiver), Some(bound)) => await_cleanup(&receiver, bound),
+            _ => STATUS_OK,
         }
     }
 }
@@ -3339,10 +3380,19 @@ impl Runtime {
 
     /// Transfers Core to its cleanup thread and optionally waits for disposal.
     ///
-    /// Explicit close waits while the OCaml lock is released. GC fallback does
-    /// not wait on this caller, so a custom-block finalizer never stalls the
-    /// collector; the dedicated cleanup thread joins any aborted start tasks.
-    fn close(mut self, wait: bool) -> Status {
+    /// Explicit close waits while the OCaml lock is released, for at most
+    /// [`RUNTIME_CLOSE_TIMEOUT`]. GC fallback does not wait on this caller, so
+    /// a custom-block finalizer never stalls the collector; the dedicated
+    /// cleanup thread joins any aborted start tasks.
+    fn close(self, wait: bool) -> Status {
+        self.close_within(wait.then_some(RUNTIME_CLOSE_TIMEOUT))
+    }
+
+    /// [`Self::close`] with an explicit wait bound; `None` does not wait. A
+    /// disposal that outlives `bound` returns [`STATUS_DETACHED`] while the
+    /// cleanup thread keeps the graph and finishes it (#1149).
+    fn close_within(mut self, bound: Option<Duration>) -> Status {
+        let wait = bound.is_some();
         // Cancel borrowed history futures before transferring their executor
         // and connection to the cleanup thread, including GC fallback close.
         self.pending_waits.clear();
@@ -3386,9 +3436,9 @@ impl Runtime {
             return STATUS_INTERNAL;
         }
 
-        match receiver {
-            Some(receiver) => receiver.recv().unwrap_or(STATUS_INTERNAL),
-            None => STATUS_OK,
+        match (receiver, bound) {
+            (Some(receiver), Some(bound)) => await_cleanup(&receiver, bound),
+            _ => STATUS_OK,
         }
     }
 }
@@ -5057,7 +5107,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_new_attached(
 /// When no attached graph remains, this destroys Core (and its Tokio pool)
 /// before returning. When graphs are still attached, it only releases this
 /// handle's reference and Core is destroyed by the last graph's release.
-/// Calling again with the now-null slot is safe.
+/// The wait is bounded by 30 s: a drop that takes longer (Core waiting for a
+/// blocking-pool thread, #1149) returns `STATUS_DETACHED` while the cleanup
+/// thread finishes it. Calling again with the now-null slot is safe.
 ///
 /// # Safety
 ///
@@ -6362,8 +6414,12 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_disconnect(
 
 /// Destroy one native runtime and clear the caller's slot.
 ///
-/// Passing the same slot again after a successful call is safe because the
-/// first call stores null before dropping the owner.
+/// The graph is disposed on its cleanup thread and this call waits for it at
+/// most the worker drain bound plus the finalize bound plus 30 s (150 s). A
+/// disposal that takes longer (#1149) returns `STATUS_DETACHED`; the cleanup
+/// thread still owns the graph and finishes it. Passing the same slot again
+/// after a successful call is safe because the first call stores null before
+/// dropping the owner.
 ///
 /// # Safety
 ///
@@ -7146,6 +7202,10 @@ mod worker_task_types;
 #[cfg(test)]
 #[path = "../tests/support/worker_tuning.rs"]
 mod worker_tuning;
+
+#[cfg(test)]
+#[path = "../tests/support/runtime_release_bound.rs"]
+mod runtime_release_bound;
 
 #[cfg(test)]
 #[path = "../tests/support/worker_shutdown_outcomes.rs"]

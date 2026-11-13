@@ -560,6 +560,7 @@ let native_status_name = function
   | Bridge.Retryable -> "retryable"
   | Bridge.Async_heartbeat_rejected -> "async_heartbeat_rejected"
   | Bridge.Resource_exhausted -> "resource_exhausted"
+  | Bridge.Detached -> "detached"
   | Bridge.Unknown code -> Printf.sprintf "unknown(%d)" code
 
 (** The [Error.error_type] carried by a client operation that the native

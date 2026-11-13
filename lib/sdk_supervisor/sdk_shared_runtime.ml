@@ -1,6 +1,10 @@
 module Bridge = Temporal_core_bridge.Native_bridge
 
-(** [mutex] protects [attached] and [closed]. It is held across the native
+(** [mutex] protects [attached], [detached] and [closed]. [detached] counts
+    attachments returned by [release_detached]: graphs whose bounded native
+    close gave up waiting while their cleanup thread still held a Core
+    reference (#1149), so destroying the shared handle cannot prove that Core
+    is gone. It is held across the native
     close in [shutdown] so that every [Ok] return, including a concurrent
     second caller's, happens after Core has been destroyed. Holding it there
     cannot deadlock: no lease is outstanding, so no [release] waits on it,
@@ -16,6 +20,7 @@ type t = {
   meter : Bridge.metric_meter option;
   mutex : Mutex.t;
   mutable attached : int;
+  mutable detached : int;
   mutable closed : bool;
 }
 
@@ -40,6 +45,7 @@ let make native metrics_address meter =
     meter;
     mutex = Mutex.create ();
     attached = 0;
+    detached = 0;
     closed = false;
   }
 
@@ -86,6 +92,12 @@ let release lease =
     with_lock lease.owner.mutex (fun () ->
         lease.owner.attached <- lease.owner.attached - 1)
 
+let release_detached lease =
+  if not (Atomic.exchange lease.released true) then
+    with_lock lease.owner.mutex (fun () ->
+        lease.owner.attached <- lease.owner.attached - 1;
+        lease.owner.detached <- lease.owner.detached + 1)
+
 let attached runtime = with_lock runtime.mutex (fun () -> runtime.attached)
 let is_shut_down runtime = with_lock runtime.mutex (fun () -> runtime.closed)
 
@@ -96,5 +108,19 @@ let shutdown runtime =
       else (
         runtime.closed <- true;
         match Bridge.shared_runtime_close runtime.native with
-        | Ok () -> Ok ()
-        | Error error -> Error (Native error)))
+        | Error error -> Error (Native error)
+        | Ok () when runtime.detached = 0 -> Ok ()
+        | Ok () ->
+            (* The shared handle's reference is gone, but a detached graph's
+               cleanup thread may still hold the last one, so Core may still
+               be running: report that instead of a destruction that cannot
+               be proven. *)
+            Error
+              (Native
+                 {
+                   Bridge.status = Bridge.Detached;
+                   message =
+                     Printf.sprintf
+                       "%d attached graph(s) were still finishing their native                         cleanup in the background when they released this                         runtime, so Temporal Core may outlive this shutdown;                         the bridge's cleanup threads finish its release"
+                       runtime.detached;
+                 })))

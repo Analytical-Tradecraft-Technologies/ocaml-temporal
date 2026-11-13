@@ -559,6 +559,7 @@ module Protocol_adapter = struct
       | Retryable -> "retryable"
       | Async_heartbeat_rejected -> "async_heartbeat_rejected"
       | Resource_exhausted -> "resource_exhausted"
+      | Detached -> "detached"
       | Unknown code -> Printf.sprintf "unknown(%d)" code
     in
     {
@@ -1643,9 +1644,16 @@ module Native_backend = struct
       | Error _ as error -> error
     in
     let runtime_result = Bridge.runtime_close runtime in
-    (* [runtime_close] has detached the graph and, on every result, dropped
-       its Core reference, so the shared runtime no longer depends on it. *)
-    Option.iter Sdk_shared_runtime.release lease;
+    (* [runtime_close] has detached the graph handle on every result. When it
+       finished within its bound the graph's Core reference is gone and the
+       attachment is simply returned. A [Detached] close (#1149) means the
+       graph's cleanup thread still holds that reference, so the attachment
+       is returned as detached: the shared runtime's shutdown then reports
+       that Core may outlive it instead of claiming it was destroyed. *)
+    (match runtime_result with
+    | Error { Bridge.status = Bridge.Detached; _ } ->
+        Option.iter Sdk_shared_runtime.release_detached lease
+    | Ok () | Error _ -> Option.iter Sdk_shared_runtime.release lease);
     match (replay_result, worker_result, client_result, runtime_result) with
     | Error _ as error, _, _, _ -> error
     | Ok (), (Error _ as error), _, _ -> error

@@ -16,6 +16,9 @@ type status =
   | Retryable
   | Async_heartbeat_rejected
   | Resource_exhausted
+  | Detached
+      (** An explicit runtime or shared-runtime release outlived its bound
+          and finishes on the bridge cleanup thread (#1149). *)
   | Unknown of int
 
 (** Error copied into the OCaml heap. Once returned, it contains no pointer to

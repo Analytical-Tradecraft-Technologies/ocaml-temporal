@@ -31,7 +31,10 @@ enum {
   OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED = 14,
   /* A bounded client-operation registry is full; the request was not admitted
      and may be retried after another in-flight operation finishes. */
-  OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED = 15
+  OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED = 15,
+  /* An explicit runtime_free or shared_runtime_free outlived its bound; the
+     handle is closed and the cleanup thread finishes the release (#1149). */
+  OCAML_TEMPORAL_CORE_STATUS_DETACHED = 16
 };
 
 /* Rust-owned byte allocation. `{ NULL, 0 }` is the sole empty representation. */
@@ -554,7 +557,9 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_disconnect(
 /*
  * Destroy a runtime and clear the caller's slot. Calling this again with the
  * same now-null slot is safe. The runtime defensively finalizes a remaining
- * worker and drops its client in reverse ownership order before Core.
+ * worker and drops its client in reverse ownership order before Core. The
+ * wait is bounded (150 s); a longer disposal returns
+ * OCAML_TEMPORAL_CORE_STATUS_DETACHED and finishes on the cleanup thread.
  */
 ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_free(
     ocaml_temporal_core_runtime **runtime);
@@ -569,8 +574,10 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_dispose(
 /*
  * Release a shared-runtime handle, clear the slot, and wait until its Core
  * reference is dropped. Core is destroyed here only if no attached graph
- * remains; otherwise the last graph's release destroys it. Calling again
- * with the now-null slot is safe.
+ * remains; otherwise the last graph's release destroys it. The wait is
+ * bounded (30 s); a longer drop returns OCAML_TEMPORAL_CORE_STATUS_DETACHED
+ * and finishes on the cleanup thread. Calling again with the now-null slot
+ * is safe.
  */
 ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_free(
     ocaml_temporal_core_shared_runtime **shared);
@@ -675,6 +682,8 @@ static_assert(OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED == 14,
               "status numbering is part of the ABI");
 static_assert(OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED == 15,
               "status numbering is part of the ABI");
+static_assert(OCAML_TEMPORAL_CORE_STATUS_DETACHED == 16,
+              "status numbering is part of the ABI");
 static_assert(offsetof(ocaml_temporal_core_buffer, ptr) == 0,
               "buffer pointer must be the first field");
 static_assert(offsetof(ocaml_temporal_core_buffer, len) == sizeof(void *),
@@ -725,6 +734,8 @@ _Static_assert(OCAML_TEMPORAL_CORE_STATUS_RETRYABLE == 13,
 _Static_assert(OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED == 14,
                "status numbering is part of the ABI");
 _Static_assert(OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED == 15,
+               "status numbering is part of the ABI");
+_Static_assert(OCAML_TEMPORAL_CORE_STATUS_DETACHED == 16,
                "status numbering is part of the ABI");
 _Static_assert(offsetof(ocaml_temporal_core_buffer, ptr) == 0,
                "buffer pointer must be the first field");

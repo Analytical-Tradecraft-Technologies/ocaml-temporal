@@ -16,6 +16,7 @@ type status =
   | Retryable
   | Async_heartbeat_rejected
   | Resource_exhausted
+  | Detached
   | Unknown of int
 
 (** Error data copied into OCaml. It never owns Rust memory. *)
@@ -370,6 +371,7 @@ let status = function
   | 13 -> Retryable
   | 14 -> Async_heartbeat_rejected
   | 15 -> Resource_exhausted
+  | 16 -> Detached
   | code -> Unknown code
 
 (** Converts a bridge status to a bounded stable tag value without exposing the
@@ -390,6 +392,7 @@ let status_name = function
   | Retryable -> "retryable"
   | Async_heartbeat_rejected -> "async_heartbeat_rejected"
   | Resource_exhausted -> "resource_exhausted"
+  | Detached -> "detached"
   | Unknown _ -> "unknown"
 
 (** Constructs a local configuration failure without entering native code. *)
@@ -1284,6 +1287,16 @@ let client_disconnect runtime =
   bridge_call "client_disconnect" (fun () ->
       Result.map (fun _ -> ()) (decode (client_disconnect_raw runtime)))
 
+(** The message of a failed explicit close or release named [operation]. A
+    [Detached] status means the bounded wait ended while the bridge cleanup
+    thread still owns the release (#1149); the handle is closed either way. *)
+let close_failure_message status operation =
+  match status with
+  | Detached ->
+      "Temporal Core " ^ operation
+      ^ " did not finish within its bound; it continues in the background"
+  | _ -> "Temporal Core " ^ operation ^ " failed"
+
 (** Closes the native owner after first clearing its OCaml-held pointer. This
     makes repeated sequential calls safe; the production supervisor serializes
     all lifecycle calls across Domains. *)
@@ -1296,7 +1309,7 @@ let runtime_close runtime =
             Error
               {
                 status = status code;
-                message = "Temporal Core runtime close failed";
+                message = close_failure_message (status code) "runtime close";
               })
   in
   let level, message, bridge_status =
@@ -1368,7 +1381,7 @@ let shared_runtime_close shared =
           Error
             {
               status = status code;
-              message = "Temporal Core shared runtime close failed";
+              message = close_failure_message (status code) "shared runtime release";
             })
   |> report_shared_lifecycle ~operation:"shared_runtime_close"
        ~ok_message:"shared runtime closed"
