@@ -253,6 +253,31 @@ let corpus_v3_random client =
     };
   ]
 
+(** Scenarios captured by the [corpus-v4-continue-as-new-options] generation
+    (#1153): the run that continued as new with options and its successor,
+    which must report the options it received. *)
+let corpus_v4_continue_as_new_options client =
+  let workflow_type = Defs.continue_as_new_options_workflow_type in
+  let workflow = remote workflow_type Temporal.Codec.string Temporal.Codec.string in
+  let first =
+    start client ~workflow ~id:"history-corpus-continue-as-new-options" ~input:"first"
+  in
+  let successor =
+    match require "continue-as-new options wait" (Temporal.Client.wait first) with
+    | Temporal.Client.Continued_as_new execution -> execution
+    | _ -> failwith "continue-as-new options first run did not continue"
+  in
+  let second =
+    require "follow options successor" (Temporal.Client.follow client ~workflow successor)
+  in
+  let observed = expect_completed "continue-as-new options successor" second in
+  if observed <> "OPTIONS:30000/7000/3/replaced" then
+    failwith ("continue-as-new options successor observed " ^ observed);
+  [
+    record ~case:"continue-as-new-options-first" ~workflow_type first;
+    record ~case:"continue-as-new-options-second" ~workflow_type second;
+  ]
+
 (** Captures one [corpus.patch] run under the current generation. *)
 let patch client ~case =
   let workflow_type = Defs.patch_workflow_type in
@@ -381,6 +406,7 @@ let scenarios generation client =
   | "corpus-lifecycle-removed" -> lifecycle_matrix client ~stage:"removed"
   | "corpus-v2-cancellation" -> corpus_v2_cancellation client
   | "corpus-v3-random" -> corpus_v3_random client
+  | "corpus-v4-continue-as-new-options" -> corpus_v4_continue_as_new_options client
   | other -> failwith ("generation has no capture scenarios: " ^ other)
 
 (** Converts a definition-set entry to a live worker registration. *)
