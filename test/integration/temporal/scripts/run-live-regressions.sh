@@ -150,6 +150,7 @@ for executable in "$@"; do
     test/integration/transport_interruption/regression.exe|\
     test/integration/update_outcomes/regression.exe|\
     test/integration/update_run_close/regression.exe|\
+    test/integration/with_start/regression.exe|\
     test/integration/worker_versioning/regression.exe)
       cli_argument=$container_cli ;;
     test/integration/activity_worker_crash/regression.exe)

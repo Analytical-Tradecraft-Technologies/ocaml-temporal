@@ -1164,6 +1164,86 @@ The OCaml protocol test is
 [`test_ocaml_client_update_protocol.ml`](../../test/bridge/test_ocaml_client_update_protocol.ml);
 Rust tests cover strict validation and Core response conversion.
 
+## Signal-with-start and update-with-start (#1151)
+
+`Temporal.Client.signal_with_start` and `Temporal.Client.update_with_start`
+deliver a message to a workflow, starting it first when its workflow ID has no
+open run. Each is one atomic Temporal operation, so an entity workflow can be
+"ensured running, then messaged" without the window in which a run closes
+between a separate `start ~id_conflict_policy:`Use_existing` and `signal`:
+
+```ocaml
+Temporal.Client.signal_with_start client ~workflow ~task_queue ~id ~input
+  ~signal ~signal_input ()
+Temporal.Client.update_with_start client ~id_conflict_policy:`Use_existing
+  ~workflow ~task_queue ~id ~input ~update ~update_input ()
+```
+
+Both are submitted calls without a synchronous symbol: `SIGNAL_WITH_START`
+(16) and `UPDATE_WITH_START` (17). Each request embeds the
+[start document](#start-a-workflow) unchanged under `start`, so every start
+option, its validation, request-ID handling and the generated request ID are
+exactly a start's, and `start.rpc_timeout_ms` bounds the whole call. In flight,
+both count against the client's start slots and share their `request_id`
+deduplication with starts: a pending request ID may only be reused for the
+same logical operation of the same kind, and any other reuse is refused at
+submission as a protocol error.
+
+[`client-signal-with-start-request.schema.json`](../schemas/bridge/client-signal-with-start-request.schema.json)
+adds `signal_name` and `signal_input`. Rust copies the start fields into one
+`SignalWithStartWorkflowExecution` RPC (default budget 10 seconds). Temporal
+records the signal before the run's first workflow task when it starts one,
+and only signals an open run under `use_existing`; `terminate_existing`
+replaces an open run. Temporal rejects `fail` for this RPC, so OCaml and Rust
+both refuse it before anything is sent, and the public parameter only offers
+the other two policies. The start's `request_id` deduplicates the start and
+the signal. The outcome is the ordinary start outcome document
+([`client-start-outcome.schema.json`](../schemas/bridge/client-start-outcome.schema.json)),
+classified exactly like a start: `already_exists` (a reuse policy refusing a
+closed run) is the typed already-started rejection, and a transport failure
+after the request may have been sent is `unknown`, which
+`Client.is_start_outcome_uncertain` recognizes. `started` follows the start
+rule: it is reported from the server under `use_existing` and is always true
+under `terminate_existing`.
+
+[`client-update-with-start-request.schema.json`](../schemas/bridge/client-update-with-start-request.schema.json)
+adds `update_id`, `update_name` and `update_input`. Rust sends one
+`ExecuteMultiOperation` of `[StartWorkflow, UpdateWorkflow]` routed by the
+workflow ID; the update names no run, as Temporal requires, and waits for the
+`Accepted` stage. Every conflict policy is sent explicitly (Temporal requires
+one here). The answer must hold exactly one start and one update response, in
+that order. As for `start_update`, an update that is only admitted is
+re-issued, identically, until it is accepted or has an outcome (the default
+budget is 30 seconds) (#772, #1078). The outcome document
+([`client-update-with-start-outcome.schema.json`](../schemas/bridge/client-update-with-start-outcome.schema.json))
+extends the start outcome:
+
+- `accepted` means Temporal answered at least once, which proves the start was
+  applied. It carries the first answer's `execution` and `started` and an
+  `update` half: `{"kind":"response",...}` with the update's ID, the run that
+  accepted it and its optional outcome (a completion or a validator
+  rejection), or `{"kind":"error","error":...}` when the wait for acceptance
+  ended first, typically `deadline_exceeded`. The public result therefore
+  returns the run handle beside the update's own result, so a validator
+  rejection never hides the run that was started.
+- `rejected` means nothing was applied: Temporal applies both operations
+  atomically. A `MultiOperationExecutionFailure` status is attributed to the
+  operation that failed (the other carries `MultiOperationExecutionAborted`):
+  a start conflict becomes the typed already-started rejection with the
+  existing run, and an update failure keeps its status code.
+- `unknown` means the first attempt's outcome cannot be proven, exactly as for
+  a start.
+
+The deterministic `mock://` backend applies the embedded start with the same
+ledger rules as `start`, in the same critical section as the message: a
+signal is recorded on the resulting run under the start's request ID (so a
+retry delivers it once), and an update is reported as the typed error
+`start_update` returns on the mock, beside the run it started. Rust tests in
+[`with_start.rs`](../../rust/core-bridge/tests/with_start.rs) drive both
+selectors against a gRPC double; the
+[with-start live regression](../../test/integration/with_start/README.md)
+checks both against Temporal Server.
+
 ## Structured failures
 
 Routine transport and Core failures do not raise OCaml exceptions. Rust emits

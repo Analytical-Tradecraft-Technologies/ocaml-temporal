@@ -799,6 +799,131 @@ let test_id_conflict_policy_protocol () =
     (Protocol.decode_start_outcome ~request:use_existing
        {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"}}|})
 
+(** Signal-with-start and update-with-start documents (#1151): both embed the
+    start document unchanged under ["start"]; signal-with-start refuses the
+    [Fail] policy; an update-with-start outcome is decoded strictly, its
+    start and update halves are correlated with the request, a validator
+    rejection keeps the started run, and rejected and unknown outcomes are a
+    start's. *)
+let test_with_start_protocol () =
+  let start = { start_request with id_conflict_policy = Protocol.Use_existing } in
+  let signal : Protocol.signal_with_start_request =
+    { start; signal_name = "deliver"; signal_input = [ payload (Bytes.of_string "ok") ] }
+  in
+  let encoded = unwrap (Protocol.encode_signal_with_start_request signal) in
+  require_fragment "embedded start" {|"start":{|} encoded;
+  require_fragment "embedded request ID" {|"request_id":"request-1"|} encoded;
+  require_fragment "signal name" {|"signal_name":"deliver"|} encoded;
+  check_error_path "fail policy" "$.start.id_conflict_policy"
+    (Protocol.encode_signal_with_start_request { signal with start = start_request });
+  check_error_path "signal name" "$.signal_name"
+    (Protocol.encode_signal_with_start_request { signal with signal_name = "" });
+  check_error_path "embedded start" "$.workflow_id"
+    (Protocol.encode_signal_with_start_request
+       { signal with start = { start with workflow_id = "" } });
+  (* The outcome is a start outcome correlated with the embedded start. *)
+  (match
+     unwrap
+       (Protocol.decode_start_outcome ~request:signal.start
+          {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-existing"},"started":false}|})
+   with
+  | Protocol.Accepted { started = false; _ } -> ()
+  | _ -> failwith "signal-with-start outcome changed shape");
+  let update : Protocol.update_with_start_request =
+    { start; update_id = "update-1"; update_name = "apply"; update_input = [] }
+  in
+  let encoded = unwrap (Protocol.encode_update_with_start_request update) in
+  require_fragment "update id" {|"update_id":"update-1"|} encoded;
+  require_fragment "update input" {|"update_input":[]|} encoded;
+  check_error_path "update id" "$.update_id"
+    (Protocol.encode_update_with_start_request { update with update_id = "" });
+  (* Unlike signal-with-start, every conflict policy may be sent. *)
+  ignore
+    (unwrap
+       (Protocol.encode_update_with_start_request { update with start = start_request }));
+  let accepted ?(workflow_id = "workflow-1") update_half =
+    Printf.sprintf
+      {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":%S,"run_id":"run-1"},"started":true,"update":%s}|}
+      workflow_id update_half
+  in
+  let response ?(update_id = "update-1") outcome =
+    Printf.sprintf
+      {|{"kind":"response","update_id":%S,"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"outcome":%s}|}
+      update_id outcome
+  in
+  let pending = accepted (response "null") in
+  (match unwrap (Protocol.decode_update_with_start_outcome ~request:update pending) with
+  | Protocol.Update_with_start_accepted
+      {
+        start = { execution = { run_id = "run-1"; _ }; started = true };
+        update = Ok { update_id = "update-1"; outcome = None; _ };
+      } ->
+      ()
+  | _ -> failwith "accepted update-with-start changed shape");
+  let decoded = unwrap (Protocol.decode_update_with_start_outcome ~request:update pending) in
+  assert (
+    unwrap
+      (Protocol.decode_update_with_start_outcome ~request:update
+         (unwrap (Protocol.encode_update_with_start_outcome decoded)))
+    = decoded);
+  let rejected_by_validator =
+    accepted
+      (response
+         {|{"kind":"failed","failure":{"message":"no","source":"worker","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"application","type":"Invalid","non_retryable":true,"details":[]}}}|})
+  in
+  (match
+     unwrap (Protocol.decode_update_with_start_outcome ~request:update rejected_by_validator)
+   with
+  | Protocol.Update_with_start_accepted
+      { start = { started = true; _ }; update = Ok { outcome = Some (Protocol.Update_failed _); _ } }
+    ->
+      ()
+  | _ -> failwith "validator rejection lost the started run");
+  let update_error code =
+    accepted (Printf.sprintf {|{"kind":"error","error":{"kind":"rpc","code":%S}}|} code)
+  in
+  (match
+     unwrap
+       (Protocol.decode_update_with_start_outcome ~request:update
+          (update_error "deadline_exceeded"))
+   with
+  | Protocol.Update_with_start_accepted
+      { update = Error (Protocol.Rpc { code = "deadline_exceeded" }); _ } ->
+      ()
+  | _ -> failwith "update deadline lost the started run");
+  check_error_path "other workflow" "$.execution.workflow_id"
+    (Protocol.decode_update_with_start_outcome ~request:update
+       (accepted ~workflow_id:"other" (response "null")));
+  check_error_path "other update" "$.update.update_id"
+    (Protocol.decode_update_with_start_outcome ~request:update
+       (accepted (response ~update_id:"update-2" "null")));
+  check_error_path "already started update" "$.update.error.kind"
+    (Protocol.decode_update_with_start_outcome ~request:update
+       (accepted
+          {|{"kind":"error","error":{"kind":"already_started","workflow_id":"workflow-1","existing_run_id":null}}|}));
+  require_error
+    (Protocol.decode_update_with_start_outcome ~request:update
+       {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"started":true}|});
+  (match
+     unwrap
+       (Protocol.decode_update_with_start_outcome ~request:update
+          {|{"kind":"rejected","error":{"kind":"already_started","workflow_id":"workflow-1","existing_run_id":"run-0"}}|})
+   with
+  | Protocol.Update_with_start_rejected
+      (Protocol.Already_started { existing_run_id = Some "run-0"; _ }) ->
+      ()
+  | _ -> failwith "start conflict changed shape");
+  (match
+     unwrap
+       (Protocol.decode_update_with_start_outcome ~request:update
+          {|{"kind":"unknown","request_id":"request-1","workflow_id":"workflow-1"}|})
+   with
+  | Protocol.Update_with_start_unknown { request_id = "request-1"; _ } -> ()
+  | _ -> failwith "uncertain update-with-start changed shape");
+  check_error_path "unknown request" "$.request_id"
+    (Protocol.decode_update_with_start_outcome ~request:update
+       {|{"kind":"unknown","request_id":"request-2","workflow_id":"workflow-1"}|})
+
 (** Reports whether [fragment] occurs in [value]; the negative counterpart of
     [require_fragment], used to check that an absent option is omitted. *)
 let contains_fragment value fragment =
@@ -1160,6 +1285,7 @@ let () =
   run "client describe and count protocol" test_describe_count_protocol;
   run "client asynchronous starts" test_async_start_protocol;
   run "client id conflict policy" test_id_conflict_policy_protocol;
+  run "client signal and update with start" test_with_start_protocol;
   run "client start execution policies" test_start_execution_policy_protocol;
   run "client rpc timeouts" test_rpc_timeout_protocol;
   run "client rpc deadline remaining budget" test_rpc_deadline_remaining;

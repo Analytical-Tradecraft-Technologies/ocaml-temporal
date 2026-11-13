@@ -182,6 +182,15 @@ for those rules.
   `Client.wait_update` polls that
   exact update until it has a typed outcome, while `Client.update_id` exposes
   the server-correlated update ID for diagnostics and retry bookkeeping.
+  `Client.signal_with_start` and `Client.update_with_start` (#1151) take
+  every start option and deliver a typed signal or update to the workflow,
+  starting it first when its ID has no open run, as one atomic Temporal
+  operation. Signal-with-start returns the exact-run handle that received the
+  signal (`Client.started` tells whether it was created) and accepts only the
+  `` `Use_existing `` (default) and `` `Terminate_existing `` conflict
+  policies; update-with-start requires a conflict policy and returns the
+  run handle beside the update's own `start_update`-shaped result, so a
+  validator rejection still reports the run that was started.
   `Client.follow`
   only validates and combines the existing client, workflow definition, and
   successor identity; it does not start or implicitly follow a run. A

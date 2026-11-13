@@ -447,6 +447,28 @@ module Native : sig
         Temporal_core_bridge.Native_bridge.error )
       result
     (** Decodes one update completion poll and preserves structured failures. *)
+
+    val encode_client_signal_with_start_request :
+      Temporal_protocol.Client_protocol.signal_with_start_request ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result
+    (** Canonically serializes one signal-with-start request (#1151). Its
+        outcome is decoded by {!decode_client_submitted_start_outcome}
+        against the embedded start. *)
+
+    val encode_client_update_with_start_request :
+      Temporal_protocol.Client_protocol.update_with_start_request ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result
+    (** Canonically serializes one update-with-start request (#1151). *)
+
+    val decode_client_update_with_start_outcome :
+      Temporal_protocol.Client_protocol.update_with_start_request ->
+      (bytes, Temporal_core_bridge.Native_bridge.error) result ->
+      ( Temporal_protocol.Client_protocol.update_with_start_outcome,
+        Temporal_core_bridge.Native_bridge.error )
+      result
+    (** Decodes a submitted update-with-start's terminal outcome, correlated
+        with its request (#1151). Native failures are preserved; the caller
+        treats them as an uncertain start, as for a submitted start. *)
   end
 
   (** Validated client settings whose representation remains bridge-private. *)
@@ -516,6 +538,16 @@ module Native : sig
     | Rpc_count :
         Temporal_protocol.Client_protocol.count_request -> int64 client_rpc
         (** Counts the executions a visibility query matches (#1152). *)
+    | Rpc_signal_with_start :
+        Temporal_protocol.Client_protocol.signal_with_start_request ->
+        Temporal_protocol.Client_protocol.start_outcome client_rpc
+        (** Signals a workflow, starting it first when needed (#1151); yields
+            the start's closed accepted/rejected/unknown outcome. *)
+    | Rpc_update_with_start :
+        Temporal_protocol.Client_protocol.update_with_start_request ->
+        Temporal_protocol.Client_protocol.update_with_start_outcome client_rpc
+        (** Starts a workflow when needed and admits one update on it
+            (#1151). *)
     | Rpc_async_activity_completion :
         Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
         (** Completes, fails, or cancels an activity handed off with

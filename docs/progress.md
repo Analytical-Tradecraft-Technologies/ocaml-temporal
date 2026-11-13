@@ -6868,3 +6868,54 @@ bounds its reserve wait and its connect to Core by the same
 and `test/runtime/test_native_worker_metrics.ml` cover release, reactivation,
 refusals and the all-or-nothing rollback against a real scrape. See
 [SDK metric registration limits](reference/observability.md#sdk-metric-registration-limits).
+
+## 2026-11-13: Describe one run and count executions
+
+`Client.describe` returns a snapshot of the run a handle addresses without
+waiting for it: identity, type, task queue, the visibility status vocabulary,
+start and close times, history length, memo, search attributes, and pending
+activities and child workflows. `Client.count` counts the executions a
+visibility query matches (#1152). Both are submitted calls on the new
+`DESCRIBE` (14) and `COUNT` (15) selectors. `tests/describe_count.rs` covers
+them against a gRPC double, and the `describe_count` live regression checks
+them against Temporal Server. See [describe and
+count](reference/client-protocol.md#describe-one-run-and-count-executions-1152).
+
+## 2026-11-13: Signal-with-start and update-with-start
+
+`Client.signal_with_start` and `Client.update_with_start` deliver a typed
+signal or update to a workflow, starting it first when its workflow ID has no
+open run, as one atomic Temporal operation each (#1151). Both take every
+`start` option. Signal-with-start offers only the `Use_existing` (default) and
+`Terminate_existing` conflict policies, because Temporal rejects `FAIL` for
+it. Update-with-start sends `ExecuteMultiOperation [StartWorkflow,
+UpdateWorkflow]` and returns the run handle beside the update's own
+`start_update`-shaped result, so a validator rejection still reports the run
+that was started. They use the new `SIGNAL_WITH_START` (16) and
+`UPDATE_WITH_START` (17) selectors, whose documents embed the start document
+unchanged and share the start slots and request-ID deduplication.
+`tests/with_start.rs` covers them against a gRPC double. The `with_start` live
+regression checks every exact run ID against Temporal Server, including a
+signal recorded before the run's first workflow task. A Python SDK
+counterpart in `sdk_interop` remains open. See [signal-with-start and
+update-with-start](reference/client-protocol.md#signal-with-start-and-update-with-start-1151).
+
+## 2026-11-13: Typed search attributes and memo upserts
+
+`Temporal.Search_attribute` pairs a registered search-attribute name with its
+indexed type (text, keyword, int64, double, bool, datetime, keyword list), so
+`encode` writes the `json/plain` payload and `type` metadata Temporal Server
+decodes and `decode` reads a value back from `Workflow.start_metadata` or
+`Client.describe` (#1154). `Workflow.upsert_typed_search_attributes` applies
+typed `set`/`unset` updates; the raw payload-list parameters are unchanged and
+remain the escape hatch. `Workflow.upsert_memo` emits Core's
+`ModifyWorkflowProperties` through a new `modify_workflow_properties` protocol
+command. Core reuses the start memo on continue-as-new, so the runtime tracks
+the merged memo and sends it in the continue-as-new command's new `memo`
+field after an upsert. `Temporal.Testing` merges both kinds of upsert and
+exposes `Testing.memo` and `Testing.search_attributes`. The
+`search_attributes` live regression finds a run by a visibility query on its
+typed keyword and int, decodes every type from `describe`, replays the
+recorded upserts, and checks the merged memo across continue-as-new. Child
+starts (#1135) and continue-as-new options (#1153) do not take memo or search
+attributes yet.

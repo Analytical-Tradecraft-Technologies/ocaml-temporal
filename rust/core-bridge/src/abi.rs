@@ -107,6 +107,38 @@ pub const STATUS_ASYNC_HEARTBEAT_REJECTED: Status = 14;
 /// `MAX_PENDING_CALLS` (#796).
 pub const STATUS_RESOURCE_EXHAUSTED: Status = 15;
 
+/// An explicit runtime or shared-runtime release did not finish within its
+/// bound (#1149). Ownership was already transferred: the dedicated cleanup
+/// thread still owns the graph or Core reference and finishes the release in
+/// the background. The usual cause is Core's final drop waiting for its
+/// workflow processing thread in Tokio's blocking pool after a worker
+/// finalizer was detached. The handle is closed either way.
+pub const STATUS_DETACHED: Status = 16;
+
+/// Bound on an explicit [`Runtime`] close, which disposes the whole graph on
+/// its cleanup thread: the worker drain ([`WORKER_SHUTDOWN_DRAIN_TIMEOUT`]),
+/// its finalization ([`WORKER_FINALIZE_TIMEOUT`]), and the final release of
+/// this graph's Core reference, with 30 s of headroom (#1149).
+const RUNTIME_CLOSE_TIMEOUT: Duration = Duration::from_secs(
+    WORKER_SHUTDOWN_DRAIN_TIMEOUT.as_secs() + WORKER_FINALIZE_TIMEOUT.as_secs() + 30,
+);
+
+/// Bound on an explicit [`SharedRuntime`] release (#1149). Attached graphs
+/// have already released their references, so this normally covers only the
+/// drop of Core itself.
+const SHARED_RUNTIME_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Waits for a cleanup thread's completion report for at most `bound`. A
+/// report that does not arrive in time is [`STATUS_DETACHED`]; a cleanup
+/// thread that ended without reporting is [`STATUS_INTERNAL`].
+fn await_cleanup(receiver: &Receiver<Status>, bound: Duration) -> Status {
+    match receiver.recv_timeout(bound) {
+        Ok(status) => status,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => STATUS_DETACHED,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => STATUS_INTERNAL,
+    }
+}
+
 /// Private transport-safety ceiling for one string crossing the bridge.
 ///
 /// This is deliberately not a claim about Temporal Server identifier limits,
@@ -266,6 +298,14 @@ enum ClientCallKind {
     /// Count the executions a visibility query matches (#1152). It has no
     /// synchronous symbol; see [`client_protocol::count_workflows`].
     Count,
+    /// Signal a workflow, starting it first when its workflow ID has no open
+    /// run (#1151). It has no synchronous symbol; its outcome is the closed
+    /// accepted/rejected/unknown start outcome of [`ClientCallKind::Start`].
+    SignalWithStart,
+    /// Start a workflow if needed and admit one update on it (#1151). It has
+    /// no synchronous symbol; see
+    /// [`client_protocol::update_with_start_workflow`].
+    UpdateWithStart,
 }
 
 impl TryFrom<u32> for ClientCallKind {
@@ -289,6 +329,8 @@ impl TryFrom<u32> for ClientCallKind {
             13 => Self::History,
             14 => Self::Describe,
             15 => Self::Count,
+            16 => Self::SignalWithStart,
+            17 => Self::UpdateWithStart,
             _ => {
                 return Err(Failure {
                     status: STATUS_INVALID_ARGUMENT,
@@ -315,6 +357,8 @@ enum ClientRpc {
     History(client_protocol::HistoryRequest),
     Describe(client_protocol::DescribeRequest),
     Count(client_protocol::CountRequest),
+    SignalWithStart(Arc<client_protocol::SignalWithStartRequest>),
+    UpdateWithStart(Arc<client_protocol::UpdateWithStartRequest>),
     /// A namespace-bound async activity completion, failure, or
     /// cancellation (#1025). `binding` is `None` straight after
     /// [`ClientRpc::decode`], which has no runtime;
@@ -436,6 +480,14 @@ impl ClientRpc {
             ClientCallKind::Count => {
                 Self::Count(client_protocol::decode_count_request(text).map_err(protocol_failure)?)
             }
+            ClientCallKind::SignalWithStart => Self::SignalWithStart(Arc::new(
+                client_protocol::decode_signal_with_start_request(text)
+                    .map_err(protocol_failure)?,
+            )),
+            ClientCallKind::UpdateWithStart => Self::UpdateWithStart(Arc::new(
+                client_protocol::decode_update_with_start_request(text)
+                    .map_err(protocol_failure)?,
+            )),
             ClientCallKind::AsyncActivityCompletion => Self::AsyncActivity {
                 request: AsyncActivityRequest::decode_completion(text)?,
                 binding: None,
@@ -551,6 +603,22 @@ impl ClientRpc {
                     .await
                     .map_err(client_operation_failure)?;
                 encode_bytes(client_protocol::encode_count_response(&response))
+            }),
+            Self::SignalWithStart(request) => Box::pin(async move {
+                let result = client_protocol::signal_with_start_workflow(
+                    connection,
+                    request.as_ref().clone(),
+                )
+                .await;
+                start_outcome_bytes(&request.start, Some(result))
+            }),
+            Self::UpdateWithStart(request) => Box::pin(async move {
+                let outcome = client_protocol::update_with_start_workflow(
+                    connection,
+                    request.as_ref().clone(),
+                )
+                .await;
+                update_with_start_outcome_bytes(&request.start, &outcome)
             }),
             Self::AsyncActivity { request, binding } => Box::pin(async move {
                 let binding = binding.ok_or_else(unbound_async_activity)?;
@@ -1018,12 +1086,72 @@ fn start_outcome_bytes(
     }
 }
 
+/// Encodes the closed outcome of one update-with-start (#1151).
+///
+/// As for [`start_outcome_bytes`], an outcome that cannot be encoded is
+/// reported as `Unknown` built from the validated start request, which always
+/// encodes: the caller then reconciles with the same request and update IDs
+/// instead of losing an applied start to a protocol error.
+fn update_with_start_outcome_bytes(
+    start: &client_protocol::StartWorkflowRequest,
+    outcome: &client_protocol::UpdateWithStartOutcome,
+) -> Operation {
+    match client_protocol::encode_update_with_start_outcome(outcome) {
+        Ok(encoded) => Ok(encoded.into_bytes()),
+        Err(_) => encode_bytes(client_protocol::encode_update_with_start_outcome(
+            &client_protocol::UpdateWithStartOutcome::Unknown {
+                request_id: start.request_id.clone(),
+                workflow_id: start.workflow_id.clone(),
+            },
+        )),
+    }
+}
+
+/// One in-flight start-like call: a plain start or a start combined with a
+/// signal or an update (#1151). They share the start slots and their
+/// `request_id` deduplication: a pending request ID may only be reused for
+/// the same logical operation of the same kind.
+enum PendingStartCall {
+    Start(Arc<client_protocol::StartWorkflowRequest>),
+    SignalWithStart(Arc<client_protocol::SignalWithStartRequest>),
+    UpdateWithStart(Arc<client_protocol::UpdateWithStartRequest>),
+}
+
+impl PendingStartCall {
+    /// The start's Temporal request ID, which the start slots deduplicate on.
+    fn request_id(&self) -> &str {
+        match self {
+            Self::Start(request) => &request.request_id,
+            Self::SignalWithStart(request) => &request.start.request_id,
+            Self::UpdateWithStart(request) => &request.start.request_id,
+        }
+    }
+
+    /// Reports whether `other` is a retry of this logical operation: the same
+    /// kind with every field equal except the RPC timeout.
+    fn same_operation(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Start(left), Self::Start(right)) => {
+                client_protocol::same_start_request(left, right)
+            }
+            (Self::SignalWithStart(left), Self::SignalWithStart(right)) => {
+                client_protocol::same_signal_with_start_request(left, right)
+            }
+            (Self::UpdateWithStart(left), Self::UpdateWithStart(right)) => {
+                client_protocol::same_update_with_start_request(left, right)
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Capacity class of one in-flight submitted call. Starts and waits keep
 /// the limits documented for the public client; the class also carries the
 /// identity those limits deduplicate on.
 enum CallScope {
-    /// A start; calls with the same `request_id` share one start slot.
-    Start(Arc<client_protocol::StartWorkflowRequest>),
+    /// A start, signal-with-start, or update-with-start; calls with the same
+    /// `request_id` share one start slot.
+    Start(PendingStartCall),
     /// An exact-run or current-run wait; calls on the same run share a slot.
     Wait(client_protocol::WaitWorkflowRequest),
     /// Any other RPC, bounded by its own deadline.
@@ -1428,10 +1556,19 @@ impl SharedRuntime {
     }
 
     /// Transfers this handle's Core reference to the cleanup thread and
-    /// optionally waits until it has been dropped. A release with attached
-    /// graphs still alive only decrements the count; Core then outlives this
-    /// handle until the last graph is closed.
+    /// optionally waits, at most [`SHARED_RUNTIME_RELEASE_TIMEOUT`], until it
+    /// has been dropped. A release with attached graphs still alive only
+    /// decrements the count; Core then outlives this handle until the last
+    /// graph is closed.
     fn release(self, wait: bool) -> Status {
+        self.release_within(wait.then_some(SHARED_RUNTIME_RELEASE_TIMEOUT))
+    }
+
+    /// [`Self::release`] with an explicit wait bound; `None` does not wait.
+    /// A wait that outlives `bound` returns [`STATUS_DETACHED`] while the
+    /// cleanup thread keeps the reference and finishes the drop (#1149).
+    fn release_within(self, bound: Option<Duration>) -> Status {
+        let wait = bound.is_some();
         let Self { core, cleanup } = self;
         let (completed, receiver) = if wait {
             let (sender, receiver) = sync_channel(1);
@@ -1446,9 +1583,9 @@ impl SharedRuntime {
             drop(error.0.core);
             return STATUS_INTERNAL;
         }
-        match receiver {
-            Some(receiver) => receiver.recv().unwrap_or(STATUS_INTERNAL),
-            None => STATUS_OK,
+        match (receiver, bound) {
+            (Some(receiver), Some(bound)) => await_cleanup(&receiver, bound),
+            _ => STATUS_OK,
         }
     }
 }
@@ -2001,13 +2138,23 @@ impl Runtime {
                 call.scope = CallScope::Released;
             }
         }
-        let scope = match &rpc {
-            ClientRpc::Start(request) => {
+        let start_call = match &rpc {
+            ClientRpc::Start(request) => Some(PendingStartCall::Start(Arc::clone(request))),
+            ClientRpc::SignalWithStart(request) => {
+                Some(PendingStartCall::SignalWithStart(Arc::clone(request)))
+            }
+            ClientRpc::UpdateWithStart(request) => {
+                Some(PendingStartCall::UpdateWithStart(Arc::clone(request)))
+            }
+            _ => None,
+        };
+        let scope = match (start_call, &rpc) {
+            (Some(request), _) => {
                 let mut distinct = HashSet::new();
                 for call in self.pending_calls.values() {
                     if let CallScope::Start(pending) = &call.scope {
-                        if pending.request_id == request.request_id
-                            && !client_protocol::same_start_request(pending, request)
+                        if pending.request_id() == request.request_id()
+                            && !pending.same_operation(&request)
                         {
                             return Err(Failure {
                                 status: STATUS_PROTOCOL,
@@ -2016,11 +2163,11 @@ impl Runtime {
                                         .to_owned(),
                             });
                         }
-                        distinct.insert(pending.request_id.as_str());
+                        distinct.insert(pending.request_id());
                     }
                 }
                 if distinct.len() >= limits.pending_starts
-                    && !distinct.contains(request.request_id.as_str())
+                    && !distinct.contains(request.request_id())
                 {
                     return Err(Failure {
                         status: STATUS_RESOURCE_EXHAUSTED,
@@ -2030,9 +2177,9 @@ impl Runtime {
                         ),
                     });
                 }
-                CallScope::Start(Arc::clone(request))
+                CallScope::Start(request)
             }
-            ClientRpc::Wait(request) => {
+            (None, ClientRpc::Wait(request)) => {
                 let distinct = self
                     .pending_calls
                     .values()
@@ -2052,7 +2199,7 @@ impl Runtime {
                 }
                 CallScope::Wait(request.clone())
             }
-            _ => CallScope::Bounded,
+            (None, _) => CallScope::Bounded,
         };
         // Hard bound on retained task handles (Codex review on #1077). An
         // aborted task's handle is only reaped once Tokio has run its
@@ -3339,10 +3486,19 @@ impl Runtime {
 
     /// Transfers Core to its cleanup thread and optionally waits for disposal.
     ///
-    /// Explicit close waits while the OCaml lock is released. GC fallback does
-    /// not wait on this caller, so a custom-block finalizer never stalls the
-    /// collector; the dedicated cleanup thread joins any aborted start tasks.
-    fn close(mut self, wait: bool) -> Status {
+    /// Explicit close waits while the OCaml lock is released, for at most
+    /// [`RUNTIME_CLOSE_TIMEOUT`]. GC fallback does not wait on this caller, so
+    /// a custom-block finalizer never stalls the collector; the dedicated
+    /// cleanup thread joins any aborted start tasks.
+    fn close(self, wait: bool) -> Status {
+        self.close_within(wait.then_some(RUNTIME_CLOSE_TIMEOUT))
+    }
+
+    /// [`Self::close`] with an explicit wait bound; `None` does not wait. A
+    /// disposal that outlives `bound` returns [`STATUS_DETACHED`] while the
+    /// cleanup thread keeps the graph and finishes it (#1149).
+    fn close_within(mut self, bound: Option<Duration>) -> Status {
+        let wait = bound.is_some();
         // Cancel borrowed history futures before transferring their executor
         // and connection to the cleanup thread, including GC fallback close.
         self.pending_waits.clear();
@@ -3386,9 +3542,9 @@ impl Runtime {
             return STATUS_INTERNAL;
         }
 
-        match receiver {
-            Some(receiver) => receiver.recv().unwrap_or(STATUS_INTERNAL),
-            None => STATUS_OK,
+        match (receiver, bound) {
+            (Some(receiver), Some(bound)) => await_cleanup(&receiver, bound),
+            _ => STATUS_OK,
         }
     }
 }
@@ -5057,7 +5213,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_new_attached(
 /// When no attached graph remains, this destroys Core (and its Tokio pool)
 /// before returning. When graphs are still attached, it only releases this
 /// handle's reference and Core is destroyed by the last graph's release.
-/// Calling again with the now-null slot is safe.
+/// The wait is bounded by 30 s: a drop that takes longer (Core waiting for a
+/// blocking-pool thread, #1149) returns `STATUS_DETACHED` while the cleanup
+/// thread finishes it. Calling again with the now-null slot is safe.
 ///
 /// # Safety
 ///
@@ -6362,8 +6520,12 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_disconnect(
 
 /// Destroy one native runtime and clear the caller's slot.
 ///
-/// Passing the same slot again after a successful call is safe because the
-/// first call stores null before dropping the owner.
+/// The graph is disposed on its cleanup thread and this call waits for it at
+/// most the worker drain bound plus the finalize bound plus 30 s (150 s). A
+/// disposal that takes longer (#1149) returns `STATUS_DETACHED`; the cleanup
+/// thread still owns the graph and finishes it. Passing the same slot again
+/// after a successful call is safe because the first call stores null before
+/// dropping the owner.
 ///
 /// # Safety
 ///
@@ -7146,6 +7308,10 @@ mod worker_task_types;
 #[cfg(test)]
 #[path = "../tests/support/worker_tuning.rs"]
 mod worker_tuning;
+
+#[cfg(test)]
+#[path = "../tests/support/runtime_release_bound.rs"]
+mod runtime_release_bound;
 
 #[cfg(test)]
 #[path = "../tests/support/worker_shutdown_outcomes.rs"]

@@ -137,6 +137,19 @@ and succeeds with
 Both are single bounded RPCs (10 s by default) whose Rust task owns only a
 connection clone and the decoded request, like every other submitted call.
 
+The signal-with-start and update-with-start selectors (`SIGNAL_WITH_START`
+16 and `UPDATE_WITH_START` 17, #1151) are additive in the same way and have
+no synchronous symbol. Each embeds the start document under `start`
+([signal-with-start](../schemas/bridge/client-signal-with-start-request.schema.json),
+[update-with-start](../schemas/bridge/client-update-with-start-request.schema.json)).
+`SIGNAL_WITH_START` succeeds with the start's accepted/rejected/unknown
+outcome document; `UPDATE_WITH_START` succeeds with
+[the update-with-start outcome](../schemas/bridge/client-update-with-start-outcome.schema.json),
+whose accepted form adds the update result. Both hold a start slot and share
+the start's `request_id` deduplication while in flight, and their Rust task
+owns only a connection clone and the decoded request, like every other
+submitted call.
+
 The canonical header is
 `rust/core-bridge/include/ocaml_temporal_core.h`. Both Rust and C compile-time
 assertions protect the status width, every numeric status value, and field
@@ -976,8 +989,38 @@ that drop happens decides what stays bounded:
 - A worker attached to a shared `Runtime.t` holds only one reference. Its
   graph's close drops that reference and returns, and the worker detaches.
   The final drop happens in `Runtime.shutdown`, through
-  `Sdk_shared_runtime.shutdown` and the shared release, which waits for it
-  without a bound. `Runtime.shutdown` can therefore hang in this case.
+  `Sdk_shared_runtime.shutdown` and the shared release.
+
+Both explicit waits for a cleanup thread are bounded (#1149). This keeps the
+supervisor Domain and `Runtime.shutdown` bounded even while the drop itself
+waits.
+
+- `runtime_free` waits at most `RUNTIME_CLOSE_TIMEOUT`: the worker drain and
+  finalize bounds plus 30 s, that is 150 s.
+- `shared_runtime_free` waits at most `SHARED_RUNTIME_RELEASE_TIMEOUT`, 30 s.
+
+A wait that ends at its bound returns `STATUS_DETACHED` (16). By then the
+handle is already closed and its reference already transferred, so the
+cleanup thread still owns the drop and finishes it once the blocking-pool
+thread exits. Nothing is leaked or dropped twice.
+
+On the OCaml side the status is `Native_bridge.Detached`.
+`Runtime.shutdown` reports it as a `` `Bridge `` error that says the release
+continues in the background, and the runtime counts as shut down.
+
+An attached graph's own `runtime_free` can also return `DETACHED`, when its
+cleanup (for example a drain of outstanding tasks) outlives the 150 s bound
+while it still holds its Core reference. The supervisor then returns its
+shared-runtime lease with `Sdk_shared_runtime.release_detached` rather than
+`release`. Nothing reports when that cleanup ends, so the attachment does not
+keep blocking `Runtime.shutdown`. Instead the runtime records it, and
+`Sdk_shared_runtime.shutdown` still releases the shared handle but returns
+the `Detached` status instead of `Ok ()`. Destroying the shared handle no
+longer proves Core is gone, so `Runtime.shutdown` reports the same
+`` `Bridge `` error rather than success. The
+`runtime_release_bound` tests reproduce the hazard directly: a closure that
+holds Core's blocking pool makes both releases return `DETACHED` at a short
+test bound while the cleanup thread still finishes the drop.
 
 The OCaml side adds a stricter, typed ordering rule on top of that memory
 safety. `Sdk_shared_runtime` (private) owns the `Native_bridge.shared_runtime`

@@ -556,6 +556,104 @@ let test_mock_start_id_conflict_policy () =
     Option.get (Temporal.Client.run_id after_close) <> Option.get (Temporal.Client.run_id replacement));
   unwrap (Temporal.Client.shutdown client)
 
+(** Signal-with-start on the mock (#1151): an absent workflow is started and
+    signalled, an open run is only signalled by default, a closed run is
+    replaced, [`Terminate_existing] replaces an open run, and the request ID
+    deduplicates the signal of a retried call. Start options are validated
+    exactly as for [Client.start]. *)
+let test_mock_signal_with_start () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client" ~namespace:"unit-test" ())
+  in
+  let signal_with_start ?id_conflict_policy ?rpc_timeout ?(id = "sws-id") ~request_id
+      input =
+    Temporal.Client.signal_with_start client ?id_conflict_policy ?rpc_timeout
+      ~request_id ~workflow:echo_workflow ~task_queue:"unit-test" ~id ~input
+      ~signal:add_document_signal ~signal_input:"document" ()
+  in
+  let first = unwrap (signal_with_start ~request_id:"sws-first" "first") in
+  assert (Temporal.Client.started first);
+  let attached = unwrap (signal_with_start ~request_id:"sws-attach" "ignored") in
+  assert (not (Temporal.Client.started attached));
+  assert (Temporal.Client.run_id attached = Temporal.Client.run_id first);
+  (* The same request ID is the same logical operation: the signal is
+     delivered once, and reusing the ID for other signal data fails. *)
+  let retried = unwrap (signal_with_start ~request_id:"sws-attach" "ignored") in
+  assert (Temporal.Client.run_id retried = Temporal.Client.run_id first);
+  expect_error_message_contains "workflow"
+    "signal request ID was already used for different signal data"
+    (Temporal.Client.signal ~request_id:"sws-attach" first
+       ~signal:add_document_signal ~input:"other");
+  let replaced =
+    unwrap
+      (signal_with_start ~id_conflict_policy:`Terminate_existing
+         ~request_id:"sws-replace" "second")
+  in
+  assert (Temporal.Client.started replaced);
+  assert (Temporal.Client.run_id replaced <> Temporal.Client.run_id first);
+  (match Temporal.Client.wait first with
+  | Ok (Temporal.Client.Terminated _) -> ()
+  | Ok _ -> failwith "terminate_existing did not terminate the open run"
+  | Error error -> failwith (Temporal.Error.message error));
+  (match Temporal.Client.wait replaced with
+  | Ok (Temporal.Client.Completed { output = "second"; _ }) -> ()
+  | Ok _ -> failwith "signal-with-start changed the started input"
+  | Error error -> failwith (Temporal.Error.message error));
+  (* A closed workflow ID is started again under the default policies. *)
+  let restarted = unwrap (signal_with_start ~request_id:"sws-restart" "third") in
+  assert (Temporal.Client.started restarted);
+  assert (Temporal.Client.run_id restarted <> Temporal.Client.run_id replaced);
+  expect_error "defect" (signal_with_start ~id:"" ~request_id:"sws-bad" "x");
+  expect_error_message_contains "defect" "rpc_timeout"
+    (signal_with_start ~rpc_timeout:(Temporal.Duration.of_ms 0L)
+       ~request_id:"sws-deadline" "x");
+  unwrap (Temporal.Client.shutdown client);
+  expect_error "bridge" (signal_with_start ~request_id:"sws-closed" "x")
+
+(** Update-with-start on the mock (#1151): the start is applied and returned
+    beside the update's own result, which is the typed update error the mock
+    reports for every update because it runs no workflow code; a start
+    conflict under [`Fail] is the typed already-started error. *)
+let test_mock_update_with_start () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client" ~namespace:"unit-test" ())
+  in
+  let update =
+    Temporal.Update.define ~name:"unit.update" ~input:Temporal.Codec.string
+      ~output:Temporal.Codec.string
+  in
+  let update_with_start ~id_conflict_policy ?update_id ~request_id input =
+    Temporal.Client.update_with_start client ~id_conflict_policy ?update_id
+      ~request_id ~workflow:echo_workflow ~task_queue:"unit-test" ~id:"uws-id"
+      ~input ~update ~update_input:"change" ()
+  in
+  let handle, update_result =
+    unwrap (update_with_start ~id_conflict_policy:`Use_existing ~request_id:"uws-1" "first")
+  in
+  assert (Temporal.Client.started handle);
+  expect_error_message_contains "update" "does not execute workflow updates"
+    update_result;
+  let attached, _ =
+    unwrap
+      (update_with_start ~id_conflict_policy:`Use_existing ~request_id:"uws-2" "ignored")
+  in
+  assert (not (Temporal.Client.started attached));
+  assert (Temporal.Client.run_id attached = Temporal.Client.run_id handle);
+  (match update_with_start ~id_conflict_policy:`Fail ~request_id:"uws-3" "x" with
+  | Ok _ -> failwith "a conflicting update-with-start unexpectedly started"
+  | Error error ->
+      assert (
+        Option.map
+          (fun (execution : Temporal.Client.execution) -> execution.run_id)
+          (Temporal.Client.already_started error)
+        = Temporal.Client.run_id handle));
+  expect_error "defect"
+    (update_with_start ~id_conflict_policy:`Use_existing ~update_id:""
+       ~request_id:"uws-4" "x");
+  unwrap (Temporal.Client.shutdown client)
+
 (** The deterministic client seam exposes the same visibility row shape as the
     native adapter. Starting two workflows proves rows retain type, queue,
     exact run identity, and monotone running status before waits complete. *)
@@ -1971,6 +2069,8 @@ let () =
   test_mock_start_idempotent_retry ();
   test_mock_start_reuses_closed_workflow_id ();
   test_mock_start_id_conflict_policy ();
+  test_mock_signal_with_start ();
+  test_mock_update_with_start ();
   test_mock_start_id_reuse_policy ();
   test_client_execution_policy_validation ();
   test_client_visibility_listing ();

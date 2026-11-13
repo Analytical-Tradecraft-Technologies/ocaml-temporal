@@ -775,6 +775,55 @@ let _client_start :
     unit -> (('input, 'output) T.Client.handle, T.Error.t) result =
   T.Client.start
 
+let _client_signal_with_start :
+    'input 'output 'signal.
+    T.Client.t ->
+    ?request_id:string ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
+    ?id_conflict_policy:[ `Use_existing | `Terminate_existing ] ->
+    ?id_reuse_policy:T.Client.id_reuse_policy ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?rpc_timeout:T.Duration.t ->
+    workflow:('input, 'output) T.Workflow.t ->
+    task_queue:string ->
+    id:string ->
+    input:'input ->
+    signal:'signal T.Signal.t ->
+    signal_input:'signal ->
+    unit -> (('input, 'output) T.Client.handle, T.Error.t) result =
+  T.Client.signal_with_start
+
+let _client_update_with_start :
+    'input 'output 'update_input 'update_output.
+    T.Client.t ->
+    ?request_id:string ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
+    id_conflict_policy:T.Client.id_conflict_policy ->
+    ?id_reuse_policy:T.Client.id_reuse_policy ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?update_id:string ->
+    ?rpc_timeout:T.Duration.t ->
+    workflow:('input, 'output) T.Workflow.t ->
+    task_queue:string ->
+    id:string ->
+    input:'input ->
+    update:('update_input, 'update_output) T.Update.t ->
+    update_input:'update_input ->
+    unit ->
+    ( ('input, 'output) T.Client.handle
+      * (('update_input, 'update_output) T.Client.update_handle, T.Error.t) result,
+      T.Error.t )
+    result =
+  T.Client.update_with_start
+
 (* The conflict policy is a closed polymorphic variant, so an exhaustive
    match here breaks if a constructor is added or renamed. *)
 let _client_id_conflict_policy_name : T.Client.id_conflict_policy -> string =
