@@ -1479,7 +1479,17 @@ and the Core runtime still returns. The
 `worker_shutdown_outcomes` ABI tests pin what each outcome becomes in
 `shutdown_worker`: a drain timeout or lane failure is `WORKER`, a panicked
 or detached finalizer is `WORKER` with its closed message, and abandoned
-leases are `OUTSTANDING_TASKS`. `worker_validation_cleanup` shows that
+leases are `OUTSTANDING_TASKS`. The `worker_shutdown_drain_timeout` test
+drives the same timeout end to end through the C ABI: a live worker
+connected to a gRPC double has its workflow lane replaced by one that never
+stops, so `worker_shutdown` returns `WORKER` with the drain-timeout message
+at the drain bound, keeps the worker in the graph with its ledger
+unfinalizable, and fails the same way when repeated; `runtime_free` then
+still returns `OK` through the last-resort path and releases Core. Both
+bounds are read from the worker (`PollLanes::shutdown_drain_bound` and
+`finalize_bound`), which is how that test shortens them; production always
+uses `WORKER_SHUTDOWN_DRAIN_TIMEOUT` and `WORKER_FINALIZE_TIMEOUT`.
+`worker_validation_cleanup` shows that
 releasing an unvalidated worker stops waiting at
 `UNVALIDATED_WORKER_RELEASE_TIMEOUT` (10 s) when the server never answers
 `ShutdownWorker`.
