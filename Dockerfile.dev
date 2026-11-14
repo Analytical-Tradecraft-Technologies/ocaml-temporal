@@ -1,4 +1,4 @@
-ARG RUST_IMAGE=rust:1.99-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29
+ARG RUST_IMAGE=rust:1.100-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
 # The digest-pinned ocaml/opam base image for one supported compiler series.
 # Each series pins its image on the single FROM line of
 # docker/ocaml-<series>/Dockerfile, which is the only source of truth; the

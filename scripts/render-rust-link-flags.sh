@@ -61,7 +61,13 @@ windows_search_dir () {
     return
   fi
   selected=
-  for metadata in "$artifact_dir"/build/winapi-x86_64-pc-windows-gnu-*/output; do
+  # Cargo through 1.99 wrote a build script's stdout to
+  # build/<package>-<hash>/output. Cargo 1.100's build-dir layout writes it to
+  # build/<package>/<hash>/run/stdout. Accept both so the bridge also builds
+  # with an older pinned toolchain and with leftover target directories.
+  for metadata in \
+    "$artifact_dir"/build/winapi-x86_64-pc-windows-gnu-*/output \
+    "$artifact_dir"/build/winapi-x86_64-pc-windows-gnu/*/run/stdout; do
     [ -f "$metadata" ] || continue
     while IFS= read -r candidate; do
       [ -n "$candidate" ] || continue

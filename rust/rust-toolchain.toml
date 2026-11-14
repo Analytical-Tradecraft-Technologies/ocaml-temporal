@@ -3,6 +3,6 @@
 # (including Dependabot's rust-toolchain update) moves every gate at once.
 # test/smoke/test_rust_toolchain.sh checks that the running rustc matches.
 [toolchain]
-channel = "1.99.1"
+channel = "1.100.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

@@ -7115,3 +7115,23 @@ redelivery under `Temporal.Testing`. Fault scenarios over TLS remain for
   test-temporal-examples-live`; macOS builds it natively after uploading its
   library artifact. Windows is not covered (`eio_posix` has no Windows
   support). Lwt has no compiled example.
+
+## 2026-11-14: Rust toolchain 1.100.0 and Cargo's new build-dir layout
+
+The exact Rust compiler moved from 1.99.1 to 1.100.0. Dependabot (#1337)
+changed only `rust/rust-toolchain.toml`. This PR also moves the `pin:rust`
+documentation value, the Makefile Docker-command fixtures, and the
+`rust:1.100-bookworm` base image of `Dockerfile.dev` and `Dockerfile.rust-ci`,
+pinned to index digest `sha256:ade39a71…3fea`, whose image reports
+`cargo 1.100.0`.
+
+Cargo 1.100 writes a build script's stdout to
+`build/<package>/<hash>/run/stdout` instead of `build/<package>-<hash>/output`.
+`scripts/render-rust-link-flags.sh` reads that file to find the MinGW import
+libraries of `winapi-x86_64-pc-windows-gnu` for OCaml's linker. With only the
+old path it found none, so Windows bridge packaging failed with "could not find
+Cargo's complete winapi import-library directory". It now reads both layouts.
+`test/smoke/test_rust_link_flags.sh` covers the new layout, including a hash
+directory with no run output, and fails without the change. On #1337 the Linux
+Rust producers already passed clippy with `-D warnings`, rustfmt and the test
+suite under 1.100.0.
