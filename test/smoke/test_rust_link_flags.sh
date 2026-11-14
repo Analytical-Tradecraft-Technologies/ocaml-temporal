@@ -30,6 +30,25 @@ if [ "$actual" != "$expected" ]; then
   exit 1
 fi
 
+# Cargo 1.100's build-dir layout keeps a build script's stdout at
+# build/<package>/<hash>/run/stdout, beside hash directories with no run output.
+# The same search directory must be found there.
+new_layout_root=$temporary_root/new-layout/target/debug
+mkdir -p "$new_layout_root/build/winapi-x86_64-pc-windows-gnu/0123456789abcdef/run" \
+  "$new_layout_root/build/winapi-x86_64-pc-windows-gnu/fedcba9876543210/out"
+printf 'cargo:rustc-link-search=native=%s\n' "$search_dir" \
+  >"$new_layout_root/build/winapi-x86_64-pc-windows-gnu/0123456789abcdef/run/stdout"
+new_layout_output=$temporary_root/new-layout-flags.sexp
+sh "$workspace_root/scripts/render-rust-link-flags.sh" \
+  'MINGW64_NT-test' "$new_layout_root" "$new_layout_output" \
+  '-lwinapi_ntdll -lbcrypt'
+actual=$(cat "$new_layout_output")
+if [ "$actual" != "$expected" ]; then
+  printf 'unexpected Windows Rust link flags from the Cargo 1.100 layout\nexpected: %s\nactual:   %s\n' \
+    "$expected" "$actual" >&2
+  exit 1
+fi
+
 non_windows_output=$temporary_root/non-windows-flags.sexp
 sh "$workspace_root/scripts/render-rust-link-flags.sh" \
   'Linux' \

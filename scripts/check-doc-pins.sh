@@ -7,7 +7,7 @@
 # corpus capture records) stay free text:
 #
 #   `8fe478ee179ed754614d230f39586f3edb57da71`<!-- pin:core -->
-#   `1.99.1`<!-- pin:rust -->
+#   `1.100.0`<!-- pin:rust -->
 #
 # A `pin:core` value must be a prefix of at least eight hex digits of the
 # `rev` of the Core crates in rust/Cargo.toml; a `pin:rust` value must equal
