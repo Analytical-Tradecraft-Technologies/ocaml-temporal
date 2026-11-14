@@ -277,9 +277,30 @@ build:
 # test-temporal-examples-live runs the same list against the Compose stack, and
 # test/smoke/test_examples_live_contract.sh fails when an example directory is
 # missing from it.
-EXAMPLE_EXECUTABLES := examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe examples/cancellation/cancellation.exe
+EXAMPLE_EXECUTABLES := examples/workflow_worker/workflow_worker.exe examples/activity_worker/activity_worker.exe examples/client/client.exe examples/cancellation/cancellation.exe examples/idempotency/idempotency.exe
 build-examples:
 	$(RUN) dune build $(DUNE_BUILD_ARGS) $(EXAMPLE_EXECUTABLES)
+
+# The Eio integration example (#1141) needs eio and eio_posix, CI-only
+# dependencies of that one executable pinned with their closure in
+# scripts/eio-example.locked; they are never SDK dependencies. It therefore
+# builds in the `examples-eio` Compose service (the development image plus that
+# closure, Dockerfile.dev's `examples-eio` stage, which also sets
+# TEMPORAL_EIO_EXAMPLE=enabled), or natively after
+# `sh scripts/opam-tool-lock.sh install scripts/eio-example.locked`.
+# examples/eio/dune is disabled without that variable, so every other build
+# skips it. The smoke artifact and test-temporal-examples-live include it, and
+# test/smoke/test_examples_live_contract.sh counts it as a declared example.
+EIO_EXAMPLE_EXECUTABLES := examples/eio/eio_example.exe
+EIO_COMPOSE_RUN := OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --profile examples-eio --progress plain build examples-eio >&2 && \
+	OCAML_IMAGE=$(OCAML_IMAGE) $(COMPOSE) --profile examples-eio --progress quiet run --rm --user $(HOST_UID):$(HOST_GID) $(CARGO_BUILD_JOBS_RUN_FLAG) examples-eio
+.PHONY: build-examples-eio native-build-examples-eio
+build-examples-eio:
+	$(EIO_COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(EIO_EXAMPLE_EXECUTABLES)
+
+native-build-examples-eio:
+	$(NATIVE_RUN) sh scripts/opam-tool-lock.sh check scripts/eio-example.locked
+	TEMPORAL_EIO_EXAMPLE=enabled $(NATIVE_ENV) $(NATIVE_RUN) dune build $(DUNE_BUILD_ARGS) $(EIO_EXAMPLE_EXECUTABLES)
 
 # Emits only the locked Cargo metadata document on stdout, allowing CI to pipe
 # it into the isolated license scanner without knowing the Compose fixture path.
@@ -577,6 +598,7 @@ test-quality-contract: check-live-acceptance-inventory test-live-acceptance-inve
 	$(LICENSE_POLICY_TEST)
 	sh test/smoke/test_build_jobs_contract.sh .
 	sh test/smoke/test_opam_locked_deps.sh .
+	sh test/smoke/test_opam_tool_lock.sh .
 	sh test/smoke/test_release_tag_contract.sh .
 	sh test/smoke/test_release_notes_contract.sh .
 	sh test/smoke/test_release_tag_commit_contract.sh .
@@ -778,7 +800,7 @@ test-temporal-diagnostics-contract:
 # CI executes (#795). Every entry must also be in scripts/ci-smoke-executables.txt,
 # and test/smoke/test_live_regressions_contract.sh fails when a regression
 # executable under test/integration is neither here nor otherwise run by CI.
-LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/activity_worker_crash/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/child_start_options/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/concurrent_client/regression.exe test/integration/fetch_history/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/non_yielding_workflow/regression.exe test/integration/sdk_interop/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/timer_cancellation/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/update_run_close/regression.exe test/integration/worker_metrics/regression.exe test/integration/worker_resource_options/regression.exe test/integration/worker_versioning/regression.exe test/integration/workflow_start_info/regression.exe
+LIVE_REGRESSION_EXECUTABLES := test/integration/activity_cancellation/regression.exe test/integration/activity_idempotency/regression.exe test/integration/activity_worker_crash/regression.exe test/integration/bounded_shutdown/regression.exe test/integration/child_start_options/regression.exe test/integration/client_policies/regression.exe test/integration/client_request_ids/regression.exe test/integration/completed_queries/regression.exe test/integration/concurrent_client/regression.exe test/integration/continue_as_new_options/regression.exe test/integration/cron_start_delay/regression.exe test/integration/describe_count/regression.exe test/integration/fetch_history/regression.exe test/integration/interaction_recovery/regression.exe test/integration/local_activity_cancellation/regression.exe test/integration/non_yielding_workflow/regression.exe test/integration/sdk_interop/regression.exe test/integration/search_attributes/regression.exe test/integration/split_worker_task_types/regression.exe test/integration/timer_cancellation/regression.exe test/integration/transport_interruption/regression.exe test/integration/update_outcomes/regression.exe test/integration/update_run_close/regression.exe test/integration/with_start/regression.exe test/integration/worker_metrics/regression.exe test/integration/worker_resource_options/regression.exe test/integration/worker_versioning/regression.exe test/integration/workflow_start_info/regression.exe
 # Seconds for each regression process; the suites normally finish in seconds.
 LIVE_REGRESSION_TIMEOUT_SECONDS ?= 180
 
@@ -1237,6 +1259,15 @@ test-activity-cancellation-live:
 	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/activity_cancellation/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL)
 
 # Requires a disposable server with a `default` namespace and an explicit
+# official Temporal CLI path (#504). Optional ACTIVITY_IDEMPOTENCY_EVIDENCE
+# names the directory for the ledger, correlation summary, describe
+# snapshots, history and worker logs; without it the suite uses a fresh
+# temporary directory and prints its path.
+.PHONY: test-activity-idempotency-live
+test-activity-idempotency-live:
+	$(RUN) dune exec $(DUNE_BUILD_ARGS) test/integration/activity_idempotency/regression.exe -- check $(TEMPORAL_CLIENT_TEST_URL) $(TEMPORAL_TEST_CLI) $(ACTIVITY_IDEMPOTENCY_EVIDENCE)
+
+# Requires a disposable server with a `default` namespace and an explicit
 # official Temporal CLI path (#519). Optional ACTIVITY_WORKER_CRASH_EVIDENCE
 # names the directory for the describe snapshots, history and worker logs;
 # without it the suite uses a fresh temporary directory and prints its path.
@@ -1522,13 +1553,15 @@ native-verify: native-version-check native-build native-lint native-test
 # controller asserts the client's exact success output, its typed failure for
 # invalid input, and that both workers exit cleanly after SIGTERM. It then runs
 # the self-checking cooperative cancellation example (#494) on its own task
-# queue and requires its exact report. Every process
+# queue and requires its exact report, and the self-checking idempotent
+# side-effect example (#504) likewise. Every process
 # is bounded by a timeout, and the stack is always removed afterwards. In CI the
 # executables come from the verified smoke artifact (TEMPORAL_PREBUILT_SMOKE=1);
 # locally they are compiled first so no long-lived `dune exec` lock is held.
 .PHONY: test-temporal-examples-live test-temporal-examples-contract
 test-temporal-examples-live: test-temporal-examples-contract test-temporal-config
 	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(EXAMPLE_EXECUTABLES)
+	$(if $(filter 1,$(TEMPORAL_PREBUILT_SMOKE)),,$(MAKE) build-examples-eio)
 	@set -eu; \
 	cleanup() { \
 		status=$$?; \
@@ -1617,7 +1650,8 @@ test-temporal-cli-retry:
 # Compile once in the selected Linux OCaml job; the live job only executes them.
 .PHONY: build-smoke-executables test-ci-artifacts
 build-smoke-executables:
-	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(shell cat scripts/ci-smoke-executables.txt)
+	$(COMPOSE_RUN) env DUNE_JOBS="$(DUNE_JOBS)" sh scripts/build-temporal-executables.sh $(filter-out $(EIO_EXAMPLE_EXECUTABLES),$(shell cat scripts/ci-smoke-executables.txt))
+	$(MAKE) build-examples-eio
 
 test-ci-artifacts:
 	python3 -m unittest discover -s test/smoke -p 'test_*artifact*.py'

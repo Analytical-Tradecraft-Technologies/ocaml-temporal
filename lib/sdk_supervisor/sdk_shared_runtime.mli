@@ -49,9 +49,10 @@ val create :
   unit ->
   (t, Temporal_core_bridge.Native_bridge.error) result
 
-(** The socket address the runtime's metrics endpoint is bound to, or
-    [None] when no exporter was configured. Constant for the value's
-    lifetime; the endpoint itself stops when Core is destroyed. *)
+(** The socket address the runtime's Prometheus endpoint is bound to, or
+    [None] when no exporter or an OTLP exporter (#1161) was configured.
+    Constant for the value's lifetime; the endpoint itself stops when Core
+    is destroyed. *)
 val metrics_address : t -> string option
 
 (** The SDK-side metrics recorder over the runtime's exporter (#500), or
@@ -77,6 +78,16 @@ val attach :
 (** Returns one attachment. Repeated calls on the same lease are no-ops. *)
 val release : lease -> unit
 
+(** Returns one attachment whose graph close reported
+    [Temporal_core_bridge.Native_bridge.Detached] (#1149): its bounded wait
+    ended while the graph's cleanup thread still held a Core reference. The
+    attachment no longer blocks {!shutdown}, which could otherwise never
+    succeed because nothing reports when that cleanup ends, but {!shutdown}
+    then returns [Native] with the [Detached] status instead of [Ok ()].
+    Repeated calls, and calls after {!release}, on the same lease are
+    no-ops. *)
+val release_detached : lease -> unit
+
 (** Number of leases currently outstanding. *)
 val attached : t -> int
 
@@ -85,6 +96,9 @@ val is_shut_down : t -> bool
 
 (** Releases the Core runtime if no lease is outstanding, waiting (with the
     OCaml runtime lock released) until Core and its threads are destroyed.
-    Repeating a successful call returns [Ok ()]. Concurrent callers are
+    When any lease was returned with {!release_detached}, the runtime is
+    still released but destruction cannot be proven, so the result is
+    [Native] with the [Detached] status rather than [Ok ()]. Repeating a
+    call after the runtime was released returns [Ok ()]. Concurrent callers are
     serialized, so every [Ok] return happens after destruction. *)
 val shutdown : t -> (unit, shutdown_error) result

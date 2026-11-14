@@ -840,6 +840,93 @@ let protocol_failure path (error : Temporal_base.Error.t) =
         info = failure_info;
       }
 
+(** Converts an optional runtime retry policy at ["$.command.retry_policy"]
+    for an activity, child, or continue-as-new command, rebuilding the exact
+    protocol durations and checking the result with the protocol's strict
+    retry-policy validator, so a policy the bridge would reject never leaves
+    the runtime. *)
+let optional_protocol_retry_policy (retry_policy : Activation.retry_policy option) =
+  match retry_policy with
+  | None -> Ok None
+  | Some value ->
+      let* initial_interval =
+        duration_of_milliseconds "$.command.retry_policy.initial_interval"
+          value.initial_interval
+      in
+      let* maximum_interval =
+        duration_of_milliseconds "$.command.retry_policy.maximum_interval"
+          value.maximum_interval
+      in
+      let policy =
+        Protocol.
+          {
+            initial_interval;
+            backoff_coefficient_bits = value.backoff_coefficient_bits;
+            maximum_interval;
+            maximum_attempts = value.maximum_attempts;
+            non_retryable_error_types =
+              List.map Fun.id value.non_retryable_error_types;
+          }
+      in
+      let* () =
+        Protocol.validate_retry_policy policy |> Result.map_error protocol_error
+      in
+      Ok (Some policy)
+
+(** Converts a search-attribute or memo map to protocol payloads, in order,
+    after checking every key with the strict identifier rule and rejecting a
+    repeated key, which the protocol's JSON object could not represent.
+    [path] locates the map in diagnostics and [label] names it. *)
+let protocol_payload_map ~path ~label values =
+  let rec convert seen reversed = function
+    | [] -> Ok (List.rev reversed)
+    | (key, payload) :: rest ->
+        let* () = validate_identifier path key in
+        if List.mem key seen then
+          Error (invalid path (label ^ " keys must be unique"))
+        else
+          let* payload = protocol_payload path payload in
+          convert (key :: seen) ((key, payload) :: reversed) rest
+  in
+  convert [] [] values
+
+(** Converts continue-as-new successor settings (#1153) without inventing
+    values: every [None] stays [None], so a command without options encodes
+    exactly as before. Timeouts become exact protocol durations, and the
+    search-attribute map gets the same key checks as an upsert. *)
+let protocol_continue_as_new_options (options : Activation.Continue_as_new_options.t) =
+  let* () =
+    match options.task_queue with
+    | None -> Ok ()
+    | Some queue -> validate_identifier "$.command.task_queue" queue
+  in
+  let* run_timeout =
+    optional_duration_of_milliseconds "$.command.run_timeout" options.run_timeout
+  in
+  let* task_timeout =
+    optional_duration_of_milliseconds "$.command.task_timeout" options.task_timeout
+  in
+  let* retry_policy = optional_protocol_retry_policy options.retry_policy in
+  let* search_attributes =
+    match options.search_attributes with
+    | None -> Ok None
+    | Some values ->
+        let* values =
+          protocol_payload_map ~path:"$.command.search_attributes"
+            ~label:"search-attribute" values
+        in
+        Ok (Some values)
+  in
+  Ok
+    {
+      Protocol.Continue_as_new_options.task_queue = options.task_queue;
+      run_timeout;
+      task_timeout;
+      retry_policy;
+      search_attributes;
+      initial_versioning_behavior = options.initial_versioning_behavior;
+    }
+
 (** Converts one command without fabricating fields. Activity commands already
     carry all Core-required identifiers, arguments, timeout policies, and
     cancellation options; the final semantic encoder below performs a second
@@ -893,37 +980,7 @@ let command_to_protocol command =
         optional_duration_of_milliseconds "$.command.heartbeat_timeout"
           heartbeat_timeout
       in
-      let* retry_policy =
-        match retry_policy with
-        | None -> Ok None
-        | Some value ->
-            let* initial_interval =
-              duration_of_milliseconds
-                "$.command.retry_policy.initial_interval"
-                value.initial_interval
-            in
-            let* maximum_interval =
-              duration_of_milliseconds
-                "$.command.retry_policy.maximum_interval"
-                value.maximum_interval
-            in
-            let policy =
-              Protocol.
-                {
-                  initial_interval;
-                  backoff_coefficient_bits = value.backoff_coefficient_bits;
-                  maximum_interval;
-                  maximum_attempts = value.maximum_attempts;
-                  non_retryable_error_types =
-                    List.map Fun.id value.non_retryable_error_types;
-                }
-            in
-            let* () =
-              Protocol.validate_retry_policy policy
-              |> Result.map_error protocol_error
-            in
-            Ok (Some policy)
-      in
+      let* retry_policy = optional_protocol_retry_policy retry_policy in
       let priority =
         Option.map
           (fun value ->
@@ -1008,31 +1065,7 @@ let command_to_protocol command =
         optional_duration_of_milliseconds
           "$.command.local_retry_threshold" local_retry_threshold
       in
-      let* retry_policy =
-        match retry_policy with
-        | None -> Ok None
-        | Some value ->
-            let* initial_interval =
-              duration_of_milliseconds
-                "$.command.retry_policy.initial_interval" value.initial_interval
-            in
-            let* maximum_interval =
-              duration_of_milliseconds
-                "$.command.retry_policy.maximum_interval" value.maximum_interval
-            in
-            let policy =
-              Protocol.
-                {
-                  initial_interval;
-                  backoff_coefficient_bits = value.backoff_coefficient_bits;
-                  maximum_interval;
-                  maximum_attempts = value.maximum_attempts;
-                  non_retryable_error_types = List.map Fun.id value.non_retryable_error_types;
-                }
-            in
-            let* () = Protocol.validate_retry_policy policy |> Result.map_error protocol_error in
-            Ok (Some policy)
-      in
+      let* retry_policy = optional_protocol_retry_policy retry_policy in
       let original_schedule_time =
         match original_schedule_time with
         | None -> None
@@ -1069,7 +1102,7 @@ let command_to_protocol command =
   | Activation.Start_child_workflow
       { seq; id; name; input; retry_policy; cancellation_type; task_queue;
         parent_close_policy; execution_timeout; run_timeout; task_timeout;
-        id_reuse_policy } ->
+        id_reuse_policy; memo; search_attributes } ->
       let* () = validate_sequence "$.command.seq" seq in
       let* () = validate_identifier "$.command.id" id in
       let* () = validate_identifier "$.command.name" name in
@@ -1079,37 +1112,7 @@ let command_to_protocol command =
         | Activation.Parent_abandon -> Protocol.Parent_abandon
         | Activation.Parent_request_cancel -> Protocol.Parent_request_cancel) parent_close_policy in
       let* input = protocol_input "$.command.input" input in
-      let* retry_policy =
-        match retry_policy with
-        | None -> Ok None
-        | Some value ->
-            let* initial_interval =
-              duration_of_milliseconds
-                "$.command.retry_policy.initial_interval"
-                value.initial_interval
-            in
-            let* maximum_interval =
-              duration_of_milliseconds
-                "$.command.retry_policy.maximum_interval"
-                value.maximum_interval
-            in
-            let policy =
-              Protocol.
-                {
-                  initial_interval;
-                  backoff_coefficient_bits = value.backoff_coefficient_bits;
-                  maximum_interval;
-                  maximum_attempts = value.maximum_attempts;
-                  non_retryable_error_types =
-                    List.map Fun.id value.non_retryable_error_types;
-                }
-            in
-            let* () =
-              Protocol.validate_retry_policy policy
-              |> Result.map_error protocol_error
-            in
-            Ok (Some policy)
-      in
+      let* retry_policy = optional_protocol_retry_policy retry_policy in
       let* execution_timeout =
         optional_duration_of_milliseconds "$.command.execution_timeout"
           execution_timeout
@@ -1129,6 +1132,18 @@ let command_to_protocol command =
             | Activation.Reuse_reject_duplicate -> Protocol.Reuse_reject_duplicate)
           id_reuse_policy
       in
+      (* An unset map stays [None] so the command encodes as before. *)
+      let optional_map ~path ~label = function
+        | None -> Ok None
+        | Some values ->
+            let* values = protocol_payload_map ~path ~label values in
+            Ok (Some values)
+      in
+      let* memo = optional_map ~path:"$.command.memo" ~label:"memo" memo in
+      let* search_attributes =
+        optional_map ~path:"$.command.search_attributes"
+          ~label:"search-attribute" search_attributes
+      in
       Ok
         (Protocol.Start_child_workflow
            {
@@ -1143,6 +1158,8 @@ let command_to_protocol command =
              run_timeout;
              task_timeout;
              id_reuse_policy;
+             memo;
+             search_attributes;
            })
   | Activation.Cancel_child_workflow { seq; reason } ->
       let* () = validate_sequence "$.command.seq" seq in
@@ -1230,27 +1247,17 @@ let command_to_protocol command =
       let* () = validate_identifier "$.command.patch_id" patch_id in
       Ok (Protocol.Set_patch_marker { patch_id; deprecated })
   | Activation.Upsert_search_attributes { search_attributes } ->
-      let rec validate_keys seen = function
-        | [] -> Ok ()
-        | (key, payload) :: rest ->
-            let* () = validate_identifier "$.command.search_attributes" key in
-            if List.mem key seen then
-              Error
-                (invalid "$.command.search_attributes"
-                   "search-attribute keys must be unique")
-            else
-              let* _ = protocol_payload "$.command.search_attributes" payload in
-              validate_keys (key :: seen) rest
+      let* search_attributes =
+        protocol_payload_map ~path:"$.command.search_attributes"
+          ~label:"search-attribute" search_attributes
       in
-      let* () = validate_keys [] search_attributes in
-      let rec convert reversed = function
-        | [] -> Ok (List.rev reversed)
-        | (key, payload) :: rest ->
-            let* payload = protocol_payload "$.command.search_attributes" payload in
-            convert ((key, payload) :: reversed) rest
-      in
-      let* search_attributes = convert [] search_attributes in
       Ok (Protocol.Upsert_search_attributes { search_attributes })
+  | Activation.Modify_workflow_properties { upserted_memo } ->
+      let* upserted_memo =
+        protocol_payload_map ~path:"$.command.upserted_memo" ~label:"memo"
+          upserted_memo
+      in
+      Ok (Protocol.Modify_workflow_properties { upserted_memo })
   | Activation.Complete_workflow payload ->
       let* payload = protocol_payload "$.command.result" payload in
       let result =
@@ -1260,10 +1267,12 @@ let command_to_protocol command =
   | Activation.Fail_workflow error ->
       let* failure = protocol_failure "$.command.failure" error in
       Ok (Protocol.Fail_workflow { failure })
-  | Activation.Continue_as_new { workflow_type; input } ->
+  | Activation.Continue_as_new { workflow_type; input; memo; options } ->
       let* () = validate_identifier "$.command.workflow_type" workflow_type in
       let* input = protocol_input "$.command.input" input in
-      Ok (Protocol.Continue_as_new { workflow_type; input })
+      let* memo = protocol_payload_map ~path:"$.command.memo" ~label:"memo" memo in
+      let* options = protocol_continue_as_new_options options in
+      Ok (Protocol.Continue_as_new { workflow_type; input; memo; options })
   | Activation.Cancel_workflow_execution ->
       Ok Protocol.Cancel_workflow_execution
 
@@ -1419,6 +1428,14 @@ let activate_translated ?versioning_behavior execution
                    Option.bind context
                      (fun (context : Protocol.initialize_context) ->
                        context.retry_policy);
+                 first_workflow_task_backoff =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.first_workflow_task_backoff);
+                 cron_schedule =
+                   Option.bind context
+                     (fun (context : Protocol.initialize_context) ->
+                       context.cron_schedule);
                  (* Only provenance is retained: the predecessor's failure and
                     completion payloads are not part of the public run info,
                     so their mutable payload bytes are never shared here. A

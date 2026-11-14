@@ -159,6 +159,7 @@ type initialize_context = {
   search_attributes : (string * payload) list option;
   workflow_execution_expiration_time : timestamp option;
   first_workflow_task_backoff : duration option;
+  cron_schedule : string option;
   identity : string;
   parent_workflow : namespaced_workflow_execution option;
   workflow_execution_timeout : duration option;
@@ -382,6 +383,35 @@ type update_response =
   | Update_rejected of failure
   | Update_completed of payload
 
+(** Routing of a continue-as-new successor's first workflow task (#1153). *)
+type continue_as_new_versioning_behavior =
+  | Successor_auto_upgrade
+  | Successor_use_ramping_version
+
+(** Optional continue-as-new successor settings; see the interface for what
+    each omitted member means to Core and the server. *)
+module Continue_as_new_options = struct
+  type t = {
+    task_queue : string option;
+    run_timeout : duration option;
+    task_timeout : duration option;
+    retry_policy : retry_policy option;
+    search_attributes : (string * payload) list option;
+    initial_versioning_behavior : continue_as_new_versioning_behavior option;
+  }
+
+  (** Every setting unset: the command earlier releases emitted. *)
+  let none =
+    {
+      task_queue = None;
+      run_timeout = None;
+      task_timeout = None;
+      retry_policy = None;
+      search_attributes = None;
+      initial_versioning_behavior = None;
+    }
+end
+
 type completion_command =
   | Schedule_activity of {
       seq : int64;
@@ -429,6 +459,8 @@ type completion_command =
       run_timeout : duration option;
       task_timeout : duration option;
       id_reuse_policy : child_workflow_id_reuse_policy option;
+      memo : (string * payload) list option;
+      search_attributes : (string * payload) list option;
     }
   | Cancel_child_workflow of { seq : int64; reason : string }
   (** Sends a signal to another workflow execution. Core resolves the command
@@ -474,9 +506,18 @@ type completion_command =
   | Set_patch_marker of { patch_id : string; deprecated : bool }
   (** Merges payload values into Temporal's indexed search-attribute map. *)
   | Upsert_search_attributes of { search_attributes : (string * payload) list }
+  (** Merges payload values into the workflow memo through Core's
+      [ModifyWorkflowProperties] command (#1154). Keys are unique protocol
+      identifiers; a [binary/null] value asks the server to remove its key. *)
+  | Modify_workflow_properties of { upserted_memo : (string * payload) list }
   | Complete_workflow of { result : payload option }
   | Fail_workflow of { failure : failure }
-  | Continue_as_new of { workflow_type : string; input : payload list }
+  | Continue_as_new of {
+      workflow_type : string;
+      input : payload list;
+      memo : (string * payload) list;
+      options : Continue_as_new_options.t;
+    }
   | Cancel_workflow_execution
 
 type versioning_behavior = Versioning_pinned | Versioning_auto_upgrade
@@ -1900,6 +1941,7 @@ let initialize_context path json =
       "memo";
       "search_attributes";
       "workflow_execution_expiration_time"; "first_workflow_task_backoff";
+      "cron_schedule";
       "identity";
       "parent_workflow";
       "workflow_execution_timeout";
@@ -1935,6 +1977,17 @@ let initialize_context path json =
     nullable (path ^ "." ^ name) duration value
   in
   let* first_workflow_task_backoff = timeout "first_workflow_task_backoff" in
+  (* Rust encodes an absent schedule as [null], never as an empty string. *)
+  let* cron_json = field path "cron_schedule" entries in
+  let* cron_schedule =
+    nullable (path ^ ".cron_schedule")
+      (fun path json ->
+        let* schedule = string path json in
+        if String.equal schedule "" then
+          Error (invalid path "cron schedule must not be empty")
+        else Ok schedule)
+      cron_json
+  in
   let* workflow_execution_timeout = timeout "workflow_execution_timeout" in
   let* workflow_run_timeout = timeout "workflow_run_timeout" in
   let* workflow_task_timeout = timeout "workflow_task_timeout" in
@@ -1958,6 +2011,7 @@ let initialize_context path json =
       memo;
       search_attributes;
       workflow_execution_expiration_time; first_workflow_task_backoff;
+      cron_schedule;
       identity;
       parent_workflow;
       workflow_execution_timeout;
@@ -2070,6 +2124,10 @@ let initialize_context_json value =
           | None -> `Null
           | Some value -> time_json value.seconds value.nanoseconds);
         ("first_workflow_task_backoff", optional_time value.first_workflow_task_backoff);
+        ( "cron_schedule",
+          match value.cron_schedule with
+          | None -> `Null
+          | Some schedule -> `String schedule );
         ("identity", `String value.identity);
         ("parent_workflow", parent_workflow);
         ("workflow_execution_timeout", optional_time value.workflow_execution_timeout);
@@ -2693,6 +2751,111 @@ let validate_child_timeouts path ~execution_timeout ~run_timeout ~task_timeout =
            "task timeout exceeds the run (or execution) timeout")
   | _ -> Ok ()
 
+(** The optional members of a continue-as-new command (#1153), in the order
+    the encoder writes them. Each is omitted when unset, so a command without
+    options keeps the exact document of earlier releases. *)
+let continue_as_new_option_members =
+  [ "task_queue"; "run_timeout"; "task_timeout"; "retry_policy";
+    "search_attributes"; "initial_versioning_behavior" ]
+
+(** Returns the subset of [names] present in the JSON object [json], so the
+    closed-object check accepts exactly the optional members supplied. *)
+let present_members json names =
+  match json with
+  | `Assoc entries -> List.filter (fun name -> List.mem_assoc name entries) names
+  | _ -> []
+
+(** Maps a successor versioning behavior to its stable JSON spelling. *)
+let continue_as_new_versioning_behavior_string = function
+  | Successor_auto_upgrade -> "auto_upgrade"
+  | Successor_use_ramping_version -> "use_ramping_version"
+
+(** Decodes the spelling produced by
+    [continue_as_new_versioning_behavior_string]. *)
+let continue_as_new_versioning_behavior path = function
+  | `String "auto_upgrade" -> Ok Successor_auto_upgrade
+  | `String "use_ramping_version" -> Ok Successor_use_ramping_version
+  | _ -> Error (invalid path "unknown continue-as-new versioning behavior")
+
+(** Decodes the optional successor settings of a continue-as-new command from
+    its already closed-checked [entries]. An absent member is [None], and so
+    is an explicit [null], as for a child start and as the Rust decoder reads
+    it; the encoder never writes [null]. The timeouts obey the
+    [Client.start] rules that apply without an execution timeout: Rust and the
+    OCaml encoder enforce the same ones. *)
+let continue_as_new_options path entries =
+  let optional name decode =
+    match List.assoc_opt name entries with
+    | None | Some `Null -> Ok None
+    | Some json ->
+        let* value = decode (path ^ "." ^ name) json in
+        Ok (Some value)
+  in
+  let* task_queue = optional "task_queue" identifier in
+  let* run_timeout = optional "run_timeout" duration in
+  let* task_timeout = optional "task_timeout" duration in
+  let* retry_policy = optional "retry_policy" retry_policy in
+  let* search_attributes = optional "search_attributes" payload_map in
+  let* initial_versioning_behavior =
+    optional "initial_versioning_behavior" continue_as_new_versioning_behavior
+  in
+  let* () =
+    validate_child_timeouts path ~execution_timeout:None ~run_timeout
+      ~task_timeout
+  in
+  Ok
+    {
+      Continue_as_new_options.task_queue;
+      run_timeout;
+      task_timeout;
+      retry_policy;
+      search_attributes;
+      initial_versioning_behavior;
+    }
+
+(** Encodes the present successor settings of a continue-as-new command as
+    JSON members, in [continue_as_new_option_members] order, after applying
+    the decoder's checks so an invalid command is never written. *)
+let continue_as_new_options_json (options : Continue_as_new_options.t) =
+  let path = "$.commands" in
+  let* () =
+    validate_child_timeouts path ~execution_timeout:None
+      ~run_timeout:options.run_timeout ~task_timeout:options.task_timeout
+  in
+  let member name encode = function
+    | None -> Ok []
+    | Some value ->
+        let* json = encode value in
+        Ok [ (name, json) ]
+  in
+  let* task_queue =
+    member "task_queue"
+      (fun queue ->
+        let* queue = identifier (path ^ ".task_queue") (`String queue) in
+        Ok (`String queue))
+      options.task_queue
+  in
+  let duration_json (value : duration) =
+    Ok (time_json value.seconds value.nanoseconds)
+  in
+  let* run_timeout = member "run_timeout" duration_json options.run_timeout in
+  let* task_timeout = member "task_timeout" duration_json options.task_timeout in
+  let* retry_policy = member "retry_policy" retry_policy_json options.retry_policy in
+  let* search_attributes =
+    member "search_attributes"
+      (payload_map_json (path ^ ".search_attributes"))
+      options.search_attributes
+  in
+  let* initial_versioning_behavior =
+    member "initial_versioning_behavior"
+      (fun value -> Ok (`String (continue_as_new_versioning_behavior_string value)))
+      options.initial_versioning_behavior
+  in
+  Ok
+    (List.concat
+       [ task_queue; run_timeout; task_timeout; retry_policy; search_attributes;
+         initial_versioning_behavior ])
+
 (** Encodes a nullable duration. *)
 let optional_duration_json = function
   | None -> `Null
@@ -2866,7 +3029,8 @@ let completion_command path json =
             List.filter
               (fun name -> List.mem_assoc name entries)
               [ "task_queue"; "parent_close_policy"; "execution_timeout";
-                "run_timeout"; "task_timeout"; "id_reuse_policy" ]
+                "run_timeout"; "task_timeout"; "id_reuse_policy"; "memo";
+                "search_attributes" ]
         | _ -> [] in
       let* entries =
         exact_object path
@@ -2922,6 +3086,8 @@ let completion_command path json =
       let* run_timeout = optional "run_timeout" duration in
       let* task_timeout = optional "task_timeout" duration in
       let* id_reuse_policy = optional "id_reuse_policy" child_id_reuse_policy in
+      let* memo = optional "memo" payload_map in
+      let* search_attributes = optional "search_attributes" payload_map in
       let* () =
         validate_child_timeouts path ~execution_timeout ~run_timeout ~task_timeout
       in
@@ -2929,7 +3095,8 @@ let completion_command path json =
         (Start_child_workflow
            { seq; workflow_id; workflow_type; input; retry_policy;
              cancellation_type; task_queue; parent_close_policy;
-             execution_timeout; run_timeout; task_timeout; id_reuse_policy })
+             execution_timeout; run_timeout; task_timeout; id_reuse_policy;
+             memo; search_attributes })
   | "cancel_child_workflow" ->
       let* entries = exact_object path [ "kind"; "seq"; "reason" ] json in
       let* seq_json = field path "seq" entries in
@@ -2981,7 +3148,10 @@ let completion_command path json =
       Ok (Request_cancel_external_workflow { seq; workflow_id; run_id; reason })
   | "continue_as_new" ->
       let* entries =
-        exact_object path [ "kind"; "workflow_type"; "input" ] json
+        exact_object path
+          ([ "kind"; "workflow_type"; "input"; "memo" ]
+          @ present_members json continue_as_new_option_members)
+          json
       in
       let* workflow_type_json = field path "workflow_type" entries in
       let* workflow_type =
@@ -2989,7 +3159,10 @@ let completion_command path json =
       in
       let* input_json = field path "input" entries in
       let* input = list (path ^ ".input") payload input_json in
-      Ok (Continue_as_new { workflow_type; input })
+      let* memo_json = field path "memo" entries in
+      let* memo = payload_map (path ^ ".memo") memo_json in
+      let* options = continue_as_new_options path entries in
+      Ok (Continue_as_new { workflow_type; input; memo; options })
   | "request_cancel_activity" ->
       let* entries = exact_object path [ "kind"; "seq" ] json in
       let* seq_json = field path "seq" entries in
@@ -3042,6 +3215,11 @@ let completion_command path json =
       let* values_json = field path "search_attributes" entries in
       let* search_attributes = payload_map (path ^ ".search_attributes") values_json in
       Ok (Upsert_search_attributes { search_attributes })
+  | "modify_workflow_properties" ->
+      let* entries = exact_object path [ "kind"; "upserted_memo" ] json in
+      let* values_json = field path "upserted_memo" entries in
+      let* upserted_memo = payload_map (path ^ ".upserted_memo") values_json in
+      Ok (Modify_workflow_properties { upserted_memo })
   | "complete_workflow" ->
       let* entries = exact_object path [ "kind"; "result" ] json in
       let* result_json = field path "result" entries in
@@ -3140,11 +3318,21 @@ let completion_command_json = function
   | Start_child_workflow
       { seq; workflow_id; workflow_type; input; retry_policy; cancellation_type;
         task_queue; parent_close_policy; execution_timeout; run_timeout;
-        task_timeout; id_reuse_policy } ->
+        task_timeout; id_reuse_policy; memo; search_attributes } ->
       let* () =
         validate_child_timeouts "$.commands" ~execution_timeout
           ~run_timeout ~task_timeout
       in
+      (* Like the other options, an unset memo or search-attribute map is
+         omitted rather than encoded, keeping earlier commands unchanged. *)
+      let optional_map name = function
+        | None -> Ok []
+        | Some values ->
+            let* encoded = payload_map_json ("$.commands." ^ name) values in
+            Ok [ (name, encoded) ]
+      in
+      let* memo = optional_map "memo" memo in
+      let* search_attributes = optional_map "search_attributes" search_attributes in
       let* input = payloads_json input in
       let* retry_policy =
         match retry_policy with
@@ -3165,7 +3353,8 @@ let completion_command_json = function
             ("run_timeout", run_timeout);
             ("task_timeout", task_timeout) ] @
         (match id_reuse_policy with None -> [] | Some value ->
-          ["id_reuse_policy", `String (child_id_reuse_policy_string value)]) in
+          ["id_reuse_policy", `String (child_id_reuse_policy_string value)]) @
+        memo @ search_attributes in
       Ok
         (`Assoc
           (options @ [
@@ -3213,15 +3402,19 @@ let completion_command_json = function
             ("run_id", `String run_id);
             ("reason", `String reason);
           ])
-  | Continue_as_new { workflow_type; input } ->
+  | Continue_as_new { workflow_type; input; memo; options } ->
       let* input = payloads_json input in
+      let* memo = payload_map_json "$.commands.memo" memo in
+      let* options = continue_as_new_options_json options in
       Ok
         (`Assoc
-          [
-            ("kind", `String "continue_as_new");
-            ("workflow_type", `String workflow_type);
-            ("input", input);
-          ])
+          ([
+             ("kind", `String "continue_as_new");
+             ("workflow_type", `String workflow_type);
+             ("input", input);
+             ("memo", memo);
+           ]
+          @ options))
   | Start_timer { seq; start_to_fire_timeout } ->
       Ok
         (`Assoc
@@ -3265,6 +3458,14 @@ let completion_command_json = function
         (`Assoc
           [ ("kind", `String "upsert_search_attributes");
             ("search_attributes", search_attributes) ])
+  | Modify_workflow_properties { upserted_memo } ->
+      let* upserted_memo =
+        payload_map_json "$.commands.upserted_memo" upserted_memo
+      in
+      Ok
+        (`Assoc
+          [ ("kind", `String "modify_workflow_properties");
+            ("upserted_memo", upserted_memo) ])
   | Complete_workflow { result } ->
       let* result = match result with None -> Ok `Null | Some value -> payload_json value in
       Ok (`Assoc [ ("kind", `String "complete_workflow"); ("result", result) ])

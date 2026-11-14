@@ -82,6 +82,26 @@ val current_owner_matches : int -> bool
     it to check that drains leave no stale binding. *)
 val bound_owner_count : unit -> int
 
+(** True while the calling system thread runs a read-only callback, an update
+    validator or a query handler, inside {!with_read_only} (#513). *)
+val in_read_only : unit -> bool
+
+(** Raises [Invalid_argument] naming [operation] inside a read-only extent and
+    returns otherwise. Scheduler-owned futures call it before any queue,
+    pending-future, or observer mutation. *)
+val reject_in_read_only : operation:string -> unit
+
+(** Runs [action] as a read-only callback on the calling system thread: it
+    sets the read-only marker and clears the scheduler owner id, so {!await}
+    cannot suspend and owner checks fail closed, and restores both bindings
+    when [action] returns or raises. Nested extents restore in LIFO order. *)
+val with_read_only : (unit -> 'a) -> 'a
+
+(** Number of system threads on the calling Domain inside a read-only extent.
+    Zero whenever no {!with_read_only} extent is active; tests use it to
+    detect a leaked marker. *)
+val bound_read_only_count : unit -> int
+
 (** Queues [thunk] on the scheduler that owns [future]. The callback is never
     run inline for an active workflow, which keeps completion ordering
     deterministic. Partial application retains only the owner callback. *)
@@ -111,7 +131,10 @@ val observe :
   ('value, 'error) t -> (('value, 'error) result -> unit) -> unit
 
 (** Registers an observer with idempotent owner-scheduler removal. Removal
-    unlinks pending storage and suppresses an already queued callback. *)
+    unlinks pending storage and suppresses an already queued callback.
+    Registration raises [Invalid_argument] inside a read-only extent (see
+    {!with_read_only}): on a pending future directly, and on a ready
+    scheduler-owned one through the owner's queue. *)
 val subscribe :
   ('value, 'error) t -> (('value, 'error) result -> unit) -> (unit -> unit)
 

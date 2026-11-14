@@ -241,9 +241,15 @@ pub struct InitializeContext {
     /// Server-enforced execution-chain deadline; zero remains a present timestamp.
     #[serde(deserialize_with = "required_nullable")]
     pub workflow_execution_expiration_time: Option<Timestamp>,
-    /// Server-applied delay before this run's first task, including continuation throttling.
+    /// Server-applied delay before this run's first task: a root start
+    /// delay, the wait for a cron schedule's next time, or continuation
+    /// throttling.
     #[serde(deserialize_with = "required_nullable")]
     pub first_workflow_task_backoff: Option<Duration>,
+    /// Cron schedule recorded on this run's start event (#1158), inherited
+    /// by every run of a cron chain; absent when Core reports none.
+    #[serde(deserialize_with = "required_nullable")]
+    pub cron_schedule: Option<String>,
     /// Identity of the client that started this execution.
     pub identity: String,
     /// Parent execution for a child workflow, otherwise absent.
@@ -758,6 +764,19 @@ pub struct RetryPolicy {
     pub non_retryable_error_types: Vec<String>,
 }
 
+/// Deployment version for the first workflow task of a continue-as-new
+/// successor (#1153), Temporal's experimental `ContinueAsNewVersioningBehavior`.
+/// After that task the successor follows its own versioning behavior; a
+/// pinned versioning override on the execution takes precedence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinueAsNewVersioningBehavior {
+    /// Start on the task queue's current (target) deployment version.
+    AutoUpgrade,
+    /// Start on the task queue's ramping deployment version.
+    UseRampingVersion,
+}
+
 /// Supported deterministic command emitted by OCaml for Core.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -816,6 +835,7 @@ pub enum CompletionCommand {
     /// code. The optional workflow timeouts and ID reuse policy are omitted
     /// from the document when unset, so commands without them are unchanged;
     /// [`validate_completion`] applies the same timeout rules as root starts.
+    /// The memo and search attributes (#1135) are likewise omitted when unset.
     StartChildWorkflow {
         seq: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -836,6 +856,12 @@ pub enum CompletionCommand {
         task_timeout: Option<Duration>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id_reuse_policy: Option<ChildWorkflowIdReusePolicy>,
+        /// The child's start memo; absent (or empty) starts it with none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memo: Option<BTreeMap<String, Payload>>,
+        /// The child's indexed search attributes; absent starts it with none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search_attributes: Option<BTreeMap<String, Payload>>,
     },
     /// Requests cancellation of a previously started child workflow.
     CancelChildWorkflow {
@@ -881,11 +907,41 @@ pub enum CompletionCommand {
         failure: Failure,
     },
     /// Replaces the current run with a fresh run of the same workflow type.
-    /// The language layer currently supplies only the workflow type and input;
-    /// all other Core options remain explicit defaults until exposed safely.
+    /// The language layer supplies the workflow type, input, and memo, and
+    /// optionally the successor settings of #1153. Each unset option is
+    /// omitted from the document, so a command without options is unchanged
+    /// from earlier releases, and stays unset in Core, which (with the
+    /// server) then inherits the current run's value. Headers and the start
+    /// backoff remain Core defaults.
     ContinueAsNew {
         workflow_type: String,
         input: Vec<Payload>,
+        /// The successor's memo (#1154). Empty, the default when the member
+        /// is absent, lets Core reuse the memo the current run started with;
+        /// the OCaml runtime fills it after a memo upsert so the merged memo
+        /// survives continue-as-new.
+        #[serde(default)]
+        memo: BTreeMap<String, Payload>,
+        /// Task queue for the successor; absent keeps the current queue.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_queue: Option<String>,
+        /// Successor run timeout; absent inherits the current run's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_timeout: Option<Duration>,
+        /// Successor workflow-task timeout; absent inherits the current one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_timeout: Option<Duration>,
+        /// Successor retry policy; absent makes Core reuse the chain's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_policy: Option<RetryPolicy>,
+        /// Successor search attributes, replacing the current ones (an empty
+        /// map clears them); absent makes Core carry the current values.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search_attributes: Option<BTreeMap<String, Payload>>,
+        /// Deployment version for the successor's first workflow task;
+        /// absent inherits the current run's versioning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_versioning_behavior: Option<ContinueAsNewVersioningBehavior>,
     },
     CancelWorkflow,
     /// Returns one query result to Core without scheduling workflow work.
@@ -914,6 +970,12 @@ pub enum CompletionCommand {
     /// Merges encoded values into Core's indexed workflow search attributes.
     UpsertSearchAttributes {
         search_attributes: BTreeMap<String, Payload>,
+    },
+    /// Merges encoded values into the workflow memo through Core's
+    /// `ModifyWorkflowProperties` command (#1154). The server removes a key
+    /// whose value is the canonical `binary/null` payload.
+    ModifyWorkflowProperties {
+        upserted_memo: BTreeMap<String, Payload>,
     },
 }
 
@@ -1466,6 +1528,17 @@ fn validate_activation(value: &Activation) -> Result<(), ProtocolError> {
                             "$.jobs.context.first_workflow_task_backoff",
                         )?;
                     }
+                    // Absence is `null`, never an empty string, so a decoded
+                    // schedule always names one.
+                    if let Some(schedule) = &context.cron_schedule {
+                        if schedule.is_empty() {
+                            return Err(ProtocolError::invalid(
+                                "$.jobs.context.cron_schedule",
+                                "cron schedule must not be empty",
+                            ));
+                        }
+                        bounded_text(schedule, "$.jobs.context.cron_schedule")?;
+                    }
                     bounded_text(&context.identity, "$.jobs.context.identity")?;
                     if let Some(parent) = &context.parent_workflow {
                         identifier(
@@ -1851,6 +1924,8 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                 execution_timeout,
                 run_timeout,
                 task_timeout,
+                memo,
+                search_attributes,
                 ..
             } => {
                 identifier(workflow_id, "$.commands.workflow_id")?;
@@ -1862,6 +1937,12 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                     validate_retry_policy(retry_policy, "$.commands.retry_policy")?;
                 }
                 validate_child_timeouts(*execution_timeout, *run_timeout, *task_timeout)?;
+                if let Some(memo) = memo {
+                    validate_payload_map(memo, "$.commands.memo")?;
+                }
+                if let Some(search_attributes) = search_attributes {
+                    validate_payload_map(search_attributes, "$.commands.search_attributes")?;
+                }
             }
             CompletionCommand::SignalExternalWorkflow {
                 workflow_id,
@@ -1931,8 +2012,31 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
             }
             CompletionCommand::RequestCancelActivity { .. }
             | CompletionCommand::RequestCancelLocalActivity { .. } => {}
-            CompletionCommand::ContinueAsNew { workflow_type, .. } => {
+            CompletionCommand::ContinueAsNew {
+                workflow_type,
+                memo,
+                task_queue,
+                run_timeout,
+                task_timeout,
+                retry_policy,
+                search_attributes,
+                ..
+            } => {
                 identifier(workflow_type, "$.commands.workflow_type")?;
+                validate_payload_map(memo, "$.commands.memo")?;
+                if let Some(task_queue) = task_queue {
+                    identifier(task_queue, "$.commands.task_queue")?;
+                }
+                if let Some(retry_policy) = retry_policy {
+                    validate_retry_policy(retry_policy, "$.commands.retry_policy")?;
+                }
+                // A successor has no execution timeout of its own: the
+                // chain's bound is enforced by the OCaml public API, which
+                // can read it from the current run's start event.
+                validate_child_timeouts(None, *run_timeout, *task_timeout)?;
+                if let Some(search_attributes) = search_attributes {
+                    validate_payload_map(search_attributes, "$.commands.search_attributes")?;
+                }
             }
             CompletionCommand::StartTimer {
                 start_to_fire_timeout,
@@ -1996,20 +2100,10 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                 }
             }
             CompletionCommand::UpsertSearchAttributes { search_attributes } => {
-                for (key, payload) in search_attributes {
-                    identifier(key, "$.commands.search_attributes")?;
-                    if payload.data.len() > MAX_PAYLOAD_BYTES
-                        || payload
-                            .metadata
-                            .values()
-                            .any(|value| value.len() > MAX_PAYLOAD_BYTES)
-                    {
-                        return Err(ProtocolError::invalid(
-                            "$.commands.search_attributes",
-                            "payload exceeds the byte limit",
-                        ));
-                    }
-                }
+                validate_payload_map(search_attributes, "$.commands.search_attributes")?;
+            }
+            CompletionCommand::ModifyWorkflowProperties { upserted_memo } => {
+                validate_payload_map(upserted_memo, "$.commands.upserted_memo")?;
             }
             _ => {}
         }
@@ -2403,6 +2497,54 @@ pub(crate) fn validate_payload_limits(value: &Payload) -> Result<(), CoreConvers
         ));
     }
     Ok(())
+}
+
+/// Checks an outbound memo or search-attribute map: every key must be a
+/// protocol identifier and every payload must fit the protocol byte limits.
+/// `path` locates the map in the diagnostic.
+fn validate_payload_map(
+    values: &BTreeMap<String, Payload>,
+    path: &str,
+) -> Result<(), ProtocolError> {
+    for (key, payload) in values {
+        identifier(key, path)?;
+        if payload.data.len() > MAX_PAYLOAD_BYTES
+            || payload
+                .metadata
+                .values()
+                .any(|value| value.len() > MAX_PAYLOAD_BYTES)
+        {
+            return Err(ProtocolError::invalid(
+                path,
+                "payload exceeds the byte limit",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Converts an outbound memo or search-attribute map into the map type of
+/// the Core command field that carries it.
+fn payload_map_to_core<M>(values: &BTreeMap<String, Payload>) -> Result<M, CoreConversionError>
+where
+    M: FromIterator<(String, api_common::Payload)>,
+{
+    values
+        .iter()
+        .map(|(key, payload)| Ok((key.clone(), payload_to_core(payload)?)))
+        .collect()
+}
+
+/// Converts the memo or search-attribute map of a Core command back to the
+/// semantic protocol, copying every payload. Keys are kept as Core holds
+/// them; the semantic validator checks them before any reuse.
+fn payload_map_from_core<'a>(
+    entries: impl IntoIterator<Item = (&'a String, &'a api_common::Payload)>,
+) -> Result<BTreeMap<String, Payload>, CoreConversionError> {
+    entries
+        .into_iter()
+        .map(|(key, payload)| Ok((key.clone(), payload_from_core(payload)?)))
+        .collect()
 }
 
 /// Builds a Core payload whose allocation ownership is transferred into protobuf values.
@@ -3200,39 +3342,6 @@ fn eviction_reason_from_core(value: i32) -> Result<EvictionReason, CoreConversio
     )
 }
 
-/// Rejects cron and root start-delay semantics. The server also inserts a
-/// first-task backoff for rapid continue-as-new and retry runs; that already
-/// applied duration is validated and retained rather than mistaken for cron.
-fn validate_initialize_subset(
-    value: &core_activation::InitializeWorkflow,
-    continuation: Option<&Continuation>,
-) -> Result<(), CoreConversionError> {
-    if !value.cron_schedule.is_empty()
-        || value.continued_initiator == i32::from(api_enums::ContinueAsNewInitiator::CronSchedule)
-    {
-        return Err(unsupported(
-            "cron schedules are not supported by the OCaml worker",
-        ));
-    }
-    let supported_continuation = continuation.is_some_and(|value| {
-        matches!(
-            value.initiator,
-            ContinueAsNewInitiator::Workflow | ContinueAsNewInitiator::Retry
-        )
-    });
-    if !supported_continuation
-        && value
-            .cron_schedule_to_schedule_interval
-            .as_ref()
-            .is_some_and(|duration| duration.seconds != 0 || duration.nanos != 0)
-    {
-        return Err(unsupported(
-            "root start delay is not supported by the OCaml worker",
-        ));
-    }
-    Ok(())
-}
-
 /// Maps one Core continue-as-new suggestion reason.
 ///
 /// Reasons are advisory, and Core copies the raw numbers from the latest
@@ -3277,8 +3386,12 @@ pub fn activation_from_core(
                 .ok_or_else(|| invalid_core("Core activation job variant is absent"))?
             {
                 Variant::InitializeWorkflow(value) => {
+                    // Cron schedules, cron-initiated runs and every first-task
+                    // backoff (a root start delay, the wait for the next cron
+                    // time, or continuation throttling) are carried as data
+                    // (#1158): the server has already applied the backoff
+                    // before the task was polled, so nothing is delayed again.
                     let continuation = continuation_from_core(value)?;
-                    validate_initialize_subset(value, continuation.as_ref())?;
                     Ok(ActivationJob::InitializeWorkflow {
                         workflow_id: value.workflow_id.clone(),
                         workflow_type: value.workflow_type.clone(),
@@ -3319,6 +3432,9 @@ pub fn activation_from_core(
                                     seconds: time.seconds,
                                     nanoseconds: time.nanos,
                                 }),
+                            // Core reports "no schedule" as an empty string.
+                            cron_schedule: (!value.cron_schedule.is_empty())
+                                .then(|| inbound_text(&value.cron_schedule)),
                             identity: inbound_text(&value.identity),
                             parent_workflow: value.parent_workflow_info.as_ref().map(|parent| {
                                 NamespacedWorkflowExecution {
@@ -3514,7 +3630,8 @@ pub fn activation_from_core(
     Ok(activation)
 }
 
-/// Applies the root-start workflow-timeout rules to a child start, mirroring
+/// Applies the root-start workflow-timeout rules to a child start (and, with
+/// no execution timeout, to a continue-as-new successor), mirroring
 /// the OCaml encoder so a hand-built document cannot bypass them: each
 /// supplied timeout is positive (Temporal reads zero as unset), the task
 /// timeout is at most 120 seconds, the run timeout is no larger than the
@@ -3796,6 +3913,32 @@ fn id_reuse_to_core(value: Option<ChildWorkflowIdReusePolicy>) -> i32 {
     })
 }
 
+/// Maps the successor versioning behavior to Core's enum; `None` is Core's
+/// unspecified value, which inherits the current run's versioning.
+fn continue_as_new_versioning_to_core(value: Option<ContinueAsNewVersioningBehavior>) -> i32 {
+    use temporalio_protos::temporal::api::enums::v1::ContinueAsNewVersioningBehavior as Core;
+    i32::from(match value {
+        None => Core::Unspecified,
+        Some(ContinueAsNewVersioningBehavior::AutoUpgrade) => Core::AutoUpgrade,
+        Some(ContinueAsNewVersioningBehavior::UseRampingVersion) => Core::UseRampingVersion,
+    })
+}
+
+/// Maps Core's successor versioning behavior back, preserving unspecified
+/// as `None` and rejecting values this protocol does not know.
+fn continue_as_new_versioning_from_core(
+    value: i32,
+) -> Result<Option<ContinueAsNewVersioningBehavior>, CoreConversionError> {
+    use temporalio_protos::temporal::api::enums::v1::ContinueAsNewVersioningBehavior as Core;
+    match Core::try_from(value)
+        .map_err(|_| invalid_core("unknown Core continue-as-new versioning behavior"))?
+    {
+        Core::Unspecified => Ok(None),
+        Core::AutoUpgrade => Ok(Some(ContinueAsNewVersioningBehavior::AutoUpgrade)),
+        Core::UseRampingVersion => Ok(Some(ContinueAsNewVersioningBehavior::UseRampingVersion)),
+    }
+}
+
 /// Rejects Core reuse policies this protocol does not offer, including the
 /// deprecated terminate-if-running value, and preserves an unspecified one.
 fn id_reuse_from_core(
@@ -3919,6 +4062,8 @@ fn command_to_core(
             run_timeout,
             task_timeout,
             id_reuse_policy,
+            memo,
+            search_attributes,
         } => Variant::StartChildWorkflowExecution(core_commands::StartChildWorkflowExecution {
             seq: *seq,
             task_queue: task_queue.clone().unwrap_or_default(),
@@ -3940,9 +4085,22 @@ fn command_to_core(
             workflow_run_timeout: run_timeout.map(duration_to_core),
             workflow_task_timeout: task_timeout.map(duration_to_core),
             workflow_id_reuse_policy: id_reuse_to_core(*id_reuse_policy),
-            // Cron, headers, memo, search attributes and the remaining child
-            // options stay at Core defaults until they have a stable public
-            // representation.
+            // An absent memo is Core's empty map: the child has no memo.
+            memo: memo
+                .as_ref()
+                .map(payload_map_to_core)
+                .transpose()?
+                .unwrap_or_default(),
+            search_attributes: search_attributes
+                .as_ref()
+                .map(|values| {
+                    Ok::<_, CoreConversionError>(api_common::SearchAttributes {
+                        indexed_fields: payload_map_to_core(values)?,
+                    })
+                })
+                .transpose()?,
+            // Cron, headers and the remaining child options stay at Core
+            // defaults until they have a stable public representation.
             ..Default::default()
         }),
         CompletionCommand::CancelChildWorkflow { seq, reason } => {
@@ -4025,12 +4183,42 @@ fn command_to_core(
         CompletionCommand::ContinueAsNew {
             workflow_type,
             input,
+            memo,
+            task_queue,
+            run_timeout,
+            task_timeout,
+            retry_policy,
+            search_attributes,
+            initial_versioning_behavior,
         } => {
             Variant::ContinueAsNewWorkflowExecution(core_commands::ContinueAsNewWorkflowExecution {
                 workflow_type: workflow_type.clone(),
+                // An empty queue is Core's "unset": the current queue.
+                task_queue: task_queue.clone().unwrap_or_default(),
                 arguments: payload_vec_to_core(input)?,
-                // The semantic protocol intentionally exposes no task queue,
-                // timeout, memo, header, retry, or versioning controls yet.
+                workflow_run_timeout: run_timeout.map(duration_to_core),
+                workflow_task_timeout: task_timeout.map(duration_to_core),
+                // An empty map is Core's "unset": it reuses the start memo.
+                memo: payload_map_to_core(memo)?,
+                // `None` makes Core carry the current search attributes;
+                // `Some` (even empty) replaces them.
+                search_attributes: search_attributes
+                    .as_ref()
+                    .map(|values| {
+                        Ok::<_, CoreConversionError>(api_common::SearchAttributes {
+                            indexed_fields: payload_map_to_core(values)?,
+                        })
+                    })
+                    .transpose()?,
+                retry_policy: retry_policy
+                    .as_ref()
+                    .map(retry_policy_to_core)
+                    .transpose()?,
+                initial_versioning_behavior: continue_as_new_versioning_to_core(
+                    *initial_versioning_behavior,
+                ),
+                // Headers, the deprecated build-ID versioning intent and the
+                // start backoff have no semantic representation.
                 ..Default::default()
             })
         }
@@ -4084,12 +4272,16 @@ fn command_to_core(
             deprecated: *deprecated,
         }),
         CompletionCommand::UpsertSearchAttributes { search_attributes } => {
-            let indexed_fields = search_attributes
-                .iter()
-                .map(|(key, payload)| Ok((key.clone(), payload_to_core(payload)?)))
-                .collect::<Result<_, CoreConversionError>>()?;
+            let indexed_fields = payload_map_to_core(search_attributes)?;
             Variant::UpsertWorkflowSearchAttributes(core_commands::UpsertWorkflowSearchAttributes {
                 search_attributes: Some(api_common::SearchAttributes { indexed_fields }),
+            })
+        }
+        CompletionCommand::ModifyWorkflowProperties { upserted_memo } => {
+            Variant::ModifyWorkflowProperties(core_commands::ModifyWorkflowProperties {
+                upserted_memo: Some(api_common::Memo {
+                    fields: payload_map_to_core(upserted_memo)?,
+                }),
             })
         }
     };
@@ -4221,8 +4413,6 @@ fn command_from_core(
             if !value.namespace.is_empty()
                 || !value.cron_schedule.is_empty()
                 || !value.headers.is_empty()
-                || !value.memo.is_empty()
-                || value.search_attributes.is_some()
                 || value.versioning_intent != 0
                 || value.priority.is_some()
             {
@@ -4263,6 +4453,18 @@ fn command_from_core(
                     .map(duration_from_core)
                     .transpose()?,
                 id_reuse_policy: id_reuse_from_core(value.workflow_id_reuse_policy)?,
+                // Core cannot tell an absent memo from an empty one; both
+                // mean "no memo", which the protocol writes as absent.
+                memo: if value.memo.is_empty() {
+                    None
+                } else {
+                    Some(payload_map_from_core(&value.memo)?)
+                },
+                search_attributes: value
+                    .search_attributes
+                    .as_ref()
+                    .map(|values| payload_map_from_core(&values.indexed_fields))
+                    .transpose()?,
             })
         }
         Variant::CancelChildWorkflowExecution(value) => {
@@ -4345,15 +4547,8 @@ fn command_from_core(
             )?,
         }),
         Variant::ContinueAsNewWorkflowExecution(value) => {
-            if !value.task_queue.is_empty()
-                || value.workflow_run_timeout.is_some()
-                || value.workflow_task_timeout.is_some()
-                || !value.memo.is_empty()
-                || !value.headers.is_empty()
-                || value.search_attributes.is_some()
-                || value.retry_policy.is_some()
+            if !value.headers.is_empty()
                 || value.versioning_intent != 0
-                || value.initial_versioning_behavior != 0
                 || value.backoff_start_interval.is_some()
             {
                 return Err(unsupported(
@@ -4365,6 +4560,35 @@ fn command_from_core(
             Ok(CompletionCommand::ContinueAsNew {
                 workflow_type: value.workflow_type.clone(),
                 input: payload_vec_from_core(&value.arguments)?,
+                memo: payload_map_from_core(&value.memo)?,
+                task_queue: if value.task_queue.is_empty() {
+                    None
+                } else {
+                    Some(value.task_queue.clone())
+                },
+                run_timeout: value
+                    .workflow_run_timeout
+                    .as_ref()
+                    .map(duration_from_core)
+                    .transpose()?,
+                task_timeout: value
+                    .workflow_task_timeout
+                    .as_ref()
+                    .map(duration_from_core)
+                    .transpose()?,
+                retry_policy: value
+                    .retry_policy
+                    .as_ref()
+                    .map(retry_policy_from_core)
+                    .transpose()?,
+                search_attributes: value
+                    .search_attributes
+                    .as_ref()
+                    .map(|values| payload_map_from_core(&values.indexed_fields))
+                    .transpose()?,
+                initial_versioning_behavior: continue_as_new_versioning_from_core(
+                    value.initial_versioning_behavior,
+                )?,
             })
         }
         Variant::CancelWorkflowExecution(value) => {
@@ -4422,15 +4646,24 @@ fn command_from_core(
             deprecated: value.deprecated,
         }),
         Variant::UpsertWorkflowSearchAttributes(value) => {
-            let search_attributes = value
-                .search_attributes
-                .as_ref()
-                .ok_or_else(|| invalid_core("Core search-attribute command has no values"))?
-                .indexed_fields
-                .iter()
-                .map(|(key, payload)| Ok((key.clone(), payload_from_core(payload)?)))
-                .collect::<Result<_, CoreConversionError>>()?;
+            let search_attributes = payload_map_from_core(
+                &value
+                    .search_attributes
+                    .as_ref()
+                    .ok_or_else(|| invalid_core("Core search-attribute command has no values"))?
+                    .indexed_fields,
+            )?;
             Ok(CompletionCommand::UpsertSearchAttributes { search_attributes })
+        }
+        Variant::ModifyWorkflowProperties(value) => {
+            let upserted_memo = payload_map_from_core(
+                &value
+                    .upserted_memo
+                    .as_ref()
+                    .ok_or_else(|| invalid_core("Core modify-properties command has no memo"))?
+                    .fields,
+            )?;
+            Ok(CompletionCommand::ModifyWorkflowProperties { upserted_memo })
         }
         _ => Err(unsupported("Core workflow command kind is not supported")),
     }

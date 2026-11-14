@@ -70,9 +70,11 @@ val implementation :
 
 (** Starts a durable Temporal timer and returns immediately. Starting several
     timers before awaiting one emits them in call order. A zero duration returns
-    a ready future without recording a timer. Outside workflow execution the
-    returned future is ready with a typed defect rather than touching global
-    time or creating an unowned timer.
+    a ready future without recording a timer. Outside workflow execution, and
+    in a read-only update validator or query handler (even for a zero
+    duration), the returned future is ready with a typed defect rather than
+    touching global time, creating an unowned timer, or recording a timer that
+    replay would not repeat.
 
     With [scope], cancelling the scope while the timer is pending records
     [TimerCanceled] in history (one [Cancel_timer] command, however often the
@@ -91,7 +93,8 @@ val start_sleep : ?scope:Scope.t -> Duration.t -> (unit, Error.t) Future.t
     the wait is [Scope.await scope (start_sleep ~scope duration)], so a scope
     cancelled by another fiber cancels the timer and returns [`Cancelled]. A
     zero duration returns immediately without recording a timer; outside
-    workflow execution it returns a typed defect. *)
+    workflow execution, and in a read-only update validator or query handler,
+    it returns {!start_sleep}'s typed defect without suspending. *)
 val sleep : ?scope:Scope.t -> Duration.t -> (unit, Error.t) result
 
 (** Sends a typed signal to another workflow execution. The operation is
@@ -99,7 +102,9 @@ val sleep : ?scope:Scope.t -> Duration.t -> (unit, Error.t) result
     activation. Omitting [run_id] lets the server resolve the current run for
     [workflow_id]; an explicit [run_id] targets that run and, like
     [workflow_id], must be non-empty, valid UTF-8, NUL-free, and at most
-    65,536 bytes, or the future resolves with a typed defect. *)
+    65,536 bytes, or the future resolves with a typed defect. A call from a
+    read-only update validator or query handler also returns a future ready
+    with a typed defect, before the input is encoded or a command recorded. *)
 val signal_external_workflow :
   workflow_id:string ->
   ?run_id:string ->
@@ -111,7 +116,9 @@ val signal_external_workflow :
 (** Requests cancellation of another workflow execution and returns a future
     resolved by Temporal's acknowledgement or structured failure. [run_id]
     follows {!signal_external_workflow}: omitted selects the current run, and
-    an explicit value must be a valid non-empty run ID. *)
+    an explicit value must be a valid non-empty run ID. Like a signal, a call
+    from a read-only update validator or query handler returns a future ready
+    with a typed defect and records nothing. *)
 val cancel_external_workflow :
   workflow_id:string ->
   ?run_id:string ->
@@ -129,14 +136,17 @@ val now : unit -> (Time.t, Error.t) result
 (** Returns a deterministic pseudo-random integer [n] with [0 <= n < bound].
     The stream is seeded by Temporal for the workflow run and replayed from
     the same initialization and reset metadata, so the result is stable for an
-    identical call sequence. [bound] must be positive; invalid bounds and calls
-    outside a workflow return a typed defect. *)
+    identical call sequence. [bound] must be positive; invalid bounds, calls
+    outside a workflow, and calls in a read-only update validator or query
+    handler (which would advance the stream on the live path only) return a
+    typed defect. *)
 val random_int : bound:int -> (int, Error.t) result
 
 (** Returns a deterministic pseudo-random float [x] with [0. <= x < 1.],
     from the same per-run stream as {!random_int} (#1155), so it is stable
     across replay and follows a reset's new seed. Calls outside a workflow,
-    or in a read-only update validator, return a typed defect. *)
+    or in a read-only update validator or query handler, return a typed
+    defect. *)
 val random_float : unit -> (float, Error.t) result
 
 (** Returns [length] deterministic pseudo-random bytes from the same stream
@@ -166,8 +176,11 @@ val current_deployment_version : unit -> deployment_version option
 
 (** A snapshot of metadata recorded when this workflow run started. [None]
     means Core omitted that protobuf field; [Some []] preserves an explicitly
-    empty map. Search attributes are their initial values, before any upsert.
-    Expiration is a server-enforced deadline across the execution chain, not
+    empty map. Search attributes and memo are their initial values, before
+    any upsert; read a typed search attribute with
+    {!Search_attribute.decode}. A continue-as-new successor starts with its
+    predecessor's current search attributes and, after an {!upsert_memo},
+    its merged memo. Expiration is a server-enforced deadline across the execution chain, not
     a timer the workflow runtime should schedule. *)
 type start_metadata = {
   memo : (string * Payload.t) list option;
@@ -234,9 +247,9 @@ module Info : sig
       - [`Continue_as_new]: the previous run called {!continue_as_new}.
       - [`Retry]: the previous run failed or timed out and the workflow
         retry policy started this run.
-      - [`Cron_schedule]: a cron schedule fired. OCaml workers currently
-        reject cron-initiated runs before workflow code starts, so this
-        constructor is reserved and is not observed today. *)
+      - [`Cron_schedule]: the previous run of a cron chain closed and the
+        schedule ([?cron_schedule] on [Client.start]) started this run at its
+        next scheduled time. *)
   type continuation_initiator = [ `Continue_as_new | `Retry | `Cron_schedule ]
 
   (** Returns the run ID this run was continued or retried from, or [None]
@@ -276,10 +289,27 @@ module Info : sig
       reported as [None]. *)
   val retry_policy : t -> Retry_policy.t option
 
+  (** Returns the cron schedule this run belongs to ([?cron_schedule] on
+      [Client.start]), or [None] when it is not part of a cron chain. Every
+      run of the chain reports the same schedule. *)
+  val cron_schedule : t -> string option
+
+  (** Returns how long Temporal held this run's first workflow task before
+      dispatching it, or [None] when it did not delay it: the
+      [?start_delay] on [Client.start], the wait until a cron schedule's
+      next time, or the brief throttle Temporal applies to a rapid retry or
+      continue-as-new. The delay has already elapsed when workflow code
+      runs; it is history metadata, and reading it schedules nothing.
+      Durations are rounded up to whole milliseconds. *)
+  val first_workflow_task_backoff : t -> Duration.t option
+
   (** Returns the parent workflow, or [None] for a top-level workflow. *)
   val parent : t -> parent option
 
-  (** Returns when the server started this run, if Temporal reported it. *)
+  (** Returns when the server started this run, if Temporal reported it.
+      This is when the run was created, before any
+      {!first_workflow_task_backoff}: a delayed or cron run's first
+      {!val-now} is later by at least that backoff. *)
   val start_time : t -> Time.t option
 
   (** Returns whether Temporal was replaying history for the activation
@@ -333,9 +363,12 @@ val is_replaying : unit -> bool
     [false], but Core needs the command to consume the recorded marker.
 
     Patch IDs must be non-empty, valid UTF-8, NUL-free, and at most 65,536
-    bytes. Invalid IDs or calls outside workflow execution raise
-    [Invalid_argument] as programmer misuse. IDs are durable history keys:
-    never reuse an ID for a different behavioral change. *)
+    bytes. Invalid IDs, calls outside workflow execution, and calls from a
+    read-only update validator or query handler raise [Invalid_argument] as
+    programmer misuse: the first call fixes the run's decision and may record
+    a marker, which replay of such a callback could not repeat. IDs are
+    durable history keys: never reuse an ID for a different behavioral
+    change. *)
 val patched : id:string -> bool
 
 (** Records that the behavioral change identified by [id] is being phased out.
@@ -346,7 +379,8 @@ val patched : id:string -> bool
 
     Patch IDs have the same validation and immutable-history requirements as
     [patched]. Invalid IDs, calls outside workflow execution, calls after that
-    execution ends, or mixed patch modes raise [Invalid_argument] as programmer
+    execution ends, calls from a read-only update validator or query handler,
+    or mixed patch modes raise [Invalid_argument] as programmer
     misuse. Replacing [patched] is safe only after marker-free executions that
     could take the old branch can no longer replay across that point. Removing
     the deprecation call is a later gate, safe only after incompatible
@@ -359,7 +393,9 @@ val deprecate_patch : id:string -> unit
     is accepted. Duplicate, empty, malformed, or oversized keys raise
     [Invalid_argument] as programmer misuse; payload ownership is copied. An
     empty list is a no-op and emits no command, because Temporal rejects an
-    empty upsert.
+    empty upsert. Calling it from an update validator or a query handler also
+    raises [Invalid_argument]: those callbacks are read-only, and a command
+    recorded there could not be reproduced on replay.
 
     Temporal Server decodes search-attribute values itself rather than
     through the worker's codecs. Each value must therefore be a [json/plain]
@@ -370,8 +406,45 @@ val deprecate_patch : id:string -> unit
     registered type is accepted like a built-in one. Other encodings, such
     as {!Codec.bytes} ([binary/plain]) or a custom encoding name, are
     rejected by the server, which fails the workflow task on every retry
-    until the code is corrected. *)
+    until the code is corrected. {!upsert_typed_search_attributes} produces
+    the right encoding from a typed {!Search_attribute.key}; this raw form
+    remains the escape hatch for values that module does not model. *)
 val upsert_search_attributes : (string * Payload.t) list -> unit
+
+(** Typed form of {!upsert_search_attributes} (#1154). [updates] are
+    encoded with {!Search_attribute.encode}, so each value has the
+    [json/plain] shape and ["type"] metadata of its key's registered type,
+    and are then merged exactly as {!upsert_search_attributes} merges raw
+    values: the change becomes visible after the workflow task is accepted,
+    a {!Search_attribute.unset} removes the name, and an empty list emits no
+    command. An update that {!Search_attribute.encode} rejects (an invalid or
+    repeated name, a non-UTF-8 string, a non-finite double, or an
+    out-of-range datetime) is programmer misuse and raises
+    [Invalid_argument], as does a call outside workflow execution or from a
+    read-only update validator or query handler. *)
+val upsert_typed_search_attributes : Search_attribute.update list -> unit
+
+(** Merges [values] into the run's memo (#1154) through one
+    [ModifyWorkflowProperties] command. Like a search-attribute upsert the
+    command is deterministic, replayed from history, and visible to
+    {!Client.describe} only after the workflow task is accepted. Unlike
+    search attributes, memo values are not indexed or decoded by the server,
+    so any payload encoding is accepted. A key whose value is exactly the
+    canonical [binary/null] payload (the one {!Codec.unit} writes, and
+    {!Codec.option} writes for [None]) is removed. An empty list is a no-op
+    and emits no command.
+
+    The merged memo is carried into a successor started by
+    {!continue_as_new} unless its [~memo] replaces it; without an upsert the
+    successor inherits the memo the run started with. Temporal cannot express an empty successor memo, so when
+    upserts have removed every key the successor inherits the start memo.
+    {!val-start_metadata} keeps reporting the memo the run started with.
+
+    Keys follow the rules of {!upsert_search_attributes}: duplicate, empty,
+    malformed, or oversized keys, and calls outside workflow execution or from
+    a read-only update validator or query handler, raise [Invalid_argument]
+    as programmer misuse. Payload bytes are copied. *)
+val upsert_memo : (string * Payload.t) list -> unit
 
 (** Ends the current run and starts a new run of [definition] with [input].
     This operation never returns to the calling workflow fiber. It is
@@ -379,12 +452,68 @@ val upsert_search_attributes : (string * Payload.t) list -> unit
     the successor command is emitted. A codec failure fails only the current
     workflow task, like any propagated [Codec] error: no continue-as-new
     command is emitted and the run stays open so a corrected worker can replay
-    it. Calling it outside workflow execution is programmer misuse and raises
-    [Invalid_argument].
+    it. Calling it outside workflow execution, or inside an update validator
+    or query handler, is programmer misuse and raises [Invalid_argument].
+
+    The optional arguments (#1153) change the successor; each one omitted
+    keeps what Temporal would otherwise do, and omitting all of them emits
+    exactly the command earlier releases emitted, so existing histories
+    replay unchanged.
+
+    - [task_queue] routes the successor's workflow tasks to another queue,
+      which must be served by a worker that registers [definition].
+      Omitted, the successor stays on the current run's queue.
+    - [run_timeout] bounds the successor run and [task_timeout] each of its
+      workflow tasks (Temporal's default is 10 seconds). Omitted, each is
+      inherited from the current run. The execution timeout set by
+      {!Client.start} bounds the whole chain and cannot be changed here.
+    - [retry_policy] replaces the workflow retry policy for the successor
+      and later runs. Omitted, Temporal keeps the policy the chain started
+      with; there is no way to remove it.
+    - [memo] replaces the successor's memo. Omitted, the successor receives
+      the current memo, including {!upsert_memo} changes. Temporal cannot
+      express an empty successor memo, so [~memo:[]] behaves as omitted.
+    - [search_attributes] replaces the successor's search attributes;
+      [~search_attributes:[]] starts it with none. Omitted, the successor
+      receives the current values, including upserts. Values must be
+      encoded as for {!Client.start}, for example with
+      {!Search_attribute.encode}.
+    - [initial_versioning_behavior] (experimental in Temporal) chooses the
+      deployment version for the successor's first workflow task on a
+      versioned worker: [`Auto_upgrade] the task queue's current version,
+      [`Use_ramping_version] its ramping version. Afterwards the successor
+      follows its own versioning behavior, and a pinned versioning override
+      on the execution always wins. Omitted, the successor inherits the
+      current run's version.
+
+    The successor reads these through {!Info.task_queue},
+    {!Info.run_timeout}, {!Info.task_timeout}, {!Info.retry_policy} and
+    {!val-start_metadata}. Timeouts follow the rules of {!Client.start}:
+    each must be positive, [task_timeout] at most 120 seconds and no larger
+    than the successor's run timeout (supplied or inherited, else the
+    chain's execution timeout), and [run_timeout] no larger than the chain's
+    execution timeout, because Temporal would silently lower a larger value.
+    An invalid setting (a bad timeout, an empty or malformed [task_queue],
+    or an empty, malformed or repeated memo or search-attribute key) fails
+    the current workflow task with a typed [Defect] before any command is
+    emitted, exactly like an input encoding failure. Payload bytes are
+    copied. Calling it from a query handler or update validator raises
+    [Invalid_argument] before any setting is checked or input encoded, so
+    only that callback is rejected and the run is left untouched.
 
     The fiber ends through a private exception that cleanup code
     ([Fun.protect ~finally]) observes but must let through. Do not wrap the
     call in a catch-all ([try ... with _ ->]): the run still continues as
     new, but whatever the handler returns is ignored with a
     [workflow_result_after_abort_ignored] warning (#1225). *)
-val continue_as_new : ('input, 'output) t -> 'input -> 'value
+val continue_as_new :
+  ?task_queue:string ->
+  ?run_timeout:Duration.t ->
+  ?task_timeout:Duration.t ->
+  ?retry_policy:Retry_policy.t ->
+  ?memo:(string * Payload.t) list ->
+  ?search_attributes:(string * Payload.t) list ->
+  ?initial_versioning_behavior:[ `Auto_upgrade | `Use_ramping_version ] ->
+  ('input, 'output) t ->
+  'input ->
+  'value

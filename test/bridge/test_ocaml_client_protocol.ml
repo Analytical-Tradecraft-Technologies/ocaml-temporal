@@ -98,6 +98,8 @@ let start_request : Protocol.start_request =
     run_timeout_ms = None;
     task_timeout_ms = None;
     retry_policy = None;
+    cron_schedule = None;
+    start_delay_ms = None;
     rpc_deadline = None;
   }
 
@@ -799,6 +801,131 @@ let test_id_conflict_policy_protocol () =
     (Protocol.decode_start_outcome ~request:use_existing
        {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"}}|})
 
+(** Signal-with-start and update-with-start documents (#1151): both embed the
+    start document unchanged under ["start"]; signal-with-start refuses the
+    [Fail] policy; an update-with-start outcome is decoded strictly, its
+    start and update halves are correlated with the request, a validator
+    rejection keeps the started run, and rejected and unknown outcomes are a
+    start's. *)
+let test_with_start_protocol () =
+  let start = { start_request with id_conflict_policy = Protocol.Use_existing } in
+  let signal : Protocol.signal_with_start_request =
+    { start; signal_name = "deliver"; signal_input = [ payload (Bytes.of_string "ok") ] }
+  in
+  let encoded = unwrap (Protocol.encode_signal_with_start_request signal) in
+  require_fragment "embedded start" {|"start":{|} encoded;
+  require_fragment "embedded request ID" {|"request_id":"request-1"|} encoded;
+  require_fragment "signal name" {|"signal_name":"deliver"|} encoded;
+  check_error_path "fail policy" "$.start.id_conflict_policy"
+    (Protocol.encode_signal_with_start_request { signal with start = start_request });
+  check_error_path "signal name" "$.signal_name"
+    (Protocol.encode_signal_with_start_request { signal with signal_name = "" });
+  check_error_path "embedded start" "$.workflow_id"
+    (Protocol.encode_signal_with_start_request
+       { signal with start = { start with workflow_id = "" } });
+  (* The outcome is a start outcome correlated with the embedded start. *)
+  (match
+     unwrap
+       (Protocol.decode_start_outcome ~request:signal.start
+          {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-existing"},"started":false}|})
+   with
+  | Protocol.Accepted { started = false; _ } -> ()
+  | _ -> failwith "signal-with-start outcome changed shape");
+  let update : Protocol.update_with_start_request =
+    { start; update_id = "update-1"; update_name = "apply"; update_input = [] }
+  in
+  let encoded = unwrap (Protocol.encode_update_with_start_request update) in
+  require_fragment "update id" {|"update_id":"update-1"|} encoded;
+  require_fragment "update input" {|"update_input":[]|} encoded;
+  check_error_path "update id" "$.update_id"
+    (Protocol.encode_update_with_start_request { update with update_id = "" });
+  (* Unlike signal-with-start, every conflict policy may be sent. *)
+  ignore
+    (unwrap
+       (Protocol.encode_update_with_start_request { update with start = start_request }));
+  let accepted ?(workflow_id = "workflow-1") update_half =
+    Printf.sprintf
+      {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":%S,"run_id":"run-1"},"started":true,"update":%s}|}
+      workflow_id update_half
+  in
+  let response ?(update_id = "update-1") outcome =
+    Printf.sprintf
+      {|{"kind":"response","update_id":%S,"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"outcome":%s}|}
+      update_id outcome
+  in
+  let pending = accepted (response "null") in
+  (match unwrap (Protocol.decode_update_with_start_outcome ~request:update pending) with
+  | Protocol.Update_with_start_accepted
+      {
+        start = { execution = { run_id = "run-1"; _ }; started = true };
+        update = Ok { update_id = "update-1"; outcome = None; _ };
+      } ->
+      ()
+  | _ -> failwith "accepted update-with-start changed shape");
+  let decoded = unwrap (Protocol.decode_update_with_start_outcome ~request:update pending) in
+  assert (
+    unwrap
+      (Protocol.decode_update_with_start_outcome ~request:update
+         (unwrap (Protocol.encode_update_with_start_outcome decoded)))
+    = decoded);
+  let rejected_by_validator =
+    accepted
+      (response
+         {|{"kind":"failed","failure":{"message":"no","source":"worker","stack_trace":"","encoded_attributes":null,"cause":null,"info":{"kind":"application","type":"Invalid","non_retryable":true,"details":[]}}}|})
+  in
+  (match
+     unwrap (Protocol.decode_update_with_start_outcome ~request:update rejected_by_validator)
+   with
+  | Protocol.Update_with_start_accepted
+      { start = { started = true; _ }; update = Ok { outcome = Some (Protocol.Update_failed _); _ } }
+    ->
+      ()
+  | _ -> failwith "validator rejection lost the started run");
+  let update_error code =
+    accepted (Printf.sprintf {|{"kind":"error","error":{"kind":"rpc","code":%S}}|} code)
+  in
+  (match
+     unwrap
+       (Protocol.decode_update_with_start_outcome ~request:update
+          (update_error "deadline_exceeded"))
+   with
+  | Protocol.Update_with_start_accepted
+      { update = Error (Protocol.Rpc { code = "deadline_exceeded" }); _ } ->
+      ()
+  | _ -> failwith "update deadline lost the started run");
+  check_error_path "other workflow" "$.execution.workflow_id"
+    (Protocol.decode_update_with_start_outcome ~request:update
+       (accepted ~workflow_id:"other" (response "null")));
+  check_error_path "other update" "$.update.update_id"
+    (Protocol.decode_update_with_start_outcome ~request:update
+       (accepted (response ~update_id:"update-2" "null")));
+  check_error_path "already started update" "$.update.error.kind"
+    (Protocol.decode_update_with_start_outcome ~request:update
+       (accepted
+          {|{"kind":"error","error":{"kind":"already_started","workflow_id":"workflow-1","existing_run_id":null}}|}));
+  require_error
+    (Protocol.decode_update_with_start_outcome ~request:update
+       {|{"kind":"accepted","execution":{"namespace":"default","workflow_id":"workflow-1","run_id":"run-1"},"started":true}|});
+  (match
+     unwrap
+       (Protocol.decode_update_with_start_outcome ~request:update
+          {|{"kind":"rejected","error":{"kind":"already_started","workflow_id":"workflow-1","existing_run_id":"run-0"}}|})
+   with
+  | Protocol.Update_with_start_rejected
+      (Protocol.Already_started { existing_run_id = Some "run-0"; _ }) ->
+      ()
+  | _ -> failwith "start conflict changed shape");
+  (match
+     unwrap
+       (Protocol.decode_update_with_start_outcome ~request:update
+          {|{"kind":"unknown","request_id":"request-1","workflow_id":"workflow-1"}|})
+   with
+  | Protocol.Update_with_start_unknown { request_id = "request-1"; _ } -> ()
+  | _ -> failwith "uncertain update-with-start changed shape");
+  check_error_path "unknown request" "$.request_id"
+    (Protocol.decode_update_with_start_outcome ~request:update
+       {|{"kind":"unknown","request_id":"request-2","workflow_id":"workflow-1"}|})
+
 (** Reports whether [fragment] occurs in [value]; the negative counterpart of
     [require_fragment], used to check that an absent option is omitted. *)
 let contains_fragment value fragment =
@@ -858,6 +985,8 @@ let test_start_execution_policy_protocol () =
       run_timeout_ms = Some 180_000L;
       task_timeout_ms = Some Protocol.max_workflow_task_timeout_ms;
       retry_policy = Some retry_policy;
+      cron_schedule = None;
+      start_delay_ms = None;
       rpc_deadline = deadline Protocol.max_rpc_timeout_ms;
     }
   in
@@ -940,6 +1069,67 @@ let test_start_execution_policy_protocol () =
              };
        })
 
+(** Checks the cron schedule and start delay of a start request (#1158):
+    both are omitted unless supplied, a delay crosses as exact milliseconds,
+    a signal-with-start forwards both, and the encoder rejects a zero or
+    overlong delay, an empty schedule, their combination, and either one on
+    update-with-start, at the member Rust would also reject. *)
+let test_start_schedule_protocol () =
+  let default = unwrap (Protocol.encode_start_request start_request) in
+  List.iter
+    (fun member ->
+      if contains_fragment default member then
+        failwith (member ^ " was sent although it was not supplied"))
+    [ "cron_schedule"; "start_delay_ms" ];
+  let cron = { start_request with cron_schedule = Some "@every 5s" } in
+  require_fragment "cron schedule" {|"cron_schedule":"@every 5s"|}
+    (unwrap (Protocol.encode_start_request cron));
+  let delayed =
+    { start_request with start_delay_ms = Some Protocol.max_workflow_timeout_ms }
+  in
+  require_fragment "start delay" {|"start_delay_ms":315576000000999|}
+    (unwrap (Protocol.encode_start_request delayed));
+  List.iter
+    (fun (label, path, request) ->
+      check_error_path label path (Protocol.encode_start_request request))
+    [
+      ("zero delay", "$.start_delay_ms", { start_request with start_delay_ms = Some 0L });
+      ( "negative delay",
+        "$.start_delay_ms",
+        { start_request with start_delay_ms = Some (-1L) } );
+      ( "overlong delay",
+        "$.start_delay_ms",
+        {
+          start_request with
+          start_delay_ms = Some (Int64.succ Protocol.max_workflow_timeout_ms);
+        } );
+      ( "delay with cron",
+        "$.start_delay_ms",
+        { cron with start_delay_ms = Some 1_000L } );
+      ("empty cron", "$.cron_schedule", { start_request with cron_schedule = Some "" });
+      ( "NUL in cron",
+        "$.cron_schedule",
+        { start_request with cron_schedule = Some "* *\000 * * *" } );
+    ];
+  let signal start : Protocol.signal_with_start_request =
+    {
+      start = { start with id_conflict_policy = Protocol.Use_existing };
+      signal_name = "deliver";
+      signal_input = [];
+    }
+  in
+  require_fragment "signal-with-start cron" {|"cron_schedule":"@every 5s"|}
+    (unwrap (Protocol.encode_signal_with_start_request (signal cron)));
+  require_fragment "signal-with-start delay" {|"start_delay_ms":315576000000999|}
+    (unwrap (Protocol.encode_signal_with_start_request (signal delayed)));
+  let update start : Protocol.update_with_start_request =
+    { start; update_id = "update-1"; update_name = "apply"; update_input = [] }
+  in
+  check_error_path "update-with-start cron" "$.start.cron_schedule"
+    (Protocol.encode_update_with_start_request (update cron));
+  check_error_path "update-with-start delay" "$.start.start_delay_ms"
+    (Protocol.encode_update_with_start_request (update delayed))
+
 (** A caller deadline resolved at dispatch sends only the budget that
     remains (#499): rounded up to whole milliseconds, never above the
     original budget, and absent once the deadline has expired. Readings are
@@ -1009,6 +1199,11 @@ let test_rpc_timeout_protocol () =
               next_page_token = None;
               rpc_deadline;
             } );
+      ( "describe",
+        fun rpc_deadline -> Protocol.encode_describe_request { execution; rpc_deadline } );
+      ( "count",
+        fun rpc_deadline ->
+          Protocol.encode_count_request { namespace = "default"; query = ""; rpc_deadline } );
     ]
   in
   List.iter
@@ -1020,6 +1215,116 @@ let test_rpc_timeout_protocol () =
       check_error_path label "$.rpc_timeout_ms"
         (encode (deadline (Int64.succ Protocol.max_rpc_timeout_ms))))
     encoders
+
+(** Describe and count documents (#1152): requests carry the run selector or
+    query and the optional budget; a describe answer is decoded strictly,
+    must name the requested execution, and maps every status and pending
+    activity state the Rust encoder can write, including [unknown_<n>]; a
+    count is a non-negative 64-bit integer. *)
+let test_describe_count_protocol () =
+  let request : Protocol.describe_request =
+    { execution = { execution with run_id = "" }; rpc_deadline = None }
+  in
+  let encoded = unwrap (Protocol.encode_describe_request request) in
+  require_fragment "describe run selector" {|"run_id":""|} encoded;
+  check_error_path "describe workflow" "$.workflow_id"
+    (Protocol.encode_describe_request
+       { request with execution = { execution with workflow_id = "" } });
+  (* [base64] is the payload data already in canonical padded base64. *)
+  let payload_json base64 =
+    Printf.sprintf
+      {|{"metadata":{"encoding":{"encoding":"base64","data":"anNvbi9wbGFpbg=="}},"data":{"encoding":"base64","data":%S}}|}
+      base64
+  in
+  let document ?(run_id = "run-1") ?(status = "running") ?(close_time = "null")
+      ?(history_length = "7") ?(memo = "[]") ?(state = "started")
+      ?(attempt = "3") ?(extra = "") () =
+    Printf.sprintf
+      {|{"execution":{"namespace":"default","workflow_id":"workflow-1","run_id":%S},"workflow_type":"Fixture","task_queue":"queue","status":%S,"start_time":{"seconds":1700000000,"nanoseconds":5},"close_time":%s,"history_length":%s,"memo":%s,"search_attributes":[],"pending_activities":[{"activity_id":"1","activity_type":"charge","state":%S,"attempt":%s}],"pending_children":[{"workflow_id":"child","run_id":null,"workflow_type":"Child"}]%s}|}
+      run_id status close_time history_length memo state attempt extra
+  in
+  let memo =
+    Printf.sprintf {|[{"key":"a","value":%s},{"key":"b","value":%s}]|}
+      (payload_json "MQ==") (payload_json "Mg==")
+  in
+  let described =
+    unwrap
+      (Protocol.decode_describe_response ~request
+         (document ~memo ~close_time:{|{"seconds":1700000060,"nanoseconds":0}|}
+            ~history_length:"9007199254740993" ()))
+  in
+  assert (described.execution.run_id = "run-1");
+  assert (described.status = `Running);
+  assert (described.start_time = { Workflow.seconds = 1_700_000_000L; nanoseconds = 5 });
+  assert (
+    described.close_time = Some { Workflow.seconds = 1_700_000_060L; nanoseconds = 0 });
+  assert (described.history_length = 9_007_199_254_740_993L);
+  assert (List.map (fun (field : Protocol.metadata_field) -> field.key) described.memo = [ "a"; "b" ]);
+  (match described.pending_activities with
+  | [ { activity_id = "1"; activity_type = "charge"; state = `Started; attempt = 3 } ] -> ()
+  | _ -> failwith "pending activity changed shape");
+  (match described.pending_children with
+  | [ { workflow_id = "child"; run_id = None; workflow_type = "Child" } ] -> ()
+  | _ -> failwith "pending child changed shape");
+  List.iter
+    (fun (state, expected) ->
+      match unwrap (Protocol.decode_describe_response ~request (document ~state ())) with
+      | { pending_activities = [ activity ]; _ } -> assert (activity.state = expected)
+      | _ -> failwith "pending activity state changed shape")
+    [
+      ("scheduled", `Scheduled);
+      ("started", `Started);
+      ("cancel_requested", `Cancel_requested);
+      ("paused", `Paused);
+      ("pause_requested", `Pause_requested);
+      ("unknown_0", `Unknown 0);
+      ("unknown_6", `Unknown 6);
+      ("unknown_-1", `Unknown (-1));
+    ];
+  assert (
+    (unwrap (Protocol.decode_describe_response ~request (document ~status:"unknown_9" ())))
+      .status
+    = `Unknown 9);
+  (* An exact request must be answered for its own run. *)
+  let exact = { request with execution } in
+  ignore (unwrap (Protocol.decode_describe_response ~request:exact (document ())));
+  check_error_path "other run" "$.execution"
+    (Protocol.decode_describe_response ~request:exact (document ~run_id:"run-2" ()));
+  check_error_path "unspecified status" "$.status"
+    (Protocol.decode_describe_response ~request (document ~status:"unspecified" ()));
+  check_error_path "named state as unknown" "$.pending_activities[0].state"
+    (Protocol.decode_describe_response ~request (document ~state:"unknown_2" ()));
+  check_error_path "negative history" "$.history_length"
+    (Protocol.decode_describe_response ~request (document ~history_length:"-1" ()));
+  check_error_path "negative attempt" "$.pending_activities[0].attempt"
+    (Protocol.decode_describe_response ~request (document ~attempt:"-1" ()));
+  check_error_path "duplicate memo key" "$.memo[1].key"
+    (Protocol.decode_describe_response ~request
+       (document
+          ~memo:
+            (Printf.sprintf {|[{"key":"a","value":%s},{"key":"a","value":%s}]|}
+               (payload_json "MQ==") (payload_json "Mg=="))
+          ()));
+  require_error
+    (Protocol.decode_describe_response ~request (document ~extra:{|,"extra":1|} ()));
+  let count_request : Protocol.count_request =
+    { namespace = "default"; query = "WorkflowType = 'x'"; rpc_deadline = None }
+  in
+  require_fragment "count query" "WorkflowType" (unwrap (Protocol.encode_count_request count_request));
+  check_error_path "count query" "$.query"
+    (Protocol.encode_count_request { count_request with query = "a\000" });
+  assert (unwrap (Protocol.decode_count_response {|{"count":42}|}) = 42L);
+  assert (
+    unwrap (Protocol.decode_count_response {|{"count":9223372036854775807}|})
+    = Int64.max_int);
+  List.iter
+    (fun malformed -> require_error (Protocol.decode_count_response malformed))
+    [
+      {|{"count":-1}|};
+      {|{"count":9223372036854775808}|};
+      {|{"count":"1"}|};
+      {|{"count":1,"groups":[]}|};
+    ]
 
 (** Runs one protocol test with a stable CI-visible name. *)
 let run name test =
@@ -1042,9 +1347,12 @@ let () =
   run "client signal protocol" test_signal_protocol;
   run "client query protocol" test_query_protocol;
   run "client visibility protocol" test_visibility_protocol;
+  run "client describe and count protocol" test_describe_count_protocol;
   run "client asynchronous starts" test_async_start_protocol;
   run "client id conflict policy" test_id_conflict_policy_protocol;
+  run "client signal and update with start" test_with_start_protocol;
   run "client start execution policies" test_start_execution_policy_protocol;
+  run "client start schedule options" test_start_schedule_protocol;
   run "client rpc timeouts" test_rpc_timeout_protocol;
   run "client rpc deadline remaining budget" test_rpc_deadline_remaining;
   run "client closed response shape" test_closed_response_shape;

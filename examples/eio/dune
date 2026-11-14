@@ -1,0 +1,24 @@
+; The Eio integration example (#1141). One self-checking process hosts a
+; worker on its own Domain and drives it from Eio fibers through a client.
+;
+; eio and eio_posix are CI-only example dependencies, pinned with their whole
+; closure in scripts/eio-example.locked (docs/dependencies.md); they are never
+; dependencies of temporal-sdk. The executable is therefore enabled only when
+; TEMPORAL_EIO_EXAMPLE=enabled, which the `make build-examples-eio` and
+; `make native-build-examples-eio` targets set after installing that closure.
+; Every other build skips this directory, so the SDK and the other examples
+; build in a switch without Eio, while an enabled build without Eio fails
+; instead of silently producing nothing.
+
+(executable
+ (name eio_example)
+ (enabled_if
+  (= %{env:TEMPORAL_EIO_EXAMPLE=disabled} enabled))
+ (libraries
+  temporal-sdk
+  temporal_sdk_examples_common
+  eio
+  eio.unix
+  eio_posix
+  threads.posix
+  unix))

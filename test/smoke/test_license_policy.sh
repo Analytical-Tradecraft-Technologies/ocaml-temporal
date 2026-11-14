@@ -70,3 +70,40 @@ if sh "$check_licenses" "$tmp/mixed.opam"; then
   echo "mixed prohibited license was incorrectly accepted" >&2
   exit 1
 fi
+
+# bigstringaf 0.10.0, in the CI-only Eio example closure (#1141), spells
+# BSD-3-Clause in lower case. SPDX identifiers match case-insensitively, but
+# the checker admits that spelling only for the reviewed package and version.
+printf '%s\n' \
+  'opam-version: "2.0"' \
+  'name: "bigstringaf"' \
+  'version: "0.10.0"' \
+  'license: "BSD-3-clause"' \
+  >"$tmp/bigstringaf.opam"
+sh "$check_licenses" "$tmp/bigstringaf.opam"
+
+printf '%s\n' \
+  'opam-version: "2.0"' \
+  'name: "bigstringaf"' \
+  'version: "0.11.0"' \
+  'license: "BSD-3-clause"' \
+  >"$tmp/new-bigstringaf.opam"
+if sh "$check_licenses" "$tmp/new-bigstringaf.opam"; then
+  echo "unreviewed bigstringaf version was incorrectly accepted" >&2
+  exit 1
+fi
+
+printf '%s\n' \
+  'opam-version: "2.0"' \
+  'name: "other"' \
+  'version: "0.10.0"' \
+  'license: "BSD-3-clause"' \
+  >"$tmp/other-lowercase.opam"
+if sh "$check_licenses" "$tmp/other-lowercase.opam"; then
+  echo "unreviewed lower-case licence spelling was incorrectly accepted" >&2
+  exit 1
+fi
+
+# seq.base is the compiler's virtual Seq package and has no licence field.
+printf '%s\n' 'opam-version: "2.0"' 'name: "seq"' 'version: "base"' >"$tmp/seq.opam"
+sh "$check_licenses" "$tmp/seq.opam"

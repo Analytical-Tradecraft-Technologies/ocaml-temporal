@@ -106,9 +106,27 @@ let test_ledger_ordering () =
   | Error _ -> failwith "ledger shutdown failed");
   assert (Shared.is_shut_down runtime);
   assert (Shared.acquire runtime = None);
+  (match Shared.shutdown runtime with
+  | Ok () -> ()
+  | Error _ -> failwith "repeated ledger shutdown failed");
+  (* A graph whose bounded close reported [Detached] (#1149) returns its
+     attachment as detached: its cleanup thread may still hold Core, so the
+     runtime is released but its shutdown must not report success. *)
+  let runtime = bridge_ok "detached ledger create" (Shared.create ~worker_threads:1 ()) in
+  let lease = Option.get (Shared.acquire runtime) in
+  Shared.release_detached lease;
+  Shared.release_detached lease;
+  Shared.release lease;
+  assert (Shared.attached runtime = 0);
+  (match Shared.shutdown runtime with
+  | Error (Shared.Native { Bridge.status = Bridge.Detached; _ }) -> ()
+  | Ok () -> failwith "a runtime with a detached graph reported destruction"
+  | Error _ -> failwith "a runtime with a detached graph failed otherwise");
+  assert (Shared.is_shut_down runtime);
+  assert (Shared.acquire runtime = None);
   match Shared.shutdown runtime with
   | Ok () -> ()
-  | Error _ -> failwith "repeated ledger shutdown failed"
+  | Error _ -> failwith "repeated detached ledger shutdown failed"
 
 (** Two real native supervisors, each with its own owner Domain and graph,
     run on one shared Core. Each supervisor releases its lease only when its

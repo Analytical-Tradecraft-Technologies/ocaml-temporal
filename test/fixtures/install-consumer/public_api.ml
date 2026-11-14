@@ -26,6 +26,7 @@ module Result_syntax = T.Result_syntax
 module Runtime = T.Runtime
 module Runtime_info = T.Runtime_info
 module Scope = T.Scope
+module Search_attribute = T.Search_attribute
 module Signal = T.Signal
 module Testing = T.Testing
 module Time = T.Time
@@ -337,6 +338,8 @@ let _child_start :
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
     ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
@@ -354,6 +357,8 @@ let _child_start_handle :
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
     ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input -> 'output T.Child_workflow.handle =
@@ -386,6 +391,8 @@ let _child_execute :
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
     ?id_reuse_policy:T.Child_workflow.id_reuse_policy ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
     id:string ->
     ('input, 'output) T.Workflow.t ->
     'input ->
@@ -581,8 +588,21 @@ let _workflow_random_bytes : length:int -> (string, T.Error.t) result =
 let _workflow_uuid4 : unit -> (string, T.Error.t) result = T.Workflow.uuid4
 let _workflow_continue_as_new :
     'input 'output 'value.
+    ?task_queue:string ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
+    ?initial_versioning_behavior:[ `Auto_upgrade | `Use_ramping_version ] ->
     ('input, 'output) T.Workflow.t -> 'input -> 'value =
   T.Workflow.continue_as_new
+
+(* Omitting every continue-as-new option keeps the earlier two-argument
+   call shape (#1153). *)
+let _workflow_continue_as_new_without_options :
+    'input 'output 'value. ('input, 'output) T.Workflow.t -> 'input -> 'value =
+ fun definition input -> T.Workflow.continue_as_new definition input
 
 let _signal_define :
     'input.
@@ -766,6 +786,8 @@ let _client_start :
     ?run_timeout:T.Duration.t ->
     ?task_timeout:T.Duration.t ->
     ?retry_policy:T.Retry_policy.t ->
+    ?cron_schedule:string ->
+    ?start_delay:T.Duration.t ->
     ?rpc_timeout:T.Duration.t ->
     workflow:('input, 'output) T.Workflow.t ->
     task_queue:string ->
@@ -773,6 +795,57 @@ let _client_start :
     input:'input ->
     unit -> (('input, 'output) T.Client.handle, T.Error.t) result =
   T.Client.start
+
+let _client_signal_with_start :
+    'input 'output 'signal.
+    T.Client.t ->
+    ?request_id:string ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
+    ?id_conflict_policy:[ `Use_existing | `Terminate_existing ] ->
+    ?id_reuse_policy:T.Client.id_reuse_policy ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?cron_schedule:string ->
+    ?start_delay:T.Duration.t ->
+    ?rpc_timeout:T.Duration.t ->
+    workflow:('input, 'output) T.Workflow.t ->
+    task_queue:string ->
+    id:string ->
+    input:'input ->
+    signal:'signal T.Signal.t ->
+    signal_input:'signal ->
+    unit -> (('input, 'output) T.Client.handle, T.Error.t) result =
+  T.Client.signal_with_start
+
+let _client_update_with_start :
+    'input 'output 'update_input 'update_output.
+    T.Client.t ->
+    ?request_id:string ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
+    id_conflict_policy:T.Client.id_conflict_policy ->
+    ?id_reuse_policy:T.Client.id_reuse_policy ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
+    ?update_id:string ->
+    ?rpc_timeout:T.Duration.t ->
+    workflow:('input, 'output) T.Workflow.t ->
+    task_queue:string ->
+    id:string ->
+    input:'input ->
+    update:('update_input, 'update_output) T.Update.t ->
+    update_input:'update_input ->
+    unit ->
+    ( ('input, 'output) T.Client.handle
+      * (('update_input, 'update_output) T.Client.update_handle, T.Error.t) result,
+      T.Error.t )
+    result =
+  T.Client.update_with_start
 
 (* The conflict policy is a closed polymorphic variant, so an exhaustive
    match here breaks if a constructor is added or renamed. *)
@@ -992,6 +1065,14 @@ let _workflow_info_retry_policy :
     T.Workflow.Info.t -> T.Retry_policy.t option =
   T.Workflow.Info.retry_policy
 
+(* The cron schedule and server-applied first-task delay of a run (#1158). *)
+let _workflow_info_cron_schedule : T.Workflow.Info.t -> string option =
+  T.Workflow.Info.cron_schedule
+
+let _workflow_info_first_workflow_task_backoff :
+    T.Workflow.Info.t -> T.Duration.t option =
+  T.Workflow.Info.first_workflow_task_backoff
+
 let _workflow_info_parent : T.Workflow.Info.t -> T.Workflow.Info.parent option =
   T.Workflow.Info.parent
 
@@ -1091,6 +1172,23 @@ let _runtime_metrics_prometheus :
     unit ->
     (T.Runtime.Metrics.t, T.Error.t) result =
   T.Runtime.Metrics.prometheus
+
+(* Opt-in OTLP push export of the same metrics (#1161). *)
+let _runtime_metrics_otlp :
+    ?headers:(string * string) list ->
+    ?period:T.Duration.t ->
+    ?protocol:[ `Grpc | `Http_protobuf ] ->
+    ?temporality:[ `Cumulative | `Delta ] ->
+    ?global_tags:(string * string) list ->
+    ?durations_as_seconds:bool ->
+    endpoint:string ->
+    unit ->
+    (T.Runtime.Metrics.t, T.Error.t) result =
+  T.Runtime.Metrics.otlp
+let _runtime_metrics_otlp_protocol : T.Runtime.Metrics.otlp_protocol list =
+  [ `Grpc; `Http_protobuf ]
+let _runtime_metrics_temporality : T.Runtime.Metrics.temporality list =
+  [ `Cumulative; `Delta ]
 let _runtime_metrics_address : T.Runtime.t -> string option =
   T.Runtime.metrics_address
 let _runtime_shutdown : T.Runtime.t -> (unit, T.Error.t) result =
@@ -1269,6 +1367,51 @@ let _client_visibility_page_fields (page : T.Client.visibility_page) :
       page.executions,
     page.next_page_token )
 
+let _client_describe :
+    'input 'output.
+    ?rpc_timeout:T.Duration.t ->
+    ('input, 'output) T.Client.handle ->
+    (T.Client.execution_description, T.Error.t) result =
+  T.Client.describe
+
+let _client_count :
+    ?rpc_timeout:T.Duration.t ->
+    T.Client.t -> query:string -> unit -> (int64, T.Error.t) result =
+  T.Client.count
+
+let _client_pending_activity_state_cases :
+    T.Client.pending_activity_state -> int = function
+  | `Scheduled -> 1
+  | `Started -> 2
+  | `Cancel_requested -> 3
+  | `Paused -> 4
+  | `Pause_requested -> 5
+  | `Unknown value -> value
+
+let _client_execution_description_fields
+    (description : T.Client.execution_description) =
+  let ({ namespace; workflow_id; run_id } : T.Client.execution) =
+    description.execution
+  in
+  ( (namespace, workflow_id, run_id),
+    (description.workflow_type, description.task_queue),
+    (description.status : T.Client.execution_status),
+    ((description.start_time : T.Time.t), (description.close_time : T.Time.t option)),
+    (description.history_length : int64),
+    ((description.memo : (string * T.Payload.t) list),
+     (description.search_attributes : (string * T.Payload.t) list)),
+    List.map
+      (fun (activity : T.Client.pending_activity) ->
+        ( activity.activity_id,
+          activity.activity_type,
+          (activity.state : T.Client.pending_activity_state),
+          (activity.attempt : int) ))
+      description.pending_activities,
+    List.map
+      (fun (child : T.Client.pending_child) ->
+        (child.child_workflow_id, (child.child_run_id : string option), child.child_workflow_type))
+      description.pending_children )
+
 let _client_start_update :
     'workflow_input 'workflow_output 'input 'output.
     ?update_id:string ->
@@ -1415,6 +1558,73 @@ let _workflow_upsert_search_attributes :
     (string * T.Payload.t) list -> unit =
   T.Workflow.upsert_search_attributes
 
+let _workflow_upsert_typed_search_attributes :
+    T.Search_attribute.update list -> unit =
+  T.Workflow.upsert_typed_search_attributes
+
+let _workflow_upsert_memo : (string * T.Payload.t) list -> unit =
+  T.Workflow.upsert_memo
+
+(* Typed search-attribute keys (#1154). The kind match names every
+   constructor so a removed or renamed indexed type fails compilation. *)
+let _search_attribute_kind_name : T.Search_attribute.kind -> string = function
+  | `Text -> "Text"
+  | `Keyword -> "Keyword"
+  | `Int -> "Int"
+  | `Double -> "Double"
+  | `Bool -> "Bool"
+  | `Datetime -> "Datetime"
+  | `Keyword_list -> "KeywordList"
+
+let _search_attribute_text : string -> string T.Search_attribute.key =
+  T.Search_attribute.text
+
+let _search_attribute_keyword : string -> string T.Search_attribute.key =
+  T.Search_attribute.keyword
+
+let _search_attribute_int64 : string -> int64 T.Search_attribute.key =
+  T.Search_attribute.int64
+
+let _search_attribute_double : string -> float T.Search_attribute.key =
+  T.Search_attribute.double
+
+let _search_attribute_bool : string -> bool T.Search_attribute.key =
+  T.Search_attribute.bool
+
+let _search_attribute_datetime : string -> T.Time.t T.Search_attribute.key =
+  T.Search_attribute.datetime
+
+let _search_attribute_keyword_list :
+    string -> string list T.Search_attribute.key =
+  T.Search_attribute.keyword_list
+
+let _search_attribute_name : 'value. 'value T.Search_attribute.key -> string =
+  T.Search_attribute.name
+
+let _search_attribute_kind :
+    'value. 'value T.Search_attribute.key -> T.Search_attribute.kind =
+  T.Search_attribute.kind
+
+let _search_attribute_set :
+    'value. 'value T.Search_attribute.key -> 'value -> T.Search_attribute.update =
+  T.Search_attribute.set
+
+let _search_attribute_unset :
+    'value. 'value T.Search_attribute.key -> T.Search_attribute.update =
+  T.Search_attribute.unset
+
+let _search_attribute_encode :
+    T.Search_attribute.update list ->
+    ((string * T.Payload.t) list, T.Error.t) result =
+  T.Search_attribute.encode
+
+let _search_attribute_decode :
+    'value.
+    'value T.Search_attribute.key ->
+    (string * T.Payload.t) list ->
+    ('value option, T.Error.t) result =
+  T.Search_attribute.decode
+
 (* In-process, time-skipping workflow test environment. *)
 let _testing_workflow :
     'input 'output.
@@ -1449,11 +1659,27 @@ let _testing_mock_activity :
     T.Testing.registered_activity =
   T.Testing.mock_activity
 
+let _testing_mock_async_activity :
+    'input 'output.
+    ?durations:T.Duration.t list ->
+    ('input, 'output) T.Activity.t ->
+    ('output T.Activity.async_context -> 'input -> 'output T.Activity.async_result) ->
+    T.Testing.registered_activity =
+  T.Testing.mock_async_activity
+
+(* The task-failure modes are matched exhaustively so a renamed or added
+   mode breaks the consumer build. *)
+let _testing_workflow_task_failure : T.Testing.workflow_task_failure -> string =
+  function
+  | `Fail_run -> "fail_run"
+  | `Retry -> "retry"
+
 let _testing_create :
     ?namespace:string ->
     ?task_queue:string ->
     ?start_time:T.Time.t ->
     ?max_activity_attempts:int ->
+    ?workflow_task_failure:T.Testing.workflow_task_failure ->
     workflows:T.Testing.registered_workflow list ->
     activities:T.Testing.registered_activity list ->
     unit -> (T.Testing.t, T.Error.t) result =
@@ -1468,6 +1694,14 @@ let _testing_skip : T.Testing.t -> T.Duration.t -> (unit, T.Error.t) result =
 let _testing_start :
     'input 'output.
     ?id:string ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
+    ?id_conflict_policy:T.Client.id_conflict_policy ->
+    ?id_reuse_policy:T.Client.id_reuse_policy ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
     T.Testing.t ->
     ('input, 'output) T.Workflow.t ->
     'input -> (('input, 'output) T.Testing.handle, T.Error.t) result =
@@ -1482,6 +1716,14 @@ let _testing_result :
 let _testing_execute :
     'input 'output.
     ?id:string ->
+    ?memo:(string * T.Payload.t) list ->
+    ?search_attributes:(string * T.Payload.t) list ->
+    ?id_conflict_policy:T.Client.id_conflict_policy ->
+    ?id_reuse_policy:T.Client.id_reuse_policy ->
+    ?execution_timeout:T.Duration.t ->
+    ?run_timeout:T.Duration.t ->
+    ?task_timeout:T.Duration.t ->
+    ?retry_policy:T.Retry_policy.t ->
     ?timeout:T.Duration.t ->
     T.Testing.t ->
     ('input, 'output) T.Workflow.t -> 'input -> ('output, T.Error.t) result =
@@ -1524,6 +1766,24 @@ let _testing_workflow_id : 'input 'output. ('input, 'output) T.Testing.handle ->
 
 let _testing_run_id : 'input 'output. ('input, 'output) T.Testing.handle -> string =
   T.Testing.run_id
+
+let _testing_started : 'input 'output. ('input, 'output) T.Testing.handle -> bool =
+  T.Testing.started
+
+let _testing_task_failure :
+    'input 'output. ('input, 'output) T.Testing.handle -> T.Error.t option =
+  T.Testing.workflow_task_failure
+
+let _testing_retry_workflow_tasks : T.Testing.t -> (unit, T.Error.t) result =
+  T.Testing.retry_workflow_tasks
+
+let _testing_memo :
+    'input 'output. ('input, 'output) T.Testing.handle -> (string * T.Payload.t) list =
+  T.Testing.memo
+
+let _testing_search_attributes :
+    'input 'output. ('input, 'output) T.Testing.handle -> (string * T.Payload.t) list =
+  T.Testing.search_attributes
 
 (* Offline history replay against registered workflow definitions. The
    failure match names every constructor so a removed or renamed verdict

@@ -60,6 +60,19 @@
       "$ref": "workflow-completion.schema.json#/$defs/retry_policy",
       "description": "Server-side workflow retry policy, in the same lossless shape as activity commands. Omitted means the workflow is not retried."
     },
+    "cron_schedule": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "pattern": "^[^\\u0000]+$",
+      "description": "Temporal cron schedule of the workflow chain (#1158). Temporal parses the expression and rejects an invalid one with invalid_argument. Omitted means no cron schedule. Must not be combined with start_delay_ms."
+    },
+    "start_delay_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 315576000000999,
+      "description": "Delay in milliseconds before Temporal dispatches the first workflow task (#1158). Omitted means no delay. Runtime validation rejects it together with cron_schedule, as Temporal does."
+    },
     "rpc_timeout_ms": {
       "type": "integer",
       "minimum": 1,

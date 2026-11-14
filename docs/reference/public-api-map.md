@@ -12,7 +12,7 @@ where application code normally uses them.
 | --- | --- | --- |
 | Workflow code | `Temporal.Workflow`, `Temporal.Activity`, `Temporal.Child_workflow`, `Temporal.Future`, `Temporal.Condition`, `Temporal.Scope`, `Temporal.Workflow_context`, `Temporal.Time`, `Temporal.Duration` | Defining deterministic work, making replay-safe time and pseudo-random choices, scheduling Temporal operations, waiting for results, and keeping execution-local state |
 | Application startup and shutdown | `Temporal.Client`, `Temporal.Worker`, `Temporal.Runtime`, `Temporal.Runtime_info` | Connecting to Temporal, registering executable definitions, running the worker, optionally sharing background I/O threads, and checking the linked bridge |
-| Values crossing a Temporal boundary | `Temporal.Codec`, `Temporal.Payload`, `Temporal.Error`, `Temporal.Result_syntax` | Encoding typed values, inspecting opaque payloads, representing expected failures, and composing `result` values |
+| Values crossing a Temporal boundary | `Temporal.Codec`, `Temporal.Payload`, `Temporal.Search_attribute`, `Temporal.Error`, `Temporal.Result_syntax` | Encoding typed values and search attributes, inspecting opaque payloads, representing expected failures, and composing `result` values |
 | Operation policies | `Temporal.Retry_policy` | Validating the retry policy passed to activities, child workflows and client starts, and reading the effective policy a run reports |
 | Signals, queries, and updates | `Temporal.Signal`, `Temporal.Query`, `Temporal.Update`, `Temporal.Interaction` | Defining typed interactions, registering handlers, and testing deterministic local dispatch |
 | Application tests | `Temporal.Testing` | Running registered workflows and activities in-process with a time-skipping virtual clock, stubbing activities and child workflows, and driving signals, queries, updates, and cancellation without a Temporal Server |
@@ -44,15 +44,23 @@ for those rules.
   (`execution_timeout`, `run_timeout`, `task_timeout`, and `retry_policy` as
   a `Retry_policy.t`), its continuation provenance
   (`continued_from_run_id` and `continuation_initiator`: `` `Continue_as_new ``,
-  `` `Retry ``, or the reserved `` `Cron_schedule ``), and the current
+  `` `Retry ``, or `` `Cron_schedule ``), the cron schedule and server-applied
+  first-task backoff of the run (`cron_schedule`,
+  `first_workflow_task_backoff`, #1158), and the current
   activation's replay flag, history length and size, and continue-as-new
   suggestion and its reasons, all taken from Temporal's activations (#512).
   `start_metadata ()` returns the start memo, search attributes, and execution
   expiration. `is_replaying ()` is the shorthand for replay-aware logging.
   `upsert_search_attributes` merges encoded values into the
   execution's indexed search attributes; the update becomes visible after the
-  workflow task is accepted. `continue_as_new` ends the current run and starts
-  a successor. `patched ~id`
+  workflow task is accepted. `upsert_typed_search_attributes` does the same
+  from typed `Temporal.Search_attribute` updates, and `upsert_memo` merges
+  values into the run's memo, which a later `continue_as_new` carries to the
+  successor (#1154). `continue_as_new` ends the current run and starts
+  a successor; its optional `?task_queue`, `?run_timeout`, `?task_timeout`,
+  `?retry_policy`, `?memo`, `?search_attributes` and
+  `?initial_versioning_behavior` change the successor, and omitting them all
+  emits the command earlier releases emitted (#1153). `patched ~id`
   introduces a new deterministic branch while allowing histories created
   before that marker to replay the old branch. `deprecate_patch ~id` is the
   later unit-returning lifecycle marker used while phasing that branch gate
@@ -88,8 +96,9 @@ for those rules.
   `Context.is_worker_shutting_down` reports that the worker has begun to stop.
 - `Temporal.Child_workflow` schedules a child workflow and exposes its typed
   future. Use its operation handle when the parent must cancel one exact child;
-  child retry and cancellation policies are passed to the durable command; see
-  the [operation policy reference](durable-operation-policies.md) for their
+  child retry and cancellation policies, timeouts, ID reuse policy, memo and
+  search attributes are passed to the durable command; see the
+  [operation policy reference](durable-operation-policies.md) for their
   parent-side behavior.
   Child scheduling and completion are durable workflow operations, not ordinary
   function calls; the [workflow guide](../guides/workflows.md) marks the
@@ -112,6 +121,15 @@ for those rules.
 - `Temporal.Codec` pairs an OCaml type with a payload encoding. The standard
   codecs are convenient defaults, not a requirement that all payloads be
   JSON; `Temporal.Payload` remains opaque bytes plus encoding metadata.
+- `Temporal.Search_attribute` (#1154) names a registered search attribute
+  with its indexed type (`text`, `keyword`, `int64`, `double`, `bool`,
+  `datetime`, `keyword_list`), so `encode` writes the `json/plain` payload
+  and `type` metadata Temporal Server decodes for that type, and `decode`
+  reads a value back from `Workflow.start_metadata` or
+  `Client.describe`. `set` and `unset` build the updates that
+  `Workflow.upsert_typed_search_attributes` applies; for `Client.start`,
+  pass the encoded list as `~search_attributes`. The raw
+  `(string * Payload.t) list` parameters remain the escape hatch.
 - `Temporal.Error.t` is the typed failure channel for expected operational
   failures. Use `Error.view`, `Error.kind`, and `Error.message` for stable
   inspection, and `Error.origin` (with `Error.timeout_type` and
@@ -140,7 +158,10 @@ for those rules.
   `` `Allow_duplicate_failed_only ``, or `` `Reject_duplicate ``) decides
   whether a closed run's ID may be reused, and `?execution_timeout`,
   `?run_timeout`, `?task_timeout`, and `?retry_policy` set server-side
-  execution policies (#499). Start and the other bounded operations accept a
+  execution policies (#499). `?start_delay` holds the first workflow task
+  for a positive duration and `?cron_schedule` makes the start a cron chain
+  whose runs Temporal starts on schedule (#1158); they are mutually
+  exclusive, as in Temporal. Start and the other bounded operations accept a
   per-call `?rpc_timeout`; an expired start deadline is recognized by
   `Client.is_start_outcome_uncertain`, and `Client.uncertain_start_request_id`
   returns the request ID to retry it with. The client retains the exact workflow/run identity, rebuilds a
@@ -160,11 +181,26 @@ for those rules.
   that successor. The client also sends typed signals and output-only or
   exactly-one-input queries. `Client.query_with_input` encodes the typed query
   argument before transport; the client lists bounded visibility results and
-  waits for typed terminal outcomes. `Client.start_update` waits until Temporal
+  waits for typed terminal outcomes. `Client.describe handle` returns a
+  snapshot of one run without waiting for it (#1152): identity, type, task
+  queue, the same `Client.execution_status` a visibility row carries, start
+  and close times, history length, memo, search attributes, and pending
+  activities and child workflows; `Client.count client ~query ()` counts the
+  executions a visibility query matches. `Client.start_update` waits until Temporal
   accepts one typed workflow update and returns an opaque handle;
   `Client.wait_update` polls that
   exact update until it has a typed outcome, while `Client.update_id` exposes
   the server-correlated update ID for diagnostics and retry bookkeeping.
+  `Client.signal_with_start` and `Client.update_with_start` (#1151) take
+  every start option (update-with-start excepting `?cron_schedule` and
+  `?start_delay`, which Temporal refuses there) and deliver a typed signal or update to the workflow,
+  starting it first when its ID has no open run, as one atomic Temporal
+  operation. Signal-with-start returns the exact-run handle that received the
+  signal (`Client.started` tells whether it was created) and accepts only the
+  `` `Use_existing `` (default) and `` `Terminate_existing `` conflict
+  policies; update-with-start requires a conflict policy and returns the
+  run handle beside the update's own `start_update`-shaped result, so a
+  validator rejection still reports the run that was started.
   `Client.follow`
   only validates and combines the existing client, workflow definition, and
   successor identity; it does not start or implicitly follow a run. A
@@ -217,8 +253,13 @@ for those rules.
   switches); the endpoint is bound before `create` returns, a busy address
   is a typed `Bridge` error, and `Runtime.metrics_address` reports the bound
   address. Every client and worker attached to the runtime reports there.
-  Metric names and labels match the official SDKs; see
-  [observability](observability.md#worker-metrics).
+  `Runtime.Metrics.otlp ~endpoint ?headers ?period ?protocol ?temporality
+  ()` instead pushes the same metrics to an OTLP collector over gRPC or
+  HTTP/protobuf (#1161), with credential headers that are never logged and
+  one final export at `Runtime.shutdown`; `Runtime.metrics_address` is then
+  `None`. Metric names and labels match the official SDKs; see
+  [observability](observability.md#worker-metrics) and
+  [OTLP export](observability.md#otlp-export).
 - `Temporal.Worker` registers workflows, activities, and the signal, query, and
   update handlers attached to each workflow registration. It owns one
   supervisor graph, runs the poll loops, and performs idempotent shutdown.
@@ -272,9 +313,13 @@ for those rules.
 - `Temporal.Testing` is the in-process workflow test environment. It drives
   the same private workflow runtime as a native worker against a
   deterministic server simulator, skipping virtual time whenever every
-  workflow is blocked on a timer or activity retry. `mock_activity` and
-  `mock_workflow` stub definitions by name; `start`, `signal`, `query`,
-  `update`, `cancel`, `skip`, and `result` drive a workflow step by step. It is
+  workflow is blocked on a timer or activity retry. `mock_activity`,
+  `mock_async_activity`, and `mock_workflow` stub definitions by name;
+  `start`, `signal`, `query`, `update`, `cancel`, `skip`, and `result` drive a
+  workflow step by step, and `start` accepts the `Client.start` memo, search
+  attribute, ID policy, timeout, and retry options. In the `` `Retry ``
+  workflow-task-failure mode, `workflow_task_failure` reports a failing task
+  and `retry_workflow_tasks` retries it. It is
   independent of `Client` and `Worker`, whose `mock://` target remains a
   plumbing-only backend that never runs workflow code. The simulated
   semantics and their limits are listed in the module documentation and the

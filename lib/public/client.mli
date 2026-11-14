@@ -15,10 +15,11 @@
       [?task_timeout] on {!start}) is a server-side execution policy recorded
       in the workflow's history. When it expires Temporal ends the workflow,
       and {!wait} reports [Timed_out].
-    - An RPC deadline ([?rpc_timeout] on {!start}, {!signal}, {!query},
+    - An RPC deadline ([?rpc_timeout] on {!start}, {!signal_with_start},
+      {!update_with_start}, {!signal}, {!query},
       {!query_with_input}, {!start_update}, {!cancel}, {!terminate},
-      {!reset}, {!list_visibility}, and {!fetch_history}) bounds one client
-      call and never
+      {!reset}, {!list_visibility}, {!fetch_history}, {!describe}, and
+      {!count}) bounds one client call and never
       affects the workflow. The deadline is fixed on a monotonic clock when
       the call begins, so it covers the time the request waits to be
       submitted, the RPC, and the transport retries the SDK performs inside
@@ -26,10 +27,12 @@
       whose deadline expires while it waits is never sent. It must be
       between 1 ms and 60 seconds; other values are
       typed defects returned before any request is sent. When omitted, each
-      operation keeps its built-in budget: 10 seconds for {!start} and
-      {!list_visibility}, 3 seconds for {!signal}, {!cancel}, {!terminate},
+      operation keeps its built-in budget: 10 seconds for {!start},
+      {!signal_with_start}, {!list_visibility}, {!describe}, and {!count},
+      3 seconds for {!signal}, {!cancel}, {!terminate},
       and {!reset}, and 30 seconds for queries, for each {!fetch_history}
-      page, and for {!start_update}'s acceptance wait. {!wait} and {!wait_update} have no RPC deadline: they
+      page, and for the acceptance wait of {!start_update} and
+      {!update_with_start}. {!wait} and {!wait_update} have no RPC deadline: they
       wait for the workflow or update, with bounded internal polls. Their
       optional [timeout] is a caller-side bound on the whole wait instead,
       described with each function.
@@ -179,6 +182,64 @@ type visibility_page = {
   next_page_token : string option;
 }
 
+(** State of an activity a described run has scheduled and not yet resolved,
+    as Temporal reports it: waiting for a worker ([`Scheduled]), running on
+    one ([`Started]), asked to cancel ([`Cancel_requested]), or paused on
+    the server ([`Paused], or [`Pause_requested] while an attempt still
+    runs). [`Unknown n] carries the wire value of a state this SDK does not
+    name, such as one a newer server adds, so a description never fails
+    because of it. *)
+type pending_activity_state =
+  [ `Scheduled
+  | `Started
+  | `Cancel_requested
+  | `Paused
+  | `Pause_requested
+  | `Unknown of int ]
+
+(** One activity a described run has scheduled and not yet resolved. *)
+type pending_activity = {
+  activity_id : string;  (** Workflow-scoped activity ID. *)
+  activity_type : string;  (** Registered activity type name. *)
+  state : pending_activity_state;
+  attempt : int;
+      (** Current attempt, starting at 1 (0 only if the server omitted it). *)
+}
+
+(** One child workflow a described run has started and not yet seen close. *)
+type pending_child = {
+  child_workflow_id : string;  (** The child's workflow ID. *)
+  child_run_id : string option;
+      (** The child's run, or [None] while its start is still being
+          initiated. *)
+  child_workflow_type : string;  (** The child's registered workflow type. *)
+}
+
+(** A snapshot of one run returned by {!describe} (#1152). *)
+type execution_description = {
+  execution : execution;
+      (** The described run. For a current-run handle this is the run that
+          was current when Temporal answered. *)
+  workflow_type : string;  (** Registered workflow type. *)
+  task_queue : string;  (** Task queue the run was started on. *)
+  status : execution_status;
+      (** The run's status, in the same type as a visibility row's. *)
+  start_time : Time.t;  (** When the run started, as recorded by Temporal. *)
+  close_time : Time.t option;  (** When the run closed; [None] while open. *)
+  history_length : int64;  (** Number of events in the run's history. *)
+  memo : (string * Payload.t) list;
+      (** The memo the run was started with, sorted by key. *)
+  search_attributes : (string * Payload.t) list;
+      (** The run's search attributes, sorted by key. Temporal Server adds a
+          [type] metadata entry (for example ["Keyword"]) to each payload, so
+          compare their data rather than the whole payload with the value
+          passed to {!start}. *)
+  pending_activities : pending_activity list;
+      (** Activities scheduled and not yet resolved, in server order. *)
+  pending_children : pending_child list;
+      (** Child workflows started and not yet closed, in server order. *)
+}
+
 (** Connects to the configured Temporal endpoint. [target_url] is copied into
     the private backend graph and [namespace] is required for every operation.
     The namespace and optional identity must be non-empty, valid UTF-8,
@@ -321,9 +382,36 @@ val create :
     namespace with matching server types. Workers
     can read the recorded values through {!Workflow.val-start_metadata}.
 
-    This client does not expose cron schedules or delayed starts. OCaml
-    workers reject cron and nonzero root start delay; do not start those
-    policies from another SDK on a queue served by this worker.
+    [start_delay] asks Temporal to wait that long before dispatching the
+    run's first workflow task (#1158). The run and its handle exist at once,
+    so signals, cancellation and termination can address it during the
+    delay. Temporal may dispatch the first task early when the run is
+    signalled during the delay (its rules differ between {!signal} and
+    {!signal_with_start} and between server versions), so do not treat the
+    delay as an exact lower bound for a signalled run. The delay must be
+    positive and no longer than a workflow timeout. Workflow code reads it through
+    {!Workflow.Info.first_workflow_task_backoff}; {!Workflow.Info.start_time}
+    remains the time Temporal accepted the start, so the first activation's
+    {!Workflow.now} is at least the delay later.
+
+    [cron_schedule] makes this a cron workflow chain (#1158): Temporal
+    delays the first run to the next scheduled time and, whenever a run
+    closes, starts the next one on schedule with the same workflow ID,
+    input, and options, until the chain is terminated, cancelled, or reaches
+    its [execution_timeout]. The expression uses Temporal's cron syntax
+    (five standard fields, or a descriptor such as ["@every 30s"]); Temporal
+    validates it and answers an invalid one with an error whose
+    {!val-rpc_status} is [Some `Invalid_argument]. Each run after the first
+    reports [`Cron_schedule] from {!Workflow.Info.val-continuation_initiator}, and
+    every run reads the schedule from {!Workflow.Info.cron_schedule}. A
+    current-run {!wait} never ends while the schedule keeps starting runs;
+    an exact-run {!wait} reports a run's own close, with the next scheduled
+    run as its successor. [cron_schedule] and [start_delay] are mutually
+    exclusive, as in Temporal, and an empty or malformed schedule string or
+    a zero delay is a typed defect returned before anything is sent.
+    Temporal Schedules, the newer replacement for cron workflows, are not
+    exposed by this client.
+
     Server-applied workflow/retry continuation backoff, timeouts, and
     execution expiration metadata are preserved.
 
@@ -345,6 +433,8 @@ val start :
   ?run_timeout:Duration.t ->
   ?task_timeout:Duration.t ->
   ?retry_policy:Retry_policy.t ->
+  ?cron_schedule:string ->
+  ?start_delay:Duration.t ->
   ?rpc_timeout:Duration.t ->
   workflow:('input, 'output) Workflow.t ->
   task_queue:string ->
@@ -352,6 +442,123 @@ val start :
   input:'input ->
   unit ->
   (('input, 'output) handle, Error.t) result
+
+(** Signals a workflow, starting it first when its workflow ID has no open
+    run (#1151): the "ensure running, then deliver" idiom of entity
+    workflows, as one atomic Temporal operation. Unlike {!start} with
+    [`Use_existing] followed by {!signal}, there is no window in which the
+    run can close between the two calls.
+
+    - When [id] has no open run (it was never used, or its latest run has
+      closed and [id_reuse_policy] allows another), Temporal starts a new run
+      and records the signal before its first workflow task, so workflow code
+      observes the signal in its first activation. {!val-started} is [true].
+    - When [id] has an open run, [id_conflict_policy] decides: [`Use_existing]
+      (the default) only signals that run, and {!val-started} is [false];
+      [`Terminate_existing] terminates it and starts and signals a new run.
+      [`Fail] is not offered: Temporal rejects it for this operation.
+
+    The returned handle names the exact run that received the signal. Every
+    start option means what it means for {!start}, with the same validation
+    and typed defects, and the signal input is encoded with [signal]'s codec
+    before anything is sent. A reuse policy that refuses a closed run returns
+    the error described at {!val-already_started}.
+
+    [request_id] is the idempotency key of the whole operation: Temporal
+    deduplicates both the start and the signal by it, so retrying an
+    uncertain outcome with the same [request_id] starts at most one run and
+    delivers the signal once. When omitted, the SDK allocates a fresh one.
+    [rpc_timeout] bounds the call (default 10 seconds; see
+    {{!section-rpc_deadlines} RPC deadlines}); an outcome Temporal did not
+    prove, including a client shutdown while the call is in flight, is
+    recognized by {!is_start_outcome_uncertain}, and in-flight calls count
+    against [max_pending_starts] like starts.
+
+    [start_delay] and [cron_schedule] apply only to a run this call starts;
+    the signal is delivered with that run's first workflow task, after the
+    delay or at the first scheduled time.
+
+    The deterministic [mock://] client applies the start as {!start} does and
+    records the signal on the resulting run. Older Temporal servers that do
+    not report whether the run was created make {!val-started} [false] under
+    [`Use_existing] even for a new run. *)
+val signal_with_start :
+  t ->
+  ?request_id:string ->
+  ?memo:(string * Payload.t) list ->
+  ?search_attributes:(string * Payload.t) list ->
+  ?id_conflict_policy:[ `Use_existing | `Terminate_existing ] ->
+  ?id_reuse_policy:id_reuse_policy ->
+  ?execution_timeout:Duration.t ->
+  ?run_timeout:Duration.t ->
+  ?task_timeout:Duration.t ->
+  ?retry_policy:Retry_policy.t ->
+  ?cron_schedule:string ->
+  ?start_delay:Duration.t ->
+  ?rpc_timeout:Duration.t ->
+  workflow:('input, 'output) Workflow.t ->
+  task_queue:string ->
+  id:string ->
+  input:'input ->
+  signal:'signal Signal.t ->
+  signal_input:'signal ->
+  unit ->
+  (('input, 'output) handle, Error.t) result
+
+(** Starts a workflow when needed and admits one typed update on it (#1151),
+    through Temporal's atomic update-with-start operation.
+
+    [id_conflict_policy] is required, as Temporal requires it here: with
+    [`Use_existing] the update goes to the open run if there is one,
+    [`Terminate_existing] replaces an open run first, and [`Fail] refuses an
+    open run with the error described at {!val-already_started}. Every other
+    start option means what it means for {!start}, and [update_id] and the
+    update input mean what they mean for {!start_update}. Temporal refuses a
+    cron schedule or start delay on this operation, so neither is offered.
+
+    The outer result is the start's outcome. [Error] means the start was not
+    applied (for example the typed already-started error), or, when
+    {!is_start_outcome_uncertain} recognizes it, that Temporal did not prove
+    whether it was; reconcile by retrying with the same [request_id] and
+    [update_id]. [Ok (handle, update)] means the start was applied: [handle]
+    names the exact run (with {!val-started} as for {!start}), and [update]
+    is the update's own result with the same shapes as {!start_update}: an
+    accepted update's handle for {!wait_update}, or the failure an outcome
+    already reports, such as a validator rejection, so a rejection never
+    hides the run that was started. An update that Temporal has only
+    admitted is re-issued with the same request and update IDs until a
+    worker accepts or rejects it; if [rpc_timeout] (default 30 seconds; see
+    {{!section-rpc_deadlines} RPC deadlines}) expires first, [update] is the
+    retryable [`Deadline_exceeded] RPC error beside the started run.
+
+    In-flight calls count against [max_pending_starts] like starts. The
+    deterministic [mock://] client applies the start as {!start} does and
+    returns the same typed update error {!start_update} returns there, since
+    it runs no workflow code. *)
+val update_with_start :
+  t ->
+  ?request_id:string ->
+  ?memo:(string * Payload.t) list ->
+  ?search_attributes:(string * Payload.t) list ->
+  id_conflict_policy:id_conflict_policy ->
+  ?id_reuse_policy:id_reuse_policy ->
+  ?execution_timeout:Duration.t ->
+  ?run_timeout:Duration.t ->
+  ?task_timeout:Duration.t ->
+  ?retry_policy:Retry_policy.t ->
+  ?update_id:string ->
+  ?rpc_timeout:Duration.t ->
+  workflow:('input, 'output) Workflow.t ->
+  task_queue:string ->
+  id:string ->
+  input:'input ->
+  update:('update_input, 'update_output) Update.t ->
+  update_input:'update_input ->
+  unit ->
+  ( ('input, 'output) handle
+    * (('update_input, 'update_output) update_handle, Error.t) result,
+    Error.t )
+  result
 
 (** Rebuilds a typed exact-run handle for an {!type-execution}, such as a
     successor returned by [wait]. [follow client ~workflow e] is
@@ -600,6 +807,39 @@ val list_visibility :
   unit ->
   (visibility_page, Error.t) result
 
+(** Describes the run [handle] addresses (#1152): its identity, type, task
+    queue, status, start and close times, history length, memo, search
+    attributes, and pending activities and child workflows. It never waits
+    for the run, so it is the non-blocking way to learn whether a run is
+    still open, unlike {!wait}. A current-run handle from {!get_handle}
+    describes the run that is current when Temporal handles the request, and
+    the returned [execution] names it.
+
+    An unknown workflow or run is an error with {!val-rpc_status}
+    [Some `Not_found], on every backend. [rpc_timeout] bounds this call
+    (default 10 seconds); see {{!section-rpc_deadlines} RPC deadlines}. The
+    deterministic [mock://] client describes its ledger: the memo and search
+    attributes passed to {!start} unchanged, ledger start and close times,
+    no pending activities or children, and a [history_length] of [0],
+    because it records no history. *)
+val describe :
+  ?rpc_timeout:Duration.t ->
+  ('workflow_input, 'workflow_output) handle ->
+  (execution_description, Error.t) result
+
+(** Counts the workflow executions a visibility query matches (#1152), with
+    the same query language and rules as {!list_visibility}: [query] may be
+    empty, which counts every execution, but must be valid UTF-8, NUL-free,
+    and no more than 65,536 bytes, or a typed defect is returned. For a
+    [GROUP BY] query the result is the total over every group. Visibility is
+    eventually consistent, so a run started a moment ago may not be counted
+    yet. [rpc_timeout] bounds this call (default 10 seconds); see
+    {{!section-rpc_deadlines} RPC deadlines}. The deterministic [mock://]
+    client accepts only an empty query and counts every run an empty
+    {!list_visibility} returns. *)
+val count :
+  ?rpc_timeout:Duration.t -> t -> query:string -> unit -> (int64, Error.t) result
+
 (** Executes a typed one-input query against the run [handle] addresses. The input is encoded with [query]'s codec before transport and
     the result is decoded with its output codec. Query handlers remain
     synchronous and read-only; routine Temporal failures are returned as
@@ -665,7 +905,9 @@ val run_id : ('input, 'output) handle -> string option
 (** Returns [true] when the [start] call that produced [handle] created its
     run, including a request-ID deduplicated retry of that same start.
     Returns [false] when a [`Use_existing] start attached to a run created by
-    another start, and for every handle built by [follow] or [get_handle]. *)
+    another start, and for every handle built by [follow] or [get_handle].
+    A handle from {!signal_with_start} or {!update_with_start} follows the
+    same rule. *)
 val started : ('input, 'output) handle -> bool
 
 (** Returns the run that made a start fail with Temporal's already-started
@@ -684,7 +926,8 @@ val started : ('input, 'output) handle -> bool
 val already_started : Error.t -> execution option
 
 (** Returns [true] when [error] means Temporal did not prove whether a
-    [start] was accepted: its RPC deadline expired, the transport failed after
+    [start] (or the start of {!signal_with_start} or {!update_with_start})
+    was accepted: its RPC deadline expired, the transport failed after
     the request may have reached the server, or the client shut down while
     the start was in flight. The workflow may or may not exist. Such an error
     has category [`Bridge], is non-retryable as a blind repeat, has

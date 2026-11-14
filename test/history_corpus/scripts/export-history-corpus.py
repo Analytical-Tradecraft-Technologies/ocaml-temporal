@@ -117,6 +117,43 @@ CASES = {
         ["child-workflow", "child-side"],
         "Child run started under the drawn ID.",
     ),
+    # corpus-v4-continue-as-new-options (#1153).
+    "continue-as-new-options-first": (
+        ["continue-as-new", "continue-as-new-options"],
+        "Continues as new with an explicit task queue, run and task timeouts, "
+        "retry policy, replacement memo and empty search-attribute map.",
+    ),
+    "continue-as-new-options-second": (
+        ["continue-as-new-successor", "continue-as-new-options"],
+        "Successor started with those options; it reads them through "
+        "Workflow.info and start_metadata.",
+    ),
+    # corpus-v5-cron-start-delay (#1158).
+    "start-delay": (
+        ["start-delay"],
+        "Root run started with a two-second start delay; it reads the "
+        "first-task backoff through Workflow.info.",
+    ),
+    "cron-first": (
+        ["cron-schedule"],
+        "First run of an @every 2s cron chain, delayed to the first "
+        "scheduled time; completes with the next run as successor.",
+    ),
+    "cron-second": (
+        ["cron-schedule", "cron-successor"],
+        "Run started by the cron schedule; it reads the schedule and the "
+        "Cron_schedule initiator through Workflow.info.",
+    ),
+    # corpus-v6-child-start-metadata (#1135).
+    "child-metadata-parent": (
+        ["child-workflow", "child-start-metadata"],
+        "Parent starts a child with a memo and a keyword search attribute.",
+    ),
+    "child-metadata-child": (
+        ["child-workflow", "child-side", "child-start-metadata"],
+        "Child run started with that memo and search attribute; it reads "
+        "both through Workflow.start_metadata.",
+    ),
 }
 
 # Patch lifecycle cases (issue #531). Each stage of the lifecycle captures the

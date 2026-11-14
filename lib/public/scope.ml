@@ -37,33 +37,37 @@ let ownership_error operation =
 (** Creates a scheduler-owned scope signal only while a workflow context is
     active. The runtime context owns the underlying future and registers its
     teardown, while this public module retains only the typed façade and its
-    one resolver. *)
+    one resolver. A read-only callback receives a typed defect instead: its
+    pending signal would outlive the callback on the live path only. *)
 let create () =
   match Temporal_sdk_kernel.Workflow_context_store.current () with
   | None ->
       Error
         (Error.defect
            ~message:"Temporal.Scope.create used outside a workflow execution")
-  | Some context ->
-      let cancellation_base, resolve =
-        Temporal_sdk_kernel.Workflow_context_store.create_signal context
-      in
-      let cancellation =
-        Future_private.of_internal
-          ~outside_error:cancellation_error cancellation_base
-      in
-      Ok
-        {
-          cancellation;
-          resolve;
-          owner_id =
-            Temporal_sdk_kernel.Future_store.owner_id cancellation_base;
-          callbacks_live =
-            (fun () ->
-              Temporal_sdk_kernel.Future_store.callbacks_live cancellation_base);
-          state = Active;
-          cancel_hooks = Temporal_base.Ordered_registry.create ();
-        }
+  | Some context -> (
+      match Error_private.check_writable ~what:"scope creation" with
+      | Error error -> Error error
+      | Ok () ->
+          let cancellation_base, resolve =
+            Temporal_sdk_kernel.Workflow_context_store.create_signal context
+          in
+          let cancellation =
+            Future_private.of_internal
+              ~outside_error:cancellation_error cancellation_base
+          in
+          Ok
+            {
+              cancellation;
+              resolve;
+              owner_id =
+                Temporal_sdk_kernel.Future_store.owner_id cancellation_base;
+              callbacks_live =
+                (fun () ->
+                  Temporal_sdk_kernel.Future_store.callbacks_live cancellation_base);
+              state = Active;
+              cancel_hooks = Temporal_base.Ordered_registry.create ();
+            })
 
 (** Checks whether the current scheduler is the one that owns [scope] and is
     still processing workflow callbacks. The liveness check makes a handle

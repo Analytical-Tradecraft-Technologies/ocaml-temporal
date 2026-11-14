@@ -21,6 +21,8 @@ type run_info = {
   run_timeout : Temporal_protocol.Workflow_protocol.duration option;
   task_timeout : Temporal_protocol.Workflow_protocol.duration option;
   retry_policy : Temporal_protocol.Workflow_protocol.retry_policy option;
+  first_workflow_task_backoff : Temporal_protocol.Workflow_protocol.duration option;
+  cron_schedule : string option;
   continued_from :
     (string * Temporal_protocol.Workflow_protocol.continue_as_new_initiator)
     option;
@@ -174,6 +176,12 @@ type t = {
      do not carry it, so the worker adapter supplies it at construction. *)
   namespace : string;
   mutable start_metadata : start_metadata option;
+  (* The run's memo after its own [upsert_memo] calls, or [None] before the
+     first one. It is derived only from the start snapshot and the run's
+     deterministic upserts, so replay rebuilds the same value, and
+     [continue_as_new] passes it to the successor because Core would
+     otherwise reuse the start memo and drop the upserts (#1154). *)
+  mutable current_memo : (string * Temporal_base.Payload.t) list option;
   (* Installed once from the initialization activation; strings are
      immutable copies owned by the protocol decoder, so they can be shared. *)
   mutable run_info : run_info option;
@@ -209,11 +217,14 @@ type t = {
      makes repeated calls replay identically without consulting process-global
      randomness or the host clock. *)
   mutable random_state : int64;
-  (* Update validators are a read-only live-request check.  The runtime flips
-     this guard only while a validator callback runs so deterministic helpers
-     such as [random_int] cannot mutate workflow state on the live path that
-     replay intentionally skips. *)
-  mutable randomness_disabled : bool;
+  (* True only while a read-only callback runs: a live update validator,
+     which replay skips, or a query handler, whose activation records no
+     command (#513). Every SDK-managed mutation of this context (local
+     values, the random stream, patch decisions, sequence allocation,
+     command emission, upserts, terminal operations) is rejected while it
+     is set, before any state changes. [with_read_only] owns the flag and
+     restores the previous value on return or exception. *)
+  mutable read_only : bool;
   mutable commands_rev : Activation.command list;
   (* Once true, [emit] ignores new commands. Set at the start of [shutdown]
      before waiters are discontinued so Fun.protect finally blocks cannot
@@ -300,6 +311,7 @@ let create ?(task_queue = "default") ?(namespace = "default")
         task_queue;
         namespace;
         start_metadata = None;
+        current_memo = None;
         run_info = None;
         conditions = Condition_store.create scheduler;
         activation_timestamp = None;
@@ -315,7 +327,7 @@ let create ?(task_queue = "default") ?(namespace = "default")
         timers = Hashtbl.create 16;
         locals = Hashtbl.create 8;
         random_state = seed_of_decimal randomness_seed;
-        randomness_disabled = false;
+        read_only = false;
         commands_rev = [];
         sealed = false;
       }
@@ -345,13 +357,15 @@ let current_binding = Thread_binding.create ()
 (** Reads the calling thread's installed workflow context. *)
 let current () = Thread_binding.get current_binding
 
-(** Marks the synchronous query callback allowed to read immutable observations
-    of its own live execution. This is separate from the scheduler owner marker:
-    queries must never gain permission to mutate scopes or resume fibers. *)
+(** Marks the synchronous read-only callback (a query handler or, since #513,
+    a live update validator) allowed to read immutable observations of its
+    own live execution. This is separate from the scheduler owner marker:
+    read-only callbacks must never gain permission to mutate scopes or resume
+    fibers. *)
 let query_read_binding = Thread_binding.create ()
 
-(** Accepts a scope status read only in the marked query for its owning live
-    execution. Both dynamic bindings are thread-local, and the sealed check
+(** Accepts a scope status read only in the marked read-only callback for its
+    owning live execution. Both dynamic bindings are thread-local, and the sealed check
     rejects a scope retained after terminal workflow completion. *)
 let query_read_owner_matches owner_id =
   match (Thread_binding.get query_read_binding, current ()) with
@@ -363,8 +377,9 @@ let query_read_owner_matches owner_id =
   | _ -> false
 
 (** Commands attached to a scope must originate in a scheduler turn, even
-    though a synchronous query may read that scope's status. Reject a nested
-    query marker as well as a paused or sealed scheduler before allocation. *)
+    though a read-only callback may read that scope's status. Reject the
+    read-only marker as well as a paused or sealed scheduler before
+    allocation. *)
 let in_owner_turn context =
   match (Thread_binding.get query_read_binding, current ()) with
   | None, Some current_context when current_context == context ->
@@ -372,6 +387,37 @@ let in_owner_turn context =
       && Scheduler.is_active context.scheduler
       && Future_store.current_owner_matches (Scheduler.id context.scheduler)
   | _ -> false
+
+(** Reports whether [context] is running a read-only callback, an update
+    validator or a query handler (see {!with_read_only}). *)
+let is_read_only context = context.read_only
+
+(** Rejects an SDK operation from a read-only callback (#513) with
+    [Invalid_argument] naming [what], before any state or command buffer
+    changes. The callbacks are read-only because replay cannot reproduce
+    their effects: update validators run only for live requests and are
+    skipped on replay, and a query activation records no commands. Public
+    operations whose contract already raises for programmer misuse (patching,
+    upserts, continue-as-new) rely on this directly; operations that return a
+    result call {!check_writable} first, and the private operations below
+    keep this as their backstop. *)
+let reject_in_read_only_callback context ~what =
+  if context.read_only then
+    invalid_arg
+      ("Temporal workflow " ^ what
+     ^ " cannot be used in a read-only update validator or query handler")
+
+(** Typed form of {!reject_in_read_only_callback} for operations whose public
+    contract returns a result or a future: a read-only callback receives a
+    non-retryable defect naming [what] and nothing is mutated. *)
+let check_writable context ~what =
+  if context.read_only then
+    Error
+      (Temporal_base.Error.defect
+         ~message:
+           ("Temporal workflow " ^ what
+          ^ " cannot be used in a read-only update validator or query handler"))
+  else Ok ()
 
 (** Creates a key whose value, when set, is retained only in each execution's
     private context. Key creation is allowed outside workflow code so one
@@ -388,8 +434,12 @@ let get_local context key =
 
 (** Stores one value in the current execution context. Replacing a value is
     deterministic because the owner Domain serializes workflow and interaction
-    handler callbacks for that execution. *)
+    handler callbacks for that execution. A read-only callback cannot store a
+    value, because replay would not repeat the write: the public setter
+    returns a typed defect first, and reaching this raises
+    [Invalid_argument]. *)
 let set_local context key value =
+  reject_in_read_only_callback context ~what:"local value";
   Hashtbl.replace context.locals key.id (Obj.repr value)
 
 (** Stores the deterministic clock value for the activation being dispatched.
@@ -487,6 +537,9 @@ let notify_has_patch context ~patch_id =
 let call_patch_api context ~patch_id ~mode =
   if context.sealed then
     invalid_arg "Temporal workflow patch API used after workflow execution ended";
+  (* The first call fixes the decision for the run and may emit a marker, so
+     a read-only callback must not be the call that does either (#513). *)
+  reject_in_read_only_callback context ~what:"patch API";
   let patch_id = snapshot_identifier patch_id in
   let state =
     match Hashtbl.find_opt context.patches patch_id with
@@ -548,18 +601,19 @@ let next_random_word context =
   context.random_state <- value;
   value
 
-(** Rejects a draw after shutdown or inside a read-only update validator,
-    where advancing the stream would change later draws on the live path
-    only. *)
+(** Rejects a draw after shutdown or inside a read-only callback (an update
+    validator or a query handler), where advancing the stream would change
+    later draws on the live path only. *)
 let check_randomness context =
   if context.sealed then
     Error
       (Temporal_base.Error.defect
          ~message:"workflow randomness used after workflow execution ended")
-  else if context.randomness_disabled then
+  else if context.read_only then
     Error
       (Temporal_base.Error.defect
-         ~message:"workflow randomness is unavailable in a read-only update validator")
+         ~message:
+           "workflow randomness is unavailable in a read-only update validator or query handler")
   else Ok ()
 
 (** Returns one unbiased integer below [bound] from the deterministic stream.
@@ -655,14 +709,29 @@ let uuid4 context =
       Buffer.contents hex)
     (random_bytes context ~length:16)
 
-(** Runs a read-only callback with workflow randomness disabled.  Update
-    validators are evaluated only on live requests and are deliberately not
-    replayed; restoring the previous flag in [finally] keeps nested callbacks
-    and subsequent workflow handlers from inheriting this temporary mode. *)
-let with_randomness_disabled context action =
-  let previous = context.randomness_disabled in
-  context.randomness_disabled <- true;
-  Fun.protect action ~finally:(fun () -> context.randomness_disabled <- previous)
+(** Runs [action] as a read-only callback of [context] (#513), the one mode
+    shared by update validators and query handlers. For the extent of
+    [action]:
+    - [context.read_only] is set, so every SDK-managed mutation of the
+      context is rejected before it changes state;
+    - the read-only marker of {!query_read_binding} names [context], so the
+      callback may read its own scopes' status while {!in_owner_turn} fails;
+    - {!Future_store.with_read_only} clears the scheduler owner id and marks
+      the thread, so no future can suspend and no scheduler work, pending
+      future, or observer can be created.
+    All three are restored when [action] returns or raises, and nested
+    extents restore in LIFO order, so the update implementation that runs
+    after a successful validator, and the next workflow fiber, see the
+    previous mode. Update validators are evaluated only on live requests and
+    are deliberately not replayed; query activations record no commands. *)
+let with_read_only context action =
+  let previous = context.read_only in
+  context.read_only <- true;
+  Fun.protect
+    ~finally:(fun () -> context.read_only <- previous)
+    (fun () ->
+      Thread_binding.with_value query_read_binding (Some context) (fun () ->
+          Future_store.with_read_only action))
 
 (** Buffers a search-attribute merge without consulting wall-clock or process
     state. The payload list is copied at the public boundary before this
@@ -679,6 +748,7 @@ let upsert_search_attributes context search_attributes =
   if context.sealed then
     invalid_arg
       "Temporal workflow search attributes used after workflow execution ended";
+  reject_in_read_only_callback context ~what:"search attributes";
   match search_attributes with
   | [] -> ()
   | _ :: _ ->
@@ -694,6 +764,60 @@ let upsert_search_attributes context search_attributes =
         Activation.Upsert_search_attributes { search_attributes = copied }
         :: context.commands_rev
 
+(** Reports whether [payload] is exactly the canonical [binary/null] value,
+    which Temporal Server treats as a removal when it merges a memo or
+    search-attribute upsert. The server compares the whole payload, so a
+    [binary/null] payload with extra metadata or data is an ordinary value. *)
+let is_removal (payload : Temporal_base.Payload.t) =
+  Bytes.length payload.data = 0
+  && (match payload.metadata with
+     | [ ("encoding", "binary/null") ] -> true
+     | _ -> false)
+
+(** Applies one memo or search-attribute upsert to [memo] as the server
+    does: a removal deletes its key, any other value replaces an existing key
+    in place or is appended. *)
+let merge_upsert memo upserted =
+  List.fold_left
+    (fun memo (key, payload) ->
+      if is_removal payload then List.filter (fun (name, _) -> not (String.equal name key)) memo
+      else if List.mem_assoc key memo then
+        List.map (fun ((name, _) as entry) -> if String.equal name key then (key, payload) else entry) memo
+      else memo @ [ (key, payload) ])
+    memo upserted
+
+(** Buffers one memo merge (#1154) and folds it into [current_memo], seeded
+    from the start snapshot on first use. Like a search-attribute upsert, an
+    empty list emits nothing, and the sealed check runs first so use after
+    the execution ended stays a programmer error. *)
+let upsert_memo context upserted =
+  if context.sealed then
+    invalid_arg "Temporal workflow memo used after workflow execution ended";
+  reject_in_read_only_callback context ~what:"memo";
+  match upserted with
+  | [] -> ()
+  | _ :: _ ->
+      let copied =
+        List.map
+          (fun (key, { Temporal_base.Payload.metadata; data }) ->
+            (snapshot_identifier key,
+             { Temporal_base.Payload.metadata = List.map Fun.id metadata;
+               data = Bytes.copy data }))
+          upserted
+      in
+      let current =
+        match context.current_memo with
+        | Some memo -> memo
+        | None -> (
+            match context.start_metadata with
+            | Some { memo = Some memo; _ } -> memo
+            | Some { memo = None; _ } | None -> [])
+      in
+      context.current_memo <- Some (merge_upsert current copied);
+      context.commands_rev <-
+        Activation.Modify_workflow_properties { upserted_memo = copied }
+        :: context.commands_rev
+
 (** Makes [context] current on the calling thread while [action] runs, then
     restores the previous value even if [action] raises. This prevents later
     code on the same thread from mistakenly appearing to run inside a workflow,
@@ -701,13 +825,12 @@ let upsert_search_attributes context search_attributes =
 let with_context context action =
   Thread_binding.with_value current_binding (Some context) action
 
-(** Runs a query with its execution context and a thread-local status-read
-    marker. The marker is restored even when the handler raises; unlike a
-    scheduler owner turn it grants no cancellation or future permissions. *)
+(** Runs a query with its execution context installed, in the read-only mode
+    of {!with_read_only}. Every binding is restored even when the handler
+    raises; unlike a scheduler owner turn the mode grants no cancellation or
+    future permissions. *)
 let with_read_only_query context action =
-  with_context context (fun () ->
-      Thread_binding.with_value query_read_binding (Some context) (fun () ->
-          with_randomness_disabled context action))
+  with_context context (fun () -> with_read_only context action)
 
 (** Runs infrastructure code with no workflow installed on the calling thread,
     then restores the previous context. This prevents re-entrant callbacks such
@@ -715,11 +838,13 @@ let with_read_only_query context action =
 let without_context action =
   Thread_binding.with_value current_binding None action
 
-(** Counts threads on the calling Domain that hold a context or query-read
-    binding, so tests can prove that every extent removed its entry. *)
+(** Counts threads on the calling Domain that hold a context, read-only
+    callback, or read-only future marker binding, so tests can prove that
+    every extent removed its entry. *)
 let bound_thread_count () =
   Thread_binding.bound_count current_binding
   + Thread_binding.bound_count query_read_binding
+  + Future_store.bound_read_only_count ()
 
 (** Builds the error returned when code waits for a workflow future from the
     wrong scheduler or after workflow execution has ended. *)
@@ -728,11 +853,10 @@ let outside_error () =
     ~message:"future awaited outside its workflow scheduler"
 
 (** Creates a future through the normal scheduler path and immediately supplies
-    its result, keeping the pending-future count correct. *)
+    its result, keeping the pending-future count correct. It is permitted in
+    a read-only callback, which uses it to return a typed rejection. *)
 let resolved context result =
-  let future, resolve = Scheduler.promise context.scheduler ~outside_error in
-  resolve result;
-  future
+  Scheduler.resolved context.scheduler ~outside_error result
 
 (** Allocates a scheduler-owned notification future without adding a history
     command. The normal scheduler teardown releases it if the workflow ends
@@ -757,8 +881,11 @@ let detached_error ~message =
   Future_store.resolved ~outside_error
     (Error (Temporal_base.Error.defect ~message))
 
-(** Returns the next command number. Zero is reserved, so the first is one. *)
+(** Returns the next command number. Zero is reserved, so the first is one.
+    A read-only callback must not consume a number: every later command
+    would then carry a different sequence on the live path than on replay. *)
 let allocate_sequence context =
+  reject_in_read_only_callback context ~what:"command sequence";
   context.next_sequence <- Int64.succ context.next_sequence;
   context.next_sequence
 
@@ -766,12 +893,18 @@ let allocate_sequence context =
     creation order before returning it. After [shutdown] or [terminate] has
     sealed the context, only query responses are allowed. Discontinued waiters
     cannot append durable commands after a terminal completion, while Core can
-    still query the retained final state without reopening the scheduler. *)
+    still query the retained final state without reopening the scheduler.
+    Inside a read-only callback any other command raises [Invalid_argument]
+    before the buffer changes (#513): the callback's own response is emitted
+    by the runtime after the callback returns, and every public operation
+    that could reach here from such a callback is rejected earlier, so this
+    check is the backstop for the whole command path. *)
 let emit context command =
   match command with
   | Activation.Query_result _ ->
       context.commands_rev <- command :: context.commands_rev
   | _ ->
+      reject_in_read_only_callback context ~what:"command";
       if not context.sealed then
         context.commands_rev <- command :: context.commands_rev
 
@@ -780,17 +913,42 @@ let emit context command =
     resumed. The context is sealed before the abort unwinds the fiber, exactly
     as [emit_terminal]/[shutdown] seal the sibling terminal path, so a
     [Fun.protect] cleanup running during that unwind cannot append a command
-    after this terminal one. *)
+    after this terminal one. A read-only callback cannot end the run: the
+    call raises [Invalid_argument] before the command is buffered or the
+    context sealed. *)
 let terminate context command =
+  reject_in_read_only_callback context ~what:"terminal command";
   emit context command;
   context.sealed <- true;
   Scheduler.abort_workflow ()
 
 (** Records the successor command before aborting the current scheduler. The
     command must be visible even though the terminal effect never resumes its
-    caller. *)
-let continue_as_new context ~workflow_type ~input =
-  terminate context (Activation.Continue_as_new { workflow_type; input })
+    caller. A non-empty explicit [memo] (#1153) replaces the successor's memo
+    and is copied here. Otherwise, after a memo upsert the successor receives
+    the merged memo, and without one the memo is left empty so Core reuses
+    the start memo; those payloads are shared with [current_memo], which
+    nothing mutates once the run has ended. [options] are already validated
+    and owned by the caller. Inside a read-only callback (an update validator
+    or query handler) the call raises [Invalid_argument] before anything is
+    buffered: the successor command, and the memo and search attributes it
+    carries, would reach history on the live path only. *)
+let continue_as_new ?memo ?(options = Activation.Continue_as_new_options.none)
+    context ~workflow_type ~input =
+  reject_in_read_only_callback context ~what:"run (continue-as-new)";
+  let memo =
+    match memo with
+    | Some (_ :: _ as memo) ->
+        List.map
+          (fun (key, { Temporal_base.Payload.metadata; data }) ->
+            (snapshot_identifier key,
+             { Temporal_base.Payload.metadata = List.map Fun.id metadata;
+               data = Bytes.copy data }))
+          memo
+    | Some [] | None -> Option.value context.current_memo ~default:[]
+  in
+  terminate context
+    (Activation.Continue_as_new { workflow_type; input; memo; options })
 
 (** Builds an error indicating that Core and the OCaml runtime disagree about
     which operation sequence is pending or that a bridge lifecycle rule was
@@ -952,6 +1110,11 @@ let schedule_activity context ~name ~input ?activity_id ?task_queue
                     "unknown or completed activity sequence %Ld" seq))
         | None -> Ok ()
         | Some _ when !cancellation_requested -> Ok ()
+        | Some _ when context.read_only ->
+            (* A read-only callback must not request cancellation: the
+               command and the handle's cancelled state would exist on the
+               live path only (#513). *)
+            check_writable context ~what:"activity cancellation"
         | Some _ -> (
             cancellation_requested := true;
             match Hashtbl.find_opt context.local_activities seq with
@@ -1003,11 +1166,12 @@ let schedule_local_activity context ~name ~input ?activity_id
     only correlates Core completion jobs with this in-memory execution. Both
     returned futures are allocated before the command so the start stage and
     the result share the sequence's lifetime. Timeouts are exact milliseconds
-    already validated by the public layer; they and the ID reuse policy are
-    copied into the command unchanged. *)
+    already validated by the public layer; they, the ID reuse policy, and the
+    memo and search-attribute maps (#1135, keys likewise validated, payloads
+    already copied) are placed in the command unchanged. *)
 let start_child_workflow context ~id ~name ~input
     ?retry_policy ?task_queue ?parent_close_policy ?execution_timeout
-    ?run_timeout ?task_timeout ?id_reuse_policy
+    ?run_timeout ?task_timeout ?id_reuse_policy ?memo ?search_attributes
     ?(cancellation_type = Activation.Child_try_cancel) ~decode () =
   let seq = allocate_sequence context in
   (* The handle closure owns this cell so a repeated cancel remains idempotent
@@ -1051,7 +1215,7 @@ let start_child_workflow context ~id ~name ~input
     (Activation.Start_child_workflow
        { seq; id; name; input; retry_policy; cancellation_type; task_queue;
          parent_close_policy; execution_timeout; run_timeout; task_timeout;
-         id_reuse_policy });
+         id_reuse_policy; memo; search_attributes });
   let cancel ~reason =
     match current () with
     | Some current when current == context ->
@@ -1080,6 +1244,8 @@ let start_child_workflow context ~id ~name ~input
                       "unknown or completed child workflow sequence %Ld" seq))
           | None -> Ok ()
           | Some _ when !cancellation_requested -> Ok ()
+          | Some _ when context.read_only ->
+              check_writable context ~what:"child workflow cancellation"
           | Some _ ->
               emit context (Activation.Cancel_child_workflow { seq; reason });
               cancellation_requested := true;
@@ -1120,6 +1286,8 @@ let start_timer context milliseconds =
            cleanup after continue-as-new or teardown from waking fibers. *)
         | _ when context.sealed -> Ok ()
         | None -> Ok ()
+        | Some _ when context.read_only ->
+            check_writable context ~what:"timer cancellation"
         | Some _ ->
             Hashtbl.remove context.timers seq;
             emit context (Activation.Cancel_timer { seq });

@@ -1,0 +1,30 @@
+# Exact OPAM closure of the CI-only Eio integration example (examples/eio).
+#
+# Format: <package> <exact version>
+#
+# Dockerfile.dev's `examples-eio` stage and the native macOS lane install these
+# packages on top of the locked SDK closure with scripts/opam-tool-lock.sh,
+# which fails if opam adds any package not listed here or moves a locked SDK
+# package. They are dependencies of one example executable only: no package
+# here is a dependency of temporal-sdk, is linked into any SDK library, or is
+# redistributed with an SDK artifact. Packages already pinned by
+# temporal-sdk.opam.locked (dune, mtime, ocamlfind, topkg) are reused at their
+# locked versions and are not repeated here; dune-configurator is pinned to the
+# locked dune release so the install cannot move dune. The closure was solved
+# for the OCaml 5.5 image that builds the live smoke executables, and
+# `make license-check` audits every entry; see docs/dependencies.md.
+bigstringaf 0.10.0
+csexp 1.5.2
+cstruct 6.3.0
+domain-local-await 1.0.1
+dune-configurator 3.24.2
+eio 1.6
+eio_posix 1.6
+fmt 0.11.0
+hmap 0.8.1
+iomux 0.4
+lwt-dllist 1.1.0
+optint 0.3.0
+psq 0.2.1
+seq base
+thread-table 1.0.0

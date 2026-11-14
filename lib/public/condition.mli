@@ -21,7 +21,11 @@ type predicate = unit -> (bool, Error.t) result
     so history records [TimerCanceled] and no timer is left pending. A zero
     [timeout] records no timer: the predicate is checked once and a false
     predicate times out at once. Without [timeout] no timer is created and
-    nothing is recorded in history. *)
+    nothing is recorded in history.
+
+    A read-only update validator or query handler cannot wait: the call
+    returns a typed defect without evaluating the predicate or creating a
+    timer. *)
 val wait_until : ?timeout:Duration.t -> (unit -> bool) -> (unit, Error.t) result
 
 (** Result-aware form of [wait_until], with the same [timeout].  [Error

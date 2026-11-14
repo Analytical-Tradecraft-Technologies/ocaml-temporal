@@ -65,6 +65,8 @@ fn child_completion(policy: Option<RetryPolicy>) -> Completion {
             run_timeout: None,
             task_timeout: None,
             id_reuse_policy: None,
+            memo: None,
+            search_attributes: None,
         }],
     }
 }

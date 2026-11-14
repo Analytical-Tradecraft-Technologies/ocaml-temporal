@@ -82,6 +82,8 @@ type start_request = {
   run_timeout_ms : int64 option;
   task_timeout_ms : int64 option;
   retry_policy : Workflow_protocol.retry_policy option;
+  cron_schedule : string option;
+  start_delay_ms : int64 option;
   rpc_deadline : rpc_deadline option;
 }
 (** Dynamic workflow-start request sent to the Rust client adapter. [request_id]
@@ -96,6 +98,10 @@ type start_request = {
     execution timeout, and a task timeout no larger than the run timeout (or
     the execution timeout when there is no run timeout). Every combination
     of the reuse and conflict policies is valid.
+    [cron_schedule] (a non-empty identifier that Temporal parses) and
+    [start_delay_ms] (positive, at most {!max_workflow_timeout_ms}) are
+    omitted when [None] and are mutually exclusive, as Temporal requires
+    (#1158); an update-with-start request carries neither.
     [rpc_deadline] bounds only this client call (default ten seconds) and
     never the workflow; its [timeout_ms] is sent as [rpc_timeout_ms] and must
     be between 1 and {!max_rpc_timeout_ms}. Every other request below that
@@ -228,6 +234,63 @@ type visibility_page = {
 }
 (** One visibility page and its optional opaque continuation token. *)
 
+type describe_request = {
+  execution : execution;
+  rpc_deadline : rpc_deadline option;
+}
+(** One run to describe (#1152). An empty run ID selects the current run,
+    which Temporal resolves when it handles the RPC. *)
+
+type pending_activity_state =
+  [ `Scheduled
+  | `Started
+  | `Cancel_requested
+  | `Paused
+  | `Pause_requested
+  | `Unknown of int ]
+(** Temporal [PendingActivityState] decoded from its Rust name. A value the
+    SDK does not name, including the unspecified [0], is [`Unknown n] with its
+    wire value. *)
+
+type pending_activity = {
+  activity_id : string;
+  activity_type : string;
+  state : pending_activity_state;
+  attempt : int;
+}
+(** One activity a described run has scheduled and not yet resolved. *)
+
+type pending_child = {
+  workflow_id : string;
+  run_id : string option;
+  workflow_type : string;
+}
+(** One child workflow a described run has initiated and not yet seen close;
+    [run_id] is [None] while the child's start is still being initiated. *)
+
+type describe_response = {
+  execution : execution;
+  workflow_type : string;
+  task_queue : string;
+  status : visibility_status;
+  start_time : Workflow_protocol.timestamp;
+  close_time : Workflow_protocol.timestamp option;
+  history_length : int64;
+  memo : metadata_field list;
+  search_attributes : metadata_field list;
+  pending_activities : pending_activity list;
+  pending_children : pending_child list;
+}
+(** The reduced description of one run. [execution] always names a concrete
+    run; memo and search attributes are sorted by key. *)
+
+type count_request = {
+  namespace : string;
+  query : string;
+  rpc_deadline : rpc_deadline option;
+}
+(** One visibility count (#1152); an empty query counts every execution. *)
+
 type update_request = {
   execution : execution;
   update_id : string;
@@ -288,6 +351,43 @@ type start_outcome =
 (** Terminal result of an asynchronous start. [Unknown] means the bridge
     cannot prove whether Temporal accepted the request; callers must reconcile
     using [request_id] rather than automatically retrying. *)
+
+type signal_with_start_request = {
+  start : start_request;
+  signal_name : string;
+  signal_input : payload list;
+}
+(** Signal-with-start request (#1151): [start] is sent unchanged as the
+    embedded start document, whose [request_id] deduplicates both the start
+    and the signal and whose [rpc_deadline] bounds the whole call (default
+    ten seconds). Its conflict policy must not be [Fail]. The terminal value
+    is the ordinary {!type-start_outcome}, decoded with
+    {!decode_start_outcome} against [start]. *)
+
+type update_with_start_request = {
+  start : start_request;
+  update_id : string;
+  update_name : string;
+  update_input : payload list;
+}
+(** Update-with-start request (#1151). The update never names a run: it
+    targets the run the start creates or attaches to. [start.rpc_deadline]
+    bounds the whole call, including re-issued attempts while the update is
+    only admitted (default thirty seconds). *)
+
+type update_with_start_outcome =
+  | Update_with_start_accepted of {
+      start : start_response;
+      update : (update_response, client_error) result;
+    }
+  | Update_with_start_rejected of client_error
+  | Update_with_start_unknown of { request_id : string; workflow_id : string }
+(** Terminal result of an update-with-start. [Update_with_start_accepted]
+    proves the start was applied and carries the update's admission response
+    (accepted, or already completed or rejected by a validator) or the error
+    that ended the wait for acceptance, which is never [Already_started] or
+    [Query_failed]. The other two cases mean exactly what [Rejected] and
+    [Unknown] mean for a start. *)
 
 type error
 (** Privacy-safe client-protocol validation failure. *)
@@ -372,6 +472,22 @@ val encode_history_request : history_request -> (string, error) result
 (** Validates and serializes one history fetch request; an empty run ID is
     allowed. *)
 
+val encode_describe_request : describe_request -> (string, error) result
+(** Validates and serializes one describe request; an empty run ID is
+    allowed. *)
+
+val decode_describe_response :
+  request:describe_request -> string -> (describe_response, error) result
+(** Strictly decodes one describe answer. The described execution must name
+    the request's namespace and workflow ID and, for an exact request, its
+    run. *)
+
+val encode_count_request : count_request -> (string, error) result
+(** Validates and serializes one visibility count request. *)
+
+val decode_count_response : string -> (int64, error) result
+(** Strictly decodes one non-negative visibility count. *)
+
 val encode_update_request : update_request -> (string, error) result
 (** Validates and serializes one update admission request; an empty run ID
     is allowed. *)
@@ -424,3 +540,25 @@ val decode_query_error : string -> (client_error, error) result
 val decode_update_error : string -> (client_error, error) result
 (** Decodes an update admission or poll error, rejecting the start-only
     [already_started] and query-only [query_failed] categories. *)
+
+val encode_signal_with_start_request :
+  signal_with_start_request -> (string, error) result
+(** Validates and serializes one signal-with-start request (#1151), rejecting
+    the [Fail] conflict policy. *)
+
+val encode_update_with_start_request :
+  update_with_start_request -> (string, error) result
+(** Validates and serializes one update-with-start request (#1151). *)
+
+val decode_update_with_start_outcome :
+  request:update_with_start_request ->
+  string ->
+  (update_with_start_outcome, error) result
+(** Strictly decodes one update-with-start outcome and correlates the start's
+    execution, the update ID and workflow, and any rejection or unknown
+    identity with [request]. *)
+
+val encode_update_with_start_outcome :
+  update_with_start_outcome -> (string, error) result
+(** Validates and serializes one update-with-start outcome; the inverse of
+    {!decode_update_with_start_outcome}. *)

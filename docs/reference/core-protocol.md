@@ -248,8 +248,10 @@ integral JSON preserves every value exactly. Activation-wide internal flags, his
 suggestions, deployment identity, SDK version, and target-deployment change are
 also preserved. Optional `context` and `metadata` objects may be absent for
 older synthetic fixtures, but when present their nested shapes are closed.
-A cron schedule or a start delay, which OCaml workers do not support, is
-rejected as `unsupported`. The few Core 1.x fields the protocol does not
+The required-nullable `first_workflow_task_backoff` and `cron_schedule`
+members carry the server-applied first-task delay and the recorded cron
+schedule (#1158); `cron_schedule` is `null` rather than an empty string when
+the run has none. The few Core 1.x fields the protocol does not
 carry yet, such as `InitializeWorkflow.original_execution_run_id`, are
 dropped; [Core bridge](core-bridge.md) lists them.
 
@@ -316,9 +318,12 @@ omitted on encoding, preserving existing default command bytes. Optional
 `id_reuse_policy` (`allow_duplicate`, `allow_duplicate_failed_only`,
 `reject_duplicate`) follow the same rule (#1135); both sides enforce the
 root-start timeout rules, and an absent reuse policy maps to Core's
-`Unspecified`. The command omits namespace, cron, headers, memo, search
-attributes, versioning, and priority because the current OCaml runtime does
-not expose them. For a live or replay worker, Rust injects
+`Unspecified`. Optional `memo` and `search_attributes` payload maps (#1135)
+are likewise omitted when unset; both sides check their keys as for the other
+payload maps, and Rust fills Core's `memo` and `search_attributes`. Core has
+no absent memo, so an empty one converts back from Core as absent. The
+command omits namespace, cron, headers, versioning, and priority because the
+current OCaml runtime does not expose them. For a live or replay worker, Rust injects
 the worker's already-validated namespace into Core's child-start command before
 submission; this is worker configuration, not workflow input. The remaining
 omitted Core fields receive explicit defaults and non-default values are
@@ -435,6 +440,32 @@ command. Rust validates the same limits before converting the map to Core's
 `UpsertWorkflowSearchAttributes` command. Core applies the map as one merge,
 and the new values become visible only after the workflow task is accepted;
 the bridge does not perform a visibility query itself.
+`Temporal.Workflow.upsert_typed_search_attributes` (#1154) emits the same
+command from typed `Temporal.Search_attribute` keys; its payloads carry an
+extra `type` metadata entry such as `Keyword`, which the bridge forwards
+unchanged.
+
+`Temporal.Workflow.upsert_memo` (#1154) merges values into the workflow memo
+with the same map shape:
+
+```json
+{
+  "kind": "modify_workflow_properties",
+  "upserted_memo": {
+    "note": {
+      "metadata": {"encoding": "json/plain"},
+      "data": "InJlYWR5Ig=="
+    }
+  }
+}
+```
+
+Rust converts it to Core's `ModifyWorkflowProperties` command, whose
+`upserted_memo` Core records as a `WorkflowPropertiesModified` event and
+matches on replay. A key whose value is exactly the canonical `binary/null`
+payload is removed by the server. As for search attributes, the OCaml API
+emits no command for an empty map, and both validators reject an empty,
+NUL-containing, or oversized key and an oversized payload.
 
 ### Continue-as-new
 
@@ -447,7 +478,8 @@ terminal command shape:
   "workflow_type": "counter",
   "input": [
     {"data":{"data":"","encoding":"base64"},"metadata":{}}
-  ]
+  ],
+  "memo": {}
 }
 ```
 
@@ -460,12 +492,40 @@ identifiers, malformed payloads, and a terminal command followed by another
 command.
 
 Rust converts this record to Core's
-`ContinueAsNewWorkflowExecution`. The current semantic protocol intentionally
-does not expose a task queue, timeout, memo, headers, search attributes,
-retry policy, or versioning controls for this command. The Rust reverse
-conversion accepts only Core's explicit defaults for those fields and returns
-`core_unsupported` for a non-default value, preventing silent loss of workflow
-semantics. The successor run is not followed by the bridge or by
+`ContinueAsNewWorkflowExecution`. `memo` is the successor's memo (#1154).
+The OCaml encoder always writes it and its decoder requires it; the Rust
+decoder treats an absent member as an empty map. An empty map is Core's
+"unset", which reuses the memo the current run started with, so the OCaml
+runtime fills it only after a `Workflow.upsert_memo`, with the start memo
+merged with every upsert: otherwise the upserted values would be lost.
+Core also gives the successor the run's current search attributes.
+
+The command may also carry optional successor settings (#1153), each written
+only when `Workflow.continue_as_new` received the matching option, so a
+command without options keeps exactly the shape above and existing histories
+replay unchanged:
+
+| Member | Core field | When absent |
+| --- | --- | --- |
+| `task_queue` (identifier) | `task_queue` | Empty: the server keeps the current queue. |
+| `run_timeout` (duration) | `workflow_run_timeout` | The server inherits the current run timeout. |
+| `task_timeout` (duration) | `workflow_task_timeout` | The server inherits the current task timeout. |
+| `retry_policy` | `retry_policy` | Core reuses the policy the chain started with. |
+| `search_attributes` (payload map) | `search_attributes` | Core carries the current values, including upserts; a present map, even `{}`, replaces them. |
+| `initial_versioning_behavior` (`auto_upgrade` or `use_ramping_version`) | `initial_versioning_behavior` | Unspecified: the successor inherits the current run's versioning. |
+
+Both decoders read an explicit `null` as absent; the encoder never writes it.
+Both validate a present task queue as an identifier, the retry policy by the
+activity rules, and the search-attribute keys and payloads as for an upsert,
+and apply the `Client.start` timeout rules that need no execution timeout:
+positive timeouts, a task timeout of at most 120 seconds and no larger than
+a present run timeout. The public API also checks the run timeout against
+the chain's recorded execution timeout and the task timeout against an
+inherited run timeout, which only it can read. Headers, the deprecated
+build-ID `versioning_intent` and `backoff_start_interval` have no semantic
+representation: the Rust reverse conversion accepts only Core's explicit
+defaults for those fields and returns `core_unsupported` for a non-default
+value, preventing silent loss of workflow semantics. The successor run is not followed by the bridge or by
 `Temporal.Client.wait` automatically.
 
 Temporal identifiers must be nonempty but use the protocol's 65,536-byte text

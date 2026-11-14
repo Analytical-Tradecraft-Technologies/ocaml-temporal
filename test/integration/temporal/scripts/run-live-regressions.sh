@@ -93,21 +93,27 @@ in_dev 60 "$container_cli" --version
 # different image. The OCaml executable hosts the workflow worker and publishes
 # its task queues in ready.json under the shared evidence directory; the
 # pinned `sdk-interop-python` service then runs the official Python SDK driver,
-# which writes python-report.json. This function records the driver's exit
+# which writes python-report.json. While the driver runs, the two processes
+# also exchange python-ready and ocaml-with-start.json in that directory so the
+# OCaml client can drive the driver's Python workflow (#1151); that handshake
+# needs nothing from this controller. This function records the driver's exit
 # status in driver-exit (through a rename, so it is never read half-written),
 # after which the OCaml process checks the reported exact runs through its own
 # client. Both statuses must be zero. The driver's container is bounded by the
-# ordinary per-suite limit; the OCaml process gets one more minute because it
-# outlives the driver to verify its report.
+# ordinary per-suite limit plus one minute, because its bound also covers the
+# hash-locked pip install of the official SDK and the activity-timeout case
+# (#1143) pushed the cases alone close to the plain limit; the OCaml process
+# gets one more minute again because it outlives the driver to verify its
+# report.
 run_sdk_interop() {
   interop_evidence="$evidence/sdk_interop"
   mkdir -p "$interop_evidence"
-  in_dev "$((limit + 60))" "/workspace/_build/default/$1" check "$address" \
+  in_dev "$((limit + 120))" "/workspace/_build/default/$1" check "$address" \
     /workspace/_build/live-regressions/sdk_interop </dev/null &
   ocaml_pid=$!
   # Interpolated by compose.yaml into the driver's environment and timeout.
   OCAML_SDK_VERSION=$ocaml_sdk_version
-  SDK_INTEROP_TIMEOUT_SECONDS=$limit
+  SDK_INTEROP_TIMEOUT_SECONDS=$((limit + 60))
   export OCAML_SDK_VERSION SDK_INTEROP_TIMEOUT_SECONDS
   driver_status=0
   compose run --rm --no-deps -T sdk-interop-python </dev/null || driver_status=$?
@@ -130,7 +136,6 @@ for executable in "$@"; do
   case "$executable" in
     test/integration/activity_cancellation/regression.exe|\
     test/integration/bounded_shutdown/regression.exe|\
-    test/integration/child_start_options/regression.exe|\
     test/integration/client_request_ids/regression.exe|\
     test/integration/completed_queries/regression.exe|\
     test/integration/concurrent_client/regression.exe|\
@@ -140,16 +145,27 @@ for executable in "$@"; do
     test/integration/worker_resource_options/regression.exe|\
     test/integration/workflow_start_info/regression.exe)
       cli_argument='' ;;
+    test/integration/child_start_options/regression.exe|\
     test/integration/client_policies/regression.exe|\
+    test/integration/continue_as_new_options/regression.exe|\
+    test/integration/cron_start_delay/regression.exe|\
+    test/integration/describe_count/regression.exe|\
     test/integration/interaction_recovery/regression.exe|\
     test/integration/local_activity_cancellation/regression.exe|\
     test/integration/non_yielding_workflow/regression.exe|\
+    test/integration/search_attributes/regression.exe|\
     test/integration/timer_cancellation/regression.exe|\
     test/integration/transport_interruption/regression.exe|\
     test/integration/update_outcomes/regression.exe|\
     test/integration/update_run_close/regression.exe|\
+    test/integration/with_start/regression.exe|\
     test/integration/worker_versioning/regression.exe)
       cli_argument=$container_cli ;;
+    test/integration/activity_idempotency/regression.exe)
+      # The CLI path, then the suite's evidence directory (#504) for its
+      # ledger, correlation summary, describe snapshots, exact-run history
+      # and worker generation logs.
+      cli_argument="$container_cli /workspace/_build/live-regressions/activity_idempotency" ;;
     test/integration/activity_worker_crash/regression.exe)
       # The CLI path, then the suite's evidence directory (#519) for its
       # describe snapshots, exact-run history and worker generation logs.

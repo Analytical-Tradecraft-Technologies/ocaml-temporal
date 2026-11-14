@@ -160,6 +160,42 @@ val random_parent_workflow_type : string
 (** [corpus.random_child]: completes at once. *)
 val random_child_workflow_type : string
 
+(** {1 Continue-as-new options workflow type (#1153)}
+
+    Captured by the [corpus-v4-continue-as-new-options] generation. *)
+
+(** [corpus.continue_as_new_options]: ["first"] continues as new with
+    ["second"] and an explicit task queue, run and task timeouts, retry
+    policy, replacement memo and empty search-attribute map; ["second"]
+    returns what it observes of them. *)
+val continue_as_new_options_workflow_type : string
+
+(** {1 Cron schedule and start delay workflow type (#1158)}
+
+    Captured by the [corpus-v5-cron-start-delay] generation. *)
+
+(** [corpus.cron_start_delay]: completes at once, reporting its recorded cron
+    schedule, whether Temporal delayed its first workflow task, and whether a
+    cron schedule started it. *)
+val cron_start_delay_workflow_type : string
+
+(** {1 Child start metadata workflow types (#1135)}
+
+    Captured by the [corpus-v6-child-start-metadata] generation. *)
+
+(** [corpus.child_metadata_parent]: runs [corpus.child_metadata_child] with
+    a memo and the [CorpusChildKeyword] search attribute, returning the
+    child's report. *)
+val child_metadata_parent_workflow_type : string
+
+(** [corpus.child_metadata_child]: reports the memo and keyword it reads
+    through [Workflow.start_metadata]. *)
+val child_metadata_child_workflow_type : string
+
+(** The keyword search attribute [corpus.child_metadata_parent] sets; the
+    capture registers it before the generation runs. *)
+val child_metadata_keyword : string Temporal.Search_attribute.key
+
 (** {1 Interaction handler names}
 
     Used by the capture driver to send the interactions recorded in history. *)
@@ -209,7 +245,13 @@ val definition_set_names : string list
     - ["corpus-v3-random"]: the deterministic randomness workflows of #1155.
     - ["negative-random-reordered"]: [corpus.random_parent] drawing its
       float first; replaying a [corpus-v3-random] parent history against it
-      must report nondeterminism. *)
+      must report nondeterminism.
+    - ["corpus-v4-continue-as-new-options"]: the continue-as-new options
+      workflow of #1153.
+    - ["corpus-v5-cron-start-delay"]: the cron schedule and start delay
+      workflow of #1158.
+    - ["corpus-v6-child-start-metadata"]: the child memo and search-attribute
+      workflows of #1135. *)
 val definition_set : string -> workflow list option
 
 (** Activities registered by the live capture worker. Every activity used by a

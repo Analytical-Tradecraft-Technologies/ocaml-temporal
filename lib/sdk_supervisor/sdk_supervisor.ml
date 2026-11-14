@@ -559,6 +559,7 @@ module Protocol_adapter = struct
       | Retryable -> "retryable"
       | Async_heartbeat_rejected -> "async_heartbeat_rejected"
       | Resource_exhausted -> "resource_exhausted"
+      | Detached -> "detached"
       | Unknown code -> Printf.sprintf "unknown(%d)" code
     in
     {
@@ -988,6 +989,37 @@ module Protocol_adapter = struct
     | Ok history -> Ok (Bytes.to_string history)
     | Error native_error -> Error native_error
 
+  (** Canonically serializes one describe request (#1152). *)
+  let encode_client_describe_request request =
+    match Client.encode_describe_request request with
+    | Ok output -> Ok (Bytes.of_string output)
+    | Error error -> client_error "client describe request encoding" error
+
+  (** Strictly decodes one describe answer for [request], which must name the
+      requested execution, or passes the native failure through unchanged
+      for the public client to classify. *)
+  let decode_client_describe_result request = function
+    | Ok input -> (
+        match Client.decode_describe_response ~request (Bytes.to_string input) with
+        | Ok response -> Ok response
+        | Error error -> client_error "client describe response decoding" error)
+    | Error native_error -> Error native_error
+
+  (** Canonically serializes one visibility count request (#1152). *)
+  let encode_client_count_request request =
+    match Client.encode_count_request request with
+    | Ok output -> Ok (Bytes.of_string output)
+    | Error error -> client_error "client count request encoding" error
+
+  (** Strictly decodes one visibility count, or passes the native failure
+      through unchanged. *)
+  let decode_client_count_result = function
+    | Ok input -> (
+        match Client.decode_count_response (Bytes.to_string input) with
+        | Ok count -> Ok count
+        | Error error -> client_error "client count response decoding" error)
+    | Error native_error -> Error native_error
+
   (** Decodes a native query payload list or preserves a structured server
       failure as an inner typed client error. The public layer enforces the
       output codec's expected payload cardinality. *)
@@ -1074,6 +1106,33 @@ module Protocol_adapter = struct
         | Ok response -> Ok (Ok response)
         | Error error -> client_error "client update poll response decoding" error)
     | Error native_error -> decode_client_update_failure native_error
+
+  (** Canonically serializes one signal-with-start request (#1151). Its
+      outcome is a start outcome, decoded by
+      [decode_client_submitted_start_outcome] against the embedded start. *)
+  let encode_client_signal_with_start_request request =
+    match Client.encode_signal_with_start_request request with
+    | Ok output -> Ok (Bytes.of_string output)
+    | Error error -> client_error "client signal-with-start request encoding" error
+
+  (** Canonically serializes one update-with-start request (#1151). *)
+  let encode_client_update_with_start_request request =
+    match Client.encode_update_with_start_request request with
+    | Ok output -> Ok (Bytes.of_string output)
+    | Error error -> client_error "client update-with-start request encoding" error
+
+  (** Decodes the terminal outcome of a submitted update-with-start (#1151),
+      correlated with [request]. As for a submitted start, any native failure
+      is preserved for the caller, which treats it as an uncertain start
+      because the request may have been sent. *)
+  let decode_client_update_with_start_outcome request = function
+    | Ok input -> (
+        match
+          Client.decode_update_with_start_outcome ~request (Bytes.to_string input)
+        with
+        | Ok outcome -> Ok outcome
+        | Error error -> client_error "client update-with-start outcome decoding" error)
+    | Error native_error -> Error native_error
 end
 
 (** The production backend owns one runtime-client-worker graph. Every
@@ -1127,6 +1186,13 @@ module Native_backend = struct
         (Client.poll_update_response, Client.client_error) result client_rpc
     | Rpc_visibility : Client.visibility_request -> Client.visibility_page client_rpc
     | Rpc_history : Client.history_request -> string client_rpc
+    | Rpc_describe : Client.describe_request -> Client.describe_response client_rpc
+    | Rpc_count : Client.count_request -> int64 client_rpc
+    | Rpc_signal_with_start :
+        Client.signal_with_start_request -> Client.start_outcome client_rpc
+    | Rpc_update_with_start :
+        Client.update_with_start_request ->
+        Client.update_with_start_outcome client_rpc
     | Rpc_async_activity_completion :
         Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
     | Rpc_async_activity_heartbeat :
@@ -1354,6 +1420,44 @@ module Native_backend = struct
           ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
           ~encode:Protocol_adapter.encode_client_history_request
           ~decode:Protocol_adapter.decode_client_history_result
+    | Rpc_describe request ->
+        submit_bounded runtime Bridge.Call_describe request.rpc_deadline
+          ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
+          ~encode:Protocol_adapter.encode_client_describe_request
+          ~decode:(Protocol_adapter.decode_client_describe_result request)
+    | Rpc_count request ->
+        submit_bounded runtime Bridge.Call_count request.rpc_deadline
+          ~with_deadline:(fun rpc_deadline -> { request with rpc_deadline })
+          ~encode:Protocol_adapter.encode_client_count_request
+          ~decode:Protocol_adapter.decode_client_count_result
+    | Rpc_signal_with_start request ->
+        (* The embedded start's deadline bounds the whole call (#1151); one
+           that expired in the mailbox is a definite rejection, as for a
+           start, because nothing was sent. *)
+        deadline request.start.rpc_deadline
+          ~expired:(fun () ->
+            Ok
+              (Client_call.Completed
+                 (Ok (Client.Rejected (Client.Rpc { code = "deadline_exceeded" })))))
+          ~live:(fun rpc_deadline ->
+            let request = { request with start = { request.start with rpc_deadline } } in
+            submit_encoded runtime Bridge.Call_signal_with_start
+              ~decode:
+                (Protocol_adapter.decode_client_submitted_start_outcome request.start)
+              (Protocol_adapter.encode_client_signal_with_start_request request))
+    | Rpc_update_with_start request ->
+        deadline request.start.rpc_deadline
+          ~expired:(fun () ->
+            Ok
+              (Client_call.Completed
+                 (Ok
+                    (Client.Update_with_start_rejected
+                       (Client.Rpc { code = "deadline_exceeded" })))))
+          ~live:(fun rpc_deadline ->
+            let request = { request with start = { request.start with rpc_deadline } } in
+            submit_encoded runtime Bridge.Call_update_with_start
+              ~decode:(Protocol_adapter.decode_client_update_with_start_outcome request)
+              (Protocol_adapter.encode_client_update_with_start_request request))
     | Rpc_async_activity_completion encoded ->
         (* The activity adapter already encoded the completion exactly once
            (issue #995); only the C call's owned copy is made here. *)
@@ -1600,9 +1704,16 @@ module Native_backend = struct
       | Error _ as error -> error
     in
     let runtime_result = Bridge.runtime_close runtime in
-    (* [runtime_close] has detached the graph and, on every result, dropped
-       its Core reference, so the shared runtime no longer depends on it. *)
-    Option.iter Sdk_shared_runtime.release lease;
+    (* [runtime_close] has detached the graph handle on every result. When it
+       finished within its bound the graph's Core reference is gone and the
+       attachment is simply returned. A [Detached] close (#1149) means the
+       graph's cleanup thread still holds that reference, so the attachment
+       is returned as detached: the shared runtime's shutdown then reports
+       that Core may outlive it instead of claiming it was destroyed. *)
+    (match runtime_result with
+    | Error { Bridge.status = Bridge.Detached; _ } ->
+        Option.iter Sdk_shared_runtime.release_detached lease
+    | Ok () | Error _ -> Option.iter Sdk_shared_runtime.release lease);
     match (replay_result, worker_result, client_result, runtime_result) with
     | Error _ as error, _, _, _ -> error
     | Ok (), (Error _ as error), _, _ -> error
@@ -1663,6 +1774,13 @@ module Native = struct
         (Client.poll_update_response, Client.client_error) result client_rpc
     | Rpc_visibility : Client.visibility_request -> Client.visibility_page client_rpc
     | Rpc_history : Client.history_request -> string client_rpc
+    | Rpc_describe : Client.describe_request -> Client.describe_response client_rpc
+    | Rpc_count : Client.count_request -> int64 client_rpc
+    | Rpc_signal_with_start :
+        Client.signal_with_start_request -> Client.start_outcome client_rpc
+    | Rpc_update_with_start :
+        Client.update_with_start_request ->
+        Client.update_with_start_outcome client_rpc
     | Rpc_async_activity_completion :
         Temporal_protocol.Encoded_activity_completion.t -> unit client_rpc
     | Rpc_async_activity_heartbeat :

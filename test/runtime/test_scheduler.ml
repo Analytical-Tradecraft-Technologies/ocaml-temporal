@@ -609,14 +609,17 @@ let test_drained_callbacks_release_memory () =
   Scheduler.spawn scheduler (fun () -> ());
   expect "memory warmup" "complete" (Scheduler.run_label scheduler);
   Gc.full_major ();
-  let baseline = (Gc.stat ()).live_words in
+  (* OCaml 5.6 deprecates [Gc.stat] in favour of [full_major] then
+     [quick_stat]; the alert is silenced here because the exact live-word
+     count must stay identical on every supported series (5.2-5.5 included). *)
+  let baseline = ((Gc.stat [@alert "-deprecated"]) ()).live_words in
   for batch = 1 to 3 do
     for _ = 1 to 10_000 do
       Scheduler.spawn scheduler (fun () -> ());
       ignore (Scheduler.run scheduler)
     done;
     Gc.full_major ();
-    let retained = (Gc.stat ()).live_words - baseline in
+    let retained = ((Gc.stat [@alert "-deprecated"]) ()).live_words - baseline in
     ignore (Sys.opaque_identity scheduler);
     if retained > 4_096 then
       failwith (Printf.sprintf "drained callbacks retained %d words after batch %d"

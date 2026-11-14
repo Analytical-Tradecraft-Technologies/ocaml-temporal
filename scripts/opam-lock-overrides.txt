@@ -16,3 +16,6 @@
 # not linked into or redistributed with the SDK. 1.9.9~preview is the only
 # opam-repository release that supports OCaml 5.5. License: MIT.
 5.5 ocamlfind 1.9.9~preview
+# The same applies to the non-blocking 5.6 readiness lane (#1164): without
+# this line the lane's dev image cannot install the locked closure at all.
+5.6 ocamlfind 1.9.9~preview

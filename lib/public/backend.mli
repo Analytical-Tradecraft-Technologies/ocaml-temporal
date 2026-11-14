@@ -49,6 +49,11 @@ type start_request = {
   task_timeout_ms : int64 option;
   (* Server-side workflow retry policy; [None] means no retry. *)
   retry_policy : Temporal_sdk_kernel.Activation.retry_policy option;
+  (* Cron schedule and first-task delay (#1158), already validated by
+     [Client.start] and never both present; [None] means none. Part of the
+     mock's request-ID fingerprint. *)
+  cron_schedule : string option;
+  start_delay_ms : int64 option;
   (* Caller deadline of the start RPC, fixed on the monotonic clock when the
      call began. It bounds one call, not the workflow, so it is not part of
      the request-ID fingerprint. *)
@@ -204,6 +209,58 @@ type visibility_page = {
   next_page_token : string option;
 }
 
+(** One run to describe (#1152): exact, or with an empty [run_id] the
+    workflow's current run. *)
+type describe_request = {
+  workflow_id : string;
+  run_id : string;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline fixed on the monotonic clock when the call began;
+          [None] keeps the ten-second default. The mock ignores it. *)
+}
+
+(** One activity a described run has scheduled and not yet resolved. *)
+type pending_activity = {
+  activity_id : string;
+  activity_type : string;
+  state : Temporal_sdk_kernel.Client_protocol.pending_activity_state;
+  attempt : int;
+}
+
+(** One child workflow a described run has initiated and not yet seen close;
+    [run_id] is [None] while its start is still being initiated. *)
+type pending_child = {
+  workflow_id : string;
+  run_id : string option;
+  workflow_type : string;
+}
+
+(** The description of one run. [run_id] is always the concrete run, also
+    for a current-run request. Memo and search attributes are copies, sorted
+    by key on the native path and in start order on the mock. *)
+type description = {
+  workflow_id : string;
+  run_id : string;
+  workflow_type : string;
+  task_queue : string;
+  status : Temporal_sdk_kernel.Client_protocol.visibility_status;
+  start_time : Time.t;
+  close_time : Time.t option;
+  history_length : int64;
+  memo : (string * Payload.t) list;
+  search_attributes : (string * Payload.t) list;
+  pending_activities : pending_activity list;
+  pending_children : pending_child list;
+}
+
+(** One visibility count (#1152); an empty query counts every execution. *)
+type count_request = {
+  query : string;
+  rpc_deadline : Temporal_sdk_kernel.Client_protocol.rpc_deadline option;
+      (** Caller deadline fixed on the monotonic clock when the call began;
+          [None] keeps the ten-second default. The mock ignores it. *)
+}
+
 (** Request to admit one named workflow update on a run selector. *)
 type update_request = {
   workflow_id : string;
@@ -237,6 +294,38 @@ type update_response = {
 
 (** Bounded completion poll response; [None] means still pending. *)
 type poll_update_response = { outcome : update_outcome option }
+
+(** One signal-with-start (#1151): [start] is applied when the workflow ID
+    has no open run, and the signal is delivered to the resulting run.
+    [start.id_conflict_policy] is [`Use_existing] or [`Terminate_existing];
+    [start.request_id] deduplicates both the start and the signal, and
+    [start.rpc_deadline] bounds the whole call. *)
+type signal_with_start_request = {
+  start : start_request;
+  signal_name : string;
+  signal_input : Payload.t list;
+      (** Encoded signal argument payloads, as for {!signal_request}. *)
+}
+
+(** One update-with-start (#1151): [start] is applied when needed and the
+    update is admitted on the run it creates or attaches to.
+    [start.rpc_deadline] bounds the whole call, including re-issued attempts
+    while the update is only admitted (default thirty seconds). *)
+type update_with_start_request = {
+  start : start_request;
+  update_id : string;
+  update_name : string;
+  update_input : Payload.t list;
+      (** Encoded update argument payloads, as for {!update_request}. *)
+}
+
+(** The applied start of an update-with-start and its update: the admission
+    response (whose outcome may already be a completion or a validator
+    rejection) or the typed error that ended the wait for acceptance. *)
+type update_with_start_response = {
+  start : start_response;
+  update : (update_response, Error.t) result;
+}
 
 (** Successor identity from an exact-run close event. The protocol already
     checks its namespace against the waited execution. *)
@@ -373,6 +462,14 @@ val client_at_capacity_error_type : string
     run with the same workflow ID. *)
 val already_started_error_type : string
 
+(** Builds that already-started error for [workflow_id], attaching the
+    conflicting run as the JSON detail {!already_started_execution} decodes
+    when [existing_run_id] is known. [Client] reports it for a refused
+    start, and [Testing] for a start its simulated ID policies refuse
+    (#1160), so [Client.already_started] recognizes both. *)
+val already_started_error :
+  namespace:string -> workflow_id:string -> existing_run_id:string option -> Error.t
+
 (** The [Error.error_type] (["StartOutcomeUncertain"]) of the non-retryable
     [`Bridge] error returned when Temporal did not prove whether a native
     start was accepted, for example because the start's RPC deadline expired
@@ -497,6 +594,16 @@ val client_list_visibility :
     deterministic mock records no histories and returns a typed defect. *)
 val client_fetch_history : client -> history_request -> (string, Error.t) result
 
+(** Describes one run (#1152). An unknown workflow or run is an error whose
+    RPC status is [`Not_found] on every backend. The deterministic mock
+    reports its ledger: no pending work and a history length of [0]. *)
+val client_describe : client -> describe_request -> (description, Error.t) result
+
+(** Counts the executions a visibility query matches (#1152). The
+    deterministic mock accepts only an empty query and counts every retained
+    run, the rows an empty listing returns. *)
+val client_count : client -> count_request -> (int64, Error.t) result
+
 (** Admits one workflow update and returns its durable update handle data. *)
 val client_update : client -> update_request -> (update_response, Error.t) result
 
@@ -505,6 +612,24 @@ val client_update : client -> update_request -> (update_response, Error.t) resul
 val client_poll_update :
   ?deadline_ns:int64 ->
   client -> update_request -> (poll_update_response, Error.t) result
+
+(** Signals a workflow, starting it first when its workflow ID has no open
+    run (#1151). Errors are classified exactly as for {!client_start},
+    including the uncertain-start error once a native call was submitted.
+    The deterministic mock applies the start and records the signal on the
+    resulting run in one critical section. *)
+val client_signal_with_start :
+  client -> signal_with_start_request -> (start_response, Error.t) result
+
+(** Starts a workflow when needed and admits one update on it (#1151). An
+    error means the start was not applied, or (for an uncertain-start error)
+    may have been; [Ok] means it was applied and carries the update result.
+    The deterministic mock applies the start and reports the update as the
+    same typed error {!client_update} returns there. *)
+val client_update_with_start :
+  client ->
+  update_with_start_request ->
+  (update_with_start_response, Error.t) result
 
 (** Closes a client backend. Native shutdown is serialized and terminal even
     when it returns an error; the public client caches that exact result so a

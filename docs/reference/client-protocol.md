@@ -119,6 +119,8 @@ omitted when absent, so Temporal applies its defaults:
 | `run_timeout_ms` | `?run_timeout` | as above, and at most `execution_timeout_ms` | the execution timeout |
 | `task_timeout_ms` | `?task_timeout` | 1 ms to 120,000 ms, and at most the run (or execution) timeout | 10 seconds |
 | `retry_policy` | `?retry_policy` | the activity retry-policy shape and invariants | no retry |
+| `cron_schedule` | `?cron_schedule` | a non-empty, NUL-free identifier of at most 65,536 bytes; Temporal parses the expression | no cron schedule |
+| `start_delay_ms` | `?start_delay` | 1 ms to 315,576,000,000,999 ms, and never beside `cron_schedule` | no delay |
 
 Temporal reads a zero timeout as "unset" and silently lowers a task timeout
 above 120 seconds or above the run timeout, and a run timeout above the
@@ -128,6 +130,14 @@ never believes a bound is in force that the server does not apply. Rust
 converts each millisecond count into a protobuf `Duration` with checked
 `try_from` conversions and copies the retry policy through the same
 lossless converter as activity and child-workflow commands.
+
+`cron_schedule` and `start_delay_ms` (#1158) become Temporal's
+`cron_schedule` and `workflow_start_delay`. Temporal refuses the two
+together and reads a zero delay as no delay, so both are rejected; an
+invalid cron expression is left to Temporal, which answers it with
+`invalid_argument`. Signal-with-start forwards both; update-with-start
+rejects both before any RPC, because Temporal refuses them on the start
+operation of `ExecuteMultiOperation`.
 
 The policies and both workflow ID policies are part of the pending-request
 equality check, so retrying a pending `request_id` with a different policy is
@@ -1164,6 +1174,89 @@ The OCaml protocol test is
 [`test_ocaml_client_update_protocol.ml`](../../test/bridge/test_ocaml_client_update_protocol.ml);
 Rust tests cover strict validation and Core response conversion.
 
+## Signal-with-start and update-with-start (#1151)
+
+`Temporal.Client.signal_with_start` and `Temporal.Client.update_with_start`
+deliver a message to a workflow, starting it first when its workflow ID has no
+open run. Each is one atomic Temporal operation, so an entity workflow can be
+"ensured running, then messaged" without the window in which a run closes
+between a separate `start ~id_conflict_policy:`Use_existing` and `signal`:
+
+```ocaml
+Temporal.Client.signal_with_start client ~workflow ~task_queue ~id ~input
+  ~signal ~signal_input ()
+Temporal.Client.update_with_start client ~id_conflict_policy:`Use_existing
+  ~workflow ~task_queue ~id ~input ~update ~update_input ()
+```
+
+Both are submitted calls without a synchronous symbol: `SIGNAL_WITH_START`
+(16) and `UPDATE_WITH_START` (17). Each request embeds the
+[start document](#start-a-workflow) unchanged under `start`, so every start
+option, its validation, request-ID handling and the generated request ID are
+exactly a start's, and `start.rpc_timeout_ms` bounds the whole call. In flight,
+both count against the client's start slots and share their `request_id`
+deduplication with starts: a pending request ID may only be reused for the
+same logical operation of the same kind, and any other reuse is refused at
+submission as a protocol error.
+
+[`client-signal-with-start-request.schema.json`](../schemas/bridge/client-signal-with-start-request.schema.json)
+adds `signal_name` and `signal_input`. Rust copies the start fields into one
+`SignalWithStartWorkflowExecution` RPC (default budget 10 seconds). Temporal
+records the signal before the run's first workflow task when it starts one,
+and only signals an open run under `use_existing`; `terminate_existing`
+replaces an open run. Temporal rejects `fail` for this RPC, so OCaml and Rust
+both refuse it before anything is sent, and the public parameter only offers
+the other two policies. The start's `request_id` deduplicates the start and
+the signal. The outcome is the ordinary start outcome document
+([`client-start-outcome.schema.json`](../schemas/bridge/client-start-outcome.schema.json)),
+classified exactly like a start: `already_exists` (a reuse policy refusing a
+closed run) is the typed already-started rejection, and a transport failure
+after the request may have been sent is `unknown`, which
+`Client.is_start_outcome_uncertain` recognizes. `started` follows the start
+rule: it is reported from the server under `use_existing` and is always true
+under `terminate_existing`.
+
+[`client-update-with-start-request.schema.json`](../schemas/bridge/client-update-with-start-request.schema.json)
+adds `update_id`, `update_name` and `update_input`. Rust sends one
+`ExecuteMultiOperation` of `[StartWorkflow, UpdateWorkflow]` routed by the
+workflow ID; the update names no run, as Temporal requires, and waits for the
+`Accepted` stage. Every conflict policy is sent explicitly (Temporal requires
+one here). The answer must hold exactly one start and one update response, in
+that order. As for `start_update`, an update that is only admitted is
+re-issued, identically, until it is accepted or has an outcome (the default
+budget is 30 seconds) (#772, #1078). The outcome document
+([`client-update-with-start-outcome.schema.json`](../schemas/bridge/client-update-with-start-outcome.schema.json))
+extends the start outcome:
+
+- `accepted` means Temporal answered at least once, which proves the start was
+  applied. It carries the first answer's `execution` and `started` and an
+  `update` half: `{"kind":"response",...}` with the update's ID, the run that
+  accepted it and its optional outcome (a completion or a validator
+  rejection), or `{"kind":"error","error":...}` when the wait for acceptance
+  ended first, typically `deadline_exceeded`. The public result therefore
+  returns the run handle beside the update's own result, so a validator
+  rejection never hides the run that was started.
+- `rejected` means nothing was applied: Temporal applies both operations
+  atomically. A `MultiOperationExecutionFailure` status is attributed to the
+  operation that failed (the other carries `MultiOperationExecutionAborted`):
+  a start conflict becomes the typed already-started rejection with the
+  existing run, and an update failure keeps its status code.
+- `unknown` means the first attempt's outcome cannot be proven, exactly as for
+  a start.
+
+The deterministic `mock://` backend applies the embedded start with the same
+ledger rules as `start`, in the same critical section as the message: a
+signal is recorded on the resulting run under the start's request ID (so a
+retry delivers it once), and an update is reported as the typed error
+`start_update` returns on the mock, beside the run it started. Rust tests in
+[`with_start.rs`](../../rust/core-bridge/tests/with_start.rs) drive both
+selectors against a gRPC double; the
+[with-start live regression](../../test/integration/with_start/README.md)
+checks both against Temporal Server, and the
+[official-SDK interoperability regression](../../test/integration/sdk_interop/README.md)
+checks both in each direction between the OCaml SDK and the official Python
+SDK.
+
 ## Structured failures
 
 Routine transport and Core failures do not raise OCaml exceptions. Rust emits
@@ -1316,6 +1409,58 @@ defect.
 The [fetch-history live regression](../../test/integration/fetch_history/README.md)
 replays fetched histories with the default page size and with one and three
 events per page.
+
+## Describe one run and count executions (#1152)
+
+`Temporal.Client.describe handle` returns a snapshot of the run the handle
+addresses without waiting for it, and `Temporal.Client.count client ~query ()`
+counts the executions a visibility query matches:
+
+```ocaml
+Temporal.Client.describe handle
+Temporal.Client.count client ~query:"ExecutionStatus = 'Running'" ()
+```
+
+Both are submitted calls without a synchronous symbol: `DESCRIBE` (14) and
+`COUNT` (15). The closed describe request
+([`client-describe-request.schema.json`](../schemas/bridge/client-describe-request.schema.json))
+carries the connected namespace, the handle's workflow ID, its run ID (empty
+for a current-run handle, which Temporal resolves) and the optional
+`rpc_timeout_ms`. Rust calls `DescribeWorkflowExecution` once within the
+budget (10 seconds by default) and reduces the answer to the closed document
+of [`client-describe-response.schema.json`](../schemas/bridge/client-describe-response.schema.json):
+the execution as Temporal resolved it, workflow type, task queue, status (the
+visibility vocabulary, so `Client.execution_status` is shared with listing
+rows), exact start and optional close timestamps, history length, the memo and
+search attributes as named payloads sorted by key, and each pending activity
+(ID, type, state, attempt) and pending child (workflow ID, run ID or `null`
+while its start is still being initiated, type). Pending-activity states use
+the fixed names `scheduled`, `started`, `cancel_requested`, `paused` and
+`pause_requested`, and `unknown_<n>` for any other wire value (including the
+unspecified `0`), as statuses do (#1078). Heartbeat details, failures, timing
+fields, callbacks and Nexus operations stay in Rust. An answer that names
+another workflow or, for an exact request, another run, lacks an execution
+record or start time, or has an unspecified status is a `core_invalid`
+protocol error; OCaml checks the identity again.
+
+The count request
+([`client-count-request.schema.json`](../schemas/bridge/client-count-request.schema.json))
+carries the namespace, the query (validated like a visibility query; empty
+counts every execution) and the optional `rpc_timeout_ms`. Rust calls
+`CountWorkflowExecutions` and returns `{"count":n}`
+([`client-count-response.schema.json`](../schemas/bridge/client-count-response.schema.json));
+for a `GROUP BY` query that is the server's total over every group, and the
+groups themselves are not returned. A negative count is a protocol error.
+
+gRPC failures of either call (for example `not_found` for an unknown run or
+`invalid_argument` for a malformed query) arrive as the closed `rpc` document,
+so `Client.rpc_status` classifies them. The deterministic `mock://` backend
+describes its ledger (the start's memo and search attributes, ledger start
+and close times, no pending work, and a history length of `0`, since it
+records no history) and counts every retained run for an empty query only.
+
+The [describe/count live regression](../../test/integration/describe_count/README.md)
+checks both against Temporal Server.
 
 ## List workflow executions through visibility
 

@@ -1,7 +1,9 @@
 # Workflow start metadata
 
 `Client.start` accepts memo and registered search attributes independently or
-in combination. The worker retains those maps from `InitializeWorkflow` and
+in combination, and so do the child starts of `Temporal.Child_workflow`
+(`~memo`, `~search_attributes`, #1135), which a child reads exactly as a root
+run reads its own. The worker retains those maps from `InitializeWorkflow` and
 workflow code can inspect an owned historical snapshot:
 
 ```ocaml
@@ -13,7 +15,13 @@ match Option.bind metadata.memo (List.assoc_opt "note") with
 ```
 
 The snapshot describes this run's start event. Later
-`Workflow.upsert_search_attributes` commands do not change it. Every access
+`Workflow.upsert_search_attributes` and `Workflow.upsert_memo` commands do
+not change it; `Temporal.Search_attribute.decode` reads a typed search
+attribute from it (#1154). A continue-as-new successor starts with its
+predecessor's current search attributes and, once the predecessor upserted
+its memo, with the merged memo, unless `Workflow.continue_as_new` replaces
+them with `~memo` or `~search_attributes` (#1153; `~search_attributes:[]`
+starts the successor with none). Every access
 copies payload bodies; mutating returned bytes cannot change a later
 observation. Replay reconstructs the snapshot from history, and a successor
 run receives its own inherited metadata. `None` preserves an absent protobuf
@@ -55,29 +63,63 @@ match Info.continuation_initiator info with
   of a retry run (`` `Retry ``) or a continue-as-new successor
   (`` `Continue_as_new ``). Both are `None` for the first run of a chain; an
   initiator Temporal did not specify is `None` rather than a guess.
-  `` `Cron_schedule `` is reserved because cron-initiated runs are still
-  rejected before workflow code runs.
+  `` `Cron_schedule `` names a run that a cron schedule started after its
+  predecessor in the chain closed (#1158).
+- `cron_schedule` returns the cron schedule recorded on the start event
+  (`?cron_schedule` on `Client.start`), the same for every run of a cron
+  chain, or `None`.
+- `first_workflow_task_backoff` returns how long Temporal held the run's
+  first workflow task, rounded up to whole milliseconds: a `?start_delay`,
+  the wait until a cron schedule's next time, or the throttle Temporal
+  applies to a rapid retry or continue-as-new. An absent or explicit-zero
+  value (Temporal records zero for an ordinary start) is `None`.
+  `start_time` is when the run was created, before the backoff, so the first
+  activation's `Workflow.now` is at least the backoff later.
 
 Every value comes from the run's `InitializeWorkflow` job, is installed
 before workflow code runs, and is unchanged by later activations, so a
 replaying worker observes the same values. The predecessor's failure and
 completion payloads are retained by the private protocol but are not yet
 public. `Temporal.Testing` reports the predecessor and `` `Continue_as_new ``
-for its continue-as-new successors. It records no workflow timeouts (all
-three are `None`) and records a retry policy only for a child started with
-one.
+for its continue-as-new successors. It records no execution timeout, and
+run and task timeouts only once a continue-as-new set them (#1153); it
+records a retry policy for a child started with one and for a successor
+given one by `continue_as_new ~retry_policy`. A successor reports the task
+queue, timeouts and retry policy its predecessor set or inherited, as the
+server does, but the environment does not enforce the timeouts or route by
+task queue. It simulates neither cron schedules nor start delays, so
+`cron_schedule` and `first_workflow_task_backoff` are always `None` there.
 
-Cron schedules and cron-initiated runs remain unsupported. Nonzero root
-start delay also remains unsupported, while absent and explicit-zero backoff
-are ordinary defaults. Temporal can insert a nonzero first-task backoff for
-rapid continue-as-new and retry runs without any cron policy: the bridge
-retains and validates that exact duration as `first_workflow_task_backoff` for
-known workflow/retry continuations. The server has already applied it before
-polling; the runtime must not delay the workflow again. An arbitrary previous
-run ID never bypasses validation. The public client exposes no cron/start-delay
-options, and its start documentation warns against sending them through
-another SDK. Payload metadata values are arbitrary bytes and reach workflow
-code losslessly (#1048).
+## Cron schedules and delayed starts
+
+`Client.start` and `Client.signal_with_start` take `?cron_schedule` and
+`?start_delay` (#1158); `Client.update_with_start` takes neither, because
+Temporal refuses both on that operation. The two are mutually exclusive, a
+delay must be positive, and an empty or NUL-bearing schedule is a typed
+defect; Temporal itself parses the cron expression and answers an invalid
+one with `` `Invalid_argument ``. OCaml workers accept every run these
+create: a root run whose first task was delayed, the first run of a cron
+chain (delayed to the schedule's first time), and each cron-initiated run.
+The bridge carries the recorded schedule and the exact first-task backoff
+through the private protocol as `cron_schedule` and
+`first_workflow_task_backoff`, for root and continued runs alike. The server
+has already applied the backoff before the task is polled; the runtime never
+delays the workflow again. A run of a cron chain started by another SDK or
+the official CLI is served the same way.
+
+A cron chain never ends on its own: when a run closes, Temporal starts the
+next one on schedule with the same workflow ID, input and options. An
+exact-run `Client.wait` reports the run's own close with the next run as its
+`successor`; a current-run wait follows the chain and therefore does not
+return while the schedule keeps starting runs, so bound it with `?timeout`
+or terminate the chain. A cron workflow reads its previous run's result
+nowhere in the public API yet: the private protocol retains the
+predecessor's completion payloads, but no accessor exposes them. Child
+workflows cannot be given a cron schedule, and Temporal Schedules (the newer
+replacement for cron workflows) are not exposed.
+
+Payload metadata values are arbitrary bytes and reach workflow code
+losslessly (#1048).
 
 ## Validation
 
@@ -140,3 +182,17 @@ run by `make test-temporal-live-regressions`, starts a root run without
 options and two chains with every timeout, a retry policy, and a memo. The
 retry run and the continue-as-new successor each report exactly what the
 client sent, before and after the worker is replaced and the run replayed.
+
+Cron schedules and delayed starts are covered by Rust conversion tests
+(root delay, every initiator with and without a backoff, cron schedule and
+cron initiator on root and continued runs), the shared protocol fixtures,
+runtime tests reading `cron_schedule` and `first_workflow_task_backoff`
+live and under replay, client validation tests on both backends, and the
+[cron/start delay live regression](../../test/integration/cron_start_delay/README.md):
+a 3 s `start_delay` on `start` and on `signal_with_start`, a client and an
+official-CLI cron chain whose second run reports `` `Cron_schedule `` and its
+predecessor, a current-run wait that does not end, server rejection of an
+invalid expression, and replay of the recorded histories. The
+[history corpus](history-corpus.md) replays the captured histories of a
+delayed root run and of the first two runs of a cron chain (capture
+`live-2026-11-13-cron`).

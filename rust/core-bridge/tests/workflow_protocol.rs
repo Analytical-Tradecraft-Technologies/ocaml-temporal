@@ -272,6 +272,407 @@ fn converts_patch_markers_losslessly() {
     );
 }
 
+/// Builds one `json/plain` string payload for memo tests.
+fn json_string_payload(value: &str) -> workflow_protocol::Payload {
+    workflow_protocol::Payload {
+        metadata: [("encoding".to_owned(), b"json/plain".to_vec())]
+            .into_iter()
+            .collect(),
+        data: format!("\"{value}\"").into_bytes(),
+    }
+}
+
+/// Proves a memo upsert (#1154) maps to Core's `ModifyWorkflowProperties`
+/// command with every key and payload byte, round-trips through the
+/// semantic JSON and back from Core, and keeps the `binary/null` removal
+/// payload exactly as the server compares it.
+#[test]
+fn converts_memo_upserts_losslessly() {
+    let mut memo = BTreeMap::new();
+    memo.insert("note".to_owned(), json_string_payload("ready"));
+    memo.insert(
+        "removed".to_owned(),
+        workflow_protocol::Payload {
+            metadata: [("encoding".to_owned(), b"binary/null".to_vec())].into(),
+            data: Vec::new(),
+        },
+    );
+    let completion = workflow_protocol::Completion {
+        versioning_behavior: None,
+        task_failure: None,
+        run_id: "memo-run".to_owned(),
+        commands: vec![
+            workflow_protocol::CompletionCommand::ModifyWorkflowProperties {
+                upserted_memo: memo.clone(),
+            },
+        ],
+    };
+    let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+    assert!(encoded.contains("\"kind\":\"modify_workflow_properties\""));
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        completion
+    );
+    let core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_ref()
+    else {
+        panic!("memo completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::ModifyWorkflowProperties(command)) =
+        success.commands[0].variant.as_ref()
+    else {
+        panic!("memo upsert did not map to Core's ModifyWorkflowProperties");
+    };
+    let fields = &command.upserted_memo.as_ref().unwrap().fields;
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields["note"].data, br#""ready""#.to_vec());
+    assert!(fields["removed"].data.is_empty());
+    assert_eq!(
+        fields["removed"].metadata["encoding"],
+        b"binary/null".to_vec()
+    );
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        completion
+    );
+}
+
+/// Rejects a memo upsert whose key is not a protocol identifier and a Core
+/// memo command without a memo, so neither direction fabricates a value.
+#[test]
+fn rejects_malformed_memo_upserts() {
+    let mut memo = BTreeMap::new();
+    memo.insert(String::new(), json_string_payload("orphan"));
+    let completion = workflow_protocol::Completion {
+        versioning_behavior: None,
+        task_failure: None,
+        run_id: "memo-run".to_owned(),
+        commands: vec![
+            workflow_protocol::CompletionCommand::ModifyWorkflowProperties {
+                upserted_memo: memo,
+            },
+        ],
+    };
+    assert!(workflow_protocol::encode_completion(&completion).is_err());
+    let mut valid = BTreeMap::new();
+    valid.insert("note".to_owned(), json_string_payload("ready"));
+    let mut core = workflow_protocol::completion_to_core(&workflow_protocol::Completion {
+        versioning_behavior: None,
+        task_failure: None,
+        run_id: "memo-run".to_owned(),
+        commands: vec![
+            workflow_protocol::CompletionCommand::ModifyWorkflowProperties {
+                upserted_memo: valid,
+            },
+        ],
+    })
+    .unwrap();
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_mut()
+    else {
+        panic!("memo completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::ModifyWorkflowProperties(command)) =
+        success.commands[0].variant.as_mut()
+    else {
+        panic!("memo upsert did not map to Core's ModifyWorkflowProperties");
+    };
+    command.upserted_memo = None;
+    assert!(workflow_protocol::completion_from_core(&core).is_err());
+}
+
+/// Builds a continue-as-new command with every #1153 successor option unset,
+/// the shape earlier releases emitted.
+fn continue_as_new_without_options(
+    workflow_type: &str,
+    input: Vec<workflow_protocol::Payload>,
+    memo: BTreeMap<String, workflow_protocol::Payload>,
+) -> workflow_protocol::CompletionCommand {
+    workflow_protocol::CompletionCommand::ContinueAsNew {
+        workflow_type: workflow_type.to_owned(),
+        input,
+        memo,
+        task_queue: None,
+        run_timeout: None,
+        task_timeout: None,
+        retry_policy: None,
+        search_attributes: None,
+        initial_versioning_behavior: None,
+    }
+}
+
+/// Wraps one command in a successful completion for the current run.
+fn single_command_completion(
+    command: workflow_protocol::CompletionCommand,
+) -> workflow_protocol::Completion {
+    workflow_protocol::Completion {
+        versioning_behavior: None,
+        task_failure: None,
+        run_id: "current-run".to_owned(),
+        commands: vec![command],
+    }
+}
+
+/// Extracts Core's continue-as-new command from a converted completion.
+fn core_continue_as_new(
+    core: &core_completion::WorkflowActivationCompletion,
+) -> &core_commands::ContinueAsNewWorkflowExecution {
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_ref()
+    else {
+        panic!("continue-as-new completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::ContinueAsNewWorkflowExecution(command)) =
+        success.commands[0].variant.as_ref()
+    else {
+        panic!("continue-as-new must map to Core's continue-as-new variant");
+    };
+    command
+}
+
+/// Proves that a continue-as-new command without #1153 options encodes to
+/// exactly the document earlier releases wrote (no option member at all) and
+/// leaves every corresponding Core field unset, so existing histories replay
+/// against the same command.
+#[test]
+fn continue_as_new_without_options_is_unchanged() {
+    let completion = single_command_completion(continue_as_new_without_options(
+        "counter",
+        Vec::new(),
+        BTreeMap::new(),
+    ));
+    let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+    assert!(
+        encoded.contains(
+            r#"{"input":[],"kind":"continue_as_new","memo":{},"workflow_type":"counter"}"#
+        ),
+        "{encoded}"
+    );
+    let core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let command = core_continue_as_new(&core);
+    assert_eq!(
+        *command,
+        core_commands::ContinueAsNewWorkflowExecution {
+            workflow_type: "counter".to_owned(),
+            ..Default::default()
+        }
+    );
+}
+
+/// Proves every #1153 successor option reaches its Core field and converts
+/// back losslessly, including an explicitly empty search-attribute map, which
+/// Core must see as present (clear) rather than absent (inherit).
+#[test]
+fn converts_continue_as_new_options() {
+    let mut search_attributes = BTreeMap::new();
+    search_attributes.insert("CustomKeywordField".to_owned(), json_string_payload("next"));
+    let command = workflow_protocol::CompletionCommand::ContinueAsNew {
+        workflow_type: "counter".to_owned(),
+        input: Vec::new(),
+        memo: BTreeMap::new(),
+        task_queue: Some("successor-queue".to_owned()),
+        run_timeout: Some(workflow_protocol::Duration {
+            seconds: 60,
+            nanoseconds: 0,
+        }),
+        task_timeout: Some(workflow_protocol::Duration {
+            seconds: 15,
+            nanoseconds: 0,
+        }),
+        retry_policy: Some(workflow_protocol::RetryPolicy {
+            initial_interval: workflow_protocol::Duration {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+            backoff_coefficient_bits: 2.0_f64.to_bits().to_string(),
+            maximum_interval: workflow_protocol::Duration {
+                seconds: 10,
+                nanoseconds: 0,
+            },
+            maximum_attempts: 3,
+            non_retryable_error_types: vec!["Fatal".to_owned()],
+        }),
+        search_attributes: Some(search_attributes),
+        initial_versioning_behavior: Some(
+            workflow_protocol::ContinueAsNewVersioningBehavior::AutoUpgrade,
+        ),
+    };
+    let completion = single_command_completion(command);
+    let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+    assert!(encoded.contains(r#""initial_versioning_behavior":"auto_upgrade""#));
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        completion
+    );
+    let core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let core_command = core_continue_as_new(&core);
+    assert_eq!(core_command.task_queue, "successor-queue");
+    assert_eq!(
+        core_command
+            .workflow_run_timeout
+            .as_ref()
+            .map(|value| value.seconds),
+        Some(60)
+    );
+    assert_eq!(
+        core_command
+            .workflow_task_timeout
+            .as_ref()
+            .map(|value| value.seconds),
+        Some(15)
+    );
+    let policy = core_command.retry_policy.as_ref().unwrap();
+    assert_eq!(policy.maximum_attempts, 3);
+    assert_eq!(policy.backoff_coefficient.to_bits(), 2.0_f64.to_bits());
+    assert_eq!(
+        core_command
+            .search_attributes
+            .as_ref()
+            .unwrap()
+            .indexed_fields["CustomKeywordField"]
+            .data,
+        br#""next""#.to_vec()
+    );
+    assert_eq!(
+        core_command.initial_versioning_behavior,
+        i32::from(
+            temporalio_protos::temporal::api::enums::v1::ContinueAsNewVersioningBehavior::AutoUpgrade
+        )
+    );
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        completion
+    );
+
+    let cleared = single_command_completion(workflow_protocol::CompletionCommand::ContinueAsNew {
+        workflow_type: "counter".to_owned(),
+        input: Vec::new(),
+        memo: BTreeMap::new(),
+        task_queue: None,
+        run_timeout: None,
+        task_timeout: None,
+        retry_policy: None,
+        search_attributes: Some(BTreeMap::new()),
+        initial_versioning_behavior: Some(
+            workflow_protocol::ContinueAsNewVersioningBehavior::UseRampingVersion,
+        ),
+    });
+    let encoded = workflow_protocol::encode_completion(&cleared).unwrap();
+    assert!(encoded.contains(r#""search_attributes":{}"#), "{encoded}");
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        cleared
+    );
+    let core = workflow_protocol::completion_to_core(&cleared).unwrap();
+    assert_eq!(
+        core_continue_as_new(&core).search_attributes,
+        Some(temporalio_protos::temporal::api::common::v1::SearchAttributes::default())
+    );
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        cleared
+    );
+}
+
+/// Proves the bridge rejects successor options Temporal would silently
+/// lower or that the OCaml encoder would never write, and Core versioning
+/// values the protocol does not know.
+#[test]
+fn rejects_invalid_continue_as_new_options() {
+    let documents = [
+        r#""task_queue":"""#,
+        r#""run_timeout":{"seconds":"0","nanoseconds":0}"#,
+        r#""task_timeout":{"seconds":"121","nanoseconds":0}"#,
+        r#""run_timeout":{"seconds":"10","nanoseconds":0},"task_timeout":{"seconds":"11","nanoseconds":0}"#,
+        r#""search_attributes":{"":{"metadata":{},"data":{"encoding":"base64","data":""}}}"#,
+        r#""initial_versioning_behavior":"pinned""#,
+        r#""headers":{}"#,
+    ];
+    let document = |options: &str| {
+        format!(
+            r#"{{"run_id":"current-run","commands":[{{"kind":"continue_as_new","workflow_type":"counter","input":[],"memo":{{}},{options}}}]}}"#
+        )
+    };
+    // The template itself is well formed: valid options decode.
+    assert!(
+        workflow_protocol::decode_completion(&document(
+            r#""task_queue":"q","search_attributes":{"k":{"metadata":{},"data":{"encoding":"base64","data":""}}}"#
+        ))
+        .is_ok()
+    );
+    for options in documents {
+        let document = document(options);
+        assert!(
+            workflow_protocol::decode_completion(&document).is_err(),
+            "{document}"
+        );
+    }
+    let completion = single_command_completion(continue_as_new_without_options(
+        "counter",
+        Vec::new(),
+        BTreeMap::new(),
+    ));
+    let mut core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_mut()
+    else {
+        panic!("continue-as-new completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::ContinueAsNewWorkflowExecution(command)) =
+        success.commands[0].variant.as_mut()
+    else {
+        panic!("continue-as-new must map to Core's continue-as-new variant");
+    };
+    command.initial_versioning_behavior = 99;
+    assert!(workflow_protocol::completion_from_core(&core).is_err());
+}
+
+/// Proves the continue-as-new memo (#1154) reaches Core's command field, so
+/// an upserted memo survives continue-as-new, and that a completion written
+/// without the member decodes with an empty memo, which Core treats as
+/// "reuse the start memo".
+#[test]
+fn converts_continue_as_new_memo() {
+    let mut memo = BTreeMap::new();
+    memo.insert("note".to_owned(), json_string_payload("carried"));
+    let completion = workflow_protocol::Completion {
+        versioning_behavior: None,
+        task_failure: None,
+        run_id: "current-run".to_owned(),
+        commands: vec![continue_as_new_without_options("counter", Vec::new(), memo)],
+    };
+    let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        completion
+    );
+    let core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_ref()
+    else {
+        panic!("continue-as-new completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::ContinueAsNewWorkflowExecution(command)) =
+        success.commands[0].variant.as_ref()
+    else {
+        panic!("continue-as-new must map to Core's continue-as-new variant");
+    };
+    assert_eq!(command.memo["note"].data, br#""carried""#.to_vec());
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        completion
+    );
+    let without_memo = r#"{"run_id":"current-run","commands":[{"kind":"continue_as_new","workflow_type":"counter","input":[]}]}"#;
+    let decoded = workflow_protocol::decode_completion(without_memo).unwrap();
+    let [workflow_protocol::CompletionCommand::ContinueAsNew { memo, .. }] =
+        decoded.commands.as_slice()
+    else {
+        panic!("continue-as-new must decode");
+    };
+    assert!(memo.is_empty());
+}
+
 /// Proves search-attribute upserts retain sorted map keys, payload bytes, and
 /// the corresponding official Core command on both conversion directions.
 #[test]
@@ -511,6 +912,8 @@ fn converts_start_child_workflow_command() {
             run_timeout: None,
             task_timeout: None,
             id_reuse_policy: None,
+            memo: None,
+            search_attributes: None,
         }],
     };
     let encoded = workflow_protocol::encode_completion(&completion).unwrap();
@@ -588,6 +991,8 @@ fn child_start_with_options(
             run_timeout,
             task_timeout,
             id_reuse_policy,
+            memo: None,
+            search_attributes: None,
         }],
     }
 }
@@ -774,6 +1179,182 @@ fn child_workflow_timeout_rules_are_enforced() {
     }
 }
 
+/// A semantic memo or search-attribute map.
+type PayloadMap = BTreeMap<String, workflow_protocol::Payload>;
+
+/// Returns `completion`'s only command, which must be a child start, so a
+/// test can set the memo and search attributes (#1135) on a command built by
+/// [`child_start_with_options`].
+fn child_start_metadata(
+    completion: &mut workflow_protocol::Completion,
+) -> (&mut Option<PayloadMap>, &mut Option<PayloadMap>) {
+    let Some(workflow_protocol::CompletionCommand::StartChildWorkflow {
+        memo,
+        search_attributes,
+        ..
+    }) = completion.commands.first_mut()
+    else {
+        panic!("completion must start a child");
+    };
+    (memo, search_attributes)
+}
+
+/// Returns the Core start-child command of a converted one-command
+/// completion.
+fn core_start_child(
+    core: &core_completion::WorkflowActivationCompletion,
+) -> &core_commands::StartChildWorkflowExecution {
+    let Some(core_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_ref()
+    else {
+        panic!("child completion must be successful");
+    };
+    let Some(core_commands::workflow_command::Variant::StartChildWorkflowExecution(child)) =
+        success.commands[0].variant.as_ref()
+    else {
+        panic!("child command must map to Core's start-child variant");
+    };
+    child
+}
+
+/// The exact child-start document with a memo and search attributes, shared
+/// with the OCaml decoder test `test_child_start_metadata` so both ends agree
+/// byte for byte.
+const CHILD_START_METADATA_DOCUMENT: &str = concat!(
+    r#"{"commands":[{"cancellation_type":"try_cancel","input":[],"#,
+    r#""kind":"start_child_workflow","memo":{"note":{"data":{"data":"ImhlbGxvIg==","#,
+    r#""encoding":"base64"},"metadata":{"encoding":{"data":"anNvbi9wbGFpbg==","#,
+    r#""encoding":"base64"}}}},"retry_policy":null,"search_attributes":"#,
+    r#"{"CustomKeywordField":{"data":{"data":"ImNoaWxkIg==","encoding":"base64"},"#,
+    r#""metadata":{"encoding":{"data":"anNvbi9wbGFpbg==","encoding":"base64"}}}},"#,
+    r#""seq":2,"workflow_id":"child/1","workflow_type":"child"}],"#,
+    r#""run_id":"parent-run"}"#
+);
+
+/// Pins the child memo and search-attribute fields (#1135) through the exact
+/// JSON document, Core's start-child command, and Core's reverse conversion.
+/// Unset maps are omitted and leave Core's memo empty and its search
+/// attributes absent, so existing child starts are unchanged. Core cannot
+/// tell an empty memo from an absent one, so an empty memo comes back from
+/// Core as absent; an empty search-attribute map stays present.
+#[test]
+fn child_workflow_memo_and_search_attributes_round_trip() {
+    let mut completion = child_start_with_options(None, None, None, None);
+    {
+        let (memo, search_attributes) = child_start_metadata(&mut completion);
+        *memo = Some([("note".to_owned(), json_string_payload("hello"))].into());
+        *search_attributes = Some(
+            [(
+                "CustomKeywordField".to_owned(),
+                json_string_payload("child"),
+            )]
+            .into(),
+        );
+    }
+    let encoded = workflow_protocol::encode_completion(&completion).unwrap();
+    assert_eq!(encoded, CHILD_START_METADATA_DOCUMENT);
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        completion
+    );
+    let core = workflow_protocol::completion_to_core(&completion).unwrap();
+    let child = core_start_child(&core);
+    assert_eq!(child.memo["note"].data, br#""hello""#.to_vec());
+    assert_eq!(
+        child.memo["note"].metadata["encoding"],
+        b"json/plain".to_vec()
+    );
+    assert_eq!(
+        child.search_attributes.as_ref().unwrap().indexed_fields["CustomKeywordField"].data,
+        br#""child""#.to_vec()
+    );
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        completion
+    );
+
+    let unset = child_start_with_options(None, None, None, None);
+    let encoded = workflow_protocol::encode_completion(&unset).unwrap();
+    assert!(!encoded.contains("memo"), "unset memo must be omitted");
+    assert!(
+        !encoded.contains("search_attributes"),
+        "unset search attributes must be omitted"
+    );
+    let core = workflow_protocol::completion_to_core(&unset).unwrap();
+    let child = core_start_child(&core);
+    assert!(child.memo.is_empty());
+    assert!(child.search_attributes.is_none());
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        unset
+    );
+
+    let mut empty = child_start_with_options(None, None, None, None);
+    {
+        let (memo, search_attributes) = child_start_metadata(&mut empty);
+        *memo = Some(BTreeMap::new());
+        *search_attributes = Some(BTreeMap::new());
+    }
+    let encoded = workflow_protocol::encode_completion(&empty).unwrap();
+    assert!(encoded.contains(r#""memo":{}"#), "{encoded}");
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        empty
+    );
+    let core = workflow_protocol::completion_to_core(&empty).unwrap();
+    assert!(core_start_child(&core).memo.is_empty());
+    let mut expected = empty.clone();
+    *child_start_metadata(&mut expected).0 = None;
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        expected
+    );
+}
+
+/// Rejects child memo and search-attribute maps the OCaml encoder would never
+/// write: an empty key, a key with NUL, and a map that is not an object, both
+/// when decoding a document and when validating a command before encoding.
+#[test]
+fn rejects_invalid_child_start_metadata() {
+    let document = |options: &str| {
+        format!(
+            r#"{{"run_id":"parent-run","commands":[{{"kind":"start_child_workflow","seq":2,"workflow_id":"child/1","workflow_type":"child","input":[],"retry_policy":null,"cancellation_type":"try_cancel",{options}}}]}}"#
+        )
+    };
+    let valid = r#"{"k":{"metadata":{},"data":{"encoding":"base64","data":""}}}"#;
+    for name in ["memo", "search_attributes"] {
+        // The template itself is well formed: a valid map decodes.
+        assert!(
+            workflow_protocol::decode_completion(&document(&format!(r#""{name}":{valid}"#)))
+                .is_ok()
+        );
+        for invalid in [
+            r#"{"":{"metadata":{},"data":{"encoding":"base64","data":""}}}"#,
+            r#"{"a\u0000b":{"metadata":{},"data":{"encoding":"base64","data":""}}}"#,
+            "[]",
+        ] {
+            let document = document(&format!(r#""{name}":{invalid}"#));
+            assert!(
+                workflow_protocol::decode_completion(&document).is_err(),
+                "{document}"
+            );
+        }
+    }
+    for (memo_key, search_key, path) in [
+        ("", "k", "$.commands.memo"),
+        ("k", "", "$.commands.search_attributes"),
+    ] {
+        let mut completion = child_start_with_options(None, None, None, None);
+        {
+            let (memo, search_attributes) = child_start_metadata(&mut completion);
+            *memo = Some([(memo_key.to_owned(), json_string_payload("v"))].into());
+            *search_attributes = Some([(search_key.to_owned(), json_string_payload("v"))].into());
+        }
+        let error = workflow_protocol::encode_completion(&completion).unwrap_err();
+        assert_eq!(error.path, path);
+    }
+}
+
 /// Proves the local-activity command and its distinct cancellation command are
 /// preserved through the strict semantic JSON protocol and Core protobuf
 /// conversion. Local activities intentionally omit remote task-queue fields,
@@ -951,6 +1532,8 @@ fn injects_worker_namespace_into_child_workflow_command() {
             run_timeout: None,
             task_timeout: None,
             id_reuse_policy: None,
+            memo: None,
+            search_attributes: None,
         }],
     };
     let core = workflow_protocol::completion_to_core_for_activation_with_namespace(
@@ -1034,6 +1617,8 @@ fn converts_all_child_cancellation_policies() {
                 run_timeout: None,
                 task_timeout: None,
                 id_reuse_policy: None,
+                memo: None,
+                search_attributes: None,
             }],
         };
         let encoded = workflow_protocol::encode_completion(&completion).unwrap();
@@ -1166,6 +1751,8 @@ fn rejects_invalid_child_cancellation_commands() {
             run_timeout: None,
             task_timeout: None,
             id_reuse_policy: None,
+            memo: None,
+            search_attributes: None,
         }],
     };
     assert!(workflow_protocol::encode_completion(&outgoing_nul).is_err());
@@ -1197,10 +1784,11 @@ fn converts_continue_as_new_command() {
         versioning_behavior: None,
         task_failure: None,
         run_id: "current-run".to_owned(),
-        commands: vec![workflow_protocol::CompletionCommand::ContinueAsNew {
-            workflow_type: "counter".to_owned(),
-            input: vec![input],
-        }],
+        commands: vec![continue_as_new_without_options(
+            "counter",
+            vec![input],
+            BTreeMap::new(),
+        )],
     };
     let encoded = workflow_protocol::encode_completion(&completion).unwrap();
     assert!(encoded.contains("\"kind\":\"continue_as_new\""));
@@ -1236,7 +1824,10 @@ fn converts_continue_as_new_command() {
     else {
         panic!("continue-as-new must map to Core's continue-as-new variant");
     };
-    command.task_queue = "other".to_owned();
+    command.headers.insert(
+        "header".to_owned(),
+        temporalio_protos::temporal::api::common::v1::Payload::default(),
+    );
     assert_eq!(
         workflow_protocol::completion_from_core(&unsupported)
             .unwrap_err()
@@ -1256,10 +1847,7 @@ fn rejects_continue_as_new_with_follow_up_command() {
         task_failure: None,
         run_id: "current-run".to_owned(),
         commands: vec![
-            workflow_protocol::CompletionCommand::ContinueAsNew {
-                workflow_type: "counter".to_owned(),
-                input: Vec::new(),
-            },
+            continue_as_new_without_options("counter", Vec::new(), BTreeMap::new()),
             workflow_protocol::CompletionCommand::StartTimer {
                 seq: 1,
                 start_to_fire_timeout: workflow_protocol::Duration {
@@ -1580,8 +2168,10 @@ fn preserves_start_metadata_on_roots_and_continuations() {
     }
 }
 
-/// Continuation identity must not bypass unsupported cron/delay validation or
-/// the shape checks on represented metadata and exact expiration timestamps.
+/// A cron schedule and a cron-initiated continuation are carried as data on
+/// root and continued runs alike (#1158), and continuation identity never
+/// bypasses the shape checks on represented metadata and exact expiration
+/// timestamps.
 #[test]
 fn validates_start_metadata_without_continuation_bypass() {
     use temporalio_protos::temporal::api::common::v1::{Memo, SearchAttributes};
@@ -1600,11 +2190,29 @@ fn validates_start_metadata_without_continuation_bypass() {
                     init.continued_initiator = 3;
                 }
             }
-            assert_eq!(
+            let activation =
                 workflow_protocol::activation_from_core(&start_metadata_activation(init))
-                    .unwrap_err()
-                    .code,
-                workflow_protocol::CoreConversionErrorCode::Unsupported
+                    .expect("cron metadata is supported");
+            let workflow_protocol::ActivationJob::InitializeWorkflow {
+                context: Some(context),
+                ..
+            } = &activation.jobs[0]
+            else {
+                panic!("missing context")
+            };
+            if field == "cron" {
+                assert_eq!(context.cron_schedule.as_deref(), Some("0 * * * * *"));
+            } else {
+                assert_eq!(context.cron_schedule, None);
+                assert_eq!(
+                    context.continuation.as_ref().map(|value| value.initiator),
+                    Some(workflow_protocol::ContinueAsNewInitiator::CronSchedule)
+                );
+            }
+            let json = workflow_protocol::encode_activation(&activation).unwrap();
+            assert_eq!(
+                workflow_protocol::decode_activation(&json).unwrap(),
+                activation
             );
         }
         // A memo key the protocol cannot carry is client-supplied and
@@ -1646,26 +2254,30 @@ fn validates_start_metadata_without_continuation_bypass() {
     }
 }
 
-/// Temporal throttles a rapid continue-as-new with a nonzero first-task
-/// backoff even without cron. Preserve that server-applied duration on known
-/// workflow/retry continuations while keeping root start delay unsupported.
+/// Temporal applies a first-task backoff for a root start delay, for the
+/// wait until a cron schedule's next time, and to throttle a rapid
+/// continue-as-new or retry. Every such server-applied duration is preserved
+/// exactly, on a root run and for every initiator including an unknown future
+/// one (#1017), while an out-of-range nanosecond field is still rejected.
 #[test]
 fn preserves_server_continuation_backoff() {
     for initiator in [0, 1, 2, 3, 99] {
-        for nanos in [0, 989_282_667, -1, 1_000_000_000] {
+        for (seconds, nanos) in [
+            (0, 0),
+            (0, 989_282_667),
+            (86_400, 5),
+            (0, -1),
+            (0, 1_000_000_000),
+        ] {
             let mut init = start_metadata_initializer();
             init.cron_schedule_to_schedule_interval =
-                Some(prost_wkt_types::Duration { seconds: 0, nanos });
+                Some(prost_wkt_types::Duration { seconds, nanos });
             if initiator != 0 {
                 init.continued_from_execution_run_id = "previous-run".to_owned();
                 init.continued_initiator = initiator;
             }
             let result = workflow_protocol::activation_from_core(&start_metadata_activation(init));
-            // An unknown future initiator (99) reads as unspecified (#1017),
-            // so it is admitted exactly like a root start: only without delay.
-            if ((matches!(initiator, 0 | 99) && nanos == 0) || matches!(initiator, 1 | 2))
-                && (0..1_000_000_000).contains(&nanos)
-            {
+            if (0..1_000_000_000).contains(&nanos) {
                 let activation = result.unwrap();
                 let workflow_protocol::ActivationJob::InitializeWorkflow {
                     context: Some(context),
@@ -1677,10 +2289,8 @@ fn preserves_server_continuation_backoff() {
                 assert_eq!(
                     context
                         .first_workflow_task_backoff
-                        .as_ref()
-                        .unwrap()
-                        .nanoseconds,
-                    nanos
+                        .map(|backoff| (backoff.seconds, backoff.nanoseconds)),
+                    Some((seconds, nanos))
                 );
                 let json = workflow_protocol::encode_activation(&activation).unwrap();
                 assert_eq!(
@@ -1688,7 +2298,7 @@ fn preserves_server_continuation_backoff() {
                     activation
                 );
             } else {
-                assert!(result.is_err(), "unsupported or invalid delay was admitted");
+                assert!(result.is_err(), "an invalid delay was admitted");
             }
         }
     }
@@ -2447,24 +3057,32 @@ fn preserves_realistic_first_workflow_activation() {
         semantic
     );
 
-    // A non-zero first-task backoff carries scheduling semantics and must not
-    // be silently discarded while this protocol slice has no representation
-    // for it.
-    let mut unsupported_backoff = core.clone();
-    let Some(Variant::InitializeWorkflow(initialize)) =
-        unsupported_backoff.jobs[0].variant.as_mut()
-    else {
+    // A root start delay (#1158) is a non-zero first-task backoff on a root
+    // run. The server has already applied it, so it is carried exactly as
+    // metadata rather than rejected or discarded.
+    let mut delayed = core.clone();
+    let Some(Variant::InitializeWorkflow(initialize)) = delayed.jobs[0].variant.as_mut() else {
         panic!("realistic activation must contain initialization");
     };
     initialize.cron_schedule_to_schedule_interval = Some(prost_wkt_types::Duration {
         seconds: 1,
         nanos: 0,
     });
-    let error = workflow_protocol::activation_from_core(&unsupported_backoff).unwrap_err();
+    let semantic = workflow_protocol::activation_from_core(&delayed).unwrap();
+    let workflow_protocol::ActivationJob::InitializeWorkflow {
+        context: Some(context),
+        ..
+    } = &semantic.jobs[0]
+    else {
+        panic!("delayed activation must retain initialization context");
+    };
     assert_eq!(
-        error.code,
-        workflow_protocol::CoreConversionErrorCode::Unsupported
+        context
+            .first_workflow_task_backoff
+            .map(|backoff| (backoff.seconds, backoff.nanoseconds)),
+        Some((1, 0))
     );
+    assert_eq!(context.cron_schedule, None);
 
     // Core copies the raw reason numbers into every later activation, so an
     // unknown reason (the reserved 4 from older servers, or a future one)
@@ -4047,6 +4665,7 @@ fn rejects_omitted_required_nullable_fields() {
         "search_attributes",
         "workflow_execution_expiration_time",
         "first_workflow_task_backoff",
+        "cron_schedule",
         "parent_workflow",
         "workflow_execution_timeout",
         "workflow_run_timeout",
@@ -4202,6 +4821,8 @@ fn child_routing_and_parent_close_round_trip() {
                 run_timeout: None,
                 task_timeout: None,
                 id_reuse_policy: None,
+                memo: None,
+                search_attributes: None,
             }],
         };
         let encoded = workflow_protocol::encode_completion(&completion).unwrap();

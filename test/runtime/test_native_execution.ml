@@ -223,6 +223,7 @@ let test_retained_payloads_are_copied () =
       search_attributes = Some [ ("CustomKeywordField", search) ];
       workflow_execution_expiration_time = None;
       first_workflow_task_backoff = None;
+      cron_schedule = None;
       first_execution_run_id = "first-run";
       start_time = None;
       root_workflow = None;
@@ -336,6 +337,7 @@ let test_start_metadata_snapshot () =
       search_attributes = Some [ ("CustomKeywordField", protocol_payload "search") ];
       workflow_execution_expiration_time = Some { seconds = 1_800_000_000L; nanoseconds = 123 };
       first_workflow_task_backoff = None;
+      cron_schedule = None;
       identity = "client"; parent_workflow = None;
       workflow_execution_timeout = None; workflow_run_timeout = None;
       workflow_task_timeout = None; first_execution_run_id = "first-run";
@@ -1805,12 +1807,15 @@ let test_command_order_and_validation () =
   let continue_completion =
     unwrap "continue-as-new command conversion"
       (Native_execution.completion_of_commands ~run_id:"run-native-translation"
-         [ Activation.Continue_as_new { workflow_type = "native"; input = [] } ])
+         [ Activation.Continue_as_new
+             { workflow_type = "native"; input = []; memo = [];
+               options = Activation.Continue_as_new_options.none } ])
   in
   (* A unit continue-as-new input arrives as zero arguments (#819), matching
      other SDKs; the next run's start decodes [[]] back to unit. *)
   (match continue_completion.commands with
-  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [] } ] ->
+  | [ Protocol.Continue_as_new { workflow_type = "native"; input = []; memo = []; options } ]
+    when options = Protocol.Continue_as_new_options.none ->
       ()
   | _ -> failwith "continue-as-new command was not translated as terminal");
   (* A non-unit argument whose bytes are [binary/null], such as an option's
@@ -1821,12 +1826,14 @@ let test_command_order_and_validation () =
            ~run_id:"run-native-translation"
            [
              Activation.Continue_as_new
-               { workflow_type = "native"; input = [ runtime_unit_payload () ] };
+               { workflow_type = "native"; input = [ runtime_unit_payload () ]; memo = [];
+                 options = Activation.Continue_as_new_options.none };
            ]))
        .commands
    with
-  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ null ] } ]
-    when null.Protocol.metadata = [ ("encoding", Bytes.of_string "binary/null") ]
+  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ null ]; memo = []; options } ]
+    when options = Protocol.Continue_as_new_options.none
+         && null.Protocol.metadata = [ ("encoding", Bytes.of_string "binary/null") ]
          && Bytes.length null.data = 0 ->
       ()
   | _ -> failwith "continue-as-new collapsed a null argument");
@@ -1835,14 +1842,48 @@ let test_command_order_and_validation () =
       (Native_execution.completion_of_commands ~run_id:"run-native-translation"
          [
            Activation.Continue_as_new
-             { workflow_type = "native"; input = [ runtime_payload "next" ] };
+             { workflow_type = "native"; input = [ runtime_payload "next" ]; memo = [];
+               options = Activation.Continue_as_new_options.none };
          ])
   in
-  match continue_completion.commands with
-  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ next ] } ]
-    when next = protocol_payload "next" ->
+  (match continue_completion.commands with
+  | [ Protocol.Continue_as_new { workflow_type = "native"; input = [ next ]; memo = []; options } ]
+    when options = Protocol.Continue_as_new_options.none
+         && next = protocol_payload "next" ->
       ()
-  | _ -> failwith "continue-as-new command did not keep its non-unit input"
+  | _ -> failwith "continue-as-new command did not keep its non-unit input");
+  (* A memo upsert and the merged memo a successor carries (#1154) cross the
+     protocol with their keys and bytes. A repeated or empty key is
+     rejected before Core sees it. *)
+  (match
+     (unwrap "memo upsert and continue-as-new memo"
+        (Native_execution.completion_of_commands ~run_id:"run-native-translation"
+           [
+             Activation.Modify_workflow_properties
+               { upserted_memo = [ ("note", runtime_payload "n"); ("draft", runtime_unit_payload ()) ] };
+             Activation.Continue_as_new
+               { workflow_type = "native"; input = [];
+                 memo = [ ("note", runtime_payload "n") ];
+                 options = Activation.Continue_as_new_options.none };
+           ]))
+       .commands
+   with
+  | [ Protocol.Modify_workflow_properties { upserted_memo };
+      Protocol.Continue_as_new { memo = [ ("note", carried) ]; _ } ]
+    when List.sort compare (List.map fst upserted_memo) = [ "draft"; "note" ]
+         && List.assoc "note" upserted_memo = protocol_payload "n"
+         && carried = protocol_payload "n" ->
+      ()
+  | _ -> failwith "memo commands were not translated");
+  expect_error_code "repeated memo key" "invalid_message"
+    (Native_execution.command_to_protocol
+       (Activation.Modify_workflow_properties
+          { upserted_memo = [ ("k", runtime_payload "a"); ("k", runtime_payload "b") ] }));
+  expect_error_code "empty continue-as-new memo key" "invalid_message"
+    (Native_execution.command_to_protocol
+       (Activation.Continue_as_new
+          { workflow_type = "native"; input = []; memo = [ ("", runtime_payload "a") ];
+            options = Activation.Continue_as_new_options.none }))
 
 (** Activity commands retain every Core-required field through translation, and
     malformed timeout/identity options fail before a completion is returned. *)
@@ -1998,6 +2039,7 @@ let test_activity_command_translation_and_validation () =
               retry_policy = None;
               cancellation_type = Activation.Child_abandon;
               execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
             }))
   with
   | Protocol.Start_child_workflow
@@ -2010,6 +2052,7 @@ let test_activity_command_translation_and_validation () =
         retry_policy = None;
         cancellation_type = Protocol.Child_abandon;
         execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
       } ->
       ()
   | _ -> failwith "child command fields were not preserved"
@@ -2026,6 +2069,7 @@ let test_activity_command_translation_and_validation () =
               retry_policy = None;
               cancellation_type = Activation.Child_abandon;
               execution_timeout = None; run_timeout = None; task_timeout = None; id_reuse_policy = None;
+          memo = None; search_attributes = None;
             }))
   with
   | Protocol.Start_child_workflow { input = [ child_input ]; _ }

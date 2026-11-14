@@ -2,7 +2,14 @@
 
     Futures are produced by activities, child workflows, timers, and other
     workflow operations. Awaiting one suspends only the current workflow
-    fiber until a later Temporal activation resolves it. *)
+    fiber until a later Temporal activation resolves it.
+
+    A read-only update validator or query handler cannot suspend or schedule
+    workflow work: there {!await} of a pending future returns the future's
+    outside-scheduler error instead of suspending, while a ready result is
+    still returned, and building a combinator ({!map}, {!both}, {!val-race} and
+    the others) over a workflow future raises [Invalid_argument], because
+    its callback would run later on the live path only. *)
 
 (** A result that may become available in a later Temporal activation. A future
     belongs to one workflow execution. It is not a general-purpose promise for

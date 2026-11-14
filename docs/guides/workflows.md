@@ -299,42 +299,64 @@ security token: the seed is recorded in the run's history. There is no
 generic "side effect" API for reading the outside world; run such code in a
 local activity, whose result is recorded.
 
-### Update indexed search attributes
+### Update indexed search attributes and the memo
 
 Workflows can publish indexed search attributes by emitting one deterministic
-merge command. The values are ordinary `Temporal.Payload.t` values, but
-Temporal Server decodes them itself with its default converter rather than
-through the worker's codecs. Each value must be a `json/plain` encoding of the
-attribute's registered type, such as the output of `Temporal.Codec.string`,
-`Temporal.Codec.int`, or `Temporal.Codec.bool`. A `binary/null` payload, such
-as `Temporal.Codec.option` encoding `None`, removes the key. A custom codec made
-with `~encoding:"json/plain"` that emits valid JSON of the registered type is
-accepted like a built-in one. Any other encoding, such as
-`Temporal.Codec.bytes` (`binary/plain`) or a custom encoding name, is rejected
-by the server with `BAD_SEARCH_ATTRIBUTES`; that fails the workflow task on every retry until
-the workflow code is corrected. Keys must be unique, non-empty, valid UTF-8
-strings no longer than 65,536 bytes; invalid keys are programmer errors and are
-rejected before the command is buffered. Upserting an empty list is a no-op and
-emits no command, so a filtered list of changed attributes can be passed
-directly.
+merge command. Temporal Server decodes search-attribute values itself, with
+its default converter rather than the worker's codecs, so each value must be
+the `json/plain` encoding of the attribute's registered type. A typed
+`Temporal.Search_attribute` key (#1154) pairs the registered name with that
+type and always produces the right encoding:
 
 ```ocaml
+let agent_status = Temporal.Search_attribute.keyword "agent_status"
+let review_count = Temporal.Search_attribute.int64 "review_count"
+
 let classify_workflow () =
-  let status = Temporal.Codec.encode Temporal.Codec.string "ready" in
-  match status with
-  | Error error -> Error error
-  | Ok status ->
-      Temporal.Workflow.upsert_search_attributes [ ("agent_status", status) ];
-      Ok "classified"
+  Temporal.Workflow.upsert_typed_search_attributes
+    [ Temporal.Search_attribute.set agent_status "ready";
+      Temporal.Search_attribute.set review_count 2L ];
+  Ok "classified"
 ```
 
-The update is recorded in workflow history and becomes visible to Temporal's
-visibility layer after the workflow task completion is accepted. Calling this
-operation does not perform network I/O, read wall-clock time, or mutate
-process-global state, which keeps replay deterministic. The current release
-has focused OCaml and Rust conversion coverage; a live visibility acceptance
-scenario is still tracked separately in the [feature coverage
-matrix](../reference/feature-coverage.md).
+The keys cover every indexed type: `text`, `keyword`, `int64`, `double`,
+`bool`, `datetime` (an RFC 3339 UTC timestamp) and `keyword_list`.
+`Search_attribute.unset` removes an attribute. `Search_attribute.encode`
+produces the raw list for `Client.start ~search_attributes`, and
+`Search_attribute.decode` reads a typed value back from
+`Workflow.start_metadata` or `Client.describe`. A key does not register its
+name: register it in the namespace first, for example with
+`temporal operator search-attribute create`.
+
+`Temporal.Workflow.upsert_search_attributes` remains the raw escape hatch:
+its values are ordinary `Temporal.Payload.t` values, such as the output of
+`Temporal.Codec.string`, `Temporal.Codec.int`, or `Temporal.Codec.bool`. A
+`binary/null` payload, such as `Temporal.Codec.option` encoding `None`, removes
+the key. A custom codec made with `~encoding:"json/plain"` that emits valid
+JSON of the registered type is accepted like a built-in one. Any other
+encoding, such as `Temporal.Codec.bytes` (`binary/plain`) or a custom encoding
+name, is rejected by the server with `BAD_SEARCH_ATTRIBUTES`; that fails the
+workflow task on every retry until the workflow code is corrected. Keys must
+be unique, non-empty, valid UTF-8 strings no longer than 65,536 bytes; invalid
+keys, and typed updates that cannot be encoded, are programmer errors and are
+rejected before the command is buffered. Upserting an empty list is a no-op
+and emits no command, so a filtered list of changed attributes can be passed
+directly.
+
+`Temporal.Workflow.upsert_memo` merges values into the run's memo the same
+way, through Core's `ModifyWorkflowProperties` command. Memo values are not
+indexed or decoded by the server, so any codec may write them; the exact
+`binary/null` payload removes a key. A later `continue_as_new` gives the
+successor the merged memo, which `Client.describe` and the successor's
+`Workflow.start_metadata` then report.
+
+Both updates are recorded in workflow history, replayed from it, and become
+visible to `Client.describe` and Temporal's visibility layer after the
+workflow task completion is accepted. Calling them does not perform network
+I/O, read wall-clock time, or mutate process-global state, which keeps replay
+deterministic. The [typed search-attribute
+regression](../../test/integration/search_attributes/README.md) checks them
+against a live server.
 
 ### Introduce a new branch with a patch marker
 
@@ -981,6 +1003,35 @@ ordered payload list. The bridge maps it to Temporal Core's
 `ContinueAsNewWorkflowExecution` command, fills only explicit Core defaults,
 and rejects unsupported non-default options instead of silently dropping them.
 
+By default the successor keeps the current task queue, run and task
+timeouts, retry policy, search attributes (including upserts) and memo
+(including `upsert_memo` changes). Optional arguments change them for the
+successor and, because a successor inherits from its predecessor, for later
+runs too (#1153):
+
+```ocaml
+Temporal.Workflow.continue_as_new
+  ~task_queue:"batch-v2"
+  ~run_timeout:(Temporal.Duration.of_minutes 30L)
+  ~task_timeout:(Temporal.Duration.of_seconds 20L)
+  ~retry_policy
+  ~memo:[ ("phase", phase_payload) ]
+  ~search_attributes:(Result.get_ok (Temporal.Search_attribute.encode [ set phase_key "two" ]))
+  process_batch_workflow next_batch
+```
+
+`~search_attributes` replaces the successor's search attributes, so
+`~search_attributes:[]` clears them; `~memo` replaces its memo, but Temporal
+cannot express an empty one, so `~memo:[]` behaves as omitted. The execution
+timeout set by `Client.start` bounds the whole chain and cannot be changed.
+`~initial_versioning_behavior` (Temporal marks it experimental) picks the
+deployment version of the successor's first workflow task on a versioned
+worker. An invalid option, such as a task timeout above 120 seconds or above
+the run timeout, or a malformed key, fails the workflow task with a typed
+`Defect` exactly like an input encoding failure, and continue-as-new is
+rejected with `Invalid_argument` inside an update validator or query
+handler.
+
 Long-running workflows should not count events by hand. `Temporal.Workflow.info ()`
 returns a snapshot whose `Info.continue_as_new_suggested`,
 `Info.history_length`, and `Info.history_size_bytes` report what Temporal sent
@@ -1014,7 +1065,12 @@ carries the start policy the client recorded: `Info.execution_timeout`,
 `Info.run_timeout`, `Info.task_timeout`, and `Info.retry_policy`. A successor
 run names its predecessor through `Info.continued_from_run_id`, and
 `Info.continuation_initiator` tells a `` `Retry `` apart from a
-`` `Continue_as_new ``. Start memo and search attributes come from
+`` `Continue_as_new `` or a `` `Cron_schedule `` run. A run started with
+`Client.start ~cron_schedule` reads the schedule through
+`Info.cron_schedule`, and a run whose first task Temporal held (a
+`~start_delay`, or a cron run waiting for its scheduled time) reads that
+delay through `Info.first_workflow_task_backoff`; it has already elapsed when
+workflow code runs (#1158). Start memo and search attributes come from
 `Temporal.Workflow.start_metadata` ([start metadata](../reference/workflow-start-metadata.md)).
 `Temporal.Workflow.is_replaying ()` is the shorthand for side effects outside
 workflow state, such as suppressing duplicate log lines during replay. Never
@@ -1445,6 +1501,13 @@ rules below keep the scheduler responsive (#1141). Workflow code is a separate
 matter. It runs under the SDK's own deterministic scheduler and must never use
 Eio, Lwt or any other I/O, as described in section 1.
 
+[`examples/eio`](../../examples/README.md#use-the-sdk-from-an-eio-program) is
+a compiled, self-checking program built from the two Eio patterns below. CI
+builds it and runs it against Temporal Server, and it checks that the client
+calls ran concurrently with other fibers and that the hosted worker shut down
+before its fiber finished. It uses `Eio_posix.run` where these snippets use
+`Eio_main.run`; both work.
+
 ### Client calls from Eio fibers
 
 Run each blocking client call in a system thread with
@@ -1516,8 +1579,9 @@ any fiber, thread or Domain:
 ```ocaml
 (* Runs [worker] on a new Domain until the calling fiber is cancelled, then
    drains and releases it. Eio cannot interrupt [Worker.run] (it is not Eio
-   code), so a daemon fiber requests the stop instead. *)
-let serve_worker ~domain_mgr worker =
+   code), so a daemon fiber requests the stop instead. [on_stopped] receives
+   the run and shutdown result on the hosting Domain. *)
+let serve_worker ~domain_mgr ~on_stopped worker =
   Eio.Switch.run @@ fun sw ->
   Eio.Fiber.fork_daemon ~sw (fun () ->
       Fun.protect
@@ -1526,7 +1590,13 @@ let serve_worker ~domain_mgr worker =
   Eio.Domain_manager.run domain_mgr (fun () ->
       let run_result = Temporal.Worker.run worker in
       let shutdown_result = Temporal.Worker.shutdown worker in
-      Result.bind run_result (fun () -> shutdown_result))
+      let result = Result.bind run_result (fun () -> shutdown_result) in
+      on_stopped result;
+      result)
+
+let report_stopped = function
+  | Ok () -> ()
+  | Error error -> prerr_endline (Temporal.Error.message error)
 
 let () =
   Eio_main.run @@ fun env ->
@@ -1547,9 +1617,9 @@ let () =
          the worker Domain has shut the worker down. *)
       Eio.Fiber.first
         (fun () ->
-          match serve_worker ~domain_mgr:(Eio.Stdenv.domain_mgr env) worker with
-          | Ok () -> ()
-          | Error error -> prerr_endline (Temporal.Error.message error))
+          ignore
+            (serve_worker ~domain_mgr:(Eio.Stdenv.domain_mgr env)
+               ~on_stopped:report_stopped worker))
         (fun () -> Eio.Promise.await stop)
 ```
 
@@ -1558,7 +1628,10 @@ requests the stop. `Worker.run` returns once each lane has finished its
 current task, or once the worker's grace period has elapsed for an activity
 callback, and the same Domain then runs the bounded `Worker.shutdown`.
 `Domain_manager.run` returns only after both have finished, so the worker
-never outlives the switch. For `SIGTERM`, keep the `Sys.signal` handler of
+never outlives the switch. The cancelled fiber then ends with Eio's
+`Cancelled` exception instead of `serve_worker`'s return value, so a failed
+drain or release would go unseen; `on_stopped` reports the result in every
+case, including when the worker stops on its own. For `SIGTERM`, keep the `Sys.signal` handler of
 [section 8](#8-register-a-worker) that calls `Worker.request_shutdown`. It
 works unchanged in an Eio program, because the handler does no I/O.
 
@@ -1639,9 +1712,8 @@ take the same definitions and handlers as `Temporal.Worker`.
 existing definition's name and codecs and replace any other registration of
 that name, so a test can reuse an application's registration list and swap
 out the activities that perform I/O or a child implemented by another
-worker. A remote reference or asynchronous activity registered with
-`Testing.activity` cannot run in-process and fails with a message asking for
-a mock.
+worker. A remote reference registered with `Testing.activity` cannot run
+in-process and fails with a message asking for a mock.
 
 For interactive workflows, start the workflow and drive it step by step:
 
@@ -1681,12 +1753,68 @@ Temporal.Testing.mock_activity charge
   (fun order -> Ok (receipt order))
 ```
 
-The simulator is not a server. Schedule-to-start timeouts never expire; a
-workflow task failure (an exception or a
-`Defect`, `Codec`, or `Bridge` error) ends the run with that error instead of
-being retried; child cancellation types are not distinguished; and
-asynchronous activities, Nexus, visibility, memos, and workflow ID reuse
-policies are not simulated. An environment must be used from one system
+An asynchronous activity (`Activity.define_async`, or a stub registered
+with `Testing.mock_async_activity`) runs in-process too. An attempt that
+returns `Will_complete_async` stays pending until the test finishes the
+handle the callback handed off, through the ordinary
+`Activity.Async_handle` functions: `complete` resolves the activity, `fail`
+fails the attempt (retried under the policy with a new handle), `heartbeat`
+restarts the heartbeat timeout and reports a cancellation request, and
+`cancel` reports a requested cancellation. Its timeouts expire in virtual
+time while it is pending, so finish the handle before waiting on `result`:
+
+```ocaml
+let pending = ref None in
+let charge_stub =
+  Temporal.Testing.mock_async_activity charge (fun context _order ->
+      let handle = Temporal.Activity.Async_context.handle context in
+      pending := Some handle;
+      Temporal.Activity.Will_complete_async handle)
+in
+(* ... create the environment with charge_stub and start the workflow ... *)
+let* () = Temporal.Activity.Async_handle.complete (Option.get !pending) receipt in
+Temporal.Testing.result handle
+```
+
+`Testing.start` and `Testing.execute` take the `Client.start` options a test
+usually needs. `?memo` and `?search_attributes` are the run's start maps;
+upserts are merged into them and carried across continue-as-new, and
+`Testing.memo` and `Testing.search_attributes` read them back.
+`?id_conflict_policy` and `?id_reuse_policy` apply to a workflow ID that is
+running or closed, and a refused start returns the error
+`Client.already_started` recognizes (a child start applies its own reuse
+policy). `?execution_timeout` and `?run_timeout`, and a child's timeouts,
+expire in virtual time with an error whose `Error.timeout_type` is
+`` `Start_to_close ``; a run timeout is retried under `?retry_policy`.
+
+By default a workflow task failure (an exception or a `Defect`, `Codec`, or
+`Bridge` error) ends the run with that error, so `result` reports it at
+once. Create the environment with `~workflow_task_failure:`Retry` to keep the
+run open instead, as a server does: `result` returns the failure,
+`Testing.workflow_task_failure` reports it, queries answer from the state
+before the failing task, and signals queue up. After fixing what the
+workflow reads, `Testing.retry_workflow_tasks` replays the run's completed
+tasks against a fresh execution and delivers the failed one again:
+
+```ocaml
+let* env =
+  Temporal.Testing.create ~workflow_task_failure:`Retry ~workflows ~activities ()
+in
+let* handle = Temporal.Testing.start env order_workflow order in
+(match Temporal.Testing.result handle with
+ | Error _ -> assert (Temporal.Testing.workflow_task_failure handle <> None)
+ | Ok _ -> assert false);
+fix_the_bug ();
+let* () = Temporal.Testing.retry_workflow_tasks env in
+Temporal.Testing.result handle
+```
+
+The simulator is not a server. Schedule-to-start timeouts never expire, a
+workflow task timeout is only reported, task retries happen only when the
+test asks, and the replay does not check for nondeterminism; child
+cancellation types are not distinguished; and Nexus and visibility queries
+are not simulated. `Testing`'s interface lists every remaining difference.
+An environment must be used from one system
 thread. [`examples/testing`](../../examples/testing/example_workflow_test.ml)
 tests the example application's workflow this way, with both its real and a
 stubbed activity.

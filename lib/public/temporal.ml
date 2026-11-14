@@ -31,6 +31,7 @@ module Retry_policy = Retry_policy
 module Runtime = Runtime
 module Runtime_info = Runtime_info
 module Scope = Scope
+module Search_attribute = Search_attribute
 module Time = Time
 module Signal = Signal
 module Testing = Testing

@@ -795,6 +795,152 @@ let random_parent ~reordered =
 let random_workflows =
   [ plain (random_parent ~reordered:false); plain random_child_workflow ]
 
+(** {1 Continue-as-new options workflow (#1153)}
+
+    Frozen with the [corpus-v4-continue-as-new-options] capture. *)
+
+let continue_as_new_options_workflow_type = "corpus.continue_as_new_options"
+
+(** Command-only reference naming the successor without a recursive value. *)
+let continue_as_new_options_target =
+  Temporal.Workflow.remote ~name:continue_as_new_options_workflow_type
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string
+
+(** The successor's retry policy: three attempts, one-second backoff. *)
+let continue_as_new_options_policy =
+  match
+    Temporal.Retry_policy.make ~initial_interval:(Temporal.Duration.of_seconds 1L)
+      ~backoff_coefficient:2.0 ~maximum_interval:(Temporal.Duration.of_seconds 10L)
+      ~maximum_attempts:3 ()
+  with
+  | Ok policy -> policy
+  | Error error -> invalid_arg (Temporal.Error.message error)
+
+(** [corpus.continue_as_new_options]: ["first"] continues as new with
+    ["second"], setting every successor option that needs no registered
+    search attribute or versioned deployment: its own task queue named
+    explicitly, a 30 s run timeout, a 7 s task timeout, the three-attempt
+    retry policy, a replacement memo, and an explicitly empty
+    search-attribute map. ["second"] returns the recorded run and task
+    timeouts, retry attempts and memo value it observes. *)
+let continue_as_new_options_workflow =
+  Temporal.Workflow.define ~name:continue_as_new_options_workflow_type
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun input ->
+      let open Temporal.Result_syntax in
+      let* info = Temporal.Workflow.info () in
+      match input with
+      | "first" ->
+          let* memo = Temporal.Codec.encode Temporal.Codec.string "replaced" in
+          Temporal.Workflow.continue_as_new
+            ~task_queue:(Temporal.Workflow.Info.task_queue info)
+            ~run_timeout:(Temporal.Duration.of_seconds 30L)
+            ~task_timeout:(Temporal.Duration.of_seconds 7L)
+            ~retry_policy:continue_as_new_options_policy ~memo:[ ("corpus", memo) ]
+            ~search_attributes:[] continue_as_new_options_target "second"
+      | "second" ->
+          let* metadata = Temporal.Workflow.start_metadata () in
+          let* memo =
+            match Option.bind metadata.memo (List.assoc_opt "corpus") with
+            | None -> Ok "-"
+            | Some payload -> Temporal.Codec.decode Temporal.Codec.string payload
+          in
+          let milliseconds = function
+            | None -> "-"
+            | Some value -> Int64.to_string (Temporal.Duration.to_ms value)
+          in
+          Ok
+            (Printf.sprintf "OPTIONS:%s/%s/%s/%s"
+               (milliseconds (Temporal.Workflow.Info.run_timeout info))
+               (milliseconds (Temporal.Workflow.Info.task_timeout info))
+               (match Temporal.Workflow.Info.retry_policy info with
+               | None -> "-"
+               | Some policy -> string_of_int (Temporal.Retry_policy.maximum_attempts policy))
+               memo)
+      | input ->
+          Error
+            (Temporal.Error.defect
+               ~message:(Printf.sprintf "unexpected continue-as-new options input %S" input)))
+
+(** {1 Cron schedule and start delay workflow (#1158)}
+
+    Frozen with the [corpus-v5-cron-start-delay] capture. *)
+
+let cron_start_delay_workflow_type = "corpus.cron_start_delay"
+
+(** [corpus.cron_start_delay]: completes at once with
+    ["CRON:<schedule>/<backoff>/<initiator>"], where [<schedule>] is the
+    recorded cron schedule, [<backoff>] is ["delayed"] when Temporal held the
+    first workflow task, and [<initiator>] is ["cron"] for a run a cron
+    schedule started; each is ["-"] when absent. The output depends only on
+    history, so it is identical under replay. *)
+let cron_start_delay_workflow =
+  Temporal.Workflow.define ~name:cron_start_delay_workflow_type
+    ~input:Temporal.Codec.string ~output:Temporal.Codec.string (fun _input ->
+      let open Temporal.Result_syntax in
+      let* info = Temporal.Workflow.info () in
+      let module Info = Temporal.Workflow.Info in
+      Ok
+        (Printf.sprintf "CRON:%s/%s/%s"
+           (Option.value (Info.cron_schedule info) ~default:"-")
+           (match Info.first_workflow_task_backoff info with
+           | None -> "-"
+           | Some _ -> "delayed")
+           (match Info.continuation_initiator info with
+           | Some `Cron_schedule -> "cron"
+           | Some (`Continue_as_new | `Retry) -> "other"
+           | None -> "-")))
+
+(** {1 Child start metadata workflows (#1135)}
+
+    Frozen with the [corpus-v6-child-start-metadata] capture. *)
+
+let child_metadata_parent_workflow_type = "corpus.child_metadata_parent"
+let child_metadata_child_workflow_type = "corpus.child_metadata_child"
+
+(** The keyword search attribute the parent sets on its child. The capture
+    script registers it in the capture namespace before this generation
+    runs, because Temporal rejects an unknown attribute. *)
+let child_metadata_keyword = Temporal.Search_attribute.keyword "CorpusChildKeyword"
+
+(** [corpus.child_metadata_child]: returns
+    ["METADATA:<memo>/<keyword>"], the memo [corpus] value and the keyword it
+    reads through [Workflow.start_metadata], each ["-"] when absent. The
+    output depends only on its start event, so it is identical under
+    replay. *)
+let child_metadata_child_workflow =
+  Temporal.Workflow.define ~name:child_metadata_child_workflow_type
+    ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+      let open Temporal.Result_syntax in
+      let* metadata = Temporal.Workflow.start_metadata () in
+      let* memo =
+        match Option.bind metadata.memo (List.assoc_opt "corpus") with
+        | None -> Ok "-"
+        | Some payload -> Temporal.Codec.decode Temporal.Codec.string payload
+      in
+      let* keyword =
+        Temporal.Search_attribute.decode child_metadata_keyword
+          (Option.value metadata.search_attributes ~default:[])
+      in
+      Ok (Printf.sprintf "METADATA:%s/%s" memo (Option.value keyword ~default:"-")))
+
+(** [corpus.child_metadata_parent]: runs [corpus.child_metadata_child] with
+    the memo [corpus = "child-memo"] and [CorpusChildKeyword = "corpus"],
+    under a child ID derived from the parent's own workflow ID, and returns
+    the child's report. *)
+let child_metadata_parent_workflow =
+  Temporal.Workflow.define ~name:child_metadata_parent_workflow_type
+    ~input:Temporal.Codec.unit ~output:Temporal.Codec.string (fun () ->
+      let open Temporal.Result_syntax in
+      let* info = Temporal.Workflow.info () in
+      let* memo = Temporal.Codec.encode Temporal.Codec.string "child-memo" in
+      let* search_attributes =
+        Temporal.Search_attribute.encode
+          [ Temporal.Search_attribute.set child_metadata_keyword "corpus" ]
+      in
+      Temporal.Child_workflow.execute
+        ~id:(Temporal.Workflow.Info.workflow_id info ^ "-child")
+        ~memo:[ ("corpus", memo) ] ~search_attributes child_metadata_child_workflow ())
+
 (** {1 Reused fixture definitions} *)
 
 (** The corrected generation of [test/integration/temporal/task_failure]. The
@@ -870,6 +1016,10 @@ let definition_sets =
     ("corpus-v3-random", random_workflows);
     ( "negative-random-reordered",
       [ plain (random_parent ~reordered:true); plain random_child_workflow ] );
+    ("corpus-v4-continue-as-new-options", [ plain continue_as_new_options_workflow ]);
+    ("corpus-v5-cron-start-delay", [ plain cron_start_delay_workflow ]);
+    ( "corpus-v6-child-start-metadata",
+      [ plain child_metadata_parent_workflow; plain child_metadata_child_workflow ] );
   ]
 
 (** Set names in declaration order. *)

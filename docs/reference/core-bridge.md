@@ -124,6 +124,32 @@ one budget. It is the one selector whose success value is binary rather than
 JSON: a single serialized `temporal.api.history.v1.History` message, at most
 the payload safety limit, built by appending each page's re-encoded history.
 
+The describe and count selectors (`DESCRIBE` 14 and `COUNT` 15, #1152) are
+additive in the same way and have no synchronous symbol either. `DESCRIBE`
+takes the run document of
+[`client-describe-request.schema.json`](../schemas/bridge/client-describe-request.schema.json)
+and succeeds with the reduced, closed document of
+[`client-describe-response.schema.json`](../schemas/bridge/client-describe-response.schema.json);
+`COUNT` takes
+[`client-count-request.schema.json`](../schemas/bridge/client-count-request.schema.json)
+and succeeds with
+[`client-count-response.schema.json`](../schemas/bridge/client-count-response.schema.json).
+Both are single bounded RPCs (10 s by default) whose Rust task owns only a
+connection clone and the decoded request, like every other submitted call.
+
+The signal-with-start and update-with-start selectors (`SIGNAL_WITH_START`
+16 and `UPDATE_WITH_START` 17, #1151) are additive in the same way and have
+no synchronous symbol. Each embeds the start document under `start`
+([signal-with-start](../schemas/bridge/client-signal-with-start-request.schema.json),
+[update-with-start](../schemas/bridge/client-update-with-start-request.schema.json)).
+`SIGNAL_WITH_START` succeeds with the start's accepted/rejected/unknown
+outcome document; `UPDATE_WITH_START` succeeds with
+[the update-with-start outcome](../schemas/bridge/client-update-with-start-outcome.schema.json),
+whose accepted form adds the update result. Both hold a start slot and share
+the start's `request_id` deduplication while in flight, and their Rust task
+owns only a connection clone and the decoded request, like every other
+submitted call.
+
 The canonical header is
 `rust/core-bridge/include/ocaml_temporal_core.h`. Both Rust and C compile-time
 assertions protect the status width, every numeric status value, and field
@@ -250,13 +276,14 @@ supervisor cycles under GC pressure. A concurrent stress runs graphs on several 
 and shared runtimes, and an OCaml test closes runtimes across Domains while
 their owners are inside native calls.
 
-There is one normal-start compatibility default in the initializer: Temporal
-Core maps the server's `first_workflow_task_backoff` to
-`cron_schedule_to_schedule_interval`, and Temporal Server sends an explicit
-zero duration for an ordinary non-cron start. The bridge accepts exactly that
-zero value because it carries no scheduling meaning. A non-zero duration (or a
-cron schedule) remains `Unsupported` until the semantic protocol models the
-delay explicitly.
+Temporal Core maps the server's `first_workflow_task_backoff` to
+`cron_schedule_to_schedule_interval`; Temporal Server sends an explicit zero
+duration for an ordinary start and a non-zero one for a start delay, a cron
+schedule's wait, or continuation throttling. The bridge carries the exact
+duration as `first_workflow_task_backoff` and a non-empty
+`InitializeWorkflow.cron_schedule` as `cron_schedule` (#1158); neither is
+rejected, and the server has already applied the delay before the task is
+polled.
 
 After protocol decoding, the private pure-OCaml
 [`Native_execution`](native-execution-translation.md) adapter translates jobs
@@ -837,8 +864,12 @@ one seam: Core moves out of the per-instance graph into a reference-counted
   fallback. Both clear the slot first and are idempotent on a null slot.
 - `ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(worker_threads,
   input, input_len, &shared, out)` (#500) is `shared_runtime_new` plus a
-  strict telemetry document of at most 16 KiB; the plain constructor now
-  delegates to it with `{}`. The only member today is optional
+  strict telemetry document of at most 256 KiB (large enough for sixteen
+  maximal OTLP headers); the plain constructor now
+  delegates to it with `{}`. It is described by
+  [`runtime-telemetry.schema.json`](../schemas/bridge/runtime-telemetry.schema.json)
+  and has two optional members, of which at most one may be present: `otlp`
+  (see below) and
   `prometheus`: `{"bind_address": "<ip>:<port>", "global_tags":
   [{"name": ..., "value": ...}], "counters_total_suffix": bool,
   "unit_suffix": bool, "durations_as_seconds": bool}` (the tag list and the
@@ -936,6 +967,54 @@ one seam: Core moves out of the per-instance graph into a reference-counted
   `temporalio-common`'s `prometheus` feature, which adds only the
   Apache-2.0 `prometheus` crate (see [dependencies](../dependencies.md)).
 
+  OTLP push export (#1161). The `otlp` member is `{"endpoint": URL,
+  "protocol": "grpc" | "http_protobuf", "headers": [{"name": ...,
+  "value": ...}], "period_ms": N, "temporality": "cumulative" | "delta",
+  "global_tags": [...], "durations_as_seconds": bool}`; every member but
+  `endpoint` defaults to Core's default (gRPC, no headers, 1000 ms,
+  cumulative, no tags, `false`), and the OCaml encoder writes them all.
+  `src/otlp.rs` validates it with the same rules as
+  `Temporal_base.Metrics_config.otlp`: the endpoint grammar (lowercase
+  `http://` or `https://`, a DNS, canonical dotted-quad IPv4 or bracketed
+  IPv6 host whose last DNS label is not all digits, optional port 1..65535,
+  no user information, fragment, or byte outside `!`..`~`, at most 2048
+  bytes), at most 16 headers with lowercase `[a-z0-9_.-]` names up to 64
+  bytes that are unique, not `-bin`, not `grpc-*` and not a
+  transport-owned name, values of 1..4096 printable ASCII bytes without
+  outer spaces, and a period of 100 ms to 1 hour; global tags follow the
+  Prometheus rules. Messages name only the violated rule, never the
+  endpoint or a header value, and `OtlpHeader`'s `Debug` prints
+  `<redacted>` for the value. After Core is built, `start_otlp` calls
+  Core's `build_otlp_metric_exporter` inside Core's Tokio context (tonic
+  spawns its lazily connecting channel worker there) and with Core's log
+  subscriber as the thread's default (Core captures it to log failed
+  exports); any builder error or panic becomes the constant
+  `CONFIGURATION` message "could not start the OTLP metrics exporter". No
+  connection is made, and the bound address reported is empty.
+
+  Exporter ownership. Core's meter owns its OpenTelemetry meter provider,
+  whose periodic-reader thread exports until the provider is dropped, and
+  dropping it makes one final export. Core, every client and worker, and
+  every SDK `MetricMeter` (freed only by OCaml's GC) clone the meter they
+  are given, so the bridge keeps the only strong reference in the
+  `OtlpExporter` guard (the `Otlp` variant of `MetricsExporter`, the first
+  field of `SharedCore`) and hands out `DetachableMeter`s that borrow it
+  under an `RwLock` for each instrument creation. Dropping the guard empties
+  the slot under the write lock and drops the meter outside it, on the
+  thread releasing Core and before Core's Tokio runtime, which the gRPC
+  final export needs. OpenTelemetry waits at most 5 s for that export; one
+  still running ends with the exporter's timeout (10 s by default) on the
+  reader thread, or for gRPC as soon as Core's runtime is dropped next. A
+  panic in that shutdown is contained and logged through Core's log
+  pipeline. Instruments created before release keep recording into the
+  detached pipeline; instruments created afterwards are Core's no-op
+  instruments, and `extend_attributes` then returns the existing
+  attributes unchanged rather than letting the no-op meter assert on
+  OpenTelemetry attributes. Recording goes straight to the instruments and
+  never takes the lock. `rust/core-bridge/tests/otlp_exporter.rs` checks
+  both transports against loopback collector doubles, the final export,
+  the failure log, and header redaction.
+
 Ownership rules. Each graph still has exactly one owner (its supervisor's
 owner Domain) and one release path; supervisors never share mutable native
 state, so "one supervisor actor per SDK instance owns its graph" still holds,
@@ -963,8 +1042,66 @@ that drop happens decides what stays bounded:
 - A worker attached to a shared `Runtime.t` holds only one reference. Its
   graph's close drops that reference and returns, and the worker detaches.
   The final drop happens in `Runtime.shutdown`, through
-  `Sdk_shared_runtime.shutdown` and the shared release, which waits for it
-  without a bound. `Runtime.shutdown` can therefore hang in this case.
+  `Sdk_shared_runtime.shutdown` and the shared release.
+
+Both explicit waits for a cleanup thread are bounded (#1149). This keeps the
+supervisor Domain and `Runtime.shutdown` bounded even while the drop itself
+waits.
+
+- `runtime_free` waits at most `RUNTIME_CLOSE_TIMEOUT`: the worker drain and
+  finalize bounds plus 30 s, that is 150 s.
+- `shared_runtime_free` waits at most `SHARED_RUNTIME_RELEASE_TIMEOUT`, 30 s.
+
+A wait that ends at its bound returns `STATUS_DETACHED` (16). By then the
+handle is already closed and its reference already transferred, so the
+cleanup thread still owns the drop and finishes it once the blocking-pool
+thread exits. Nothing is leaked or dropped twice.
+
+On the OCaml side the status is `Native_bridge.Detached`.
+`Runtime.shutdown` reports it as a `` `Bridge `` error that says the release
+continues in the background, and the runtime counts as shut down.
+
+An attached graph's own `runtime_free` can also return `DETACHED`, when its
+cleanup (for example a drain of outstanding tasks) outlives the 150 s bound
+while it still holds its Core reference. The supervisor then returns its
+shared-runtime lease with `Sdk_shared_runtime.release_detached` rather than
+`release`. Nothing reports when that cleanup ends, so the attachment does not
+keep blocking `Runtime.shutdown`. Instead the runtime records it, and
+`Sdk_shared_runtime.shutdown` still releases the shared handle but returns
+the `Detached` status instead of `Ok ()`. Destroying the shared handle no
+longer proves Core is gone, so `Runtime.shutdown` reports the same
+`` `Bridge `` error rather than success. The
+`runtime_release_bound` tests reproduce the hazard directly: a closure that
+holds Core's blocking pool makes both releases return `DETACHED` at a short
+test bound while the cleanup thread still finishes the drop.
+
+The `real_processing_thread_detach` lifecycle tests keep Core's *real*
+workflow processing thread alive instead. A gRPC double hands a workflow
+worker one task, then fails every later workflow poll with gRPC's
+non-retryable "message larger than max" status. The workflow lane publishes
+that error and exits, and the run's activation, or the eviction that follows
+its failure, is never acknowledged. Core's default `ignore_evicts_on_shutdown`
+is false, so the thread never reaches its shutdown condition. The tests drive
+everything through the C ABI, for a worker with its own runtime and for one
+attached to a shared runtime. They show that this state cannot reach Core's
+finalizer through the bridge. Core reports `ShutDown` from a workflow poll
+only once the processing thread's stream has ended. The activity lane, which
+every workflow worker runs for local activities, sees `ShutDown` only after
+that. A drain that succeeds therefore means the thread is already exiting, so
+`finalize_bounded` never runs `finalize_shutdown` while the thread lives.
+Instead:
+
+- `worker_shutdown` times out at the drain bound (`WORKER`).
+- Disposal times out the same way, refuses finalization for the lost poll
+  lease, and drops the worker.
+- Dropping Core does not wait for the thread, which is a plain OS thread, not
+  blocking-pool work. `runtime_free` and `shared_runtime_free` therefore
+  return `OK` in well under a second once the shortened drain has elapsed.
+
+The `DETACHED` bounds stay as defence against any other blocking-pool work
+that outlives a release. In production the same scenario waits out the
+90-second drain bound twice: once in `Worker.shutdown`, whose teardown timeout
+then reports `Detached`, and once in disposal.
 
 The OCaml side adds a stricter, typed ordering rule on top of that memory
 safety. `Sdk_shared_runtime` (private) owns the `Native_bridge.shared_runtime`
@@ -1370,7 +1507,17 @@ and the Core runtime still returns. The
 `worker_shutdown_outcomes` ABI tests pin what each outcome becomes in
 `shutdown_worker`: a drain timeout or lane failure is `WORKER`, a panicked
 or detached finalizer is `WORKER` with its closed message, and abandoned
-leases are `OUTSTANDING_TASKS`. `worker_validation_cleanup` shows that
+leases are `OUTSTANDING_TASKS`. The `worker_shutdown_drain_timeout` test
+drives the same timeout end to end through the C ABI: a live worker
+connected to a gRPC double has its workflow lane replaced by one that never
+stops, so `worker_shutdown` returns `WORKER` with the drain-timeout message
+at the drain bound, keeps the worker in the graph with its ledger
+unfinalizable, and fails the same way when repeated; `runtime_free` then
+still returns `OK` through the last-resort path and releases Core. Both
+bounds are read from the worker (`PollLanes::shutdown_drain_bound` and
+`finalize_bound`), which is how that test shortens them; production always
+uses `WORKER_SHUTDOWN_DRAIN_TIMEOUT` and `WORKER_FINALIZE_TIMEOUT`.
+`worker_validation_cleanup` shows that
 releasing an unvalidated worker stops waiting at
 `UNVALIDATED_WORKER_RELEASE_TIMEOUT` (10 s) when the server never answers
 `ShutdownWorker`.

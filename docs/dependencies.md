@@ -11,7 +11,9 @@ metadata; it does not run the scanner. Cargo license scanning deliberately
 does not run in the compiler/architecture matrix or as a Makefile target.
 `make license-check` also audits the CI-only official Python SDK closure of
 the interoperability regression in the pinned Python image; see
-[CI-only interoperability tooling](#ci-only-interoperability-tooling).
+[CI-only interoperability tooling](#ci-only-interoperability-tooling). It
+applies the OPAM policy to the CI-only closure of the Eio integration example
+as well; see [CI-only Eio example dependencies](#ci-only-eio-example-dependencies).
 The Makefile's `quality` target is a separate contributor/CI gate for RustSec,
 unused-dependency, and spelling checks.
 
@@ -34,6 +36,7 @@ nor Docker.
 | [Per-compiler lock overrides](#per-compiler-lock-overrides) | The compiler series and package of each entry in `scripts/opam-lock-overrides.txt` |
 | [Linking-exception scope](#linking-exception-scope) | `ocaml`, `ocaml-base-compiler`, and `ocamlbuild` in `temporal-sdk.opam.locked`, and `tyxml`, `re`, and `camlp-streams` in `scripts/docs-tools.locked` |
 | [CI-only documentation tooling](#ci-only-documentation-tooling) | Every package and exact version in `scripts/docs-tools.locked`, which no licence gate audits |
+| [CI-only Eio example dependencies](#ci-only-eio-example-dependencies) | Every package in `scripts/eio-example.locked` |
 | [CI-only interoperability tooling](#ci-only-interoperability-tooling) | Every package in `test/integration/sdk_interop/python/requirements.lock` |
 | [Builder image tooling](#builder-image-tooling), [toolchain and CI images](#toolchain-and-ci-images), and [local integration service images](#local-integration-service-images) | The repository of every digest-pinned image reference in `Dockerfile.dev`, `docker/ocaml-*/Dockerfile`, `Dockerfile.rust-ci`, `test/integration/temporal/compose.yaml`, and the GitHub workflows and composite actions |
 | [Locked Cargo closure](#locked-cargo-closure) | The Temporal Core revision in `rust/Cargo.toml` |
@@ -70,8 +73,14 @@ versions and ordinary LGPL packages remain prohibited.
 `CC0-1.0+` metadata. CC0 is permissive; the exception is package- and
 version-specific rather than a general substring match.
 
-The `base-*` entries below are virtual packages shipped by the OCaml compiler
-distribution. Their OPAM records contain no independent source or license, so
+`bigstringaf.0.10.0`, a CI-only dependency of the
+[Eio example](#ci-only-eio-example-dependencies), declares `BSD-3-clause`.
+SPDX license identifiers match case-insensitively, so this is BSD-3-Clause,
+the license of the upstream project. The checker admits that spelling only
+for this exact package and version.
+
+The `base-*` entries below, and `seq.base` in the CI-only tool locks, are
+virtual packages shipped by the OCaml compiler distribution. Their OPAM records contain no independent source or license, so
 the checker recognizes only these exact package names at version `base` and
 attributes them to the reviewed compiler distribution.
 
@@ -178,6 +187,52 @@ Packages the docs stage reuses from the SDK lock (`dune`, `ocamlfind`,
 | tyxml | 4.6.0 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | HTML generation (see [linking-exception scope](#linking-exception-scope)) |
 | re | 1.14.0 | LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception | Regular expressions used by tyxml (see [linking-exception scope](#linking-exception-scope)) |
 | camlp-streams | 5.0.1 | LGPL-2.1-only WITH OCaml-LGPL-linking-exception | Stream compatibility library used by odoc-parser (see [linking-exception scope](#linking-exception-scope)) |
+
+## CI-only Eio example dependencies
+
+The [Eio integration example](../examples/README.md#use-the-sdk-from-an-eio-program)
+(#1141) shows how an Eio program calls the blocking client and hosts a worker.
+It needs `eio` and `eio_posix`, whose exact closure is
+`scripts/eio-example.locked`. The `examples-eio` stage of `Dockerfile.dev`
+and the native macOS lane install it with `scripts/opam-tool-lock.sh` on top
+of the locked SDK closure. That script fails if opam adds or moves any
+package the tool lock does not list, including a locked SDK dependency, and
+then re-checks the SDK closure. None of these packages is an SDK dependency:
+they are absent from `temporal-sdk.opam` and its lock, are used only by
+`examples/eio` (whose Dune stanza is enabled only by `TEMPORAL_EIO_EXAMPLE`),
+and are not linked into or redistributed with any SDK artifact. The macOS lane
+installs them only after its SDK library artifact has been verified and
+uploaded. Packages the example reuses from the SDK lock (`dune`, `mtime`,
+`ocamlfind`, and `topkg`) are listed only in the locked OCaml closure;
+`dune-configurator` is pinned to the locked `dune` release so the install
+cannot move it. Installing `fmt` makes opam rebuild the locked `logs` with
+its optional `fmt` support in that image or lane; its version, and every SDK
+artifact built without the tool lock, are unchanged. The closure was solved for OCaml 5.5, the compiler of the live
+smoke executables.
+
+Unlike the documentation tools, every package here meets the SDK's own OPAM
+policy, so `make license-check` audits each locked version exactly as it
+audits the SDK lock, and this table records only the names. The closure is
+not `eio_main`, which would add the Linux `io_uring` backend's packages; the
+example runs `Eio_posix` directly. Lwt is not used.
+
+| Package | License | Role |
+|---|---|---|
+| eio | ISC | Effect-based direct-style I/O API: fibers, switches, promises and `Eio_unix.run_in_systhread` |
+| eio_posix | ISC | Eio's POSIX backend, which runs the example's event loop |
+| bigstringaf | BSD-3-Clause | Bigstring primitives used by Eio's buffered readers and writers (metadata spells `BSD-3-clause`; see [Policy](#policy)) |
+| cstruct | ISC | Buffer slices used by Eio's I/O interfaces |
+| domain-local-await | ISC | Cross-Domain blocking used by Eio |
+| thread-table | ISC | Thread-indexed table used by domain-local-await |
+| fmt | ISC | Formatting utilities |
+| hmap | ISC | Heterogeneous maps for Eio's fiber-local values |
+| iomux | ISC | `poll`/`ppoll` bindings for the POSIX backend |
+| lwt-dllist | MIT | Doubly linked lists for Eio's switches; the Lwt runtime is not used |
+| optint | ISC | Integer type used by Eio's file offsets |
+| psq | ISC | Priority search queues for Eio's timer queue |
+| csexp | MIT | Canonical S-expressions used by dune-configurator |
+| dune-configurator | MIT | Build-time C configuration for bigstringaf; pinned to the locked dune release |
+| seq | compiler virtual package | No independent source; part of OCaml distribution |
 
 ## CI-only interoperability tooling
 
@@ -308,6 +363,7 @@ and `make license-check` audits them alongside the lock.
 | OCaml series | Package | License | Reason |
 |---|---|---|---|
 | 5.5 | ocamlfind | MIT | `ocamlfind.1.9.8` declares `ocaml < 5.5.0~`; build-only tool reached through topkg and not linked into the SDK |
+| 5.6 | ocamlfind | MIT | Same reason, for the non-blocking 5.6 readiness lane (#1164); `1.9.9~preview` has no upper OCaml bound |
 
 ## Toolchain and CI images
 
@@ -393,12 +449,43 @@ Some crates are locked at more than one version because different packages in
 the graph require incompatible releases. The client, common, and SDK-Core
 dependencies disable their default features: `temporalio-client` enables
 `core-based-sdk` and `tls-ring`, `temporalio-sdk-core` enables `tls-ring`, and
-`temporalio-common` enables only `prometheus`. That feature backs the opt-in
-Prometheus metrics endpoint of a shared `Temporal.Runtime` (#500). It adds one
-package, `prometheus` 0.14.0 (Apache-2.0, default features off), and activates
-Core's existing `hyper`, `hyper-util`, and `http-body-util` dependencies for
-the scrape server; all three were already locked through Core's gRPC
-transport. Core's `otel` feature (OTLP export) stays disabled. `temporalio-protos` uses its
+`temporalio-common` enables `otel` and `prometheus`. `prometheus` backs the
+opt-in Prometheus metrics endpoint of a shared `Temporal.Runtime` (#500). It
+adds one package, `prometheus` 0.14.0 (Apache-2.0, default features off), and
+activates Core's existing `hyper`, `hyper-util`, and `http-body-util`
+dependencies for the scrape server; all three were already locked through
+Core's gRPC transport.
+
+`otel` backs the opt-in OTLP metrics exporter (#1161); only the
+`temporalio-common` feature is enabled, not `temporalio-sdk-core`'s, which
+adds nothing the bridge uses. It adds no package to `rust/Cargo.lock`: the
+OpenTelemetry crates, `reqwest` and their dependencies were already locked
+(and therefore already licence-audited), because Cargo's lock records the
+optional dependencies of locked packages whether or not a feature enables
+them, and the lock diff is two dependency edges
+(`opentelemetry_sdk` on the already-locked `tokio` and `tokio-stream`,
+`temporalio-common` on `opentelemetry` and `opentelemetry_sdk`). It does
+enlarge what is compiled and linked. On the macOS host build, 16 locked
+crates become compiled: `opentelemetry`, `opentelemetry_sdk`,
+`opentelemetry-otlp`, `opentelemetry-proto`, `opentelemetry-http` (all
+Apache-2.0), `reqwest` and `rustls-platform-verifier` (MIT OR Apache-2.0),
+`hyper-rustls` (Apache-2.0 OR ISC OR MIT), `tower-http` and `tonic-types`
+(MIT), `ipnet`, `rand` 0.9, `rand_chacha` 0.9, `rand_core` 0.9 and
+`ppv-lite86` (MIT OR Apache-2.0), and `zerocopy` (BSD-2-Clause OR Apache-2.0
+OR MIT). Across all targets (`cargo tree --target all`) the set is 38 crates;
+the others are platform-specific dependencies of the platform certificate
+verifier and `reqwest` (`jni*`, `wasm-bindgen*`, `js-sys`, `web-sys`,
+`webpki-root-certs` under CDLA-Permissive-2.0, `walkdir`, `same-file` and
+`winapi-util` under Unlicense OR MIT, `bumpalo`, `combine`, `simd_cesu8`,
+`simdutf8`, `portable-atomic`, `rustls-platform-verifier-android`, and
+`zerocopy-derive`), every one permissive and already in the audited lock.
+On macOS arm64 the release-profile bridge `cdylib`, a proxy for the code a
+linked executable keeps, grew from 20.0 MiB to 22.4 MiB (about 12%) when the
+feature was enabled (#1161); the `staticlib` archive, which also carries
+code the linker later drops, grew from 175 MiB to 192 MiB.
+`opentelemetry` is compiled without its `internal-logs` feature, so
+OpenTelemetry's internal diagnostics, which can print request metadata, are
+not compiled in. `temporalio-protos` uses its
 default feature set. The project bridge is Apache-2.0 and
 emits `staticlib` and `cdylib` artifacts for the native boundary plus an
 internal `rlib` for Rust integration tests.

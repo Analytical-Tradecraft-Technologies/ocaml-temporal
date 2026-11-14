@@ -11,7 +11,11 @@
 type t
 
 (** Creates a scope for the workflow execution currently running on this
-    Domain. Outside workflow execution this returns a typed defect. *)
+    Domain. Outside workflow execution, and in a read-only update validator
+    or query handler, this returns a typed defect. Such a callback may still
+    read the status of an existing scope with {!is_cancelled} and {!check},
+    but {!cancel}, {!on_cancel} and {!await} return their ownership defect
+    there, as outside the owning scheduler. *)
 val create : unit -> (t, Error.t) result
 
 (** Creates a scope, runs [body], and cancels the scope during cleanup. The

@@ -31,7 +31,10 @@ enum {
   OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED = 14,
   /* A bounded client-operation registry is full; the request was not admitted
      and may be retried after another in-flight operation finishes. */
-  OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED = 15
+  OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED = 15,
+  /* An explicit runtime_free or shared_runtime_free outlived its bound; the
+     handle is closed and the cleanup thread finishes the release (#1149). */
+  OCAML_TEMPORAL_CORE_STATUS_DETACHED = 16
 };
 
 /* Rust-owned byte allocation. `{ NULL, 0 }` is the sole empty representation. */
@@ -137,12 +140,16 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_new(
 
 /*
  * shared_runtime_new plus an opt-in telemetry document (#500). `input` is a
- * strict UTF-8 JSON object of at most 16 KiB; `{}` configures no exporter and
+ * strict UTF-8 JSON object of at most 256 KiB; `{}` configures no exporter,
  * `{"prometheus":{"bind_address":"127.0.0.1:9464",...}}` serves Core's
- * metrics for scraping until Core is destroyed. Invalid input or an unusable
- * address returns OCAML_TEMPORAL_CORE_STATUS_CONFIGURATION and leaves
- * `*shared` NULL. On success the result value is the bound socket address as
- * UTF-8 text (empty without an exporter).
+ * metrics for scraping until Core is destroyed, and
+ * `{"otlp":{"endpoint":"http://127.0.0.1:4317",...}}` pushes them to an OTLP
+ * collector until Core is destroyed, with one final export then (#1161). At
+ * most one exporter may be configured. Invalid input or an unusable address
+ * returns OCAML_TEMPORAL_CORE_STATUS_CONFIGURATION and leaves `*shared` NULL;
+ * no message echoes an OTLP header value. On success the result value is the
+ * bound Prometheus socket address as UTF-8 text (empty without an exporter
+ * and for OTLP).
  */
 ocaml_temporal_core_status
 ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json(
@@ -287,7 +294,23 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_wait_workflow_json(
  * (default 30 s, #1210). The bridge follows every page and
  * its success value is binary, not JSON: one serialized
  * temporal.api.history.v1.History message of at most the payload safety
- * limit, the form Temporal.Replay.History.of_protobuf accepts. */
+ * limit, the form Temporal.Replay.History.of_protobuf accepts.
+ * DESCRIBE and COUNT have no synchronous symbol either (#1152). DESCRIBE's
+ * document is {"namespace","workflow_id","run_id"} (an empty run ID selects
+ * the current run) with optional "rpc_timeout_ms" (default 10 s); its
+ * success value is the reduced describe document of
+ * docs/schemas/bridge/client-describe-response.schema.json. COUNT's document
+ * is {"namespace","query"} with optional "rpc_timeout_ms" (default 10 s); its
+ * success value is {"count":<n>}.
+ * SIGNAL_WITH_START and UPDATE_WITH_START have no synchronous symbol either
+ * (#1151). Both embed the START document unchanged as "start", whose
+ * "rpc_timeout_ms" bounds the whole call. SIGNAL_WITH_START adds
+ * "signal_name" and "signal_input" (a payload array), rejects the "fail"
+ * conflict policy, and succeeds with START's accepted/rejected/unknown
+ * outcome document. UPDATE_WITH_START adds "update_id", "update_name" and
+ * "update_input" (default budget 30 s) and succeeds with the outcome
+ * document of docs/schemas/bridge/client-update-with-start-outcome.schema.json:
+ * START's outcome whose "accepted" form also carries the update result. */
 enum {
   OCAML_TEMPORAL_CORE_CLIENT_CALL_START = 1,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_WAIT = 2,
@@ -301,7 +324,11 @@ enum {
   OCAML_TEMPORAL_CORE_CLIENT_CALL_VISIBILITY = 10,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_COMPLETION = 11,
   OCAML_TEMPORAL_CORE_CLIENT_CALL_ASYNC_ACTIVITY_HEARTBEAT = 12,
-  OCAML_TEMPORAL_CORE_CLIENT_CALL_HISTORY = 13
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_HISTORY = 13,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_DESCRIBE = 14,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_COUNT = 15,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_SIGNAL_WITH_START = 16,
+  OCAML_TEMPORAL_CORE_CLIENT_CALL_UPDATE_WITH_START = 17
 };
 
 /* Submit one client RPC without waiting for Temporal (#807). Only the
@@ -545,7 +572,9 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_client_disconnect(
 /*
  * Destroy a runtime and clear the caller's slot. Calling this again with the
  * same now-null slot is safe. The runtime defensively finalizes a remaining
- * worker and drops its client in reverse ownership order before Core.
+ * worker and drops its client in reverse ownership order before Core. The
+ * wait is bounded (150 s); a longer disposal returns
+ * OCAML_TEMPORAL_CORE_STATUS_DETACHED and finishes on the cleanup thread.
  */
 ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_free(
     ocaml_temporal_core_runtime **runtime);
@@ -560,8 +589,10 @@ ocaml_temporal_core_status ocaml_temporal_core_v4_runtime_dispose(
 /*
  * Release a shared-runtime handle, clear the slot, and wait until its Core
  * reference is dropped. Core is destroyed here only if no attached graph
- * remains; otherwise the last graph's release destroys it. Calling again
- * with the now-null slot is safe.
+ * remains; otherwise the last graph's release destroys it. The wait is
+ * bounded (30 s); a longer drop returns OCAML_TEMPORAL_CORE_STATUS_DETACHED
+ * and finishes on the cleanup thread. Calling again with the now-null slot
+ * is safe.
  */
 ocaml_temporal_core_status ocaml_temporal_core_v4_shared_runtime_free(
     ocaml_temporal_core_shared_runtime **shared);
@@ -666,6 +697,8 @@ static_assert(OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED == 14,
               "status numbering is part of the ABI");
 static_assert(OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED == 15,
               "status numbering is part of the ABI");
+static_assert(OCAML_TEMPORAL_CORE_STATUS_DETACHED == 16,
+              "status numbering is part of the ABI");
 static_assert(offsetof(ocaml_temporal_core_buffer, ptr) == 0,
               "buffer pointer must be the first field");
 static_assert(offsetof(ocaml_temporal_core_buffer, len) == sizeof(void *),
@@ -716,6 +749,8 @@ _Static_assert(OCAML_TEMPORAL_CORE_STATUS_RETRYABLE == 13,
 _Static_assert(OCAML_TEMPORAL_CORE_STATUS_ASYNC_HEARTBEAT_REJECTED == 14,
                "status numbering is part of the ABI");
 _Static_assert(OCAML_TEMPORAL_CORE_STATUS_RESOURCE_EXHAUSTED == 15,
+               "status numbering is part of the ABI");
+_Static_assert(OCAML_TEMPORAL_CORE_STATUS_DETACHED == 16,
                "status numbering is part of the ABI");
 _Static_assert(offsetof(ocaml_temporal_core_buffer, ptr) == 0,
                "buffer pointer must be the first field");

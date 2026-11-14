@@ -1,0 +1,133 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-11-13T07:46:15.085709836Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048716",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "corpus.cron_start_delay"
+        },
+        "taskQueue": {
+          "name": "ocaml-temporal-history-corpus",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImNyb24i"
+            }
+          ]
+        },
+        "workflowTaskTimeout": "10s",
+        "continuedExecutionRunId": "01a1d3df-0dc6-7300-8649-fadb8dca738a",
+        "initiator": "CONTINUE_AS_NEW_INITIATOR_CRON_SCHEDULE",
+        "lastCompletionResult": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "IkNST046QGV2ZXJ5IDJzL2RlbGF5ZWQvLSI="
+            }
+          ]
+        },
+        "originalExecutionRunId": "04a29d1b-0820-41b4-b0ab-0a5eff759a4f",
+        "firstExecutionRunId": "01a1d3df-0dc6-7300-8649-fadb8dca738a",
+        "attempt": 1,
+        "cronSchedule": "@every 2s",
+        "firstWorkflowTaskBackoff": "2s",
+        "prevAutoResetPoints": {
+          "points": [
+            {
+              "buildId": "ocaml-temporal",
+              "runId": "01a1d3df-0dc6-7300-8649-fadb8dca738a",
+              "firstWorkflowTaskCompletedId": "4",
+              "createTime": "2026-11-13T07:46:15.085619503Z",
+              "expireTime": "2026-11-14T07:46:15.085709836Z",
+              "resettable": true
+            }
+          ]
+        },
+        "workflowId": "history-corpus-cron"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-11-13T07:46:17.090356379Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048723",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "ocaml-temporal-history-corpus",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-11-13T07:46:17.098323670Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048726",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "history-corpus-corpus-v5-cron-start-delay",
+        "requestId": "6a9c0ada-adcc-403b-a162-ed620e69dad5",
+        "historySizeBytes": "499",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        }
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-11-13T07:46:17.109756295Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048730",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "history-corpus-corpus-v5-cron-start-delay",
+        "workerVersion": {
+          "buildId": "ocaml-temporal"
+        },
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            3,
+            2,
+            1
+          ],
+          "sdkName": "temporal-ocaml",
+          "sdkVersion": "0.1.0-rc.1"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-11-13T07:46:17.109807254Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1048731",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "IkNST046QGV2ZXJ5IDJzL2RlbGF5ZWQvY3JvbiI="
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "4",
+        "newExecutionRunId": "b375792e-36b3-4a72-8877-4bd9de348991"
+      }
+    }
+  ]
+}

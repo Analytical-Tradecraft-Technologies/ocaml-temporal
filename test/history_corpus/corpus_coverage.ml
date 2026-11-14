@@ -94,6 +94,17 @@ let table =
     (* Deterministic uuid4, random_bytes and random_float draws (#1155),
        captured by corpus-v3-random. *)
     replayed "deterministic-randomness";
+    (* Continue-as-new successor options (#1153), captured by
+       corpus-v4-continue-as-new-options. *)
+    replayed "continue-as-new-options";
+    (* Delayed starts and cron chains (#1158), captured by
+       corpus-v5-cron-start-delay. *)
+    replayed "start-delay";
+    replayed "cron-schedule";
+    replayed "cron-successor";
+    (* Child memo and search attributes (#1135), captured by
+       corpus-v6-child-start-metadata. *)
+    replayed "child-start-metadata";
     (* Remote activities. *)
     replayed "activity";
     replayed "activity-retry";

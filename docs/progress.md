@@ -6868,3 +6868,250 @@ bounds its reserve wait and its connect to Core by the same
 and `test/runtime/test_native_worker_metrics.ml` cover release, reactivation,
 refusals and the all-or-nothing rollback against a real scrape. See
 [SDK metric registration limits](reference/observability.md#sdk-metric-registration-limits).
+
+## 2026-11-13: Describe one run and count executions
+
+`Client.describe` returns a snapshot of the run a handle addresses without
+waiting for it: identity, type, task queue, the visibility status vocabulary,
+start and close times, history length, memo, search attributes, and pending
+activities and child workflows. `Client.count` counts the executions a
+visibility query matches (#1152). Both are submitted calls on the new
+`DESCRIBE` (14) and `COUNT` (15) selectors. `tests/describe_count.rs` covers
+them against a gRPC double, and the `describe_count` live regression checks
+them against Temporal Server. See [describe and
+count](reference/client-protocol.md#describe-one-run-and-count-executions-1152).
+
+## 2026-11-13: Signal-with-start and update-with-start
+
+`Client.signal_with_start` and `Client.update_with_start` deliver a typed
+signal or update to a workflow, starting it first when its workflow ID has no
+open run, as one atomic Temporal operation each (#1151). Both take every
+`start` option. Signal-with-start offers only the `Use_existing` (default) and
+`Terminate_existing` conflict policies, because Temporal rejects `FAIL` for
+it. Update-with-start sends `ExecuteMultiOperation [StartWorkflow,
+UpdateWorkflow]` and returns the run handle beside the update's own
+`start_update`-shaped result, so a validator rejection still reports the run
+that was started. They use the new `SIGNAL_WITH_START` (16) and
+`UPDATE_WITH_START` (17) selectors, whose documents embed the start document
+unchanged and share the start slots and request-ID deduplication.
+`tests/with_start.rs` covers them against a gRPC double. The `with_start` live
+regression checks every exact run ID against Temporal Server, including a
+signal recorded before the run's first workflow task. A Python SDK
+counterpart in `sdk_interop` remains open. See [signal-with-start and
+update-with-start](reference/client-protocol.md#signal-with-start-and-update-with-start-1151).
+
+## 2026-11-13: Typed search attributes and memo upserts
+
+`Temporal.Search_attribute` pairs a registered search-attribute name with its
+indexed type (text, keyword, int64, double, bool, datetime, keyword list), so
+`encode` writes the `json/plain` payload and `type` metadata Temporal Server
+decodes and `decode` reads a value back from `Workflow.start_metadata` or
+`Client.describe` (#1154). `Workflow.upsert_typed_search_attributes` applies
+typed `set`/`unset` updates; the raw payload-list parameters are unchanged and
+remain the escape hatch. `Workflow.upsert_memo` emits Core's
+`ModifyWorkflowProperties` through a new `modify_workflow_properties` protocol
+command. Core reuses the start memo on continue-as-new, so the runtime tracks
+the merged memo and sends it in the continue-as-new command's new `memo`
+field after an upsert. `Temporal.Testing` merges both kinds of upsert and
+exposes `Testing.memo` and `Testing.search_attributes`. The
+`search_attributes` live regression finds a run by a visibility query on its
+typed keyword and int, decodes every type from `describe`, replays the
+recorded upserts, and checks the merged memo across continue-as-new. Child
+starts (#1135) and continue-as-new options (#1153) do not take memo or search
+attributes yet.
+
+## 2026-11-13: Continue-as-new successor options
+
+`Workflow.continue_as_new` takes optional `?task_queue`, `?run_timeout`,
+`?task_timeout`, `?retry_policy`, `?memo`, `?search_attributes` and the
+experimental `?initial_versioning_behavior` (#1153). Each crosses the
+activation command, the semantic protocol and the Rust conversion to the
+matching Core `ContinueAsNewWorkflowExecution` field. An unset option is left
+out of the JSON document and unset in Core, so a call without options emits
+the exact command of earlier releases and existing histories replay
+unchanged. The public layer applies the `Client.start` timeout rules, also
+checking the run timeout against the chain's recorded execution timeout. An
+invalid option fails only the workflow task with a typed `Defect`. An
+explicit `~memo` replaces the merged memo of #1154, and `~search_attributes:[]`
+clears the successor's search attributes. Continue-as-new is rejected inside
+update validators and query handlers. `Temporal.Testing` carries set options
+to the successor and later runs. The `continue_as_new_options` live
+regression routes a successor to another task queue with new timeouts, retry
+policy, memo and search attributes, checks that the next run inherits them
+and that a short run timeout ends the last run as `Timed_out`, and replays
+the histories. Capture `live-2026-11-13-can-options` adds the history corpus
+entries. Child starts (#1135) still take no memo or search attributes.
+
+## 2026-11-13: Cron schedules and delayed starts
+
+`Client.start` and `Client.signal_with_start` take `?cron_schedule` and
+`?start_delay` (#1158). The public client, the OCaml protocol encoder and
+Rust validate them identically: the delay must be positive, the schedule must
+be a non-empty identifier, and the two cannot be combined. They become
+Temporal's `cron_schedule` and `workflow_start_delay`, and Temporal parses
+the cron expression. `Client.update_with_start` offers neither, because
+Temporal refuses both on `ExecuteMultiOperation`. OCaml workers no longer
+reject cron schedules, cron-initiated runs or a non-zero root first-task
+backoff. The activation protocol now carries the recorded `cron_schedule`
+beside the exact `first_workflow_task_backoff`, and workflow code reads them
+through `Workflow.Info.cron_schedule` and
+`Workflow.Info.first_workflow_task_backoff`. `` `Cron_schedule `` is now an
+initiator that workflows observe. `Temporal.Testing` simulates neither. The
+`cron_start_delay` live regression covers delayed `start` and
+`signal_with_start`, client-started and official-CLI cron chains whose second
+run reports `` `Cron_schedule `` and its predecessor, a current-run wait that
+does not end on a chain, server rejection of an invalid expression, and
+replay. Capture `live-2026-11-13-cron` adds a delayed run and two cron runs
+to the history corpus. Child cron schedules, Temporal Schedules and access to
+a cron run's previous result remain unimplemented.
+
+## 2026-11-13: OTLP metrics export and the tracing decision
+
+`Runtime.Metrics.otlp ~endpoint ?headers ?period ?protocol ?temporality
+?global_tags ?durations_as_seconds ()` pushes Temporal Core's worker and
+client metrics, and the SDK's `temporal_ocaml_` series, to an OTLP collector
+over gRPC or HTTP/protobuf (#1161). It enables only `temporalio-common`'s
+`otel` feature at the existing Core pin; the lock gains two dependency edges
+and no package, every newly compiled crate is permissive, and the Cargo
+licence scanner and the dependency inventory pass. The options are validated
+with the same grammar in OCaml and Rust, header values never appear in a
+message, a log record or `Debug` output, and the bridge owns the exporter: a
+detachable meter keeps clients, workers and the GC-released SDK recorder from
+extending its life, and runtime release makes one final export before Core's
+Tokio runtime stops. Rust tests run against loopback OTLP/gRPC and OTLP/HTTP
+collector doubles; the `worker_metrics` live regression repeats its scenario
+on an OTLP runtime with an in-process collector stub and requires the same
+families as the Prometheus path. Tracing is not exported, by recorded
+decision, until headers (#1139) and interceptors (#1162) make context
+propagation possible.
+
+## 2026-11-13: `Temporal.Testing` fidelity (#1160)
+
+- The opt-in `` `Retry `` workflow-task-failure mode keeps a failing run open, answers queries from its last completed task, and retries it with `Testing.retry_workflow_tasks` by replaying the completed activations.
+- `Testing.start`/`execute` take memo, search attributes, ID conflict and reuse policies (refused starts return the client's already-started error), timeouts and a retry policy. Child starts apply their reuse policy.
+- Workflow execution and run timeouts, top-level and child, expire in virtual time.
+- Asynchronous activities wait for their real `Activity.Async_handle`, with heartbeats, cancellation and timeouts (`Testing.mock_async_activity`).
+- Covered by `test/unit/test_testing_fidelity.ml`. Schedule-to-start timeouts and visibility queries remain deliberately unsimulated.
+
+## 2026-11-14: Signal-with-start and update-with-start across SDKs
+
+The official-SDK interoperability regression now runs signal-with-start and
+update-with-start in both directions (#1151). The official Python client
+signal-with-starts an OCaml entity workflow on an absent workflow, its open
+run, under `TERMINATE_EXISTING` and after the run closed, and
+update-with-starts it with accepted updates, an OCaml validator rejection on
+an open and on a newly started run, and a `FAIL` conflict. The driver also
+hosts a Python entity with the same protocol, which the OCaml client drives
+with `Client.signal_with_start` and `Client.update_with_start` through the
+same cases while the driver runs its own. Each side checks the other's runs:
+exact run IDs, signals recorded before the first workflow task, the replaced
+run terminated, update results, the validator rejection's type and detail
+beside the run, the typed already-started refusal, and only accepted updates
+in history. The two processes coordinate through `python-ready` and
+`ocaml-with-start.json` in the shared evidence directory. The whole suite
+took 24 seconds locally against Temporal Server 1.32.2.
+
+## 2026-11-14: Child memo and search attributes
+
+`Child_workflow.start`, `start_handle` and `execute` take `?memo` and
+`?search_attributes` (#1135), as raw `(string * Payload.t)` lists like
+`Client.start`; typed values come from `Search_attribute.encode`. Their keys
+are checked by the rules `Workflow.upsert_memo` and continue-as-new already
+use, now in one private module. A bad key returns a ready typed defect before
+any command. An omitted or empty map leaves the start command byte-identical
+to earlier releases. The maps travel through the runtime command, the OCaml
+protocol, the completion schema and the Rust `StartChildWorkflow` decoder,
+which re-checks the keys and fills Core's `memo` and `search_attributes`
+fields instead of leaving them at their defaults. `Temporal.Testing` passes
+both maps to the child's start metadata. Bilateral exact-document tests pin
+the protocol. The `child_start_options` live regression now registers a
+keyword and starts a child with a memo and that keyword. The child reads both
+through `Workflow.start_metadata` before and after worker replacement,
+`Client.list_visibility` finds it by the keyword, and `Client.describe`
+reports both. Capture `live-2026-11-13-child-metadata` adds the parent and
+child histories to the corpus. With the child timeouts, reuse policy and
+typed timeout origin already merged, this completes the #1135 scope. Child
+cron schedules and headers stay out of scope.
+
+## 2026-11-14: Enforced read-only mode for queries and update validators
+
+Query handlers and live update validators now run in one read-only mode
+(#513), `Workflow_context_store.with_read_only`. Replay never runs a query
+and skips every validator, so the mode rejects each SDK operation that would
+change replay-sensitive state, emit a command, or suspend before it changes
+anything. Operations that return a result or future fail with a typed
+defect: `Workflow_context.Local.set`, random draws, `Workflow.sleep` and
+`start_sleep` (unscoped and zero-duration included), activity, local activity
+and child starts, external signals and cancellations, handle and scope
+cancellation, `Scope.create`, condition waits, and `Future.await` of a pending
+future. Operations that already raise for misuse raise `Invalid_argument`:
+`patched`, `deprecate_patch`, the upserts, `continue_as_new`, and future
+combinators over a workflow future. The dispatcher turns a raised rejection
+into a failed query or a rejected update. `emit`, sequence allocation,
+`set_local`, `terminate`, and scheduler enqueue and promise allocation keep
+raising backstops. The mode clears the scheduler owner id, so a validator can
+no longer suspend, and it restores every binding on return, exception, and
+nesting. Validators may now read their own scopes' status, as queries could.
+`test/runtime/test_read_only_mode.ml` runs one workflow live with interleaved
+queries and rejected, raising and accepted updates that try every mutating
+operation, live without them, after an eviction, and as a full replay with
+validation skipped, and requires identical durable commands. It also checks
+restoration and that an accepted update can then mutate and suspend. The
+guard covers SDK state only, not OCaml references, I/O, or foreign calls; the
+v1 policy keeps queries and updates Experimental pending the #489 decision
+and the live update qualification of #505.
+
+## 2026-11-14: Idempotent side effects across a worker restart
+
+The idempotent side-effect example (`examples/idempotency`, #504) posts each
+line of an order to a file-backed ledger under the business key
+`<order ID>/line-<N>`, carried in the activity input. The ledger's contract
+is atomic: a complete, synced record is published with a hard link that
+fails if the key's record exists, so the first request performs the posting
+and every later one gets the original record back as a duplicate, while a
+different posting under the same key is a conflict that fails the activity
+non-retryably. The self-checking example, run by
+`make test-temporal-examples-live`, shows two identical lines posted under
+two keys, a resubmitted order (a new run) answered entirely as duplicates,
+and a second order with identical lines posted under its own keys. The
+`activity_idempotency` live regression kills the worker with `SIGKILL` right
+after line 1's posting commits and before its completion; Temporal times the
+attempt out, a replacement process's attempt 2 is answered as a duplicate,
+and the run completes with one posting per line. Its artifacts (the ledger,
+`correlation.json`, `Client.describe` snapshots, history and worker logs)
+correlate every request with its workflow, run, activity, attempt and worker
+generation. `test/idempotency` tests the ledger contract (including
+concurrent requests from several Domains) and the same lost-completion
+redelivery under `Temporal.Testing`. Fault scenarios over TLS remain for
+#496.
+
+## 2026-11-14: compiled Eio integration example (#1141)
+
+- `examples/eio/eio_example.ml` is a self-checking Eio program built from the
+  workflow guide's "Use the SDK from Eio and Lwt applications" patterns. It
+  creates a worker and a client through `Eio_unix.run_in_systhread`, hosts the
+  worker on its own Domain with `Eio.Domain_manager.run` (a daemon fiber turns
+  cancellation into `Worker.request_shutdown`), and starts and awaits three
+  workflows from three fibers while a ticker fiber runs. It checks that all
+  three blocking calls were in flight at once, that the ticker ran while they
+  waited, and that the worker was drained and released before its hosting
+  fiber finished. Calling the client directly on a fiber fails the first
+  check (verified by mutation).
+- Building it showed that a cancelled hosting fiber ends with Eio's
+  `Cancelled` exception, not `serve_worker`'s result, so the guide's snippet
+  now reports the run/shutdown result through `~on_stopped` on the hosting
+  Domain. Both guide snippets were type-checked against the tree again.
+- Eio stays out of the SDK. `scripts/eio-example.locked` pins the CI-only
+  closure (eio, eio_posix 1.6 and 13 dependencies; dune-configurator pinned
+  to the locked dune). The `examples-eio` stage of `Dockerfile.dev` and the
+  native macOS lane install it with the new `scripts/opam-tool-lock.sh`, which
+  the docs stage now shares and which fails if opam adds or moves an unlisted
+  package. `examples/eio/dune` is enabled only by `TEMPORAL_EIO_EXAMPLE`.
+  `make license-check` audits the closure (exact exceptions:
+  `bigstringaf.0.10.0`'s lower-case `BSD-3-clause`, and `seq.base`), and
+  docs/dependencies.md inventories it.
+- CI: smoke-build compiles it in the `examples-eio` image into the smoke
+  artifact; the baseline live shard runs it in `make
+  test-temporal-examples-live`; macOS builds it natively after uploading its
+  library artifact. Windows is not covered (`eio_posix` has no Windows
+  support). Lwt has no compiled example.

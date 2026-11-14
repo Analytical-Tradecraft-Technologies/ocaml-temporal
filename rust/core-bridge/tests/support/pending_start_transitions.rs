@@ -73,6 +73,8 @@ fn request() -> Arc<client_protocol::StartWorkflowRequest> {
         run_timeout_ms: None,
         task_timeout_ms: None,
         retry_policy: None,
+        cron_schedule: None,
+        start_delay_ms: None,
         rpc_timeout_ms: None,
     })
 }

@@ -107,6 +107,38 @@ pub const STATUS_ASYNC_HEARTBEAT_REJECTED: Status = 14;
 /// `MAX_PENDING_CALLS` (#796).
 pub const STATUS_RESOURCE_EXHAUSTED: Status = 15;
 
+/// An explicit runtime or shared-runtime release did not finish within its
+/// bound (#1149). Ownership was already transferred: the dedicated cleanup
+/// thread still owns the graph or Core reference and finishes the release in
+/// the background. The usual cause is Core's final drop waiting for its
+/// workflow processing thread in Tokio's blocking pool after a worker
+/// finalizer was detached. The handle is closed either way.
+pub const STATUS_DETACHED: Status = 16;
+
+/// Bound on an explicit [`Runtime`] close, which disposes the whole graph on
+/// its cleanup thread: the worker drain ([`WORKER_SHUTDOWN_DRAIN_TIMEOUT`]),
+/// its finalization ([`WORKER_FINALIZE_TIMEOUT`]), and the final release of
+/// this graph's Core reference, with 30 s of headroom (#1149).
+const RUNTIME_CLOSE_TIMEOUT: Duration = Duration::from_secs(
+    WORKER_SHUTDOWN_DRAIN_TIMEOUT.as_secs() + WORKER_FINALIZE_TIMEOUT.as_secs() + 30,
+);
+
+/// Bound on an explicit [`SharedRuntime`] release (#1149). Attached graphs
+/// have already released their references, so this normally covers only the
+/// drop of Core itself.
+const SHARED_RUNTIME_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Waits for a cleanup thread's completion report for at most `bound`. A
+/// report that does not arrive in time is [`STATUS_DETACHED`]; a cleanup
+/// thread that ended without reporting is [`STATUS_INTERNAL`].
+fn await_cleanup(receiver: &Receiver<Status>, bound: Duration) -> Status {
+    match receiver.recv_timeout(bound) {
+        Ok(status) => status,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => STATUS_DETACHED,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => STATUS_INTERNAL,
+    }
+}
+
 /// Private transport-safety ceiling for one string crossing the bridge.
 ///
 /// This is deliberately not a claim about Temporal Server identifier limits,
@@ -260,6 +292,20 @@ enum ClientCallKind {
     /// `History` message rather than a JSON document; see
     /// [`client_protocol::fetch_history`].
     History,
+    /// Describe one run (#1152). It has no synchronous symbol; see
+    /// [`client_protocol::describe_workflow`].
+    Describe,
+    /// Count the executions a visibility query matches (#1152). It has no
+    /// synchronous symbol; see [`client_protocol::count_workflows`].
+    Count,
+    /// Signal a workflow, starting it first when its workflow ID has no open
+    /// run (#1151). It has no synchronous symbol; its outcome is the closed
+    /// accepted/rejected/unknown start outcome of [`ClientCallKind::Start`].
+    SignalWithStart,
+    /// Start a workflow if needed and admit one update on it (#1151). It has
+    /// no synchronous symbol; see
+    /// [`client_protocol::update_with_start_workflow`].
+    UpdateWithStart,
 }
 
 impl TryFrom<u32> for ClientCallKind {
@@ -281,6 +327,10 @@ impl TryFrom<u32> for ClientCallKind {
             11 => Self::AsyncActivityCompletion,
             12 => Self::AsyncActivityHeartbeat,
             13 => Self::History,
+            14 => Self::Describe,
+            15 => Self::Count,
+            16 => Self::SignalWithStart,
+            17 => Self::UpdateWithStart,
             _ => {
                 return Err(Failure {
                     status: STATUS_INVALID_ARGUMENT,
@@ -305,6 +355,10 @@ enum ClientRpc {
     PollUpdate(client_protocol::PollWorkflowUpdateRequest),
     Visibility(client_protocol::VisibilityRequest),
     History(client_protocol::HistoryRequest),
+    Describe(client_protocol::DescribeRequest),
+    Count(client_protocol::CountRequest),
+    SignalWithStart(Arc<client_protocol::SignalWithStartRequest>),
+    UpdateWithStart(Arc<client_protocol::UpdateWithStartRequest>),
     /// A namespace-bound async activity completion, failure, or
     /// cancellation (#1025). `binding` is `None` straight after
     /// [`ClientRpc::decode`], which has no runtime;
@@ -420,6 +474,20 @@ impl ClientRpc {
             ClientCallKind::History => Self::History(
                 client_protocol::decode_history_request(text).map_err(protocol_failure)?,
             ),
+            ClientCallKind::Describe => Self::Describe(
+                client_protocol::decode_describe_request(text).map_err(protocol_failure)?,
+            ),
+            ClientCallKind::Count => {
+                Self::Count(client_protocol::decode_count_request(text).map_err(protocol_failure)?)
+            }
+            ClientCallKind::SignalWithStart => Self::SignalWithStart(Arc::new(
+                client_protocol::decode_signal_with_start_request(text)
+                    .map_err(protocol_failure)?,
+            )),
+            ClientCallKind::UpdateWithStart => Self::UpdateWithStart(Arc::new(
+                client_protocol::decode_update_with_start_request(text)
+                    .map_err(protocol_failure)?,
+            )),
             ClientCallKind::AsyncActivityCompletion => Self::AsyncActivity {
                 request: AsyncActivityRequest::decode_completion(text)?,
                 binding: None,
@@ -523,6 +591,34 @@ impl ClientRpc {
                 client_protocol::fetch_history(connection, request)
                     .await
                     .map_err(client_operation_failure)
+            }),
+            Self::Describe(request) => Box::pin(async move {
+                let response = client_protocol::describe_workflow(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_describe_response(&response))
+            }),
+            Self::Count(request) => Box::pin(async move {
+                let response = client_protocol::count_workflows(connection, request)
+                    .await
+                    .map_err(client_operation_failure)?;
+                encode_bytes(client_protocol::encode_count_response(&response))
+            }),
+            Self::SignalWithStart(request) => Box::pin(async move {
+                let result = client_protocol::signal_with_start_workflow(
+                    connection,
+                    request.as_ref().clone(),
+                )
+                .await;
+                start_outcome_bytes(&request.start, Some(result))
+            }),
+            Self::UpdateWithStart(request) => Box::pin(async move {
+                let outcome = client_protocol::update_with_start_workflow(
+                    connection,
+                    request.as_ref().clone(),
+                )
+                .await;
+                update_with_start_outcome_bytes(&request.start, &outcome)
             }),
             Self::AsyncActivity { request, binding } => Box::pin(async move {
                 let binding = binding.ok_or_else(unbound_async_activity)?;
@@ -990,12 +1086,72 @@ fn start_outcome_bytes(
     }
 }
 
+/// Encodes the closed outcome of one update-with-start (#1151).
+///
+/// As for [`start_outcome_bytes`], an outcome that cannot be encoded is
+/// reported as `Unknown` built from the validated start request, which always
+/// encodes: the caller then reconciles with the same request and update IDs
+/// instead of losing an applied start to a protocol error.
+fn update_with_start_outcome_bytes(
+    start: &client_protocol::StartWorkflowRequest,
+    outcome: &client_protocol::UpdateWithStartOutcome,
+) -> Operation {
+    match client_protocol::encode_update_with_start_outcome(outcome) {
+        Ok(encoded) => Ok(encoded.into_bytes()),
+        Err(_) => encode_bytes(client_protocol::encode_update_with_start_outcome(
+            &client_protocol::UpdateWithStartOutcome::Unknown {
+                request_id: start.request_id.clone(),
+                workflow_id: start.workflow_id.clone(),
+            },
+        )),
+    }
+}
+
+/// One in-flight start-like call: a plain start or a start combined with a
+/// signal or an update (#1151). They share the start slots and their
+/// `request_id` deduplication: a pending request ID may only be reused for
+/// the same logical operation of the same kind.
+enum PendingStartCall {
+    Start(Arc<client_protocol::StartWorkflowRequest>),
+    SignalWithStart(Arc<client_protocol::SignalWithStartRequest>),
+    UpdateWithStart(Arc<client_protocol::UpdateWithStartRequest>),
+}
+
+impl PendingStartCall {
+    /// The start's Temporal request ID, which the start slots deduplicate on.
+    fn request_id(&self) -> &str {
+        match self {
+            Self::Start(request) => &request.request_id,
+            Self::SignalWithStart(request) => &request.start.request_id,
+            Self::UpdateWithStart(request) => &request.start.request_id,
+        }
+    }
+
+    /// Reports whether `other` is a retry of this logical operation: the same
+    /// kind with every field equal except the RPC timeout.
+    fn same_operation(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Start(left), Self::Start(right)) => {
+                client_protocol::same_start_request(left, right)
+            }
+            (Self::SignalWithStart(left), Self::SignalWithStart(right)) => {
+                client_protocol::same_signal_with_start_request(left, right)
+            }
+            (Self::UpdateWithStart(left), Self::UpdateWithStart(right)) => {
+                client_protocol::same_update_with_start_request(left, right)
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Capacity class of one in-flight submitted call. Starts and waits keep
 /// the limits documented for the public client; the class also carries the
 /// identity those limits deduplicate on.
 enum CallScope {
-    /// A start; calls with the same `request_id` share one start slot.
-    Start(Arc<client_protocol::StartWorkflowRequest>),
+    /// A start, signal-with-start, or update-with-start; calls with the same
+    /// `request_id` share one start slot.
+    Start(PendingStartCall),
     /// An exact-run or current-run wait; calls on the same run share a slot.
     Wait(client_protocol::WaitWorkflowRequest),
     /// Any other RPC, bounded by its own deadline.
@@ -1153,13 +1309,15 @@ impl Drop for CoreDropMarker {
 /// panics.
 ///
 /// Field order is load-bearing: Rust drops fields in declaration order, so
-/// the metrics exporter's scrape server is aborted first, then Core is
-/// dropped (its Tokio shutdown closes the scrape socket) before the log
-/// writer (which then flushes Core's shutdown records within
-/// `CORE_LOG_CLOSE_TIMEOUT`), and the drop marker last.
+/// the metrics exporter is stopped first (a Prometheus scrape server is
+/// aborted; an OTLP exporter makes its final export, which for gRPC needs
+/// Core's Tokio runtime still running), then Core is dropped (its Tokio
+/// shutdown closes the scrape socket) before the log writer (which then
+/// flushes Core's shutdown records within `CORE_LOG_CLOSE_TIMEOUT`), and the
+/// drop marker last.
 pub(crate) struct SharedCore {
-    /// Opt-in Prometheus scrape server running on Core's Tokio pool (#500);
-    /// see [`telemetry::MetricsExporter`].
+    /// Opt-in Prometheus scrape server (#500) or OTLP push exporter (#1161)
+    /// running on Core's Tokio pool; see [`telemetry::MetricsExporter`].
     metrics: Option<telemetry::MetricsExporter>,
     core: CoreRuntime,
     /// Writer thread draining Core's log queue to stderr, absent when Core
@@ -1400,10 +1558,19 @@ impl SharedRuntime {
     }
 
     /// Transfers this handle's Core reference to the cleanup thread and
-    /// optionally waits until it has been dropped. A release with attached
-    /// graphs still alive only decrements the count; Core then outlives this
-    /// handle until the last graph is closed.
+    /// optionally waits, at most [`SHARED_RUNTIME_RELEASE_TIMEOUT`], until it
+    /// has been dropped. A release with attached graphs still alive only
+    /// decrements the count; Core then outlives this handle until the last
+    /// graph is closed.
     fn release(self, wait: bool) -> Status {
+        self.release_within(wait.then_some(SHARED_RUNTIME_RELEASE_TIMEOUT))
+    }
+
+    /// [`Self::release`] with an explicit wait bound; `None` does not wait.
+    /// A wait that outlives `bound` returns [`STATUS_DETACHED`] while the
+    /// cleanup thread keeps the reference and finishes the drop (#1149).
+    fn release_within(self, bound: Option<Duration>) -> Status {
+        let wait = bound.is_some();
         let Self { core, cleanup } = self;
         let (completed, receiver) = if wait {
             let (sender, receiver) = sync_channel(1);
@@ -1418,9 +1585,9 @@ impl SharedRuntime {
             drop(error.0.core);
             return STATUS_INTERNAL;
         }
-        match receiver {
-            Some(receiver) => receiver.recv().unwrap_or(STATUS_INTERNAL),
-            None => STATUS_OK,
+        match (receiver, bound) {
+            (Some(receiver), Some(bound)) => await_cleanup(&receiver, bound),
+            _ => STATUS_OK,
         }
     }
 }
@@ -1973,13 +2140,23 @@ impl Runtime {
                 call.scope = CallScope::Released;
             }
         }
-        let scope = match &rpc {
-            ClientRpc::Start(request) => {
+        let start_call = match &rpc {
+            ClientRpc::Start(request) => Some(PendingStartCall::Start(Arc::clone(request))),
+            ClientRpc::SignalWithStart(request) => {
+                Some(PendingStartCall::SignalWithStart(Arc::clone(request)))
+            }
+            ClientRpc::UpdateWithStart(request) => {
+                Some(PendingStartCall::UpdateWithStart(Arc::clone(request)))
+            }
+            _ => None,
+        };
+        let scope = match (start_call, &rpc) {
+            (Some(request), _) => {
                 let mut distinct = HashSet::new();
                 for call in self.pending_calls.values() {
                     if let CallScope::Start(pending) = &call.scope {
-                        if pending.request_id == request.request_id
-                            && !client_protocol::same_start_request(pending, request)
+                        if pending.request_id() == request.request_id()
+                            && !pending.same_operation(&request)
                         {
                             return Err(Failure {
                                 status: STATUS_PROTOCOL,
@@ -1988,11 +2165,11 @@ impl Runtime {
                                         .to_owned(),
                             });
                         }
-                        distinct.insert(pending.request_id.as_str());
+                        distinct.insert(pending.request_id());
                     }
                 }
                 if distinct.len() >= limits.pending_starts
-                    && !distinct.contains(request.request_id.as_str())
+                    && !distinct.contains(request.request_id())
                 {
                     return Err(Failure {
                         status: STATUS_RESOURCE_EXHAUSTED,
@@ -2002,9 +2179,9 @@ impl Runtime {
                         ),
                     });
                 }
-                CallScope::Start(Arc::clone(request))
+                CallScope::Start(request)
             }
-            ClientRpc::Wait(request) => {
+            (None, ClientRpc::Wait(request)) => {
                 let distinct = self
                     .pending_calls
                     .values()
@@ -2024,7 +2201,7 @@ impl Runtime {
                 }
                 CallScope::Wait(request.clone())
             }
-            _ => CallScope::Bounded,
+            (None, _) => CallScope::Bounded,
         };
         // Hard bound on retained task handles (Codex review on #1077). An
         // aborted task's handle is only reaped once Tokio has run its
@@ -2604,9 +2781,12 @@ impl Runtime {
     /// 1. initiate Core shutdown, unless [`Self::initiate_worker_shutdown`]
     ///    already did when the run loop stopped (#1028; it is idempotent);
     /// 2. retire every outstanding task while joining both poll lanes, for at
-    ///    most [`WORKER_SHUTDOWN_DRAIN_TIMEOUT`];
+    ///    most the worker's drain bound ([`WORKER_SHUTDOWN_DRAIN_TIMEOUT`]);
     /// 3. run Core's finalizer in a task that owns the worker, waiting for at
-    ///    most [`WORKER_FINALIZE_TIMEOUT`].
+    ///    most its finalize bound ([`WORKER_FINALIZE_TIMEOUT`]).
+    ///
+    /// Both bounds are read from the worker (see
+    /// [`PollLanes::shutdown_drain_bound`]); only tests change them.
     ///
     /// Contract: tasks that never reached OCaml (queued handoffs, polls in
     /// flight at shutdown, Core's own cache evictions) are retired silently,
@@ -2627,14 +2807,16 @@ impl Runtime {
             let _runtime_guard = handle.enter();
             worker.initiate_shutdown();
         }
+        let drain_bound = worker.shutdown_drain_bound();
         let retirement = handle
-            .block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT))
+            .block_on(worker.drain_and_join_for_shutdown(drain_bound))
             .map_err(shutdown_drain_failure)?;
         let worker = self
             .worker
             .take()
             .expect("drained worker remains owned until terminal finalization");
-        let released = match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+        let finalize_bound = worker.finalize_bound();
+        let released = match handle.block_on(worker.finalize_bounded(finalize_bound)) {
             BoundedFinalize::Refused(worker, error) => {
                 // The bridge would not consume the worker (for example after a
                 // lost poll lease). Keep it owned by the graph so runtime close
@@ -3311,10 +3493,19 @@ impl Runtime {
 
     /// Transfers Core to its cleanup thread and optionally waits for disposal.
     ///
-    /// Explicit close waits while the OCaml lock is released. GC fallback does
-    /// not wait on this caller, so a custom-block finalizer never stalls the
-    /// collector; the dedicated cleanup thread joins any aborted start tasks.
-    fn close(mut self, wait: bool) -> Status {
+    /// Explicit close waits while the OCaml lock is released, for at most
+    /// [`RUNTIME_CLOSE_TIMEOUT`]. GC fallback does not wait on this caller, so
+    /// a custom-block finalizer never stalls the collector; the dedicated
+    /// cleanup thread joins any aborted start tasks.
+    fn close(self, wait: bool) -> Status {
+        self.close_within(wait.then_some(RUNTIME_CLOSE_TIMEOUT))
+    }
+
+    /// [`Self::close`] with an explicit wait bound; `None` does not wait. A
+    /// disposal that outlives `bound` returns [`STATUS_DETACHED`] while the
+    /// cleanup thread keeps the graph and finishes it (#1149).
+    fn close_within(mut self, bound: Option<Duration>) -> Status {
+        let wait = bound.is_some();
         // Cancel borrowed history futures before transferring their executor
         // and connection to the cleanup thread, including GC fallback close.
         self.pending_waits.clear();
@@ -3358,9 +3549,9 @@ impl Runtime {
             return STATUS_INTERNAL;
         }
 
-        match receiver {
-            Some(receiver) => receiver.recv().unwrap_or(STATUS_INTERNAL),
-            None => STATUS_OK,
+        match (receiver, bound) {
+            (Some(receiver), Some(bound)) => await_cleanup(&receiver, bound),
+            _ => STATUS_OK,
         }
     }
 }
@@ -3444,7 +3635,8 @@ fn drop_runtime_graph(
         // while the lanes stop, and is bounded so dispose cannot hang on a
         // debt Core keeps outstanding (issue #769). A timeout leaves the
         // worker unfinalizable, which the match below handles.
-        let _ = handle.block_on(worker.drain_and_join_for_shutdown(WORKER_SHUTDOWN_DRAIN_TIMEOUT));
+        let drain_bound = worker.shutdown_drain_bound();
+        let _ = handle.block_on(worker.drain_and_join_for_shutdown(drain_bound));
         // An admitted workflow completion that outlived the bounded drain is
         // still awaiting Core and holds a worker reference. Abort it and wait
         // for the abort, so no task outlives the graph; its outcome is
@@ -3456,7 +3648,8 @@ fn drop_runtime_graph(
         // the only window in which a late task could otherwise be dropped with
         // an outstanding Core completion debt.
         handle.block_on(worker.force_complete_outstanding_for_dispose());
-        match handle.block_on(worker.finalize_bounded(WORKER_FINALIZE_TIMEOUT)) {
+        let finalize_bound = worker.finalize_bound();
+        match handle.block_on(worker.finalize_bounded(finalize_bound)) {
             BoundedFinalize::Refused(worker, _) => {
                 // Dispose cannot wait for OCaml. Dropping after force-complete
                 // is the last-resort reclaim path.
@@ -4869,9 +5062,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new(
     }
 }
 
-/// Upper bound on a runtime telemetry document. The largest valid document
-/// (sixteen maximal global tags) is well below this.
-const MAX_TELEMETRY_CONFIG_BYTES: usize = 16 * 1024;
+/// Upper bound on a runtime telemetry document. The largest valid document,
+/// an OTLP exporter with sixteen maximal headers whose values are entirely
+/// JSON-escaped characters (about 136 KiB) plus a maximal endpoint and
+/// global tags, is below this.
+const MAX_TELEMETRY_CONFIG_BYTES: usize = 256 * 1024;
 
 /// Create a shareable Core runtime with opt-in telemetry export (#500).
 ///
@@ -4879,16 +5074,19 @@ const MAX_TELEMETRY_CONFIG_BYTES: usize = 16 * 1024;
 /// telemetry document (see `docs/reference/core-bridge.md`). `{}` configures
 /// no exporter. With a `prometheus` member, Core's built-in worker and client
 /// metrics are served at `http://<bind_address>/metrics` from a scrape server
-/// on the runtime's own Tokio pool; the server stops when Core is destroyed,
-/// that is, when the last of the shared handle and its attached graphs is
-/// released.
+/// on the runtime's own Tokio pool; with an `otlp` member (#1161) they are
+/// pushed to an OTLP collector by Core's OpenTelemetry exporter. Either
+/// exporter stops when Core is destroyed, that is, when the last of the
+/// shared handle and its attached graphs is released; an OTLP exporter makes
+/// one final export then (see [`crate::otlp::OtlpExporter`]).
 ///
-/// The document is validated, and the endpoint bound, before the handle is
-/// published: an invalid document or an unusable address fails with
-/// `STATUS_CONFIGURATION` and leaves `*shared` null with nothing running. On
-/// success the result value is the UTF-8 socket address the endpoint
-/// actually listens on (an ephemeral port `0` is resolved), or empty when no
-/// exporter was configured.
+/// The document is validated, and a Prometheus endpoint bound, before the
+/// handle is published: an invalid document or an unusable address fails
+/// with `STATUS_CONFIGURATION` and leaves `*shared` null with nothing
+/// running. No message echoes an OTLP header value. On success the result
+/// value is the UTF-8 socket address a Prometheus endpoint actually listens
+/// on (an ephemeral port `0` is resolved), or empty when no exporter or an
+/// OTLP exporter was configured.
 ///
 /// # Safety
 ///
@@ -4956,10 +5154,13 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new_with_telemetr
                 &telemetry,
                 diagnostics::CoreLogWriter::spawn_stderr,
             )?;
+            // Only a Prometheus endpoint listens; an OTLP exporter reports
+            // the empty address like a runtime without an exporter.
             let address = core
                 .metrics
                 .as_ref()
-                .map(|exporter| exporter.bound_address().to_string())
+                .and_then(telemetry::MetricsExporter::bound_address)
+                .map(|address| address.to_string())
                 .unwrap_or_default();
             let owned = Box::into_raw(Box::new(SharedRuntime::new(core)?));
             // SAFETY: The slot was validated above and is exclusively owned
@@ -5029,7 +5230,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_new_attached(
 /// When no attached graph remains, this destroys Core (and its Tokio pool)
 /// before returning. When graphs are still attached, it only releases this
 /// handle's reference and Core is destroyed by the last graph's release.
-/// Calling again with the now-null slot is safe.
+/// The wait is bounded by 30 s: a drop that takes longer (Core waiting for a
+/// blocking-pool thread, #1149) returns `STATUS_DETACHED` while the cleanup
+/// thread finishes it. Calling again with the now-null slot is safe.
 ///
 /// # Safety
 ///
@@ -6334,8 +6537,12 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_disconnect(
 
 /// Destroy one native runtime and clear the caller's slot.
 ///
-/// Passing the same slot again after a successful call is safe because the
-/// first call stores null before dropping the owner.
+/// The graph is disposed on its cleanup thread and this call waits for it at
+/// most the worker drain bound plus the finalize bound plus 30 s (150 s). A
+/// disposal that takes longer (#1149) returns `STATUS_DETACHED`; the cleanup
+/// thread still owns the graph and finishes it. Passing the same slot again
+/// after a successful call is safe because the first call stores null before
+/// dropping the owner.
 ///
 /// # Safety
 ///
@@ -6538,7 +6745,7 @@ pub unsafe fn test_runtime_has_metrics_meter(runtime: *const Runtime) -> Option<
 /// Stops Core's own Prometheus scrape server on a shared handle while the
 /// bridge's public accept loop keeps running, reproducing the state an accept
 /// error on Core's private listener leaves behind (#1030). Returns whether
-/// the handle had an exporter. Not part of the C ABI.
+/// the handle had a Prometheus exporter. Not part of the C ABI.
 ///
 /// # Safety
 ///
@@ -6549,18 +6756,16 @@ pub unsafe fn test_shared_runtime_stop_core_metrics_server(shared: *const Shared
     let Some(shared) = (unsafe { shared.as_ref() }) else {
         return false;
     };
-    match shared.core.metrics.as_ref() {
-        Some(exporter) => {
-            exporter.stop_core_server();
-            true
-        }
-        None => false,
-    }
+    shared
+        .core
+        .metrics
+        .as_ref()
+        .is_some_and(telemetry::MetricsExporter::stop_core_server)
 }
 
 /// Reports whether Core's own Prometheus scrape server on a shared handle has
-/// stopped (#1030); `None` for a null or released handle or one without an
-/// exporter. Not part of the C ABI.
+/// stopped (#1030); `None` for a null or released handle or one without a
+/// Prometheus exporter. Not part of the C ABI.
 ///
 /// # Safety
 ///
@@ -6571,8 +6776,7 @@ pub unsafe fn test_shared_runtime_core_metrics_server_stopped(
 ) -> Option<bool> {
     // SAFETY: The caller promises a null or live handle.
     let shared = unsafe { shared.as_ref() }?;
-    let exporter = shared.core.metrics.as_ref()?;
-    Some(exporter.core_server_stopped())
+    shared.core.metrics.as_ref()?.core_server_stopped()
 }
 
 /// Returns the number of live references to a shared handle's Core (the
@@ -6619,6 +6823,31 @@ pub fn test_runtime_new_with_core_log_sink(
         })
         .ok_or_else(|| "runtime has no Core log writer".to_owned())?;
     Ok((Box::into_raw(Box::new(runtime)), queue))
+}
+
+/// Creates a shared runtime from a telemetry document, like
+/// [`ocaml_temporal_core_v4_shared_runtime_new_with_telemetry_json`], whose
+/// Core log records at `level` drain into `sink` instead of stderr.
+///
+/// This is intentionally not part of the C ABI. It lets the OTLP tests
+/// (#1161) capture every record Core and the exporter emit and prove that a
+/// header value never reaches the log. The handle must be released with
+/// [`ocaml_temporal_core_v4_shared_runtime_free`].
+#[doc(hidden)]
+pub fn test_shared_runtime_new_with_telemetry_and_log_sink(
+    document: &[u8],
+    level: diagnostics::CoreLogLevel,
+    sink: Box<dyn std::io::Write + Send>,
+) -> std::result::Result<*mut SharedRuntime, String> {
+    let telemetry =
+        telemetry::parse_telemetry_config(document).map_err(|failure| failure.message)?;
+    let worker_threads = runtime_worker_threads(0).map_err(|failure| failure.message)?;
+    let core = create_shared_core(Some(level), worker_threads, &telemetry, || {
+        diagnostics::CoreLogWriter::spawn(sink, diagnostics::CORE_LOG_QUEUE_CAPACITY)
+    })
+    .map_err(|failure| failure.message)?;
+    let shared = SharedRuntime::new(core).map_err(|failure| failure.message)?;
+    Ok(Box::into_raw(Box::new(shared)))
 }
 
 /// Returns the number of Tokio worker threads driving a live runtime, or
@@ -7120,8 +7349,26 @@ mod worker_task_types;
 mod worker_tuning;
 
 #[cfg(test)]
+#[path = "../tests/support/runtime_release_bound.rs"]
+mod runtime_release_bound;
+
+#[cfg(test)]
 #[path = "../tests/support/worker_shutdown_outcomes.rs"]
 mod worker_shutdown_outcomes;
+
+/// gRPC double shared by the in-crate live-worker tests below; a file may
+/// be loaded as a module only once.
+#[cfg(test)]
+#[path = "../tests/support/grpc_double.rs"]
+mod grpc_double;
+
+#[cfg(test)]
+#[path = "../tests/support/worker_shutdown_drain_timeout.rs"]
+mod worker_shutdown_drain_timeout;
+
+#[cfg(test)]
+#[path = "../tests/support/real_processing_thread_detach.rs"]
+mod real_processing_thread_detach;
 
 /// SDK name reported to Temporal as the `client-name` RPC header and recorded
 /// in `WorkflowTaskCompleted.sdk_metadata`. Core would otherwise attribute

@@ -88,14 +88,18 @@ module Handler = struct
             | None -> Ok ()
             | Some validate -> (
                 try
-                  (* Validators run only for live requests, so a deterministic
-                     helper must not advance mutable workflow state here.  The
-                     runtime guard is scoped to this callback and restored
-                     before the update implementation runs. *)
+                  (* Validators run only for live requests, so they run in
+                     the read-only mode shared with query handlers (#513):
+                     no SDK operation may change replay-sensitive workflow
+                     state, emit a command, or suspend here. The mode is
+                     scoped to this callback and restored, even when it
+                     raises, before the update implementation runs. A
+                     rejection the SDK raises is caught below like any other
+                     validator exception and becomes a typed rejection. *)
                   match Temporal_sdk_kernel.Workflow_context_store.current () with
                   | None -> validate input
                   | Some context ->
-                      Temporal_sdk_kernel.Workflow_context_store.with_randomness_disabled
+                      Temporal_sdk_kernel.Workflow_context_store.with_read_only
                         context (fun () -> validate input)
                 with
                 | exception_ ->

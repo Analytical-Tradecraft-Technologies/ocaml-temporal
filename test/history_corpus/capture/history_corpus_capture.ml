@@ -253,6 +253,98 @@ let corpus_v3_random client =
     };
   ]
 
+(** Scenarios captured by the [corpus-v4-continue-as-new-options] generation
+    (#1153): the run that continued as new with options and its successor,
+    which must report the options it received. *)
+let corpus_v4_continue_as_new_options client =
+  let workflow_type = Defs.continue_as_new_options_workflow_type in
+  let workflow = remote workflow_type Temporal.Codec.string Temporal.Codec.string in
+  let first =
+    start client ~workflow ~id:"history-corpus-continue-as-new-options" ~input:"first"
+  in
+  let successor =
+    match require "continue-as-new options wait" (Temporal.Client.wait first) with
+    | Temporal.Client.Continued_as_new execution -> execution
+    | _ -> failwith "continue-as-new options first run did not continue"
+  in
+  let second =
+    require "follow options successor" (Temporal.Client.follow client ~workflow successor)
+  in
+  let observed = expect_completed "continue-as-new options successor" second in
+  if observed <> "OPTIONS:30000/7000/3/replaced" then
+    failwith ("continue-as-new options successor observed " ^ observed);
+  [
+    record ~case:"continue-as-new-options-first" ~workflow_type first;
+    record ~case:"continue-as-new-options-second" ~workflow_type second;
+  ]
+
+(** Scenarios captured by the [corpus-v5-cron-start-delay] generation
+    (#1158): a root run started with a start delay, and the first two runs of
+    a cron chain. The chain is terminated once its second run has closed, so
+    no scheduled run outlives the capture. *)
+let corpus_v5_cron_start_delay client =
+  let workflow_type = Defs.cron_start_delay_workflow_type in
+  let workflow = remote workflow_type Temporal.Codec.string Temporal.Codec.string in
+  let delayed =
+    require "start delayed"
+      (Temporal.Client.start client ~workflow ~task_queue:Defs.task_queue
+         ~id:"history-corpus-start-delay" ~start_delay:(Temporal.Duration.of_seconds 2L)
+         ~input:"delayed" ())
+  in
+  let observed = expect_completed "start delay" delayed in
+  if observed <> "CRON:-/delayed/-" then failwith ("delayed run observed " ^ observed);
+  let schedule = "@every 2s" in
+  let first =
+    require "start cron"
+      (Temporal.Client.start client ~workflow ~task_queue:Defs.task_queue
+         ~id:"history-corpus-cron" ~cron_schedule:schedule ~input:"cron" ())
+  in
+  let successor =
+    match require "cron first wait" (Temporal.Client.wait first) with
+    | Temporal.Client.Completed { output; successor = Some successor }
+      when output = "CRON:" ^ schedule ^ "/delayed/-" ->
+        successor
+    | Temporal.Client.Completed { output; _ } -> failwith ("cron first run observed " ^ output)
+    | _ -> failwith "cron first run did not complete"
+  in
+  let second = require "follow cron successor" (Temporal.Client.follow client ~workflow successor) in
+  let observed = expect_completed "cron second run" second in
+  if observed <> "CRON:" ^ schedule ^ "/delayed/cron" then
+    failwith ("cron second run observed " ^ observed);
+  require "terminate cron chain"
+    (Result.bind
+       (Temporal.Client.get_handle client ~workflow ~id:"history-corpus-cron" ())
+       (Temporal.Client.terminate ~reason:"history corpus capture complete"));
+  [
+    record ~case:"start-delay" ~workflow_type delayed;
+    record ~case:"cron-first" ~workflow_type first;
+    record ~case:"cron-second" ~workflow_type second;
+  ]
+
+(** Scenarios captured by the [corpus-v6-child-start-metadata] generation
+    (#1135): a parent that starts its child with a memo and a keyword search
+    attribute, and that child, which must report both. The child's run ID is
+    resolved by the export script from its derived workflow ID. *)
+let corpus_v6_child_start_metadata client =
+  let workflow_type = Defs.child_metadata_parent_workflow_type in
+  let handle =
+    start client
+      ~workflow:(remote workflow_type Temporal.Codec.unit Temporal.Codec.string)
+      ~id:"history-corpus-child-metadata-parent" ~input:()
+  in
+  let observed = expect_completed "child-metadata-parent" handle in
+  if observed <> "METADATA:child-memo/corpus" then
+    failwith ("child metadata parent observed " ^ observed);
+  [
+    record ~case:"child-metadata-parent" ~workflow_type handle;
+    {
+      case = "child-metadata-child";
+      workflow_id = "history-corpus-child-metadata-parent-child";
+      run_id = None;
+      workflow_type = Defs.child_metadata_child_workflow_type;
+    };
+  ]
+
 (** Captures one [corpus.patch] run under the current generation. *)
 let patch client ~case =
   let workflow_type = Defs.patch_workflow_type in
@@ -381,6 +473,9 @@ let scenarios generation client =
   | "corpus-lifecycle-removed" -> lifecycle_matrix client ~stage:"removed"
   | "corpus-v2-cancellation" -> corpus_v2_cancellation client
   | "corpus-v3-random" -> corpus_v3_random client
+  | "corpus-v4-continue-as-new-options" -> corpus_v4_continue_as_new_options client
+  | "corpus-v5-cron-start-delay" -> corpus_v5_cron_start_delay client
+  | "corpus-v6-child-start-metadata" -> corpus_v6_child_start_metadata client
   | other -> failwith ("generation has no capture scenarios: " ^ other)
 
 (** Converts a definition-set entry to a live worker registration. *)

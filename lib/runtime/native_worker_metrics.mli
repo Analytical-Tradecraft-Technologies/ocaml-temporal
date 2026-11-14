@@ -2,8 +2,9 @@
 
     Temporal Core instruments its workers itself (polls, slots, task
     latency, failures). A few worker states exist only in this SDK, and this
-    module records them into the runtime's Prometheus registry through the
-    bridge's metric meter, next to Core's own series:
+    module records them into the runtime's Prometheus registry or OTLP
+    pipeline (#1161) through the bridge's metric meter, next to Core's own
+    series:
 
     - activity-lane occupancy and callback duration;
     - activity tasks admitted to a callback, and tasks the SDK refused;

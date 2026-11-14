@@ -109,6 +109,7 @@ Temporal.Activity
 Temporal.Child_workflow
 Temporal.Future
 Temporal.Scope
+Temporal.Search_attribute
 Temporal.Condition
 Temporal.Signal
 Temporal.Query

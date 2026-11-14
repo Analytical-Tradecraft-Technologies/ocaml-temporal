@@ -556,6 +556,104 @@ let test_mock_start_id_conflict_policy () =
     Option.get (Temporal.Client.run_id after_close) <> Option.get (Temporal.Client.run_id replacement));
   unwrap (Temporal.Client.shutdown client)
 
+(** Signal-with-start on the mock (#1151): an absent workflow is started and
+    signalled, an open run is only signalled by default, a closed run is
+    replaced, [`Terminate_existing] replaces an open run, and the request ID
+    deduplicates the signal of a retried call. Start options are validated
+    exactly as for [Client.start]. *)
+let test_mock_signal_with_start () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client" ~namespace:"unit-test" ())
+  in
+  let signal_with_start ?id_conflict_policy ?rpc_timeout ?(id = "sws-id") ~request_id
+      input =
+    Temporal.Client.signal_with_start client ?id_conflict_policy ?rpc_timeout
+      ~request_id ~workflow:echo_workflow ~task_queue:"unit-test" ~id ~input
+      ~signal:add_document_signal ~signal_input:"document" ()
+  in
+  let first = unwrap (signal_with_start ~request_id:"sws-first" "first") in
+  assert (Temporal.Client.started first);
+  let attached = unwrap (signal_with_start ~request_id:"sws-attach" "ignored") in
+  assert (not (Temporal.Client.started attached));
+  assert (Temporal.Client.run_id attached = Temporal.Client.run_id first);
+  (* The same request ID is the same logical operation: the signal is
+     delivered once, and reusing the ID for other signal data fails. *)
+  let retried = unwrap (signal_with_start ~request_id:"sws-attach" "ignored") in
+  assert (Temporal.Client.run_id retried = Temporal.Client.run_id first);
+  expect_error_message_contains "workflow"
+    "signal request ID was already used for different signal data"
+    (Temporal.Client.signal ~request_id:"sws-attach" first
+       ~signal:add_document_signal ~input:"other");
+  let replaced =
+    unwrap
+      (signal_with_start ~id_conflict_policy:`Terminate_existing
+         ~request_id:"sws-replace" "second")
+  in
+  assert (Temporal.Client.started replaced);
+  assert (Temporal.Client.run_id replaced <> Temporal.Client.run_id first);
+  (match Temporal.Client.wait first with
+  | Ok (Temporal.Client.Terminated _) -> ()
+  | Ok _ -> failwith "terminate_existing did not terminate the open run"
+  | Error error -> failwith (Temporal.Error.message error));
+  (match Temporal.Client.wait replaced with
+  | Ok (Temporal.Client.Completed { output = "second"; _ }) -> ()
+  | Ok _ -> failwith "signal-with-start changed the started input"
+  | Error error -> failwith (Temporal.Error.message error));
+  (* A closed workflow ID is started again under the default policies. *)
+  let restarted = unwrap (signal_with_start ~request_id:"sws-restart" "third") in
+  assert (Temporal.Client.started restarted);
+  assert (Temporal.Client.run_id restarted <> Temporal.Client.run_id replaced);
+  expect_error "defect" (signal_with_start ~id:"" ~request_id:"sws-bad" "x");
+  expect_error_message_contains "defect" "rpc_timeout"
+    (signal_with_start ~rpc_timeout:(Temporal.Duration.of_ms 0L)
+       ~request_id:"sws-deadline" "x");
+  unwrap (Temporal.Client.shutdown client);
+  expect_error "bridge" (signal_with_start ~request_id:"sws-closed" "x")
+
+(** Update-with-start on the mock (#1151): the start is applied and returned
+    beside the update's own result, which is the typed update error the mock
+    reports for every update because it runs no workflow code; a start
+    conflict under [`Fail] is the typed already-started error. *)
+let test_mock_update_with_start () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client" ~namespace:"unit-test" ())
+  in
+  let update =
+    Temporal.Update.define ~name:"unit.update" ~input:Temporal.Codec.string
+      ~output:Temporal.Codec.string
+  in
+  let update_with_start ~id_conflict_policy ?update_id ~request_id input =
+    Temporal.Client.update_with_start client ~id_conflict_policy ?update_id
+      ~request_id ~workflow:echo_workflow ~task_queue:"unit-test" ~id:"uws-id"
+      ~input ~update ~update_input:"change" ()
+  in
+  let handle, update_result =
+    unwrap (update_with_start ~id_conflict_policy:`Use_existing ~request_id:"uws-1" "first")
+  in
+  assert (Temporal.Client.started handle);
+  expect_error_message_contains "update" "does not execute workflow updates"
+    update_result;
+  let attached, _ =
+    unwrap
+      (update_with_start ~id_conflict_policy:`Use_existing ~request_id:"uws-2" "ignored")
+  in
+  assert (not (Temporal.Client.started attached));
+  assert (Temporal.Client.run_id attached = Temporal.Client.run_id handle);
+  (match update_with_start ~id_conflict_policy:`Fail ~request_id:"uws-3" "x" with
+  | Ok _ -> failwith "a conflicting update-with-start unexpectedly started"
+  | Error error ->
+      assert (
+        Option.map
+          (fun (execution : Temporal.Client.execution) -> execution.run_id)
+          (Temporal.Client.already_started error)
+        = Temporal.Client.run_id handle));
+  expect_error "defect"
+    (update_with_start ~id_conflict_policy:`Use_existing ~update_id:""
+       ~request_id:"uws-4" "x");
+  unwrap (Temporal.Client.shutdown client)
+
 (** The deterministic client seam exposes the same visibility row shape as the
     native adapter. Starting two workflows proves rows retain type, queue,
     exact run identity, and monotone running status before waits complete. *)
@@ -635,6 +733,98 @@ let test_client_fetch_history_validation () =
   unwrap (Temporal.Client.shutdown client);
   expect_error_message_contains "bridge" "client is shut down"
     (Temporal.Client.fetch_history handle)
+
+(** [Client.describe] and [Client.count] (#1152) on the deterministic
+    client: an open run reports its identity, type, queue, [`Running], a start
+    time and no close time, and the memo and search attributes passed to
+    [start] sorted by key (they are passed out of order); after [terminate] the same exact run is [`Terminated]
+    with a close time no earlier than its start; a current-run handle names
+    the concrete run; an unknown workflow or run is [`Not_found]. [count]
+    matches the rows of an empty listing and refuses a non-empty query like
+    the mock's listing. Invalid deadlines and queries are typed defects and
+    a shut-down client reports the closed-client error. The native path is
+    covered by the bridge test and the live regression. *)
+let test_client_describe_and_count () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://describe"
+         ~namespace:"unit-test" ())
+  in
+  let payload data : Temporal.Payload.t =
+    { metadata = [ ("encoding", "json/plain") ]; data = Bytes.of_string data }
+  in
+  let memo = [ ("note", payload "\"memo\""); ("author", payload "\"ada\"") ] in
+  let search_attributes =
+    [ ("Key", payload "\"value\""); ("AKey", payload "\"first\"") ]
+  in
+  let by_key = List.sort (fun (left, _) (right, _) -> String.compare left right) in
+  let handle =
+    unwrap
+      (Temporal.Client.start client ~workflow:echo_workflow ~memo
+         ~search_attributes ~task_queue:"unit-test" ~id:"describe-a" ~input:"a"
+         ())
+  in
+  let run_id = Option.get (Temporal.Client.run_id handle) in
+  let described = unwrap (Temporal.Client.describe handle) in
+  assert (
+    described.execution
+    = { namespace = "unit-test"; workflow_id = "describe-a"; run_id });
+  assert (described.workflow_type = "unit.echo");
+  assert (described.task_queue = "unit-test");
+  assert (described.status = `Running);
+  assert (described.close_time = None);
+  assert (described.memo = by_key memo);
+  assert (described.search_attributes = by_key search_attributes);
+  assert (described.pending_activities = [] && described.pending_children = []);
+  assert (described.history_length = 0L);
+  let current =
+    unwrap
+      (Temporal.Client.get_handle client ~workflow:echo_workflow ~id:"describe-a" ())
+  in
+  assert ((unwrap (Temporal.Client.describe current)).execution.run_id = run_id);
+  unwrap (Temporal.Client.terminate handle);
+  let closed = unwrap (Temporal.Client.describe handle) in
+  assert (closed.status = `Terminated);
+  (match closed.close_time with
+  | Some close_time ->
+      assert (Temporal.Time.compare closed.start_time close_time <= 0)
+  | None -> failwith "a terminated mock run has no close time");
+  ignore
+    (unwrap
+       (Temporal.Client.start client ~workflow:echo_workflow
+          ~task_queue:"unit-test" ~id:"describe-b" ~input:"b" ()));
+  let listed = unwrap (Temporal.Client.list_visibility client ~query:"" ()) in
+  assert (
+    unwrap (Temporal.Client.count client ~query:"" ())
+    = Int64.of_int (List.length listed.executions));
+  assert (unwrap (Temporal.Client.count client ~query:"" ()) = 2L);
+  let not_found = function
+    | Error error -> assert (Temporal.Client.rpc_status error = Some `Not_found)
+    | Ok _ -> failwith "an unknown run was described"
+  in
+  not_found
+    (Temporal.Client.describe
+       (unwrap
+          (Temporal.Client.get_handle client ~workflow:echo_workflow
+             ~id:"describe-missing" ())));
+  not_found
+    (Temporal.Client.describe
+       (unwrap
+          (Temporal.Client.get_handle client ~workflow:echo_workflow
+             ~id:"describe-a" ~run_id:"other-run" ())));
+  expect_error "defect"
+    (Temporal.Client.describe ~rpc_timeout:(Temporal.Duration.of_ms 0L) handle);
+  expect_error "defect"
+    (Temporal.Client.count ~rpc_timeout:(Temporal.Duration.of_ms 0L) client
+       ~query:"" ());
+  expect_error "defect" (Temporal.Client.count client ~query:"a\000" ());
+  expect_error_message_contains "defect" "only supports an empty"
+    (Temporal.Client.count client ~query:"WorkflowType = 'x'" ());
+  unwrap (Temporal.Client.shutdown client);
+  expect_error_message_contains "bridge" "client is shut down"
+    (Temporal.Client.describe handle);
+  expect_error_message_contains "bridge" "client is shut down"
+    (Temporal.Client.count client ~query:"" ())
 
 (** A continuation identity can be turned back into a typed exact-run handle
     without starting a second execution. Using the mock ledger's existing run
@@ -1862,6 +2052,81 @@ let test_client_execution_policy_validation () =
          (Temporal.Error.make ~category:`Bridge ~message:"other" ())));
   unwrap (Temporal.Client.shutdown client)
 
+(** A cron schedule and a start delay (#1158) are validated at the public
+    boundary exactly as the protocol encoder and Rust bridge validate them,
+    so the mock rejects a zero delay, an empty or NUL-bearing schedule, and
+    their combination before anything is started, on {!Temporal.Client.start}
+    and {!Temporal.Client.signal_with_start} alike. Accepted options start
+    normally (the mock does not schedule runs), and both take part in the
+    request-ID fingerprint. *)
+let test_client_start_schedule_validation () =
+  let client =
+    unwrap
+      (Temporal.Client.create ~target_url:"mock://client"
+         ~namespace:"unit-test" ())
+  in
+  let ms = Temporal.Duration.of_ms in
+  let start ?request_id ?cron_schedule ?start_delay id =
+    Temporal.Client.start client ?request_id ?cron_schedule ?start_delay
+      ~workflow:echo_workflow ~task_queue:"unit-test" ~id ~input:"x" ()
+  in
+  let signal_with_start ?cron_schedule ?start_delay id =
+    Temporal.Client.signal_with_start client ?cron_schedule ?start_delay
+      ~workflow:echo_workflow ~task_queue:"unit-test" ~id ~input:"x"
+      ~signal:add_document_signal ~signal_input:"document" ()
+  in
+  List.iter
+    (fun (label, fragment, cron_schedule, start_delay) ->
+      List.iter
+        (fun (operation, result) ->
+          match result with
+          | Ok _ -> failwith (operation ^ " accepted " ^ label)
+          | Error _ as error ->
+              expect_error_message_contains "defect" fragment error)
+        [
+          ("start", start ?cron_schedule ?start_delay "schedule-rejected");
+          ( "signal_with_start",
+            signal_with_start ?cron_schedule ?start_delay "schedule-rejected" );
+        ])
+    [
+      ("a zero delay", "start_delay must be positive", None, Some (ms 0L));
+      ( "a delay with a cron schedule",
+        "start_delay cannot be combined with cron_schedule",
+        Some "@every 5s",
+        Some (ms 1_000L) );
+      ("an empty schedule", "cron schedule must not be empty", Some "", None);
+      ( "a NUL in the schedule",
+        "cron schedule must not contain NUL",
+        Some "* *\000 * * *",
+        None );
+    ];
+  let page = unwrap (Temporal.Client.list_visibility client ~query:"" ()) in
+  assert (
+    List.for_all
+      (fun (execution : Temporal.Client.visibility_execution) ->
+        not (contains_substring execution.workflow_id "schedule-rejected"))
+      page.executions);
+  let cron =
+    unwrap
+      (start ~request_id:"schedule-fp" ~cron_schedule:"@every 5s"
+         "schedule-cron")
+  in
+  assert (Temporal.Client.started cron);
+  expect_error_message_contains "workflow" "different start data"
+    (start ~request_id:"schedule-fp" ~cron_schedule:"@every 6s"
+       "schedule-cron");
+  expect_error_message_contains "workflow" "different start data"
+    (start ~request_id:"schedule-fp" "schedule-cron");
+  let delayed =
+    unwrap (start ~start_delay:(ms 315_576_000_000_999L) "schedule-delayed")
+  in
+  assert (Temporal.Client.started delayed);
+  assert (
+    Temporal.Client.started
+      (unwrap
+         (signal_with_start ~start_delay:(ms 1L) "schedule-signal-delayed")));
+  unwrap (Temporal.Client.shutdown client)
+
 (** Runs all public worker and client regression assertions. *)
 let () =
   test_duplicate_workflows ();
@@ -1879,10 +2144,14 @@ let () =
   test_mock_start_idempotent_retry ();
   test_mock_start_reuses_closed_workflow_id ();
   test_mock_start_id_conflict_policy ();
+  test_mock_signal_with_start ();
+  test_mock_update_with_start ();
   test_mock_start_id_reuse_policy ();
   test_client_execution_policy_validation ();
+  test_client_start_schedule_validation ();
   test_client_visibility_listing ();
   test_client_fetch_history_validation ();
+  test_client_describe_and_count ();
   test_follow_continued_as_new_handle ();
   test_follow_rejects_malformed_successor_identity ();
   test_follow_rejects_cross_namespace_execution ();

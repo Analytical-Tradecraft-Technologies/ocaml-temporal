@@ -2,8 +2,8 @@
 
 The OCaml SDK uses the [`logs`](https://ocaml.org/p/logs/latest) library for
 application-configurable logging, and can export Temporal Core's worker and
-client metrics, plus the SDK's own worker metrics, to Prometheus
-([worker metrics](#worker-metrics)). The SDK creates sources and submits events,
+client metrics, plus the SDK's own worker metrics, to Prometheus or an OTLP
+collector ([worker metrics](#worker-metrics)). The SDK creates sources and submits events,
 but never installs a reporter or changes reporting levels. An application owns
 those process-wide choices.
 
@@ -410,7 +410,8 @@ commands to the activation being reported.
 
 Temporal Core instruments every worker and client it runs. The SDK exports
 those instruments, with Core's names and labels, through a Prometheus scrape
-endpoint on a shared `Temporal.Runtime` (#500):
+endpoint (#500) or an OTLP push exporter ([OTLP export](#otlp-export), #1161)
+on a shared `Temporal.Runtime`:
 
 ```ocaml
 let ( let* ) = Result.bind
@@ -438,10 +439,10 @@ names the address and leaves nothing running. It stops when
 `Runtime.shutdown` has destroyed the runtime.
 
 This is the same mechanism and naming the official SDKs use (their runtime
-telemetry options feed Core's Prometheus exporter), so existing Temporal SDK
-dashboards and alerts apply unchanged. OTLP/OpenTelemetry push export,
-custom metric prefixes, and application-defined metrics are not offered yet;
-`Runtime.Metrics` is where they would be added.
+telemetry options feed Core's Prometheus and OTLP exporters), so existing
+Temporal SDK dashboards and alerts apply unchanged. A runtime has at most
+one exporter. Custom metric prefixes and application-defined metrics are
+not offered yet; `Runtime.Metrics` is where they would be added.
 
 ### Metric set
 
@@ -548,6 +549,9 @@ series cannot be registered runs without SDK metrics after one
 
 ### Failure isolation and resource use
 
+This section describes the Prometheus endpoint; the OTLP exporter's
+behavior is described under [OTLP export](#otlp-export).
+
 The scrape server is Core's own Prometheus exporter, running as one task on
 the runtime's background I/O threads behind the SDK's own listener. The SDK
 accepts scrape connections on `bind_address` and relays each one to Core's
@@ -616,11 +620,96 @@ runtime outlives the worker; the endpoint itself stops with the runtime. A
 saturated activity lane also shows as `temporal_ocaml_activity_callbacks_running`
 at 1 with long `temporal_ocaml_activity_callback_duration` observations.
 
+### OTLP export
+
+`Runtime.Metrics.otlp` pushes the same metrics to an OpenTelemetry collector
+(or any OTLP metrics endpoint) instead of serving them for scraping (#1161):
+
+```ocaml
+let* metrics =
+  Temporal.Runtime.Metrics.otlp ~endpoint:"https://otlp.example.com:4317"
+    ~headers:[ ("authorization", "Bearer " ^ token) ]
+    ~period:(Temporal.Duration.of_seconds 10L)
+    ~global_tags:[ ("deployment", "orders-blue") ] ()
+in
+let* runtime = Temporal.Runtime.create ~metrics () in
+```
+
+It is Temporal Core's own OTLP exporter (Core's `otel` feature, the builder
+the official SDKs' `OpenTelemetryConfig` feeds), so every family, unit and
+label in the tables above is exported under the same name, SDK series
+included. The live regression runs one worker scenario on each exporter and
+requires the same families from both.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `endpoint` | required | `http://` or `https://` URL. For `` `Grpc `` the collector's gRPC address (conventionally port 4317); for `` `Http_protobuf `` the complete metrics URL, conventionally `http://collector:4318/v1/metrics`: no path is appended. The host is a DNS name, dotted-quad IPv4 or bracketed IPv6 address; user information, fragments, spaces and control characters are rejected, so a credential belongs in `headers`. |
+| `protocol` | `` `Grpc `` | `` `Grpc `` (OTLP/gRPC) or `` `Http_protobuf `` (OTLP/HTTP with protobuf bodies). |
+| `headers` | none | Sent with every export, for example an `authorization` or `api-key` header. At most 16; lowercase names of `[a-z0-9_.-]` (at most 64 bytes, unique, not ending in `-bin`, not `grpc-*`, and not a header the transport sets such as `content-type`, `host`, `te` or `user-agent`); values of 1 to 4,096 bytes of printable ASCII without leading or trailing spaces. |
+| `period` | 1 s | Interval between exports, 100 ms to 1 hour. |
+| `temporality` | `` `Cumulative `` | `` `Cumulative `` or `` `Delta `` aggregation for counters and histograms. Use cumulative for Prometheus-compatible backends. |
+| `global_tags` | none | Same rules as for Prometheus. Exported as OTLP resource attributes next to Core's `service.name` (`temporal-core-sdk`); collectors typically turn resource attributes into labels. |
+| `durations_as_seconds` | `false` | As for Prometheus. `counters_total_suffix` and `unit_suffix` are Prometheus naming rules and do not apply: OTLP carries units in the metric itself. |
+
+TLS: an `https://` endpoint is verified against the operating system's root
+certificates (gRPC through Core's `tonic` transport, HTTP through `reqwest`
+with the platform verifier). A custom CA, client certificates and
+compression are not offered, because Core's exporter does not expose them.
+The underlying OpenTelemetry exporter also reads the standard
+`OTEL_EXPORTER_OTLP_*` environment variables for options the SDK does not
+set: `*_HEADERS` adds headers, `*_TIMEOUT` overrides the 10-second export
+timeout, and `*_COMPRESSION` requests compression, which this build does not
+include, so setting it makes `Runtime.create` fail with a `Bridge` error.
+With `` `Http_protobuf ``, a `*_PROTOCOL` value of `grpc` makes
+`Runtime.create` fail the same way. `OTEL_RESOURCE_ATTRIBUTES` and
+`OTEL_SERVICE_NAME` add resource attributes. The endpoint, period and
+temporality given to `otlp` always take precedence over the environment.
+
+Lifecycle and failure isolation. `Runtime.create` validates the options and
+starts the exporter, but contacts no collector: `Runtime.metrics_address` is
+`None` and an unreachable collector does not fail creation. The exporter
+collects and pushes on its own background thread every `period`; the request
+runs on the runtime's I/O threads (gRPC) or the HTTP client's own thread, and
+no OCaml code runs on either, so a slow, failing or absent collector cannot
+block, fail or reorder workflow and activity execution. A failed export (an
+unreachable collector, an authentication failure, a timeout) is logged by
+Core as one `warn` record per attempt, "OTLP metric export failed; metrics may
+be dropped", with the transport's error text, and the next period tries again
+with the then-current values; nothing is buffered beyond one interval.
+`Runtime.shutdown` stops the exporter before the runtime's I/O threads: it
+collects and exports one final time and waits at most 5 seconds for that
+export. An export still running then ends within its own timeout (10 s by
+default) on the exporter's thread; for gRPC it ends as soon as the runtime's
+I/O threads stop. The bridge owns the exporter and stops it exactly once at
+runtime release; clients, workers and the SDK recorder hold only a detachable
+reference, so a recorder kept alive by the garbage collector cannot keep the
+exporter running ([Core bridge reference](core-bridge.md)).
+
+Header values are credentials. They are never written to a log record or an
+error message: validation messages name only the violated rule, the bridge
+reduces failures of the exporter builder to a constant message, its debug
+output redacts header values, and OpenTelemetry's own internal logging, which
+could print request metadata, is not compiled in. The transport's error text
+in the `warn` record above comes from the collector's response (for example
+`gRPC code: Unauthenticated`); a collector that echoes request headers in
+its error responses is outside the SDK's control.
+
 ### Tracing
 
-Distributed tracing (OpenTelemetry spans across client, workflow, and
-activity) is deferred. Core's internal spans reach operators only as the
-stderr log records described above.
+Decision (#1161): the SDK does not export traces, and OTLP tracing is not
+planned until context propagation exists. Temporal Core at the pinned
+revision exports metrics only; its `otel` feature has no span exporter, and
+Core's internal spans reach operators only as the stderr log records
+described above. In the official SDKs, distributed tracing is a
+language-layer feature: an interceptor starts client, workflow and activity
+spans and carries the trace context between processes in Temporal headers.
+This SDK has neither user-visible headers nor interceptors yet (#1139 and
+#1162), so exporting spans now would produce disconnected per-process spans
+that cannot be joined into one trace, and workflow spans additionally need a
+replay-safe design so that replays do not emit duplicates. Tracing is
+revisited once #1139 and #1162 land; until then the correlated log records
+(workflow ID, run ID, activity identity, replay flag) are the per-execution
+diagnostic, and metrics are the aggregate one.
 
 ## Verification
 
@@ -676,8 +765,32 @@ in the scrape, checks the global tag, requires the SDK series (an admitted
 and timed activity callback, and after `Worker.shutdown` one `clean` shutdown
 for its task queue), and checks that every
 `workflow_activation_completed` record for the run carries its workflow ID,
-run ID, and `temporal.replaying=false`. `test/observability/test_logging.ml`
+run ID, and `temporal.replaying=false`. The same executable then repeats the
+scenario on an OTLP runtime pushing to an in-process OTLP/HTTP collector stub
+(`test/integration/worker_metrics/otlp_collector.ml`) and requires every
+family the Prometheus path requires, the configured `authorization` header
+on every export, the global tag and task queue in the exports, and no
+execution identifier (#1161). `test/observability/test_logging.ml`
 checks the `temporal.replaying` tag on replayed and fresh executions.
+
+OTLP (#1161): `test/unit/test_metrics_config.ml` also covers the endpoint
+grammar, header and period rules, that no rejection echoes a header value
+or the endpoint, and the exact bridge document; the Rust unit tests in
+`rust/core-bridge/tests/support/otlp_validation.rs` apply the same accepted
+and rejected endpoints and headers to the bridge's validator, check that
+debug output redacts header values, and check that a detached meter hands
+out no-op instruments. `rust/core-bridge/tests/otlp_exporter.rs` runs
+against loopback OTLP/gRPC and OTLP/HTTP collector doubles
+(`tests/support/otlp_collector.rs`): exports carry the configured headers,
+the global tag as a resource attribute, Core's `service_name` and the
+series' own labels; the exported names equal the families a Prometheus
+runtime serves for the same SDK series; releasing a runtime with a one-hour
+period makes exactly one final export and nothing afterwards; rejecting and
+unreachable collectors neither fail creation nor bound release beyond its
+limit, and Core's captured log at `trace` level records the failures without
+any header value; and invalid documents publish nothing.
+`test/bridge/test_runtime_metrics.ml` checks the public OTLP lifecycle
+without a collector.
 `test/runtime/test_native_activity_execution.ml` checks that activity lease
 records carry the attempt identity, bracket the callback's own logs, never
 contain the task token, and carry no identity for a bare cancellation;

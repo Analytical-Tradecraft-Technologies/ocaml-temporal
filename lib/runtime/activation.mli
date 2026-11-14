@@ -118,6 +118,30 @@ type retry_policy = {
     server default and the weight is an IEEE-754 single-precision bit pattern. *)
 type priority = Temporal_base.Priority.t
 
+(** Optional successor settings of a continue-as-new command (#1153), already
+    validated by the public API. Timeouts are exact positive milliseconds.
+    [None] leaves a setting to Core and the server: the task queue and the
+    run and task timeouts are inherited from the current run, the retry
+    policy is the one the chain started with, the search attributes are the
+    current ones (including upserts), and the versioning is inherited.
+    [search_attributes = Some values] replaces the successor's search
+    attributes, so [Some []] starts it with none. *)
+module Continue_as_new_options : sig
+  type t = {
+    task_queue : string option;
+    run_timeout : int64 option;
+    task_timeout : int64 option;
+    retry_policy : retry_policy option;
+    search_attributes : (string * Temporal_base.Codec.payload) list option;
+    initial_versioning_behavior :
+      Temporal_protocol.Workflow_protocol.continue_as_new_versioning_behavior
+      option;
+  }
+
+  (** Every setting [None], the command earlier releases emitted. *)
+  val none : t
+end
+
 (** An instruction produced by workflow code for Temporal Core. Commands are
     returned in the order they were created because Temporal records that order
     in workflow history and expects replay to reproduce it. Activity timeout
@@ -174,6 +198,12 @@ type command =
           (** Child workflow-task timeout in milliseconds, or [None] for
               Temporal's 10-second default. *)
       id_reuse_policy : child_workflow_id_reuse_policy option;
+      memo : (string * Temporal_base.Codec.payload) list option;
+          (** The child's start memo (#1135), or [None] for none. Keys were
+              validated by the public layer. *)
+      search_attributes : (string * Temporal_base.Codec.payload) list option;
+          (** The child's indexed search attributes (#1135), or [None] for
+              none. *)
     }
   (** Requests cancellation of a pending child workflow. *)
   | Cancel_child_workflow of { seq : int64; reason : string }
@@ -221,6 +251,12 @@ type command =
   | Upsert_search_attributes of {
       search_attributes : (string * Temporal_base.Codec.payload) list;
     }
+  (** Merges encoded values into the workflow's memo through Core's
+      [ModifyWorkflowProperties] command (#1154); a [binary/null] value
+      removes its key. Core records the merge in history and replays it. *)
+  | Modify_workflow_properties of {
+      upserted_memo : (string * Temporal_base.Codec.payload) list;
+    }
   | Complete_workflow of Temporal_base.Codec.payload
   | Fail_workflow of Temporal_base.Error.t
   (** Replaces the current run with a new run of the same workflow type. The
@@ -231,5 +267,13 @@ type command =
       workflow_type : string;
       input : Temporal_base.Codec.payload list;
           (** Exact argument payloads, as for [Start_child_workflow]. *)
+      memo : (string * Temporal_base.Codec.payload) list;
+          (** The successor's memo. Empty asks Core to reuse the memo the
+              current run started with; the runtime fills it only after a
+              memo upsert, so upserted values survive continue-as-new, and an
+              explicit [~memo] on [Workflow.continue_as_new] replaces it. *)
+      options : Continue_as_new_options.t;
+          (** The other successor settings (#1153);
+              {!Continue_as_new_options.none} leaves them all to Core. *)
     }
   | Cancel_workflow_execution
