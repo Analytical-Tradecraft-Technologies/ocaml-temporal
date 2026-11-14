@@ -1528,23 +1528,39 @@ impl Runtime {
     }
 }
 
+/// Starts one named, detached cleanup thread that runs `run` with `SIGPIPE`
+/// blocked, because destruction on it (dropping Core, a client, or a worker)
+/// can flush or close network connections. Used by [`Runtime::new`] and
+/// [`SharedRuntime::new`] so a handle is published only after its
+/// non-blocking release path exists; a spawn failure is `STATUS_INTERNAL`.
+fn spawn_cleanup_thread(
+    name: &str,
+    run: impl FnOnce() + Send + 'static,
+) -> std::result::Result<(), Failure> {
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            crate::sigpipe::block_current_thread();
+            run()
+        })
+        // The thread is detached: it exits once its handle's channel closes.
+        .map(|_detached| ())
+        .map_err(|error| Failure {
+            status: STATUS_INTERNAL,
+            message: format!("could not start Temporal runtime cleanup thread: {error}"),
+        })
+}
+
 impl SharedRuntime {
     /// Starts the cleanup thread before exposing a handle, mirroring
     /// [`Runtime::new`]: every published handle has a non-blocking release
     /// path.
     fn new(core: SharedCore) -> std::result::Result<Self, Failure> {
         let (cleanup, receiver) = channel();
-        std::thread::Builder::new()
-            .name("ocaml-temporal-shared-runtime-cleanup".to_owned())
-            .spawn(move || {
-                // Dropping Core here can flush or close its connections.
-                crate::sigpipe::block_current_thread();
-                run_shared_runtime_cleanup(receiver)
-            })
-            .map_err(|error| Failure {
-                status: STATUS_INTERNAL,
-                message: format!("could not start Temporal runtime cleanup thread: {error}"),
-            })?;
+        // Dropping Core on this thread can flush or close its connections.
+        spawn_cleanup_thread("ocaml-temporal-shared-runtime-cleanup", move || {
+            run_shared_runtime_cleanup(receiver)
+        })?;
         SHARED_RUNTIMES_CREATED.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             core: Arc::new(core),
@@ -1815,18 +1831,11 @@ impl Runtime {
     /// runtime allocation already has a non-blocking GC fallback path.
     fn new(core: Arc<SharedCore>) -> std::result::Result<Self, Failure> {
         let (cleanup, receiver) = channel();
-        std::thread::Builder::new()
-            .name("ocaml-temporal-runtime-cleanup".to_owned())
-            .spawn(move || {
-                // Dropping a client or worker here can flush or close its
-                // connections.
-                crate::sigpipe::block_current_thread();
-                run_runtime_cleanup(receiver)
-            })
-            .map_err(|error| Failure {
-                status: STATUS_INTERNAL,
-                message: format!("could not start Temporal runtime cleanup thread: {error}"),
-            })?;
+        // Dropping a client or worker on this thread can flush or close its
+        // connections.
+        spawn_cleanup_thread("ocaml-temporal-runtime-cleanup", move || {
+            run_runtime_cleanup(receiver)
+        })?;
         RUNTIMES_CREATED.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             core: Some(core),
@@ -3037,18 +3046,8 @@ impl Runtime {
             .replay_worker
             .take()
             .ok_or_else(replay_worker_not_running)?;
-        match handle.block_on(worker.finalize(&handle)) {
-            Ok(()) => {
-                self.worker_namespace = None;
-                self.workflow_activations.clear();
-                self.activity_tasks.clear();
-                Ok(Vec::new())
-            }
-            Err((worker, error)) => {
-                self.replay_worker = Some(worker);
-                Err(replay_worker_failure(error))
-            }
-        }
+        let outcome = handle.block_on(worker.finalize(&handle));
+        self.settle_replay_teardown(outcome)
     }
 
     /// Explicitly abandons a replay, force-completing its native debts and
@@ -3062,7 +3061,19 @@ impl Runtime {
             .replay_worker
             .take()
             .expect("replay worker was checked before disposal");
-        match handle.block_on(worker.dispose(&handle)) {
+        let outcome = handle.block_on(worker.dispose(&handle));
+        self.settle_replay_teardown(outcome)
+    }
+
+    /// Applies the outcome of a replay finalize or dispose. Success forgets
+    /// the replay's namespace and every leased activation and activity task;
+    /// failure puts the returned worker back so ownership is never lost and
+    /// a later dispose can retry.
+    fn settle_replay_teardown(
+        &mut self,
+        outcome: std::result::Result<(), (ReplayWorker, ReplayWorkerError)>,
+    ) -> Operation {
+        match outcome {
             Ok(()) => {
                 self.worker_namespace = None;
                 self.workflow_activations.clear();
@@ -5243,8 +5254,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_new_attached(
 pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_free(
     shared: *mut *mut SharedRuntime,
 ) -> Status {
-    // SAFETY: The slot contract is forwarded unchanged.
-    unsafe { release_shared_runtime_slot(shared, true) }
+    // SAFETY: The slot contract is forwarded unchanged; non-null values in
+    // this slot come from `Box::into_raw` in `shared_runtime_new`.
+    unsafe { release_boxed_slot(shared, |shared| shared.release(true)) }
 }
 
 /// Transfer a shared-runtime handle's reference to its cleanup thread
@@ -5257,30 +5269,40 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_free(
 pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_dispose(
     shared: *mut *mut SharedRuntime,
 ) -> Status {
-    // SAFETY: The slot contract is forwarded unchanged.
-    unsafe { release_shared_runtime_slot(shared, false) }
+    // SAFETY: As for `shared_runtime_free`.
+    unsafe { release_boxed_slot(shared, |shared| shared.release(false)) }
 }
 
-/// Shared body of the two shared-runtime release exports: clears the slot
-/// before releasing, contains panics, and is idempotent on a null slot.
+/// Shared body of every export that releases a boxed handle through the
+/// caller's pointer-to-pointer slot (runtime, shared runtime, metric meter).
+///
+/// A null slot pointer is `STATUS_INVALID_ARGUMENT`. Otherwise the slot is
+/// cleared before `release` runs, so even a panic during destruction cannot
+/// invite a second attempt to free the same allocation, and a call with an
+/// already-null slot returns `STATUS_OK` without calling `release`. A panic is
+/// contained and reported as `STATUS_PANIC`; it is never unwound into C.
 ///
 /// # Safety
 ///
-/// As for [`ocaml_temporal_core_v4_shared_runtime_free`].
-unsafe fn release_shared_runtime_slot(shared: *mut *mut SharedRuntime, wait: bool) -> Status {
-    if shared.is_null() {
+/// `slot` must be null or exclusively writable, with no concurrent access.
+/// Every non-null value stored in it must come from `Box::into_raw` of a `T`
+/// that has not been reclaimed: this call consumes it exactly once.
+unsafe fn release_boxed_slot<T>(
+    slot: *mut *mut T,
+    release: impl FnOnce(Box<T>) -> Status,
+) -> Status {
+    if slot.is_null() {
         return STATUS_INVALID_ARGUMENT;
     }
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: The caller guarantees exclusive writable access to the slot.
-        let owned = unsafe { ptr::replace(shared, ptr::null_mut()) };
+        let owned = unsafe { ptr::replace(slot, ptr::null_mut()) };
         if owned.is_null() {
             STATUS_OK
         } else {
-            // SAFETY: Non-null values in this slot originate from
-            // `Box::into_raw` in `shared_runtime_new` and are consumed once.
-            let shared = unsafe { Box::from_raw(owned) };
-            shared.release(wait)
+            // SAFETY: The caller guarantees non-null values originate from
+            // `Box::into_raw` and are consumed only here, once.
+            release(unsafe { Box::from_raw(owned) })
         }
     }));
     outcome.unwrap_or(STATUS_PANIC)
@@ -5500,21 +5522,14 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_release(
 pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_free(
     meter: *mut *mut MetricMeter,
 ) -> Status {
-    if meter.is_null() {
-        return STATUS_INVALID_ARGUMENT;
+    // SAFETY: The slot contract is forwarded unchanged; non-null values in
+    // this slot come from `Box::into_raw` in `shared_runtime_metric_meter`.
+    unsafe {
+        release_boxed_slot(meter, |meter| {
+            drop(meter);
+            STATUS_OK
+        })
     }
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: The caller guarantees exclusive writable access to the slot.
-        let owned = unsafe { ptr::replace(meter, ptr::null_mut()) };
-        if !owned.is_null() {
-            // SAFETY: Non-null values in this slot originate from
-            // `Box::into_raw` in `shared_runtime_metric_meter` and are
-            // consumed once.
-            drop(unsafe { Box::from_raw(owned) });
-        }
-        STATUS_OK
-    }));
-    outcome.unwrap_or(STATUS_PANIC)
 }
 
 /// Connect the runtime graph's single official Temporal client from strict
@@ -6551,29 +6566,9 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_disconnect(
 /// concurrently, and all future child handles must be closed first.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_free(runtime: *mut *mut Runtime) -> Status {
-    if runtime.is_null() {
-        return STATUS_INVALID_ARGUMENT;
-    }
-
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        // Clear first so even a defensive panic during destruction cannot
-        // invite a second attempt to free the same allocation.
-        // SAFETY: The caller guarantees exclusive writable access to the slot.
-        let owned = unsafe { ptr::replace(runtime, ptr::null_mut()) };
-        if owned.is_null() {
-            STATUS_OK
-        } else {
-            // SAFETY: Non-null values in this slot originate from `Box::into_raw`
-            // in `runtime_new` and have not been reclaimed previously.
-            let runtime = unsafe { Box::from_raw(owned) };
-            runtime.close(true)
-        }
-    }));
-
-    match outcome {
-        Ok(status) => status,
-        Err(_) => STATUS_PANIC,
-    }
+    // SAFETY: The slot contract is forwarded unchanged; non-null values in
+    // this slot come from `Box::into_raw` in `runtime_new`.
+    unsafe { release_boxed_slot(runtime, |runtime| runtime.close(true)) }
 }
 
 /// Transfer a runtime to its cleanup thread without waiting for destruction.
@@ -6590,27 +6585,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_free(runtime: *mut *mut 
 pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_dispose(
     runtime: *mut *mut Runtime,
 ) -> Status {
-    if runtime.is_null() {
-        return STATUS_INVALID_ARGUMENT;
-    }
-
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: The caller guarantees exclusive writable access to the slot.
-        let owned = unsafe { ptr::replace(runtime, ptr::null_mut()) };
-        if owned.is_null() {
-            STATUS_OK
-        } else {
-            // SAFETY: The pointer was created by `runtime_new` and is consumed
-            // exactly once by this pointer-to-pointer operation.
-            let runtime = unsafe { Box::from_raw(owned) };
-            runtime.close(false)
-        }
-    }));
-
-    match outcome {
-        Ok(status) => status,
-        Err(_) => STATUS_PANIC,
-    }
+    // SAFETY: As for `runtime_free`.
+    unsafe { release_boxed_slot(runtime, |runtime| runtime.close(false)) }
 }
 
 /// Release both owned buffers in a result and reset it to the empty state.
