@@ -1,0 +1,78 @@
+# Bug report form (#1140). The fields mirror what maintainers need to triage
+# an SDK defect: exact versions and pins, platform, a reproduction command,
+# and exact workflow/run IDs. Payload contents must be redacted.
+name: Bug report
+description: Report incorrect behavior, a crash, a hang or a test failure in the SDK.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Please do **not** report security
+        vulnerabilities here; see CONTRIBUTING.md ("Reporting a security
+        problem"). Redact workflow/activity payloads, credentials and other
+        sensitive data from everything you paste.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened, and what did you expect?
+      description: Describe the observed behavior and the expected behavior.
+    validations:
+      required: true
+  - type: input
+    id: sdk-version
+    attributes:
+      label: SDK version or commit
+      description: The temporal-sdk version (for example 0.1.0~rc.1) or the full commit SHA you built.
+    validations:
+      required: true
+  - type: input
+    id: ocaml-version
+    attributes:
+      label: OCaml version and switch
+      description: Output of `ocaml -version`, and the Docker image if you use the Compose path (for example `OCAML_VERSION=5.5`).
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux amd64
+        - Linux arm64
+        - macOS ARM64
+        - Windows x64
+        - Other (describe below)
+    validations:
+      required: true
+  - type: input
+    id: server
+    attributes:
+      label: Temporal Server
+      description: Server version and deployment (for example "1.32.2 in the repository Compose fixture", "Temporal Cloud", or "not involved").
+    validations:
+      required: true
+  - type: input
+    id: pins
+    attributes:
+      label: Other pins (if relevant)
+      description: Temporal Core revision or Rust toolchain if you changed them, and any other SDK you interoperate with and its version.
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: The smallest program, test or `make` target that reproduces the problem, with the exact command you ran.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: identifiers
+    attributes:
+      label: Workflow and run IDs
+      description: Exact workflow IDs, run IDs, task queues and namespaces involved, and the CI run link if this happened in CI.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and diagnostics
+      description: Relevant SDK logs, error values (`Temporal.Error.t`), or history excerpts, with payloads redacted.
+      render: text

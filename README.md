@@ -398,6 +398,8 @@ are excluded from log messages. See the [observability reference](docs/reference
 - [Release checklist and bad-release remediation](docs/reference/release-checklist.md)
 - [Dependency and license inventory](docs/dependencies.md)
 - [Verified progress](docs/progress.md)
+- [Contributing guide](CONTRIBUTING.md) (draft pending maintainer adoption,
+  #1140)
 
 ## License
 

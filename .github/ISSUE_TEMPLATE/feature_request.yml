@@ -1,0 +1,39 @@
+# Feature request form (#1140). New features are scoped before code: the
+# form asks for the use case and the Temporal behavior, not another SDK's API.
+name: Feature request
+description: Propose a new capability or a change to the public OCaml API.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        New public APIs and new Temporal features need a scope decision before
+        implementation, and large ones a design note under `docs/design/`.
+        Please describe the problem and the Temporal behavior you need; the
+        OCaml API is designed idiomatically rather than translated from
+        another SDK. Check the
+        [feature coverage](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/blob/master/docs/reference/feature-coverage.md)
+        and the open issues first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and why is it hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: temporal-behavior
+    attributes:
+      label: Temporal behavior
+      description: The Temporal feature or server behavior involved, with links to Temporal documentation or another SDK's behavior if useful.
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed OCaml surface (optional)
+      description: A sketch of how it could look from OCaml, including how failures would be reported as typed results.
+      render: ocaml
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
+      description: What you use today, and other approaches you considered.
