@@ -92,7 +92,7 @@ def package_list(document: dict[str, Any], container: str) -> list[Any]:
 
 
 def package_fields(
-    package: Any, container: str, fields: tuple[str, ...], missing: str
+    package: object, container: str, fields: tuple[str, ...], missing: str
 ) -> tuple[str, ...]:
     """Return the named fields of one package entry, each a non-empty string.
 

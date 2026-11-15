@@ -223,7 +223,7 @@ def manifest_list(entry: dict[str, object], key: str, where: str) -> list[object
 
 
 def load_reviewed_entry(
-    entry: object, where: str, directory: Path
+    value: object, where: str, directory: Path
 ) -> tuple[list[tuple[str, str]], ReviewedNotice]:
     """Validate one manifest entry and read the texts it vendors.
 
@@ -236,7 +236,7 @@ def load_reviewed_entry(
     with an explicit `maintainer_exception`.
     """
 
-    entry = manifest_object(entry, where, "entry")
+    entry = manifest_object(value, where, "entry")
     license = manifest_string(entry, "license", where)
     manifest_string(entry, "evidence", where)
     packages = []
