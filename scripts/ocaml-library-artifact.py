@@ -243,11 +243,13 @@ def prepare_consumer(root, destination):
         "installed_replay.ml",
     ):
         shutil.copyfile(root / "test/fixtures/install-consumer" / name, destination / name)
-    # installed_replay.exe replays this frozen corpus history (#497).
-    shutil.copyfile(
-        root / "test/fixtures/history-corpus/histories/live-2026-10-08-timer.pb",
-        destination / "timer-history.pb",
-    )
+    # installed_replay.exe replays these frozen corpus histories, one
+    # successful run and one failed run (#497).
+    for history, name in (
+        ("live-2026-10-08-timer.pb", "timer-history.pb"),
+        ("task-failure-business-permanent.pb", "failed-history.pb"),
+    ):
+        shutil.copyfile(root / "test/fixtures/history-corpus/histories" / history, destination / name)
     shutil.copyfile(root / "scripts/ocaml-library-environment.sh", destination / "environment.sh")
     shutil.copyfile(root / "test/bridge/test_prebuilt_library.sh", destination / "test.sh")
 

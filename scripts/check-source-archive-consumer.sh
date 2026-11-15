@@ -22,7 +22,8 @@ set -eu
 #    prefix prepended to OCAMLPATH. The executables are the ones
 #    test/bridge/test_install.sh builds from a checkout: the public API witness
 #    as native code and as a Dune (modes byte) program, the worker-environment
-#    probe, and offline replay of a frozen history-corpus capture.
+#    probe, and offline replay of a successful and a failed frozen
+#    history-corpus capture.
 #
 # A switch that already contains temporal-sdk is refused: the consumer could
 # then resolve the switch's copy instead of the archive's, and the check would
@@ -89,7 +90,7 @@ if [ ! -f "$installed/META" ] ||
 fi
 
 fixture=$package_root/test/fixtures/install-consumer
-history=$package_root/test/fixtures/history-corpus/histories/live-2026-10-08-timer.pb
+histories=$package_root/test/fixtures/history-corpus/histories
 mkdir "$consumer"
 for file in dune-project dune main.ml public_api.ml worker_environment.ml installed_replay.ml; do
   if [ ! -f "$fixture/$file" ]; then
@@ -98,11 +99,16 @@ for file in dune-project dune main.ml public_api.ml worker_environment.ml instal
   fi
   cp "$fixture/$file" "$consumer/"
 done
-if [ ! -f "$history" ]; then
-  echo "source archive is missing the replay history ${history#"$package_root"/}" >&2
-  exit 1
-fi
-cp "$history" "$consumer/timer-history.pb"
+# The consumer receives the successful and the failed history under fixed names.
+for pair in live-2026-10-08-timer.pb:timer-history.pb \
+  task-failure-business-permanent.pb:failed-history.pb; do
+  history=$histories/${pair%%:*}
+  if [ ! -f "$history" ]; then
+    echo "source archive is missing the replay history ${history#"$package_root"/}" >&2
+    exit 1
+  fi
+  cp "$history" "$consumer/${pair#*:}"
+done
 
 # The subshell confines the prefix's OCAMLPATH to the consumer build. The
 # remaining entries, if any, are the caller's (for example the switch's
@@ -116,11 +122,11 @@ cp "$history" "$consumer/timer-history.pb"
 "$consumer/_build/default/main.exe"
 "$consumer/_build/default/main.bc"
 "$consumer/_build/default/worker_environment.exe"
-# Replay the recorded history through the installed package: it must pass, and
-# the fixture also checks that the same workflow without its timer is
-# nondeterministic (#497).
+# Replay the recorded successful and failed histories through the installed
+# package: the recorded code must pass for both, and the fixture also checks
+# that an incompatible change to each is nondeterministic (#497).
 (
   cd "$consumer" || exit 1
-  ./_build/default/installed_replay.exe timer-history.pb
+  ./_build/default/installed_replay.exe timer-history.pb failed-history.pb
 )
 echo "installed consumer of $(basename "$package_root") built and ran from $prefix"

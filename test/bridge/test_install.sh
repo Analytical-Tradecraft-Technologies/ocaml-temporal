@@ -132,9 +132,12 @@ cp "$root/test/fixtures/install-consumer/main.ml" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/public_api.ml" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/worker_environment.ml" "$output_dir/"
 cp "$root/test/fixtures/install-consumer/installed_replay.ml" "$output_dir/"
-# The installed replay check reuses a frozen history-corpus capture (#497).
+# The installed replay check reuses two frozen history-corpus captures, one
+# successful run and one failed run (#497).
 cp "$root/test/fixtures/history-corpus/histories/live-2026-10-08-timer.pb" \
   "$output_dir/timer-history.pb"
+cp "$root/test/fixtures/history-corpus/histories/task-failure-business-permanent.pb" \
+  "$output_dir/failed-history.pb"
 cp "$root/test/fixtures/install-consumer/negative-dune" "$output_dir/dune-negative"
 cp "$root/test/fixtures/install-consumer/negative/forbidden_"*.ml "$output_dir/"
 consumer_ocamlpath=$dune_install_root
@@ -155,13 +158,14 @@ fi
 # without looking for a dllocaml_temporal_core_bridge shared library.
 "$output_dir/_build/default/main.bc"
 
-# Offline replay through the installed package: the recorded code must pass and
-# the same workflow type without its timer must be nondeterministic (#497).
-# The history is passed as a relative path from the consumer directory: the
-# executable is native, so on Windows it cannot open a Cygwin /cygdrive path.
+# Offline replay through the installed package: for the successful and the
+# failed history, the recorded code must pass and an incompatible change must
+# be nondeterministic (#497). The histories are passed as relative paths from
+# the consumer directory: the executable is native, so on Windows it cannot
+# open a Cygwin /cygdrive path.
 (
   cd "$output_dir"
-  ./_build/default/installed_replay.exe timer-history.pb
+  ./_build/default/installed_replay.exe timer-history.pb failed-history.pb
 )
 
 # Malformed legacy settings used to fail before native client configuration.

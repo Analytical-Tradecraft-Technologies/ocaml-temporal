@@ -9,7 +9,7 @@ set -eu
 # - a complete build is installed from the unpacked archive with the build's
 #   `-p` flags into WORK/prefix, the consumer is copied from the archive's own
 #   fixture into WORK/consumer, built with the prefix first on OCAMLPATH, and
-#   every consumer executable runs (replay with the archive's history);
+#   every consumer executable runs (replay with the archive's histories);
 # - a switch that already provides temporal-sdk is refused before installing;
 # - a work directory without the sandboxed build is refused;
 # - an archive without the consumer fixture is refused; and
@@ -99,7 +99,9 @@ make_work() {
       done
       ;;
   esac
-  : >"$package_root/test/fixtures/history-corpus/histories/live-2026-10-08-timer.pb"
+  for history in live-2026-10-08-timer.pb task-failure-business-permanent.pb; do
+    : >"$package_root/test/fixtures/history-corpus/histories/$history"
+  done
 }
 
 # Runs the check on work directory $1 with switch prefix $2; the exit status
@@ -150,10 +152,11 @@ grep -Eq "^dune build --root $work/consumer -j [1-9][0-9]* ./main.exe ./main.bc 
 expect_log "ocamlpath $work/prefix/lib:/caller/lib"
 grep -Fqx '(* archive copy of main.ml *)' "$work/consumer/main.ml"
 test -f "$work/consumer/timer-history.pb"
+test -f "$work/consumer/failed-history.pb"
 expect_log "run main.exe  in $(pwd -P)"
 expect_log "run main.bc  in $(pwd -P)"
 expect_log "run worker_environment.exe  in $(pwd -P)"
-expect_log "run installed_replay.exe timer-history.pb in $work/consumer"
+expect_log "run installed_replay.exe timer-history.pb failed-history.pb in $work/consumer"
 
 # A second run must not reuse the first run's prefix or consumer.
 run_check "$work" "$temporary_root/switch"

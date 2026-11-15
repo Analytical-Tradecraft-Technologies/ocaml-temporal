@@ -513,10 +513,14 @@ documented size message.
 The installed-package consumer
 [`installed_replay.ml`](../../test/fixtures/install-consumer/installed_replay.ml)
 runs `Temporal.Replay` from outside the SDK workspace, both after
-`make test-install` and in the relocated binary-only consumer. It replays the
-corpus history `live-2026-10-08-timer.pb`: the recorded `corpus.timer` code
-must pass, and the same type with its timer removed must be `Nondeterminism`
-at the recorded `TimerStarted` event. The
+`make test-install`, in the relocated binary-only consumer, and in the
+source-archive consumer. It replays two corpus histories. For the successful
+`live-2026-10-08-timer.pb`, the recorded `corpus.timer` code must pass, and
+the same type with its timer removed must be `Nondeterminism` at the recorded
+`TimerStarted` event. For the failed `task-failure-business-permanent.pb`, the
+recorded code, which returns a non-retryable application error, must pass,
+and the same type changed to succeed must be `Nondeterminism` at the recorded
+`WorkflowExecutionFailed` event. The
 [replay command's process test](../../test/replay_cli/test_replay_cli.ml)
 feeds a sparse file of `max_bytes + 1` bytes and requires exit status 3.
 
