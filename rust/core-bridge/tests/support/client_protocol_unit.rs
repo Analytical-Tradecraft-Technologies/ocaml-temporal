@@ -258,6 +258,18 @@ fn start_request_execution_policies_are_validated() {
         }))
         .is_ok()
     );
+    // A zero interval or the all-zero coefficient bits are Temporal's "unset"
+    // values (#1145): the server applies its defaults, so they are accepted.
+    assert!(
+        with(serde_json::json!({"retry_policy": {
+            "initial_interval": {"seconds": 0, "nanoseconds": 0},
+            "backoff_coefficient_bits": "0",
+            "maximum_interval": {"seconds": 1, "nanoseconds": 0},
+            "maximum_attempts": 2,
+            "non_retryable_error_types": []
+        }}))
+        .is_ok()
+    );
 
     for rejected in [
         serde_json::json!({"execution_timeout_ms": 0}),
@@ -272,10 +284,19 @@ fn start_request_execution_policies_are_validated() {
         serde_json::json!({"execution_timeout_ms": 1_000, "task_timeout_ms": 1_001}),
         serde_json::json!({"rpc_timeout_ms": 0}),
         serde_json::json!({"rpc_timeout_ms": MAX_RPC_TIMEOUT_MS + 1}),
+        // Both intervals set, with the maximum below the initial interval.
         serde_json::json!({"retry_policy": {
-            "initial_interval": {"seconds": 0, "nanoseconds": 0},
+            "initial_interval": {"seconds": 2, "nanoseconds": 0},
             "backoff_coefficient_bits": 2.0_f64.to_bits().to_string(),
             "maximum_interval": {"seconds": 1, "nanoseconds": 0},
+            "maximum_attempts": 2,
+            "non_retryable_error_types": []
+        }}),
+        // A set coefficient below 1.0 (zero bits alone mean "unset").
+        serde_json::json!({"retry_policy": {
+            "initial_interval": {"seconds": 0, "nanoseconds": 0},
+            "backoff_coefficient_bits": 0.5_f64.to_bits().to_string(),
+            "maximum_interval": {"seconds": 0, "nanoseconds": 0},
             "maximum_attempts": 2,
             "non_retryable_error_types": []
         }}),
