@@ -246,14 +246,37 @@ pub fn decode(input: &str) -> Result<Envelope, ProtocolError> {
 pub fn encode(envelope: &Envelope) -> Result<String, ProtocolError> {
     validate_envelope(envelope)?;
     let output = render_envelope(envelope)?;
-    let reparsed = decode(&output)?;
-    if render_envelope(&reparsed)? != output {
-        return Err(ProtocolError::invalid(
-            "$",
-            "outgoing envelope did not round trip",
-        ));
+    let rerendered = render_envelope(&decode(&output)?)?;
+    require_round_trip(output, rerendered, "outgoing envelope did not round trip")
+}
+
+/// Returns `output` only when `rerendered`, the rendering of its strict
+/// reparse, is byte-identical to it; otherwise reports `message` at `$`.
+///
+/// Both outgoing encoders use this as their final step so that a document
+/// crossing the native boundary is never one the strict decoder on the other
+/// side would read differently.
+fn require_round_trip(
+    output: String,
+    rerendered: String,
+    message: &'static str,
+) -> Result<String, ProtocolError> {
+    if rerendered == output {
+        Ok(output)
+    } else {
+        Err(ProtocolError::invalid("$", message))
     }
-    Ok(output)
+}
+
+/// Refuses any JSON value other than an object, reporting `message` at
+/// `path`. Operation bodies, outgoing objects, and envelope bodies all share
+/// this closed-root rule.
+fn require_object(value: &JsonValue, path: &str, message: &str) -> Result<(), ProtocolError> {
+    if matches!(value, JsonValue::Object(_)) {
+        Ok(())
+    } else {
+        Err(ProtocolError::invalid(path, message))
+    }
 }
 
 /// Strictly decodes one operation-specific object using the shared limits.
@@ -293,43 +316,25 @@ fn decode_object_with_string_limit(
     string_limit: usize,
 ) -> Result<JsonValue, ProtocolError> {
     let value = parse_strict_with_string_limit(input, string_limit)?;
-    if matches!(value, JsonValue::Object(_)) {
-        Ok(value)
-    } else {
-        Err(ProtocolError::invalid(
-            "$",
-            "operation body must be a JSON object",
-        ))
-    }
+    require_object(&value, "$", "operation body must be a JSON object")?;
+    Ok(value)
 }
 
 /// Validates, renders, and independently reparses one outgoing object.
 ///
 /// The rendered text is reparsed with the same `string_limit` and rendered
-/// again; it is returned only when both renderings are byte-identical, so an
-/// outgoing document is never one the strict decoder on the other side of the
-/// native boundary would read differently.
+/// again; it is returned only when both renderings are byte-identical (see
+/// [`require_round_trip`]).
 fn encode_object_with_string_limit(
     value: &JsonValue,
     string_limit: usize,
 ) -> Result<String, ProtocolError> {
-    if !matches!(value, JsonValue::Object(_)) {
-        return Err(ProtocolError::invalid(
-            "$",
-            "operation body must be a JSON object",
-        ));
-    }
+    require_object(value, "$", "operation body must be a JSON object")?;
     let mut nodes = 0;
     validate_tree(value, 1, &mut nodes, string_limit)?;
     let output = render_json(value)?;
-    let reparsed = decode_object_with_string_limit(&output, string_limit)?;
-    if render_json(&reparsed)? != output {
-        return Err(ProtocolError::invalid(
-            "$",
-            "outgoing object did not round trip",
-        ));
-    }
-    Ok(output)
+    let rerendered = render_json(&decode_object_with_string_limit(&output, string_limit)?)?;
+    require_round_trip(output, rerendered, "outgoing object did not round trip")
 }
 
 /// Deserializes one already-decoded payload object into a typed semantic
@@ -392,6 +397,52 @@ pub(crate) fn encode_validated_semantic<T: serde::Serialize>(
     Ok(output)
 }
 
+/// Defines the public codec pair of each typed semantic document.
+///
+/// One entry declares both functions of a document, each with its own doc
+/// comment and visibility, followed by the validator and diagnostics they
+/// share:
+///
+/// - `fn decode(input: &str)` expands to
+///   `fn decode(input: &str) -> Result<Document, ProtocolError>`, the strict
+///   inbound contract of [`decode_validated_semantic`] with the `invalid`
+///   Serde diagnostic and the `validate` semantic validator;
+/// - `fn encode(value: &Document)` expands to
+///   `fn encode(value: &Document) -> Result<String, ProtocolError>`, the
+///   outbound contract of [`encode_validated_semantic`]: `validate` runs before
+///   rendering (reporting `unencodable` if Serde fails) and the rendered text
+///   must be accepted by the paired decoder before it crosses the boundary.
+///
+/// Sharing one validator between both directions is the point: a document is
+/// accepted inbound exactly when it may be produced outbound. Every entry,
+/// including the last, ends with the comma after `unencodable`.
+macro_rules! semantic_codecs {
+    ($(
+        $(#[$decode_meta:meta])*
+        $decode_vis:vis fn $decode:ident(input: &str);
+        $(#[$encode_meta:meta])*
+        $encode_vis:vis fn $encode:ident(value: &$document:ty);
+        validate: $validate:path,
+        invalid: $invalid:literal,
+        unencodable: $unencodable:literal,
+    )*) => {$(
+        $(#[$decode_meta])*
+        $decode_vis fn $decode(
+            input: &str,
+        ) -> Result<$document, $crate::protocol::ProtocolError> {
+            $crate::protocol::decode_validated_semantic(input, $invalid, $validate)
+        }
+
+        $(#[$encode_meta])*
+        $encode_vis fn $encode(
+            value: &$document,
+        ) -> Result<String, $crate::protocol::ProtocolError> {
+            $crate::protocol::encode_validated_semantic(value, $validate, $unencodable, $decode)
+        }
+    )*};
+}
+pub(crate) use semantic_codecs;
+
 /// Converts the duplicate-aware protocol tree into Serde's value tree.
 ///
 /// Duplicate members were already refused by the strict parser, so collecting
@@ -453,16 +504,20 @@ pub fn decode_payload(input: &str) -> Result<Vec<u8>, ProtocolError> {
         ));
     }
     let data = expect_string(field(&entries, "data", "$")?, "$.data")?;
-    let bytes = STANDARD
-        .decode(data.as_bytes())
-        .map_err(|_| ProtocolError::invalid("$.data", "payload is not canonical padded base64"))?;
-    if bytes.len() > MAX_PAYLOAD_BYTES || STANDARD.encode(&bytes) != data {
-        return Err(ProtocolError::invalid(
-            "$.data",
-            "payload is not canonical padded base64",
-        ));
-    }
-    Ok(bytes)
+    decode_canonical_base64(&data)
+        .ok_or_else(|| ProtocolError::invalid("$.data", "payload is not canonical padded base64"))
+}
+
+/// Decodes canonical padded base64 holding at most [`MAX_PAYLOAD_BYTES`]
+/// bytes, or returns `None`.
+///
+/// Canonical means that re-encoding the decoded bytes reproduces `data`
+/// exactly, so every byte string has one accepted spelling on both sides of
+/// the native boundary. Payload wrappers, semantic payload bytes, and
+/// activity task tokens all share this rule.
+pub(crate) fn decode_canonical_base64(data: &str) -> Option<Vec<u8>> {
+    let bytes = STANDARD.decode(data.as_bytes()).ok()?;
+    (bytes.len() <= MAX_PAYLOAD_BYTES && STANDARD.encode(&bytes) == data).then_some(bytes)
 }
 
 /// Encodes opaque bytes and independently reparses the result.
@@ -766,12 +821,7 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), ProtocolError> {
         ));
     }
     if let Some(body) = body {
-        if !matches!(body, JsonValue::Object(_)) {
-            return Err(ProtocolError::invalid(
-                "$.body",
-                "body must be a JSON object",
-            ));
-        }
+        require_object(body, "$.body", "body must be a JSON object")?;
         let mut nodes = 0;
         validate_tree(body, 2, &mut nodes, MAX_STRING_BYTES)?;
     }
