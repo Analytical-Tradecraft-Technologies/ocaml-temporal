@@ -4626,19 +4626,8 @@ unsafe fn decode_config<T: for<'de> Deserialize<'de>>(
             message: format!("lifecycle configuration exceeds {MAX_LIFECYCLE_CONFIG_BYTES} bytes"),
         });
     }
-    if input_len > 0 && input.is_null() {
-        return Err(Failure {
-            status: STATUS_INVALID_ARGUMENT,
-            message: "configuration input is null but input_len is nonzero".to_owned(),
-        });
-    }
-    let bytes = if input_len == 0 {
-        &[]
-    } else {
-        // SAFETY: The caller promises the readable span documented above, and
-        // the nonempty null case was rejected before constructing this slice.
-        unsafe { std::slice::from_raw_parts(input, input_len) }
-    };
+    // SAFETY: The caller promises the readable span documented above.
+    let bytes = unsafe { borrow_span(input, input_len, "configuration input") }?;
     serde_json::from_slice(bytes).map_err(|_error| Failure {
         status: STATUS_CONFIGURATION,
         message: "invalid lifecycle configuration JSON".to_owned(),
@@ -4661,18 +4650,41 @@ unsafe fn input_span<'a>(
             message: format!("native input exceeds {maximum} bytes"),
         });
     }
-    if input_len != 0 && input.is_null() {
+    // SAFETY: The caller owns the readable span documented above.
+    unsafe { borrow_span(input, input_len, "input") }
+}
+
+/// Borrows a caller-owned native input span: the one place the bridge turns a
+/// C `(pointer, length)` pair into a Rust slice.
+///
+/// A zero length yields an empty slice without reading `input`, so C callers
+/// may pass null for an empty span. A null pointer with a nonzero length is
+/// `STATUS_INVALID_ARGUMENT` with the message
+/// "`{name}` is null but input_len is nonzero". Callers apply their own size
+/// ceiling first, because each export reports an oversized span with its own
+/// status.
+///
+/// # Safety
+///
+/// A nonzero `input_len` with a non-null `input` must identify that many
+/// readable bytes that stay valid and unmodified for `'a`.
+unsafe fn borrow_span<'a>(
+    input: *const u8,
+    input_len: usize,
+    name: &str,
+) -> std::result::Result<&'a [u8], Failure> {
+    if input_len == 0 {
+        return Ok(&[]);
+    }
+    if input.is_null() {
         return Err(Failure {
             status: STATUS_INVALID_ARGUMENT,
-            message: "input is null but input_len is nonzero".to_owned(),
+            message: format!("{name} is null but input_len is nonzero"),
         });
     }
-    if input_len == 0 {
-        Ok(&[])
-    } else {
-        // SAFETY: The caller owns the readable span documented above.
-        Ok(unsafe { std::slice::from_raw_parts(input, input_len) })
-    }
+    // SAFETY: `input` is non-null and the caller promises `input_len`
+    // readable bytes for `'a`.
+    Ok(unsafe { std::slice::from_raw_parts(input, input_len) })
 }
 
 /// Reclaims one bridge allocation and resets the buffer to canonical empty.
@@ -4734,24 +4746,12 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_echo(
     input_len: usize,
     output: *mut Result,
 ) -> Status {
-    // SAFETY: `invoke` validates the output pointer. Input is checked for null
-    // before constructing the slice; remaining validity is the caller's ABI
+    // SAFETY: `invoke` validates the output pointer, and `borrow_span` rejects
+    // a null nonempty input; remaining validity is the caller's ABI
     // obligation documented above.
     unsafe {
         invoke(output, || {
-            if input_len == 0 {
-                return Ok(Vec::new());
-            }
-            if input.is_null() {
-                return Err(Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "input is null but input_len is nonzero".to_owned(),
-                });
-            }
-
-            // SAFETY: The caller guarantees a readable input allocation of
-            // `input_len` bytes and the null case was rejected above.
-            Ok(std::slice::from_raw_parts(input, input_len).to_vec())
+            Ok(borrow_span(input, input_len, "input")?.to_vec())
         })
     }
 }
@@ -5139,19 +5139,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new_with_telemetr
                     ),
                 });
             }
-            if input_len != 0 && input.is_null() {
-                return Err(Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "telemetry input is null but input_len is nonzero".to_owned(),
-                });
-            }
-            let bytes = if input_len == 0 {
-                &[]
-            } else {
-                // SAFETY: The caller promises the readable span documented
-                // above; the nonempty null case was rejected.
-                std::slice::from_raw_parts(input, input_len)
-            };
+            // SAFETY: The caller promises the readable span documented above.
+            let bytes = borrow_span(input, input_len, "telemetry input")?;
             // Validate everything that allocates nothing before building Core.
             let telemetry = telemetry::parse_telemetry_config(bytes)?;
             let worker_threads = runtime_worker_threads(worker_threads)?;
