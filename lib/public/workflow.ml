@@ -223,22 +223,15 @@ let cancel_external_workflow ~workflow_id ?run_id ~reason () =
       match
         Result.bind
           (Error_private.check_writable ~what:"external workflow cancellation")
-          (fun () -> validate_external_target ~workflow_id ~run_id)
+          (fun () ->
+            Result.bind (validate_external_target ~workflow_id ~run_id)
+              (fun () ->
+                Temporal_base.Codec.validate_cancellation_reason
+                  ~subject:"external" reason
+                |> Result.map_error Error_private.of_base))
       with
       | Error error ->
           failed_external_operation context error
-      | Ok () when String.equal reason "" ->
-          failed_external_operation context
-            (Error.defect ~message:"external cancellation reason must not be empty")
-      | Ok () when String.contains reason '\000' ->
-          failed_external_operation context
-            (Error.defect ~message:"external cancellation reason must not contain NUL")
-      | Ok () when String.length reason > max_name_bytes ->
-          failed_external_operation context
-            (Error.defect ~message:"external cancellation reason exceeds 65536 bytes")
-      | Ok () when not (Temporal_base.Codec.valid_utf_8 reason) ->
-          failed_external_operation context
-            (Error.defect ~message:"external cancellation reason must be valid UTF-8")
       | Ok () ->
           Future_private.of_internal
             (Temporal_sdk_kernel.Workflow_context_store.cancel_external_workflow

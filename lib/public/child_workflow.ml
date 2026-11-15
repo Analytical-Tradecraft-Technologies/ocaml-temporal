@@ -76,17 +76,8 @@ let validate_id id =
     history. Empty reasons are rejected so every cancellation has a useful
     diagnostic in Core and in replay logs. *)
 let validate_reason reason =
-  if String.equal reason "" then
-    Error (Error.defect ~message:"child cancellation reason must not be empty")
-  else if String.contains reason '\000' then
-    Error (Error.defect ~message:"child cancellation reason must not contain NUL")
-  else if String.length reason > max_id_utf_8_bytes then
-    Error
-      (Error.defect
-         ~message:"child cancellation reason exceeds 65536 bytes")
-  else if not (Temporal_base.Codec.valid_utf_8 reason) then
-    Error (Error.defect ~message:"child cancellation reason must be valid UTF-8")
-  else Ok ()
+  Temporal_base.Codec.validate_cancellation_reason ~subject:"child" reason
+  |> Result.map_error Error_private.of_base
 
 (** Converts the public policy to the package-private runtime variant at the
     final boundary before command emission. *)

@@ -96,6 +96,24 @@ let valid_utf_8 value =
   in
   loop 0
 
+(** Longest accepted cancellation reason, in bytes: the bridge's per-string
+    protocol limit, which the Rust command validator enforces again. *)
+let max_cancellation_reason_bytes = 65_536
+
+(** Checks the cancellation-reason text contract in a fixed order so the first
+    violated rule names the failure. The order and messages match the earlier
+    per-caller copies this replaces, which public tests observe. *)
+let validate_cancellation_reason ~subject reason =
+  let defect rule =
+    Error (Error.defect ~message:(subject ^ " cancellation reason " ^ rule))
+  in
+  if String.equal reason "" then defect "must not be empty"
+  else if String.contains reason '\000' then defect "must not contain NUL"
+  else if String.length reason > max_cancellation_reason_bytes then
+    defect "exceeds 65536 bytes"
+  else if not (valid_utf_8 reason) then defect "must be valid UTF-8"
+  else Ok ()
+
 (** Converts an OCaml string to the JSON representation used in a Temporal
     [json/plain] payload. Yojson handles quoting and escaping. The explicit
     UTF-8 check prevents malformed strings from being stored by Temporal. *)

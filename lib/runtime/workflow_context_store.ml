@@ -1218,24 +1218,13 @@ let start_child_workflow context ~id ~name ~input
          id_reuse_policy; memo; search_attributes });
   let cancel ~reason =
     match current () with
-    | Some current when current == context ->
-        if String.equal reason "" then
-          Error
-            (Temporal_base.Error.defect
-               ~message:"child cancellation reason must not be empty")
-        else if String.contains reason '\000' then
-          Error
-            (Temporal_base.Error.defect
-               ~message:"child cancellation reason must not contain NUL")
-        else if String.length reason > 65_536 then
-          Error
-            (Temporal_base.Error.defect
-               ~message:"child cancellation reason exceeds 65536 bytes")
-        else if not (Temporal_base.Codec.valid_utf_8 reason) then
-          Error
-            (Temporal_base.Error.defect
-               ~message:"child cancellation reason must be valid UTF-8")
-        else (
+    | Some current when current == context -> (
+        match
+          Temporal_base.Codec.validate_cancellation_reason ~subject:"child"
+            reason
+        with
+        | Error _ as invalid -> invalid
+        | Ok () -> (
           match Hashtbl.find_opt context.child_workflows seq with
           | None when not !terminal && not !cancellation_requested ->
               Error
@@ -1249,7 +1238,7 @@ let start_child_workflow context ~id ~name ~input
           | Some _ ->
               emit context (Activation.Cancel_child_workflow { seq; reason });
               cancellation_requested := true;
-              Ok ())
+              Ok ()))
     | _ ->
         Error
           (Temporal_base.Error.defect
