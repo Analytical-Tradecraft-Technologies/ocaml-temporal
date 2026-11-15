@@ -7096,8 +7096,8 @@ mod grpc_double;
 mod worker_shutdown_drain_timeout;
 
 #[cfg(test)]
-#[path = "../tests/support/real_processing_thread_detach.rs"]
-mod real_processing_thread_detach;
+#[path = "../tests/support/fatal_workflow_poll_shutdown.rs"]
+mod fatal_workflow_poll_shutdown;
 
 /// SDK name reported to Temporal as the `client-name` RPC header and recorded
 /// in `WorkflowTaskCompleted.sdk_metadata`. Core would otherwise attribute

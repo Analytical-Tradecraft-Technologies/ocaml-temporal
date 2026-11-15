@@ -566,12 +566,14 @@ and bridge, read the [documentation guide](../README.md) first.
     happens in `Runtime.shutdown`. That call waits for the drop at most 30 s
     and otherwise returns a `` `Bridge `` error saying the release continues
     in the background; the bridge's cleanup thread finishes it once the
-    thread exits (see [Core bridge](core-bridge.md)). A lifecycle test keeps
-    Core's real processing thread alive past shutdown and finds that the
-    bridge never reaches Core's finalizer in that state: the drain times out
-    instead, disposal drops the unfinalized worker, and both releases return
-    without waiting for the thread. The 30 s bound is therefore a defence,
-    not the expected path. If no thread can be created, the
+    thread exits (see [Core bridge](core-bridge.md)). The bridge reaches
+    Core's finalizer only after a drain that observed Core's `ShutDown`,
+    which Core reports once that thread's stream has ended, so the 30 s
+    bound is a defence, not the expected path. A fatal workflow poll error
+    does not change this: the workflow lane keeps polling after it, so the
+    drain still retires Core's remaining activation and eviction and the
+    worker is finalized; a lifecycle test pins this for both release paths
+    (#1351). If no thread can be created, the
     sequence runs on the caller and only the bridge bounds it, with the same
     exception.
   - The typed outcome distinguishes abandonment from failure. Abandoned

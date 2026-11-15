@@ -1,43 +1,41 @@
-//! Lifecycle stress case for #1149: Core's real workflow processing thread
-//! stays alive through worker shutdown and runtime release.
+//! Regression case for #1351: worker shutdown after a fatal workflow poll
+//! error drains Core's remaining run state and finalizes the worker once,
+//! within its bounds.
 //!
-//! Included as a child module of `src/abi.rs`, so it can shorten the
-//! worker's shutdown bounds, while the worker itself is created, polled,
-//! shut down, and released through the real C ABI entry points.
+//! Included as a child module of `src/abi.rs`, so it can install test
+//! shutdown bounds, while the worker itself is created, polled, shut down,
+//! and released through the real C ABI entry points.
 //!
 //! The scenario needs no fault injection inside the bridge or Core. A gRPC
 //! double hands the workflow worker one workflow task and then fails every
 //! later workflow poll with gRPC's "message larger than max" status, which
 //! Core's client forwards at once instead of retrying. Core passes that
-//! error to the bridge's workflow lane, which publishes it and exits, and
-//! starts shutting the worker down. Core's workflow processing thread,
-//! however, still holds the workflow run: its activation, or the eviction
-//! Core issues once shutdown has failed that activation, is never
-//! acknowledged, because no lane polls any more and Core's default
-//! `ignore_evicts_on_shutdown` is false. The thread therefore never reaches
-//! its shutdown condition and stays alive for the rest of the worker's life.
+//! error to the bridge's workflow lane and starts shutting the worker down,
+//! but its workflow processing thread still holds the run: its activation,
+//! and the eviction Core issues once shutdown has failed that activation,
+//! must be completed before Core reports `ShutDown` from the workflow poll,
+//! and the local-activity side of the activity lane, which every workflow
+//! worker has, reports `ShutDown` only after that.
 //!
-//! This is as far as Core's real thread can be kept alive, and it shows
-//! where the bounds actually apply. Core reports `ShutDown` from a workflow
-//! poll only once the processing thread's stream has ended, and the bridge's
-//! local-activity lane, which every workflow worker has, only after that. A
-//! drain that succeeds therefore implies the thread is already exiting, so
-//! `finalize_bounded` never runs Core's finalizer while the thread lives.
-//! Instead the drain times out: `worker_shutdown` returns at its drain bound,
-//! and runtime disposal refuses finalization (lost poll lease) and drops the
-//! worker. Dropping Core does not wait for the thread, which is a plain OS
-//! thread rather than blocking-pool work, so both releases return
-//! `STATUS_OK` far within their production bounds. The blocking-pool hazard
-//! that does make those releases return `STATUS_DETACHED` is reproduced by
-//! `runtime_release_bound.rs`.
+//! The lane used to exit on that error, so nothing polled the eviction any
+//! more: `worker_shutdown` waited out its whole drain bound, runtime
+//! disposal waited it out again and dropped the worker without Core's
+//! finalizer, and Core's processing thread stayed alive (#1149 used this
+//! state to show that releases do not wait for that thread). The lane now
+//! publishes the error and keeps polling, so the shutdown drain retires the
+//! activation and Core's eviction like any other debt, both lanes reach
+//! `ShutDown`, and the worker is finalized inside `worker_shutdown` itself.
+//! The drain bound installed here is far above what that takes, so a
+//! regression shows up as a drain timeout at the bound rather than a hang.
 
 use super::{
-    Result as AbiResult, Runtime, STATUS_NOT_READY, STATUS_OK, STATUS_WORKER, SharedRuntime,
-    Status, ocaml_temporal_core_v4_client_connect_json, ocaml_temporal_core_v4_result_free,
-    ocaml_temporal_core_v4_runtime_free, ocaml_temporal_core_v4_runtime_new,
-    ocaml_temporal_core_v4_runtime_new_attached, ocaml_temporal_core_v4_shared_runtime_free,
-    ocaml_temporal_core_v4_shared_runtime_new, ocaml_temporal_core_v4_worker_shutdown,
-    ocaml_temporal_core_v4_worker_start_json, ocaml_temporal_core_v4_worker_try_poll_workflow,
+    Result as AbiResult, Runtime, STATUS_NOT_READY, STATUS_OK, STATUS_OUTSTANDING_TASKS,
+    STATUS_WORKER, SharedRuntime, Status, ocaml_temporal_core_v4_client_connect_json,
+    ocaml_temporal_core_v4_result_free, ocaml_temporal_core_v4_runtime_free,
+    ocaml_temporal_core_v4_runtime_new, ocaml_temporal_core_v4_runtime_new_attached,
+    ocaml_temporal_core_v4_shared_runtime_free, ocaml_temporal_core_v4_shared_runtime_new,
+    ocaml_temporal_core_v4_worker_shutdown, ocaml_temporal_core_v4_worker_start_json,
+    ocaml_temporal_core_v4_worker_try_poll_workflow,
 };
 use prost::Message;
 use prost_wkt_types::{Duration as ProtoDuration, Timestamp};
@@ -59,38 +57,38 @@ use temporalio_common::protos::temporal::api::{
 
 use super::grpc_double::{self, Reply};
 
-/// Drain bound installed in place of the 90-second production bound. The
-/// drain cannot succeed while the processing thread lives, so worker
-/// shutdown and runtime disposal each wait this long.
-const DRAIN_BOUND: Duration = Duration::from_millis(300);
+/// Drain bound installed in place of the 90-second production bound. A
+/// fixed bridge drains this scenario in milliseconds; the bound only turns a
+/// regression into a prompt `WORKER` drain timeout instead of a long wait.
+const DRAIN_BOUND: Duration = Duration::from_secs(10);
 
-/// Finalize bound installed in place of the 30-second production bound. A
-/// timed-out drain never reaches Core's finalizer, so this only caps a
-/// regression.
+/// Finalize bound installed in place of the 30-second production bound.
+/// Core's finalizer awaits only the double's immediate `ShutdownWorker`
+/// reply and its own teardown.
 const FINALIZE_BOUND: Duration = Duration::from_secs(5);
 
-/// Upper bound for one release of a runtime or shared runtime. Each waits
-/// only for the shortened drain and the drop of Core, far below the 150 s
-/// and 30 s production bounds, and must not wait for the processing thread.
+/// Upper bound for the whole `worker_shutdown` call: well below the drain
+/// bound, so a shutdown that merely survived until a timeout cannot pass.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Upper bound for one release of a runtime or shared runtime. The worker
+/// is already finalized, so each release only drops the graph and Core.
 const RELEASE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Upper bound for any one step of the test; a step that outlives it is
 /// reported as a hang.
 const STEP_DEADLINE: Duration = Duration::from_secs(30);
 
-/// The closed diagnostic `shutdown_worker` reports for a timed-out drain.
-const DRAIN_TIMEOUT_MESSAGE: &str =
-    "Temporal worker poll lanes did not stop within the shutdown bound";
-
 /// Task queue served by the double.
-const TASK_QUEUE: &str = "processing-thread-detach-test";
+const TASK_QUEUE: &str = "fatal-workflow-poll-shutdown-test";
 
 /// Workflow worker without remote activities. Its activity lane serves only
-/// local activities, so it ends only after the workflow poll has ended.
+/// local activities, so it ends only after the workflow poll has ended; the
+/// drain can therefore succeed only if the workflow lane reaches `ShutDown`.
 const WORKFLOW_WORKER: &[u8] = br#"{
-    "namespace":"processing-thread-detach-test",
-    "task_queue":"processing-thread-detach-test",
-    "build_id":"processing-thread-detach-build",
+    "namespace":"fatal-workflow-poll-shutdown-test",
+    "task_queue":"fatal-workflow-poll-shutdown-test",
+    "build_id":"fatal-workflow-poll-shutdown-build",
     "versioning":{"kind":"none"},
     "max_cached_workflows":10,
     "max_outstanding_workflow_tasks":10,
@@ -141,7 +139,7 @@ fn first_task_history(run_id: &str) -> History {
             history_event::Attributes::WorkflowExecutionStartedEventAttributes(
                 WorkflowExecutionStartedEventAttributes {
                     workflow_type: Some(WorkflowType {
-                        name: "processing-thread-detach".to_owned(),
+                        name: "fatal-workflow-poll-shutdown".to_owned(),
                     }),
                     task_queue: task_queue(),
                     workflow_task_timeout: task_timeout(),
@@ -177,7 +175,7 @@ fn first_task_history(run_id: &str) -> History {
         attributes: Some(
             history_event::Attributes::WorkflowTaskStartedEventAttributes(
                 WorkflowTaskStartedEventAttributes {
-                    identity: "processing-thread-detach".to_owned(),
+                    identity: "fatal-workflow-poll-shutdown".to_owned(),
                     scheduled_event_id: 2,
                     ..Default::default()
                 },
@@ -200,7 +198,7 @@ fn workflow_task_message(run_id: &str) -> Vec<u8> {
             run_id: run_id.to_owned(),
         }),
         workflow_type: Some(WorkflowType {
-            name: "processing-thread-detach".to_owned(),
+            name: "fatal-workflow-poll-shutdown".to_owned(),
         }),
         started_event_id: 3,
         attempt: 1,
@@ -312,7 +310,7 @@ fn bounded<T: Send + 'static>(
     });
     receiver
         .recv_timeout(STEP_DEADLINE)
-        .unwrap_or_else(|_| panic!("{what} must return in bounded time (#1149)"))
+        .unwrap_or_else(|_| panic!("{what} must return in bounded time (#1351)"))
 }
 
 /// Runs one runtime-only ABI entry point under [`bounded`] and returns the
@@ -336,7 +334,7 @@ fn call(
 /// the ABI, then shortens the worker's shutdown bounds.
 fn start_worker(runtime: &mut OwnedRuntime, double: &grpc_double::Double) {
     let client = format!(
-        r#"{{"target_url":"http://{}","identity":"processing-thread-detach"}}"#,
+        r#"{{"target_url":"http://{}","identity":"fatal-workflow-poll-shutdown"}}"#,
         double.address
     );
     let mut result = AbiResult::default();
@@ -376,12 +374,14 @@ fn start_worker(runtime: &mut OwnedRuntime, double: &grpc_double::Double) {
 }
 
 /// Polls the worker through the ABI until its workflow lane reports the
-/// forwarded poll error. An activation delivered first is leased and never
-/// completed, as by a supervisor whose run loop stopped on the lane error;
-/// whether it arrives before the error depends on Core's poll timing, and
-/// either way the run stays with the processing thread.
-fn wait_for_lane_failure(mut runtime: OwnedRuntime) -> OwnedRuntime {
+/// forwarded poll error, and returns the runtime with the number of
+/// activations leased on the way. A leased activation is never completed, as
+/// by a supervisor whose run loop stopped on the lane error; whether it
+/// arrives before the error depends on Core's poll timing, and either way
+/// Core keeps the run until the shutdown drain retires it.
+fn wait_for_lane_failure(mut runtime: OwnedRuntime) -> (OwnedRuntime, usize) {
     let deadline = Instant::now() + STEP_DEADLINE;
+    let mut leased = 0;
     loop {
         let (returned, status, message, _) = call(
             runtime,
@@ -390,52 +390,55 @@ fn wait_for_lane_failure(mut runtime: OwnedRuntime) -> OwnedRuntime {
         );
         runtime = returned;
         match status {
-            STATUS_OK => {}
+            STATUS_OK => leased += 1,
             STATUS_NOT_READY if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }
-            STATUS_WORKER => return runtime,
+            STATUS_WORKER => return (runtime, leased),
             _ => panic!("the workflow lane never failed: {status} {message}"),
         }
     }
 }
 
-/// Shuts the worker down through the ABI and checks that the drain, which
-/// cannot finish while the processing thread lives, times out at its bound
-/// with the closed diagnostic and keeps the worker in the graph, its ledger
-/// unfinalizable, for runtime disposal.
-fn shutdown_times_out(runtime: OwnedRuntime) -> OwnedRuntime {
+/// Shuts the worker down through the ABI and checks that, despite the
+/// earlier lane failure, the drain retires Core's run and both lanes stop,
+/// so Core's finalizer runs and the graph releases the worker, all well
+/// inside the drain bound. `leased` activations were abandoned by the test,
+/// which the call reports as `OUTSTANDING_TASKS`; without one it is `OK`.
+/// Either status means the worker was finalized: a drain timeout, refused
+/// or detached finalizer would be `WORKER` and keep or detach the worker.
+fn shutdown_finalizes(runtime: OwnedRuntime, leased: usize) -> OwnedRuntime {
     let (mut runtime, status, message, elapsed) = call(
         runtime,
         "worker shutdown",
         ocaml_temporal_core_v4_worker_shutdown,
     );
-    assert_eq!(status, STATUS_WORKER, "{message}");
-    assert_eq!(message, DRAIN_TIMEOUT_MESSAGE);
-    assert!(
-        elapsed >= DRAIN_BOUND,
-        "the drain returned before its bound: {elapsed:?}"
+    let expected = if leased == 0 {
+        STATUS_OK
+    } else {
+        STATUS_OUTSTANDING_TASKS
+    };
+    assert_eq!(
+        status, expected,
+        "worker shutdown after a fatal workflow poll error must finalize \
+         ({leased} abandoned leases): {message}"
     );
     assert!(
-        elapsed < DRAIN_BOUND + FINALIZE_BOUND,
-        "worker shutdown outlived its bounds: {elapsed:?}"
+        elapsed < SHUTDOWN_DEADLINE,
+        "worker shutdown waited instead of draining Core's eviction: {elapsed:?}"
     );
     runtime.with_graph(|graph| {
-        let worker = graph
-            .worker
-            .as_ref()
-            .expect("a timed-out drain keeps the worker in the graph");
         assert!(
-            !worker.can_finalize(),
-            "a timed-out drain must leave the worker unfinalizable"
+            graph.worker.is_none(),
+            "a finalized worker must leave the graph"
         );
     });
     runtime
 }
 
-/// Releases `runtime` through `runtime_free`, which disposes any worker
-/// still in the graph, and checks that it reports success within
-/// [`RELEASE_DEADLINE`] and clears the slot. Consumes the owner.
+/// Releases `runtime` through `runtime_free` and checks that it reports
+/// success within [`RELEASE_DEADLINE`] and clears the slot. The worker was
+/// already finalized, so no disposal remains. Consumes the owner.
 fn free_runtime(runtime: OwnedRuntime) {
     let ((status, cleared), elapsed) = bounded("runtime free", move || {
         // Move the whole owner into the helper; a closure capturing only
@@ -443,8 +446,7 @@ fn free_runtime(runtime: OwnedRuntime) {
         let runtime = runtime;
         let mut slot = runtime.0.as_ptr();
         // SAFETY: The helper exclusively owns the live runtime, and the owner
-        // is consumed here, so nothing uses the pointer afterwards. Freeing
-        // with a live worker is allowed: it disposes the whole graph.
+        // is consumed here, so nothing uses the pointer afterwards.
         let status = unsafe { ocaml_temporal_core_v4_runtime_free(&mut slot) };
         (status, slot.is_null())
     });
@@ -452,18 +454,17 @@ fn free_runtime(runtime: OwnedRuntime) {
     assert!(cleared, "runtime_free must clear the caller's slot");
     assert!(
         elapsed < RELEASE_DEADLINE,
-        "runtime free waited for the processing thread: {elapsed:?}"
+        "runtime free outlived its deadline: {elapsed:?}"
     );
 }
 
 /// A worker with its own runtime, released as `Worker.shutdown_with_report`
-/// releases it: `worker_shutdown` returns at the drain bound, and
-/// `runtime_free`, which disposes the worker and performs Core's final drop,
-/// returns `STATUS_OK` without waiting for the live processing thread, having
-/// released Core.
+/// releases it: after the lane failure `worker_shutdown` finalizes the
+/// worker promptly, and `runtime_free`, which performs Core's final drop,
+/// returns `STATUS_OK` having released Core.
 #[test]
-fn own_runtime_release_stays_bounded_while_processing_thread_lives() {
-    let double = spawn_double("issue-1149-own-runtime");
+fn own_runtime_worker_finalizes_after_fatal_workflow_poll_error() {
+    let double = spawn_double("issue-1351-own-runtime");
     let mut slot = ptr::null_mut();
     let mut result = AbiResult::default();
     // SAFETY: Both output locations are writable and exclusively owned.
@@ -471,8 +472,8 @@ fn own_runtime_release_stays_bounded_while_processing_thread_lives() {
     assert_eq!(release(result).0, STATUS_OK);
     let mut runtime = OwnedRuntime::published(slot);
     start_worker(&mut runtime, &double);
-    let runtime = wait_for_lane_failure(runtime);
-    let mut runtime = shutdown_times_out(runtime);
+    let (runtime, leased) = wait_for_lane_failure(runtime);
+    let mut runtime = shutdown_finalizes(runtime, leased);
     // The double handed out the workflow task and failed at least one later
     // poll, so Core holds a run whether or not its activation reached the
     // bridge before the lane error.
@@ -490,13 +491,15 @@ fn own_runtime_release_stays_bounded_while_processing_thread_lives() {
 }
 
 /// A worker attached to a shared runtime, released as `Runtime.shutdown`
-/// releases it: after the same timed-out `worker_shutdown`, the graph's
-/// `runtime_free` disposes the worker and drops only its own reference, and
+/// releases it: the same `worker_shutdown` finalizes the worker, which is
+/// what unregisters it from the shared client (the drop that disposal used
+/// to fall back to leaked that registration, #1229). The graph's
+/// `runtime_free` then drops only its own reference, and
 /// `shared_runtime_free`, which performs Core's final drop, returns
-/// `STATUS_OK` within its bound rather than `STATUS_DETACHED`.
+/// `STATUS_OK` within its bound.
 #[test]
-fn shared_runtime_release_stays_bounded_while_processing_thread_lives() {
-    let double = spawn_double("issue-1149-shared-runtime");
+fn shared_runtime_worker_finalizes_after_fatal_workflow_poll_error() {
+    let double = spawn_double("issue-1351-shared-runtime");
     let mut shared_slot: *mut SharedRuntime = ptr::null_mut();
     let mut result = AbiResult::default();
     // SAFETY: Both output locations are writable and exclusively owned.
@@ -514,8 +517,8 @@ fn shared_runtime_release_stays_bounded_while_processing_thread_lives() {
     assert_eq!(release(result).0, STATUS_OK);
     let mut runtime = OwnedRuntime::published(slot);
     start_worker(&mut runtime, &double);
-    let runtime = wait_for_lane_failure(runtime);
-    let runtime = shutdown_times_out(runtime);
+    let (runtime, leased) = wait_for_lane_failure(runtime);
+    let runtime = shutdown_finalizes(runtime, leased);
     // The double handed out the workflow task and failed at least one later
     // poll, so Core holds a run whether or not its activation reached the
     // bridge before the lane error.
@@ -536,7 +539,7 @@ fn shared_runtime_release_stays_bounded_while_processing_thread_lives() {
     assert!(cleared, "shared_runtime_free must clear the caller's slot");
     assert!(
         elapsed < RELEASE_DEADLINE,
-        "the shared release waited for the processing thread: {elapsed:?}"
+        "the shared release outlived its deadline: {elapsed:?}"
     );
     assert_eq!(core.strong_count(), 0, "the shared release kept Core alive");
 }

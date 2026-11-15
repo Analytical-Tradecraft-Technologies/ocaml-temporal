@@ -1075,33 +1075,34 @@ longer proves Core is gone, so `Runtime.shutdown` reports the same
 holds Core's blocking pool makes both releases return `DETACHED` at a short
 test bound while the cleanup thread still finishes the drop.
 
-The `real_processing_thread_detach` lifecycle tests keep Core's *real*
-workflow processing thread alive instead. A gRPC double hands a workflow
-worker one task, then fails every later workflow poll with gRPC's
-non-retryable "message larger than max" status. The workflow lane publishes
-that error and exits, and the run's activation, or the eviction that follows
-its failure, is never acknowledged. Core's default `ignore_evicts_on_shutdown`
-is false, so the thread never reaches its shutdown condition. The tests drive
-everything through the C ABI, for a worker with its own runtime and for one
-attached to a shared runtime. They show that this state cannot reach Core's
-finalizer through the bridge. Core reports `ShutDown` from a workflow poll
-only once the processing thread's stream has ended. The activity lane, which
-every workflow worker runs for local activities, sees `ShutDown` only after
-that. A drain that succeeds therefore means the thread is already exiting, so
-`finalize_bounded` never runs `finalize_shutdown` while the thread lives.
-Instead:
+Core's *real* workflow processing thread cannot outlive a release through
+the bridge's own paths. Core reports `ShutDown` from a workflow poll only once
+that thread's stream has ended, and the activity lane, which every workflow
+worker runs for local activities, sees `ShutDown` only after that. A drain
+that succeeds therefore means the thread is already exiting, so
+`finalize_bounded` never runs `finalize_shutdown` while the thread lives. The
+`DETACHED` bounds stay as defence against any other blocking-pool work that
+outlives a release.
 
-- `worker_shutdown` times out at the drain bound (`WORKER`).
-- Disposal times out the same way, refuses finalization for the lost poll
-  lease, and drops the worker.
-- Dropping Core does not wait for the thread, which is a plain OS thread, not
-  blocking-pool work. `runtime_free` and `shared_runtime_free` therefore
-  return `OK` in well under a second once the shortened drain has elapsed.
-
-The `DETACHED` bounds stay as defence against any other blocking-pool work
-that outlives a release. In production the same scenario waits out the
-90-second drain bound twice: once in `Worker.shutdown`, whose teardown timeout
-then reports `Detached`, and once in disposal.
+Until #1351 a fatal workflow poll error kept that thread alive: the workflow
+lane exited on the error, so the run's activation, or the eviction that
+follows its failure, was never acknowledged (Core's default
+`ignore_evicts_on_shutdown` is false). In production `Worker.shutdown` then
+waited out the 90-second drain bound, its teardown timeout reported
+`Detached`, disposal waited the bound out again and dropped the worker
+without Core's finalizer, and on a shared runtime that leaked the client
+registration described below. The lane now keeps polling after the error
+(see the worker shutdown protocol under
+[Lifecycle configuration JSON](#lifecycle-configuration-json)), and the
+`fatal_workflow_poll_shutdown` lifecycle tests pin the corrected behaviour
+through the C ABI, for a worker with its own runtime and for one attached to
+a shared runtime. A gRPC double hands a workflow worker one task, then fails
+every later workflow poll with gRPC's non-retryable "message larger than
+max" status. `worker_shutdown` then drains the run, finalizes the worker
+well inside a 10-second test drain bound, and returns `OK` (or
+`OUTSTANDING_TASKS` when the test leased the activation before the error
+and abandoned it). `runtime_free` and `shared_runtime_free` return `OK` and
+release Core.
 
 The OCaml side adds a stricter, typed ordering rule on top of that memory
 safety. `Sdk_shared_runtime` (private) owns the `Native_bridge.shared_runtime`
@@ -1443,6 +1444,19 @@ OCaml supervisor reports an empty poll so `Worker.run` continues (issue #801).
 A replay instead returns the protocol error, because it must not report
 history it never checked as compatible. If the rejection itself fails, the
 original decode failure stays primary with the rejection category appended.
+
+A fatal (non-`ShutDown`) workflow poll error does not end the workflow
+lane. Core answers it by initiating worker shutdown, but its workflow stream
+still owns every run it created and reports `ShutDown` only after their
+activations and the evictions that follow have been completed. The lane
+therefore publishes the first error once, behind any work already queued, so
+OCaml's run loop observes the failure, and then keeps polling: it admits and
+queues what Core still produces for the shutdown drain below to retire, and
+drops later errors, which only polls already in flight can report, after a
+10 ms backoff. It ends only at `ShutDown` or when its ready queue has closed.
+Exiting on the error left both lanes unable to stop, so shutdown and
+disposal each waited out the whole drain bound and the worker was never
+finalized (issue #1351).
 
 Shutdown first closes ledger admission and both readiness signals, then asks
 Core to wake both polls. From that point the supervisor Domain is blocked in

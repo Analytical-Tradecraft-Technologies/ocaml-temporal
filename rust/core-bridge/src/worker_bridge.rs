@@ -351,9 +351,14 @@ pub fn poll_lanes_for(task_types: &WorkerTaskTypes) -> (bool, bool) {
 /// to `Worker.create` instead of wedging the supervisor Domain forever.
 pub const UNVALIDATED_WORKER_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Delay before re-polling after Core reports a non-shutdown poll error while
-/// an unvalidated worker drains, preventing a tight error loop.
-const UNVALIDATED_WORKER_POLL_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+/// Delay before re-polling after Core reports a non-shutdown poll error,
+/// preventing a tight error loop.
+///
+/// Core initiates worker shutdown on every such error, so only polls already
+/// in flight can report more of them. Both the unvalidated-worker drain and a
+/// workflow lane that has already failed (see [`run_workflow_lane`]) keep
+/// polling past those errors until Core reports `ShutDown`.
+const POLL_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
 /// Releases a Core worker whose namespace validation failed before it was
 /// published into the runtime graph.
@@ -408,7 +413,7 @@ async fn drain_unvalidated_workflow_polls(worker: &Worker) {
                 )
                 .await;
             }
-            Err(_) => tokio::time::sleep(UNVALIDATED_WORKER_POLL_ERROR_BACKOFF).await,
+            Err(_) => tokio::time::sleep(POLL_ERROR_BACKOFF).await,
         }
     }
 }
@@ -430,7 +435,7 @@ async fn drain_unvalidated_activity_polls(worker: &Worker) {
                     .await;
                 }
             }
-            Err(_) => tokio::time::sleep(UNVALIDATED_WORKER_POLL_ERROR_BACKOFF).await,
+            Err(_) => tokio::time::sleep(POLL_ERROR_BACKOFF).await,
         }
     }
 }
@@ -500,7 +505,8 @@ pub enum BoundedFinalize {
     /// paths finalize only after a drain that observed the workflow poll's
     /// `ShutDown`, which Core reports once that thread's stream has ended,
     /// so the explicit releases bound this wait defensively (see
-    /// `real_processing_thread_detach.rs`).
+    /// `runtime_release_bound.rs`; `fatal_workflow_poll_shutdown.rs` drives
+    /// the case of a lane failure, which still finalizes).
     Detached,
 }
 
@@ -2761,12 +2767,31 @@ impl PollLanes {
 /// Every activation returned by Core must either be delivered to OCaml or
 /// force-failed back to Core. Admission rejections therefore complete the
 /// undeliverable activation before the lane error is published.
+///
+/// The lane ends only when Core reports `ShutDown` or the ready channel has
+/// closed, never on a fatal poll error. Core answers such an error by
+/// initiating worker shutdown, but its workflow stream still owns every run
+/// it created: an activation already produced, and the eviction Core issues
+/// once shutdown has failed that activation, must still be polled and
+/// completed before Core reports `ShutDown`. The local-activity side of the
+/// activity lane reports `ShutDown` only after that. A lane that exited on
+/// the error therefore left both lanes unable to stop, so worker shutdown
+/// and disposal each waited out the whole drain bound and the worker was
+/// never finalized (issue #1351). Instead the lane publishes the first error
+/// once, so OCaml observes the failure behind any work already queued, and
+/// keeps admitting and queueing what Core produces for
+/// [`PollLanes::drain_and_join_for_shutdown`] to retire, exactly as after a
+/// bridge-initiated shutdown. Later errors, which only polls already in
+/// flight can report, are dropped after [`POLL_ERROR_BACKOFF`]. A replay
+/// worker shares this lane; its bounded join already acknowledges every
+/// activation until `ShutDown` (see [`PollLanes::join_replay_poll_lane`]).
 async fn run_workflow_lane(
     worker: Arc<Worker>,
     ledger: Arc<Mutex<TaskLedger>>,
     sender: mpsc::UnboundedSender<ReadyTask<WorkflowActivation>>,
     signal: Arc<Readiness>,
 ) {
+    let mut failure_published = false;
     loop {
         let activation = match worker.poll_workflow_activation().await {
             Ok(activation) => activation,
@@ -2775,8 +2800,12 @@ async fn run_workflow_lane(
                 return;
             }
             Err(error) => {
-                signal.publish_poll_failure(&sender, PollLaneError::Core(error.to_string()));
-                return;
+                if !failure_published {
+                    failure_published = true;
+                    signal.publish_poll_failure(&sender, PollLaneError::Core(error.to_string()));
+                }
+                tokio::time::sleep(POLL_ERROR_BACKOFF).await;
+                continue;
             }
         };
         let admission = lock(&ledger)

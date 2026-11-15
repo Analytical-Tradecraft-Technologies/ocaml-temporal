@@ -448,20 +448,19 @@ recurrence in their summary (`contained_upstream_panics`) and fail on a panic
 located in bridge code. It stays tracked here, not upstream, and needs
 re-evaluation after the next Core upgrade.
 
-## Live Core processing thread at shutdown (#1149)
+## Shutdown after a fatal workflow poll error (#1149, #1351)
 
-`rust/core-bridge/tests/support/real_processing_thread_detach.rs` is an
+`rust/core-bridge/tests/support/fatal_workflow_poll_shutdown.rs` is an
 in-crate lifecycle case. It runs in the ordinary `cargo test` in about a
-second and needs no server. It keeps Core's real workflow processing thread
-alive across worker shutdown and runtime release.
+second and needs no server.
 
 **Setup.** A gRPC double hands a workflow worker one task, then fails every
 later workflow poll with the non-retryable "message larger than max" status.
-The workflow lane exits on that error. The run's activation, or the eviction
-that follows its failure, is never acknowledged.
+Core forwards that error to the workflow lane and initiates worker shutdown,
+but its workflow processing thread still holds the run.
 
 **What it checks.** Every lifecycle call goes through the C ABI. The test
-shortens the worker's drain bound, then checks two release paths:
+installs a 10-second drain bound, then checks two release paths:
 
 - a worker with its own runtime, released as `Worker.shutdown_with_report`
   releases it;
@@ -470,20 +469,27 @@ shortens the worker's drain bound, then checks two release paths:
 
 On both paths:
 
-- `worker_shutdown` returns `WORKER` at the drain bound and keeps the worker,
-  unfinalizable.
+- the workflow poll reports the lane error;
+- `worker_shutdown` returns within 5 seconds with `OK`, or
+  `OUTSTANDING_TASKS` when the test leased the activation before the error
+  and abandoned it, and the finalized worker leaves the graph;
 - `runtime_free` returns `OK` well within its deadline and releases Core.
 - On the shared path, `shared_runtime_free`, which performs Core's final
   drop, also returns `OK` and releases Core.
 
-**What it found.** A drain cannot succeed while the processing thread lives,
-because the workflow poll, and after it the local-activity lane, report
-`ShutDown` only once that thread's stream has ended. Core's finalizer
-therefore never runs, and so never joins the thread, while the thread is
-alive. Dropping Core does not wait for a plain OS thread. The `DETACHED` path
-of the bounded releases is covered by `runtime_release_bound.rs` with held
-blocking-pool work instead. See [Core bridge](core-bridge.md) for the
-production timings.
+**What it found.** Originally (#1149) the case kept Core's real processing
+thread alive across shutdown and release. The workflow lane exited on the
+error, so the run's activation, or the eviction that follows its failure,
+was never acknowledged, and neither the workflow poll nor, after it, the
+local-activity lane could report `ShutDown`. `worker_shutdown` timed out at
+the drain bound, disposal timed out again and dropped the unfinalized
+worker, and the releases returned only because dropping Core does not wait
+for a plain OS thread. That double wait of the 90-second production bound
+was issue #1351. The lane now keeps polling after a fatal error, so the
+drain retires the activation and the eviction, both lanes reach `ShutDown`,
+and the worker is finalized. The `DETACHED` path of the bounded releases is
+covered by `runtime_release_bound.rs` with held blocking-pool work instead.
+See [Core bridge](core-bridge.md) for the shutdown protocol.
 
 ## What each tool observes
 
