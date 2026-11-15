@@ -10,11 +10,20 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import sys
 from pathlib import Path
 from typing import Any
+
+# `python3 -I` leaves this script's directory off the import path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from script_support import (  # noqa: E402
+    add_generate_or_audit,
+    load_json_object,
+    load_script,
+    package_fields,
+    package_list,
+)
 
 
 NAMESPACE = "https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/sbom/cargo"
@@ -25,29 +34,8 @@ CORE_LICENSE_COMMENT = (
 )
 
 
-def load_license_policy() -> Any:
-    """Import the Cargo licence scanner so both tools share one conclusion.
-
-    The scanner's file name contains hyphens, so it is loaded by path. It is a
-    sibling of this script in every checkout and CI container mount. The
-    module is registered before execution because its dataclasses resolve
-    their defining module through `sys.modules`.
-    """
-
-    name = "check_cargo_licenses"
-    if name in sys.modules:
-        return sys.modules[name]
-    path = Path(__file__).with_name("check-cargo-licenses.py")
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load Cargo license policy from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-LICENSE_POLICY = load_license_policy()
+# The Cargo licence scanner owns the policy, so both tools share one conclusion.
+LICENSE_POLICY = load_script("check-cargo-licenses")
 
 
 def document_namespace(document: dict[str, Any]) -> str:
@@ -116,36 +104,19 @@ def package_spdx_id(
     return f"SPDXRef-Package-{digest}"
 
 
-def load_json(path: Path) -> dict[str, Any]:
-    """Load a JSON object and turn malformed input into a concise CLI error."""
-
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read JSON {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ValueError(f"JSON root in {path} must be an object")
-    return value
-
-
 def make_document(metadata: dict[str, Any]) -> dict[str, Any]:
     """Convert `cargo metadata --format-version 1` into SPDX 2.3 JSON."""
 
-    packages = metadata.get("packages")
-    if not isinstance(packages, list) or not packages:
-        raise ValueError("Cargo metadata contains no packages")
+    packages = package_list(metadata, "Cargo metadata")
     workspace_root = metadata.get("workspace_root")
     if workspace_root is not None and not isinstance(workspace_root, str):
         raise ValueError("Cargo metadata workspace_root must be a string")
     normalized: list[dict[str, Any]] = []
     for package in packages:
-        if not isinstance(package, dict):
-            raise ValueError("Cargo metadata package is not an object")
-        package_id = package.get("id")
-        name = package.get("name")
-        version = package.get("version")
-        if not all(isinstance(value, str) and value for value in (package_id, name, version)):
-            raise ValueError("Cargo package is missing id, name, or version")
+        _, name, version = package_fields(
+            package, "Cargo metadata", ("id", "name", "version"),
+            "Cargo package is missing id, name, or version",
+        )
         # SPDX 2.3 separates what the package states (licenseDeclared) from
         # what the SBOM author concludes after review (licenseConcluded). The
         # pinned Core crates state only a licence file, so their declaration
@@ -197,19 +168,14 @@ def audit_document(document: dict[str, Any]) -> None:
         raise ValueError("SBOM data license is invalid")
     if document.get("SPDXID") != "SPDXRef-DOCUMENT":
         raise ValueError("SBOM document identifier is invalid")
-    packages = document.get("packages")
-    if not isinstance(packages, list) or not packages:
-        raise ValueError("SBOM contains no packages")
+    packages = package_list(document, "SBOM")
     ids: set[str] = set()
     sort_keys: list[tuple[str, str, str]] = []
     for package in packages:
-        if not isinstance(package, dict):
-            raise ValueError("SBOM package is not an object")
-        identifier = package.get("SPDXID")
-        name = package.get("name")
-        version = package.get("versionInfo")
-        if not all(isinstance(value, str) and value for value in (identifier, name, version)):
-            raise ValueError("SBOM package is missing SPDXID, name, or version")
+        identifier, name, version = package_fields(
+            package, "SBOM", ("SPDXID", "name", "versionInfo"),
+            "SBOM package is missing SPDXID, name, or version",
+        )
         if identifier in ids:
             raise ValueError(f"duplicate SBOM package identifier: {identifier}")
         if package.get("filesAnalyzed") is not False:
@@ -243,17 +209,16 @@ def main() -> int:
     """Run generation or validation selected by the command-line arguments."""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--metadata", type=Path, help="Cargo metadata JSON input")
-    group.add_argument("--audit", type=Path, help="SPDX JSON document to validate")
+    add_generate_or_audit(parser, "--metadata", "Cargo metadata JSON input",
+                          "SPDX JSON document to validate")
     args = parser.parse_args()
     try:
         if args.metadata is not None:
-            document = make_document(load_json(args.metadata))
+            document = make_document(load_json_object(args.metadata))
             json.dump(document, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
         else:
-            audit_document(load_json(args.audit))
+            audit_document(load_json_object(args.audit))
             print("cargo SBOM audit: ok")
     except ValueError as exc:
         print(f"cargo SBOM audit: {exc}", file=sys.stderr)

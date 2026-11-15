@@ -6,6 +6,11 @@ archives and metadata. Exact compiler/compiled-dependency identities are checked
 before an installation is exposed. A caller supplies provenance independently.
 """
 
+# The docstring above is the command's --help text. This file is copied alone
+# into every bundle (`TOOLS`), so it imports only the standard library;
+# `smoke-artifact.py` and `package-release-bridges.py` load it as a module and
+# reuse its manifest, archive-member and command-line checks.
+
 import argparse
 import hashlib
 import json
@@ -103,6 +108,42 @@ def check_files(files, platform):
         raise ValueError("Windows SDK is missing its MinGW import libraries")
 
 
+def identity(commit, ocaml, platform, profile):
+    """Return the provenance fields `pack` records and `validate` requires, in manifest order."""
+    return {"schema": 1, "commit": commit, "ocaml": ocaml, "platform": platform, "profile": profile}
+
+
+def read_manifest(directory, expected, artifact):
+    """Load a bundle's manifest.json and require every `expected` provenance field.
+
+    `artifact` names the bundle kind in the mismatch error.
+    """
+    manifest = json.loads((directory / "manifest.json").read_text())
+    if any(manifest.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"{artifact} provenance mismatch")
+    return manifest
+
+
+def member_stream(tar, member, expected, found, artifact):
+    """Open one archive member, rejecting anything but a new regular file in `expected`.
+
+    `found` holds the names already verified; the caller checks the member's
+    digest and then records its name there, so a repeated member fails here.
+    `artifact` names the archive kind in the error.
+    """
+    if member.name not in expected or member.name in found or not member.isfile():
+        raise ValueError(f"unexpected {artifact} archive member: {member.name}")
+    return tar.extractfile(member)
+
+
+def operation_parser(description, operations):
+    """Start a command line taking one of `operations` and the bundle `--directory`."""
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("operation", choices=operations)
+    parser.add_argument("--directory", required=True, type=Path)
+    return parser
+
+
 def check_environment(value, ocaml, platform):
     """Reject a mislabeled patch, CPU, or operating system before packaging."""
     config = dict(line.split(": ", 1) for line in value.splitlines() if ": " in line)
@@ -134,9 +175,8 @@ def pack(stage, output, commit, ocaml, platform, profile, bridge_key):
     with tarfile.open(archive, "w:gz", compresslevel=1) as tar:
         for name in files:
             tar.add(stage / name, arcname=name, recursive=False)
-    manifest = {
-        "schema": 1, "commit": commit, "ocaml": ocaml, "platform": platform,
-        "profile": profile, "rust_bridge_key": bridge_key,
+    manifest = identity(commit, ocaml, platform, profile) | {
+        "rust_bridge_key": bridge_key,
         "environment": abi, "host": split_host(abi)[1],
         "files": files, "archive_sha256": sha256(archive),
     }
@@ -147,11 +187,8 @@ def pack(stage, output, commit, ocaml, platform, profile, bridge_key):
 
 def validate(directory, commit, ocaml, platform, profile):
     """Check complete provenance and every archive member without extracting."""
-    manifest = json.loads((directory / "manifest.json").read_text())
-    expected = {"schema": 1, "commit": commit, "ocaml": ocaml,
-                "platform": platform, "profile": profile}
-    if any(manifest.get(key) != value for key, value in expected.items()):
-        raise ValueError("OCaml library artifact provenance mismatch")
+    manifest = read_manifest(directory, identity(commit, ocaml, platform, profile),
+                             "OCaml library artifact")
     check_environment(manifest["environment"], ocaml, platform)
     files = manifest["files"]
     check_files(files, platform)
@@ -161,9 +198,7 @@ def validate(directory, commit, ocaml, platform, profile):
     found = set()
     with tarfile.open(archive, "r:gz") as tar:
         for member in tar:
-            if member.name not in files or member.name in found or not member.isfile():
-                raise ValueError(f"unexpected OCaml library archive member: {member.name}")
-            stream = tar.extractfile(member)
+            stream = member_stream(tar, member, files, found, "OCaml library")
             if hashlib.file_digest(stream, "sha256").hexdigest() != files[member.name]:
                 raise ValueError(f"OCaml library file checksum mismatch: {member.name}")
             found.add(member.name)
@@ -219,9 +254,7 @@ def prepare_consumer(root, destination):
 
 def main():
     """Expose packaging, installation and the independent consumer fixture."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("pack", "unpack", "prepare-consumer"))
-    parser.add_argument("--directory", required=True, type=Path)
+    parser = operation_parser(__doc__, ("pack", "unpack", "prepare-consumer"))
     parser.add_argument("--stage", type=Path)
     parser.add_argument("--prefix", type=Path)
     parser.add_argument("--environment", type=Path)

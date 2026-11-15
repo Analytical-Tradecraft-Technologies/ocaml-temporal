@@ -13,7 +13,6 @@ a 1.9 GB archive and was most of the smoke-build job. GitHub-hosted Ubuntu
 runners ship `zstd`; a local run of `make test-ci-artifacts` needs it too.
 """
 
-import argparse
 import contextlib
 import hashlib
 import io
@@ -23,8 +22,18 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 from typing import Iterator
+
+# `python3 -I` leaves this script's directory off the import path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from script_support import load_script  # noqa: E402
+
+# The SDK bundle tool owns the manifest, archive-member and command-line checks
+# this transport shares; it is loaded as a module so `pack`/`unpack` here stay
+# this script's own operations.
+ARTIFACT = load_script("ocaml-library-artifact")
 
 ARCHIVE = "executables.tar.zst"
 # The decompressor must be given the same window (--long=30, 1 GiB) to accept
@@ -135,10 +144,8 @@ def unpack(root: Path, directory: Path, commit: str, ocaml: str) -> None:
     member has matched its manifest digest are they moved into _build/default.
     A failure removes the staging directory and leaves no executable behind.
     """
-    manifest = json.loads((directory / "manifest.json").read_text())
     expected = {"schema": 2, "commit": commit, "ocaml": ocaml, "platform": "linux-amd64"}
-    if any(manifest.get(key) != value for key, value in expected.items()):
-        raise ValueError("smoke artifact provenance mismatch")
+    manifest = ARTIFACT.read_manifest(directory, expected, "smoke artifact")
     names = targets(root)
     if set(manifest["files"]) != set(names):
         raise ValueError("smoke executable list mismatch")
@@ -159,9 +166,7 @@ def unpack(root: Path, directory: Path, commit: str, ocaml: str) -> None:
             try:
                 with tarfile.open(fileobj=process.stdout, mode="r|") as tar:
                     for member in tar:
-                        if member.name not in names or member.name in verified or not member.isfile():
-                            raise ValueError(f"unexpected smoke archive member: {member.name}")
-                        stream = tar.extractfile(member)
+                        stream = ARTIFACT.member_stream(tar, member, names, verified, "smoke")
                         assert stream is not None
                         content = stream.read()
                         if digest(content) != manifest["files"][member.name]:
@@ -195,9 +200,7 @@ def unpack(root: Path, directory: Path, commit: str, ocaml: str) -> None:
 
 def main() -> None:
     """Dispatch the producer/consumer operation with explicit tested identity."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("pack", "unpack"))
-    parser.add_argument("--directory", required=True, type=Path)
+    parser = ARTIFACT.operation_parser(__doc__, ("pack", "unpack"))
     parser.add_argument("--commit", required=True)
     parser.add_argument("--ocaml", required=True)
     args = parser.parse_args()

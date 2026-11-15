@@ -208,7 +208,15 @@ def concluded_license(package: dict[str, Any]) -> str | None:
     return None
 
 
+def package_label(package: dict[str, Any]) -> str:
+    """Name a package as `name version` in diagnostics without assuming metadata is valid."""
+
+    return f"{package.get('name', '<missing-name>')} {package.get('version', '<missing-version>')}"
+
+
 def check(metadata: dict[str, Any], output: TextIO) -> bool:
+    """Print one ALLOW or DENY line per package, by name and version; return whether all passed."""
+
     packages = metadata.get("packages")
     if not isinstance(packages, list):
         print("DENY metadata missing packages array", file=output)
@@ -216,33 +224,32 @@ def check(metadata: dict[str, Any], output: TextIO) -> bool:
 
     passed = True
     for package in sorted(packages, key=lambda item: (item.get("name", ""), item.get("version", ""))):
-        name = package.get("name", "<missing-name>")
-        version = package.get("version", "<missing-version>")
+        label = package_label(package)
         expression = package.get("license")
         if expression is None:
             if reviewed_core_license(package):
                 print(
-                    f"ALLOW {name} {version} {REVIEWED_CORE_LICENSE} via pinned Core LICENSE.txt",
+                    f"ALLOW {label} {REVIEWED_CORE_LICENSE} via pinned Core LICENSE.txt",
                     file=output,
                 )
             else:
-                print(f"DENY  {name} {version} missing-license", file=output)
+                print(f"DENY  {label} missing-license", file=output)
                 passed = False
             continue
         if not isinstance(expression, str):
-            print(f"DENY  {name} {version} invalid-license-value", file=output)
+            print(f"DENY  {label} invalid-license-value", file=output)
             passed = False
             continue
         try:
             allowed, choice = evaluate(Parser(expression).parse())
         except ExpressionError as error:
-            print(f"DENY  {name} {version} malformed-expression: {error}", file=output)
+            print(f"DENY  {label} malformed-expression: {error}", file=output)
             passed = False
             continue
         if allowed:
-            print(f"ALLOW {name} {version} {expression} via {choice}", file=output)
+            print(f"ALLOW {label} {expression} via {choice}", file=output)
         else:
-            print(f"DENY  {name} {version} {expression}", file=output)
+            print(f"DENY  {label} {expression}", file=output)
             passed = False
     return passed
 
