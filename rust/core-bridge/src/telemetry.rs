@@ -234,12 +234,40 @@ struct PrometheusConfig {
     durations_as_seconds: bool,
 }
 
-/// One constant metric label.
+/// One constant metric label: a Prometheus global tag, an OTLP resource
+/// attribute ([`crate::otlp::OtlpConfig`]), or a label of one SDK series.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GlobalTag {
+pub(crate) struct GlobalTag {
     name: String,
     value: String,
+}
+
+impl GlobalTag {
+    /// Borrows `tags` as `(name, value)` pairs, in caller order, for the
+    /// shared tag validator and [`owned_pairs`].
+    pub(crate) fn pairs(tags: &[GlobalTag]) -> impl ExactSizeIterator<Item = (&str, &str)> {
+        tags.iter()
+            .map(|tag| (tag.name.as_str(), tag.value.as_str()))
+    }
+
+    /// Names of `tags`, in caller order, as every exporter reports them to
+    /// [`MetricMeter`] (see [`MetricsExporter::global_tag_names`]).
+    pub(crate) fn names(tags: &[GlobalTag]) -> Vec<String> {
+        tags.iter().map(|tag| tag.name.clone()).collect()
+    }
+}
+
+/// Copies borrowed `(name, value)` pairs into the owned map Core's exporter
+/// builders take for global tags and OTLP headers. Input order is not kept;
+/// the validators have already rejected duplicate names.
+pub(crate) fn owned_pairs<'a>(
+    pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> HashMap<String, String> {
+    pairs
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
 }
 
 /// Owns the running metrics exporter of one Core runtime, whichever kind
@@ -623,28 +651,38 @@ async fn relay_until_idle(client: &mut TcpStream, upstream: &mut TcpStream) {
         // chosen is dropped before any bytes are consumed from its socket.
         let step = tokio::time::timeout(RELAY_IDLE_TIMEOUT, async {
             tokio::select! {
-                read = client_read.read(&mut to_core), if client_open => match read {
-                    Ok(0) => {
-                        client_open = false;
-                        core_write.shutdown().await.is_ok()
-                    }
-                    Ok(count) => core_write.write_all(&to_core[..count]).await.is_ok(),
-                    Err(_) => false,
-                },
-                read = core_read.read(&mut to_client), if core_open => match read {
-                    Ok(0) => {
-                        core_open = false;
-                        client_write.shutdown().await.is_ok()
-                    }
-                    Ok(count) => client_write.write_all(&to_client[..count]).await.is_ok(),
-                    Err(_) => false,
-                },
+                read = client_read.read(&mut to_core), if client_open => {
+                    forward_read(read, &to_core, &mut client_open, &mut core_write).await
+                }
+                read = core_read.read(&mut to_client), if core_open => {
+                    forward_read(read, &to_client, &mut core_open, &mut client_write).await
+                }
             }
         })
         .await;
         if !matches!(step, Ok(true)) {
             return;
         }
+    }
+}
+
+/// Forwards the outcome of one read on a relay side to the other side's
+/// `writer`: the bytes in `buffer[..count]`, or, at end of input, a write
+/// shutdown after marking the reading side closed in `open`. Returns `false`
+/// when the read or the write failed, which ends the relay.
+async fn forward_read(
+    read: std::io::Result<usize>,
+    buffer: &[u8],
+    open: &mut bool,
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> bool {
+    match read {
+        Ok(0) => {
+            *open = false;
+            writer.shutdown().await.is_ok()
+        }
+        Ok(count) => writer.write_all(&buffer[..count]).await.is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -698,22 +736,22 @@ async fn read_request_head(client: &mut TcpStream) -> RequestHead {
 /// Answers `400 Bad Request` and closes, for a request head that never
 /// completed.
 async fn answer_bad_request(client: &mut TcpStream) {
-    let body = "incomplete request head\n";
-    let response = format!(
-        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\n\
-         Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = client.write_all(response.as_bytes()).await;
-    let _ = client.shutdown().await;
+    answer_and_close(client, "400 Bad Request", "incomplete request head\n").await;
 }
 
 /// Answers `503 Service Unavailable` with `body` and closes. The request head
 /// was already read, so the close is an orderly FIN and the scraper sees the
 /// status rather than a reset caused by unread request bytes.
 async fn answer_unavailable(client: &mut TcpStream, body: &str) {
+    answer_and_close(client, "503 Service Unavailable", body).await;
+}
+
+/// Writes one complete plain-text `HTTP/1.1` response with `status` (code and
+/// reason phrase) and `body`, then shuts the write side down. Write errors
+/// are ignored: the scraper has gone, and there is nobody else to tell.
+async fn answer_and_close(client: &mut TcpStream, status: &str, body: &str) {
     let response = format!(
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\n\
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n\
          Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
@@ -721,8 +759,9 @@ async fn answer_unavailable(client: &mut TcpStream, body: &str) {
     let _ = client.shutdown().await;
 }
 
-/// Builds a configuration failure with a constant-shaped message.
-fn invalid(message: String) -> Failure {
+/// Builds a configuration failure with a constant-shaped message; shared with
+/// [`crate::otlp`]'s validation.
+pub(crate) fn invalid(message: String) -> Failure {
     Failure {
         status: STATUS_CONFIGURATION,
         message,
@@ -754,11 +793,7 @@ fn valid_tag_name(name: &str) -> bool {
 /// zero-padded ports), so both sides accept exactly the same text.
 fn parse_bind_address(text: &str) -> Option<SocketAddr> {
     let (host, port) = text.rsplit_once(':')?;
-    let canonical_port = !port.is_empty()
-        && port.len() <= 5
-        && port.bytes().all(|byte| byte.is_ascii_digit())
-        && (port == "0" || !port.starts_with('0'));
-    if !canonical_port || host.contains('%') {
+    if !crate::otlp::canonical_decimal(port, 5) || host.contains('%') {
         return None;
     }
     let address = SocketAddr::from_str(text).ok()?;
@@ -801,12 +836,7 @@ fn validate_prometheus(config: &PrometheusConfig) -> Result<(), Failure> {
             "metrics bind_address must be an IP socket address such as 127.0.0.1:9464".to_owned(),
         ));
     }
-    validate_global_tags(
-        config
-            .global_tags
-            .iter()
-            .map(|tag| (tag.name.as_str(), tag.value.as_str())),
-    )
+    validate_global_tags(GlobalTag::pairs(&config.global_tags))
 }
 
 /// Applies the global-tag rules shared by every exporter: at most
@@ -904,14 +934,9 @@ fn start_prometheus(
         },
         0,
     );
-    let global_tags: HashMap<String, String> = prometheus
-        .global_tags
-        .iter()
-        .map(|tag| (tag.name.clone(), tag.value.clone()))
-        .collect();
     let options = PrometheusExporterOptions::builder()
         .socket_addr(core_bind)
-        .global_tags(global_tags)
+        .global_tags(owned_pairs(GlobalTag::pairs(&prometheus.global_tags)))
         .counters_total_suffix(prometheus.counters_total_suffix)
         .unit_suffix(prometheus.unit_suffix)
         .use_seconds_for_durations(prometheus.durations_as_seconds)
@@ -955,11 +980,7 @@ fn start_prometheus(
         bound_address,
         accept_loop,
         core_server,
-        global_tag_names: prometheus
-            .global_tags
-            .iter()
-            .map(|tag| tag.name.clone())
-            .collect(),
+        global_tag_names: GlobalTag::names(&prometheus.global_tags),
     })
 }
 

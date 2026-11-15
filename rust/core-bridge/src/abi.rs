@@ -405,9 +405,8 @@ struct ThrottledHeartbeat {
 impl ThrottledHeartbeat {
     /// Strictly decodes an async-activity heartbeat document.
     fn decode(text: &str) -> std::result::Result<Self, Failure> {
-        let semantic = activity_protocol::decode_async_heartbeat(text).map_err(protocol_failure)?;
-        let task_token =
-            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
+        let (semantic, task_token) =
+            decode_with_task_token(text, activity_protocol::decode_async_heartbeat)?;
         let heartbeat_timeout = match semantic.heartbeat_timeout {
             None => None,
             Some(timeout) => Some(std_duration(timeout)?),
@@ -420,16 +419,60 @@ impl ThrottledHeartbeat {
     }
 }
 
+/// A semantic activity document that addresses its task by an opaque token,
+/// carried as canonical base64 in the document's `task_token` member.
+trait TaskTokenDocument {
+    /// The document's base64 `task_token` member, not yet decoded.
+    fn encoded_task_token(&self) -> &str;
+}
+
+/// Implements [`TaskTokenDocument`] for semantic activity documents whose
+/// `task_token` member holds the base64 token.
+macro_rules! task_token_documents {
+    ($($document:ty),* $(,)?) => {
+        $(
+            impl TaskTokenDocument for $document {
+                fn encoded_task_token(&self) -> &str {
+                    &self.task_token
+                }
+            }
+        )*
+    };
+}
+
+task_token_documents!(
+    activity_protocol::ActivityTask,
+    activity_protocol::ActivityCompletion,
+    activity_protocol::ActivityHeartbeat,
+    activity_protocol::AsyncActivityHeartbeat,
+);
+
+/// Strictly decodes one semantic activity document with `decode` together
+/// with its opaque task token. Either failure is the generic
+/// [`protocol_failure`]; nothing else is inspected.
+fn decode_with_task_token<T: TaskTokenDocument>(
+    text: &str,
+    decode: fn(&str) -> std::result::Result<T, crate::protocol::ProtocolError>,
+) -> std::result::Result<(T, Vec<u8>), Failure> {
+    let semantic = decode(text).map_err(protocol_failure)?;
+    let task_token =
+        activity_protocol::decode_token(semantic.encoded_task_token()).map_err(protocol_failure)?;
+    Ok((semantic, task_token))
+}
+
 /// Converts a validated nonnegative protobuf duration to a standard one.
 fn std_duration(value: workflow_protocol::Duration) -> std::result::Result<Duration, Failure> {
-    let seconds = u64::try_from(value.seconds).map_err(|_| Failure {
-        status: STATUS_PROTOCOL,
-        message: "duration must not be negative".to_owned(),
-    })?;
-    let nanoseconds = u32::try_from(value.nanoseconds).map_err(|_| Failure {
-        status: STATUS_PROTOCOL,
-        message: "duration nanoseconds are outside protobuf range".to_owned(),
-    })?;
+    let out_of_range = |message: &'static str| {
+        move |_: std::num::TryFromIntError| Failure {
+            status: STATUS_PROTOCOL,
+            message: message.to_owned(),
+        }
+    };
+    let seconds =
+        u64::try_from(value.seconds).map_err(out_of_range("duration must not be negative"))?;
+    let nanoseconds = u32::try_from(value.nanoseconds).map_err(out_of_range(
+        "duration nanoseconds are outside protobuf range",
+    ))?;
     Ok(Duration::new(seconds, 0).saturating_add(Duration::from_nanos(u64::from(nanoseconds))))
 }
 
@@ -730,6 +773,70 @@ fn replay_worker_not_running() -> Failure {
     }
 }
 
+/// Aborts every task in `tasks`, then settles them with
+/// [`join_now_or_hand_off`]: no aborted task is detached while it may still
+/// own a connection clone.
+fn abort_and_settle(
+    core: Option<&Arc<SharedCore>>,
+    wait: bool,
+    tasks: impl Iterator<Item = JoinHandle<()>>,
+) -> Vec<JoinHandle<()>> {
+    let tasks = tasks.collect::<Vec<_>>();
+    for task in &tasks {
+        task.abort();
+    }
+    join_now_or_hand_off(core, wait, tasks)
+}
+
+/// Blocks the calling owner thread on `handle` until every task in `tasks`
+/// has finished. For aborted tasks this waits only for Tokio to run their
+/// cancellation, so it is bounded. Callers run it with the OCaml runtime
+/// lock released.
+fn join_all_blocking(handle: &tokio::runtime::Handle, tasks: Vec<JoinHandle<()>>) {
+    handle.block_on(async {
+        for task in tasks {
+            let _ = task.await;
+        }
+    });
+}
+
+/// Joins aborted `tasks` on the owner thread when an explicit shutdown
+/// (`wait`) still has Core's executor, returning nothing left to join;
+/// otherwise (the GC fallback, or no Core) returns them for the cleanup
+/// thread to join before Core is released.
+fn join_now_or_hand_off(
+    core: Option<&Arc<SharedCore>>,
+    wait: bool,
+    tasks: Vec<JoinHandle<()>>,
+) -> Vec<JoinHandle<()>> {
+    match (wait, core) {
+        (true, Some(core)) => {
+            join_all_blocking(&core.tokio_handle(), tasks);
+            Vec::new()
+        }
+        _ => tasks,
+    }
+}
+
+/// The `STATUS_RESOURCE_EXHAUSTED` failure of an admission refused because
+/// `what` (for example "workflow starts") already holds `limit` pending
+/// entries; nothing was spawned or registered.
+fn pending_limit_failure(what: &str, limit: usize) -> Failure {
+    Failure {
+        status: STATUS_RESOURCE_EXHAUSTED,
+        message: format!("too many Temporal {what} are pending (limit {limit})"),
+    }
+}
+
+/// The `STATUS_INTERNAL` failure of a registry that could not reserve room
+/// for one more `slot` (for example "client call") before its task exists.
+fn slot_reservation_failure(slot: &str) -> Failure {
+    Failure {
+        status: STATUS_INTERNAL,
+        message: format!("could not reserve a Temporal {slot} slot"),
+    }
+}
+
 /// Returns the Tokio executor of a graph's Core runtime, or
 /// [`runtime_closed`] once the graph has released its Core reference.
 ///
@@ -838,9 +945,8 @@ impl AsyncActivityRequest {
     /// not a terminal client operation. A cancellation must carry a canceled
     /// failure, whose details become the RPC details.
     fn decode_completion(text: &str) -> std::result::Result<Self, Failure> {
-        let semantic = activity_protocol::decode_completion(text).map_err(protocol_failure)?;
-        let task_token =
-            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
+        let (semantic, task_token) =
+            decode_with_task_token(text, activity_protocol::decode_completion)?;
         Ok(match &semantic.result {
             activity_protocol::ActivityCompletionResult::Completed { result } => Self::Completed {
                 task_token,
@@ -883,9 +989,8 @@ impl AsyncActivityRequest {
 
     /// Strictly decodes a semantic activity heartbeat for the async client.
     fn decode_heartbeat(text: &str) -> std::result::Result<Self, Failure> {
-        let semantic = activity_protocol::decode_heartbeat(text).map_err(protocol_failure)?;
-        let task_token =
-            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
+        let (semantic, task_token) =
+            decode_with_task_token(text, activity_protocol::decode_heartbeat)?;
         Ok(Self::Heartbeat {
             task_token,
             details: async_payloads(&semantic.details)?,
@@ -1528,23 +1633,26 @@ impl Runtime {
     }
 }
 
-/// Starts one named, detached cleanup thread that runs `run` with `SIGPIPE`
-/// blocked, because destruction on it (dropping Core, a client, or a worker)
-/// can flush or close network connections. Used by [`Runtime::new`] and
-/// [`SharedRuntime::new`] so a handle is published only after its
-/// non-blocking release path exists; a spawn failure is `STATUS_INTERNAL`.
-fn spawn_cleanup_thread(
+/// Starts one named, detached cleanup thread that runs `run` on the
+/// receiving end of a new channel with `SIGPIPE` blocked, because
+/// destruction on it (dropping Core, a client, or a worker) can flush or
+/// close network connections, and returns the channel's sender. Used by
+/// [`Runtime::new`] and [`SharedRuntime::new`] so a handle is published only
+/// after its non-blocking release path exists; a spawn failure is
+/// `STATUS_INTERNAL` and drops the unused channel.
+fn spawn_cleanup_thread<T: Send + 'static>(
     name: &str,
-    run: impl FnOnce() + Send + 'static,
-) -> std::result::Result<(), Failure> {
+    run: fn(Receiver<T>),
+) -> std::result::Result<std::sync::mpsc::Sender<T>, Failure> {
+    let (cleanup, receiver) = channel();
     std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
             crate::sigpipe::block_current_thread();
-            run()
+            run(receiver)
         })
         // The thread is detached: it exits once its handle's channel closes.
-        .map(|_detached| ())
+        .map(|_detached| cleanup)
         .map_err(|error| Failure {
             status: STATUS_INTERNAL,
             message: format!("could not start Temporal runtime cleanup thread: {error}"),
@@ -1556,11 +1664,11 @@ impl SharedRuntime {
     /// [`Runtime::new`]: every published handle has a non-blocking release
     /// path.
     fn new(core: SharedCore) -> std::result::Result<Self, Failure> {
-        let (cleanup, receiver) = channel();
         // Dropping Core on this thread can flush or close its connections.
-        spawn_cleanup_thread("ocaml-temporal-shared-runtime-cleanup", move || {
-            run_shared_runtime_cleanup(receiver)
-        })?;
+        let cleanup = spawn_cleanup_thread(
+            "ocaml-temporal-shared-runtime-cleanup",
+            run_shared_runtime_cleanup,
+        )?;
         SHARED_RUNTIMES_CREATED.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             core: Arc::new(core),
@@ -1664,6 +1772,29 @@ struct PendingStart {
     >,
     /// Tokio task performing the network call through Core's runtime.
     task: JoinHandle<()>,
+}
+
+/// Diagnostic of a live workflow completion that matches no leased
+/// activation; see [`Runtime::leased_workflow_completion`].
+const LIVE_COMPLETION_UNMATCHED: &str = "workflow completion does not match a leased activation";
+
+/// Diagnostic of a live workflow completion validated without a worker
+/// namespace; see [`Runtime::leased_workflow_completion`].
+const LIVE_COMPLETION_NAMESPACE_MISSING: &str =
+    "Temporal workflow worker namespace is not available";
+
+/// Which readiness of a live worker [`Runtime::wait_live_lane`] waits for.
+#[derive(Clone, Copy)]
+enum LiveLane {
+    /// The workflow-activation lane.
+    Workflow,
+    /// The remote-activity lane. As with workflow readiness, the wait is
+    /// bounded so the owner supervisor can process shutdown messages.
+    Activity,
+    /// Either lane. The worker loop uses this for its single idle native
+    /// wait, so a task on the lane it did not expect wakes the supervisor at
+    /// once rather than after the bounded timeout (#806).
+    Any,
 }
 
 /// Result of one owner-side ticket-channel read.
@@ -1830,12 +1961,9 @@ impl Runtime {
     /// Starts the cleanup thread before exposing a handle, so every successful
     /// runtime allocation already has a non-blocking GC fallback path.
     fn new(core: Arc<SharedCore>) -> std::result::Result<Self, Failure> {
-        let (cleanup, receiver) = channel();
         // Dropping a client or worker on this thread can flush or close its
         // connections.
-        spawn_cleanup_thread("ocaml-temporal-runtime-cleanup", move || {
-            run_runtime_cleanup(receiver)
-        })?;
+        let cleanup = spawn_cleanup_thread("ocaml-temporal-runtime-cleanup", run_runtime_cleanup)?;
         RUNTIMES_CREATED.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             core: Some(core),
@@ -1981,12 +2109,7 @@ impl Runtime {
                         .to_owned(),
             });
         }
-        let connection = self
-            .client
-            .as_ref()
-            .cloned()
-            .ok_or_else(client_not_connected)?;
-        let handle = core_tokio_handle(&self.core)?;
+        let (connection, handle) = self.client_and_handle()?;
         // Capture validated request identities before the request is moved into
         // the Core start call so an unencodable server response can still report
         // an Unknown outcome rather than dropping an accepted start.
@@ -2071,13 +2194,29 @@ impl Runtime {
     fn client_and_handle(
         &self,
     ) -> std::result::Result<(Connection, tokio::runtime::Handle), Failure> {
-        let connection = self
-            .client
+        Ok((self.connection()?, core_tokio_handle(&self.core)?))
+    }
+
+    /// Strictly decodes one client request document with `decode`, then
+    /// looks up the connection and Tokio handle it runs on, so malformed
+    /// input fails before the lifecycle check.
+    fn decode_client_request<T>(
+        &self,
+        input: &[u8],
+        decode: fn(&str) -> std::result::Result<T, crate::protocol::ProtocolError>,
+    ) -> std::result::Result<(T, Connection, tokio::runtime::Handle), Failure> {
+        let request = decode(decode_semantic_input(input)?).map_err(protocol_failure)?;
+        let (connection, handle) = self.client_and_handle()?;
+        Ok((request, connection, handle))
+    }
+
+    /// Returns a clone of the connected client, or [`client_not_connected`]
+    /// before a client is connected or after it is released.
+    fn connection(&self) -> std::result::Result<Connection, Failure> {
+        self.client
             .as_ref()
             .cloned()
-            .ok_or_else(client_not_connected)?;
-        let handle = core_tokio_handle(&self.core)?;
-        Ok((connection, handle))
+            .ok_or_else(client_not_connected)
     }
 
     /// Runs one bounded client RPC to completion on the calling owner thread.
@@ -2088,11 +2227,24 @@ impl Runtime {
     /// waits for the network (#807). The request is validated before the
     /// connection lookup, matching the asynchronous path.
     fn client_rpc_blocking(&mut self, kind: ClientCallKind, input: &[u8]) -> Operation {
+        let (rpc, connection, handle) = self.prepare_client_rpc(kind, input)?;
+        handle.block_on(rpc.into_future(connection))
+    }
+
+    /// Decodes and binds one client request for `kind` and looks up the
+    /// connection and Tokio handle it runs on, in that order, so malformed
+    /// input fails before the lifecycle check, identically on the blocking
+    /// and the submitted path.
+    fn prepare_client_rpc(
+        &self,
+        kind: ClientCallKind,
+        input: &[u8],
+    ) -> std::result::Result<(ClientRpc, Connection, tokio::runtime::Handle), Failure> {
         let text = decode_semantic_input(input)?;
         let rpc =
             ClientRpc::decode(kind, text)?.bind_async_activity(|| self.async_activity_binding())?;
         let (connection, handle) = self.client_and_handle()?;
-        handle.block_on(rpc.into_future(connection))
+        Ok((rpc, connection, handle))
     }
 
     /// Submits one client RPC and returns its call identifier at once (#807).
@@ -2121,10 +2273,7 @@ impl Runtime {
     /// are aborted and joined.
     fn submit_client_call(&mut self, kind: u32, input: &[u8]) -> Operation {
         let kind = ClientCallKind::try_from(kind)?;
-        let text = decode_semantic_input(input)?;
-        let rpc =
-            ClientRpc::decode(kind, text)?.bind_async_activity(|| self.async_activity_binding())?;
-        let (connection, handle) = self.client_and_handle()?;
+        let (rpc, connection, handle) = self.prepare_client_rpc(kind, input)?;
         let limits = self.client_limits;
         // Dropping a finished task's handle cannot detach live work: its
         // future, and with it the connection clone, has already completed.
@@ -2180,13 +2329,10 @@ impl Runtime {
                 if distinct.len() >= limits.pending_starts
                     && !distinct.contains(request.request_id())
                 {
-                    return Err(Failure {
-                        status: STATUS_RESOURCE_EXHAUSTED,
-                        message: format!(
-                            "too many Temporal workflow starts are pending (limit {})",
-                            limits.pending_starts
-                        ),
-                    });
+                    return Err(pending_limit_failure(
+                        "workflow starts",
+                        limits.pending_starts,
+                    ));
                 }
                 CallScope::Start(request)
             }
@@ -2200,13 +2346,10 @@ impl Runtime {
                     })
                     .collect::<HashSet<_>>();
                 if distinct.len() >= limits.pending_waits && !distinct.contains(request) {
-                    return Err(Failure {
-                        status: STATUS_RESOURCE_EXHAUSTED,
-                        message: format!(
-                            "too many Temporal workflow waits are pending (limit {})",
-                            limits.pending_waits
-                        ),
-                    });
+                    return Err(pending_limit_failure(
+                        "workflow waits",
+                        limits.pending_waits,
+                    ));
                 }
                 CallScope::Wait(request.clone())
             }
@@ -2233,21 +2376,17 @@ impl Runtime {
         if in_flight >= limits.in_flight_calls
             || crate::client_calls::registered_calls(self.call_owner) >= limits.in_flight_calls
         {
-            return Err(Failure {
-                status: STATUS_RESOURCE_EXHAUSTED,
-                message: format!(
-                    "too many Temporal client calls are pending (limit {})",
-                    limits.in_flight_calls
-                ),
-            });
+            return Err(pending_limit_failure(
+                "client calls",
+                limits.in_flight_calls,
+            ));
         }
         // Reserve the task-registry entry before the call exists, so no
         // allocation can unwind between spawning the task and registering
         // its handle for shutdown.
-        self.pending_calls.try_reserve(1).map_err(|_| Failure {
-            status: STATUS_INTERNAL,
-            message: "could not reserve a Temporal client call slot".to_owned(),
-        })?;
+        self.pending_calls
+            .try_reserve(1)
+            .map_err(|_| slot_reservation_failure("client call"))?;
         let (call, guard) = crate::client_calls::register(self.call_owner)?;
         // The handle is `<owner>.<call>`: awaiting requires both, so only the
         // graph that submitted the call can collect its outcome.
@@ -2283,11 +2422,7 @@ impl Runtime {
         if tasks.is_empty() {
             return;
         }
-        handle.block_on(async {
-            for task in tasks {
-                let _ = task.await;
-            }
-        });
+        join_all_blocking(handle, tasks);
     }
 
     /// The worker state an async activity request is bound to on submission;
@@ -2315,18 +2450,7 @@ impl Runtime {
             &mut self.heartbeat_throttle,
             Arc::new(HeartbeatThrottle::new()),
         );
-        let drivers = throttle.shutdown();
-        match (wait, self.core.as_ref()) {
-            (true, Some(core)) => {
-                core.tokio_handle().block_on(async {
-                    for driver in drivers {
-                        let _ = driver.await;
-                    }
-                });
-                Vec::new()
-            }
-            _ => drivers,
-        }
+        join_now_or_hand_off(self.core.as_ref(), wait, throttle.shutdown())
     }
 
     /// Releases every submitted call and returns task handles still to join.
@@ -2339,25 +2463,11 @@ impl Runtime {
     /// still owns a connection clone.
     fn abort_pending_calls(&mut self, wait: bool) -> Vec<JoinHandle<()>> {
         crate::client_calls::release_owner(self.call_owner);
-        let tasks = self
-            .pending_calls
-            .drain()
-            .map(|(_, call)| call.task)
-            .collect::<Vec<_>>();
-        for task in &tasks {
-            task.abort();
-        }
-        match (wait, self.core.as_ref()) {
-            (true, Some(core)) => {
-                core.tokio_handle().block_on(async {
-                    for task in tasks {
-                        let _ = task.await;
-                    }
-                });
-                Vec::new()
-            }
-            _ => tasks,
-        }
+        abort_and_settle(
+            self.core.as_ref(),
+            wait,
+            self.pending_calls.drain().map(|(_, call)| call.task),
+        )
     }
 
     /// Begins one workflow start without waiting for the RPC response.
@@ -2369,14 +2479,8 @@ impl Runtime {
     /// while an operation is pending returns the original ticket, preventing a
     /// caller retry from issuing a second Temporal start.
     fn begin_start_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_start_request(text).map_err(protocol_failure)?;
-        let connection = self
-            .client
-            .as_ref()
-            .cloned()
-            .ok_or_else(client_not_connected)?;
-        let handle = core_tokio_handle(&self.core)?;
+        let (request, connection, handle) =
+            self.decode_client_request(input, client_protocol::decode_start_request)?;
 
         // A caller that retries a begin request with the same logical ID must
         // observe the existing ticket only when every validated request field
@@ -2400,13 +2504,10 @@ impl Runtime {
                 .into_bytes());
         }
         if self.pending_starts.len() >= self.client_limits.pending_starts {
-            return Err(Failure {
-                status: STATUS_RESOURCE_EXHAUSTED,
-                message: format!(
-                    "too many Temporal workflow starts are pending (limit {})",
-                    self.client_limits.pending_starts
-                ),
-            });
+            return Err(pending_limit_failure(
+                "workflow starts",
+                self.client_limits.pending_starts,
+            ));
         }
 
         // Reserve the registry slot before spawning Tokio work.  Once the
@@ -2480,18 +2581,22 @@ impl Runtime {
                     status: STATUS_PROTOCOL,
                     message: "unknown Temporal workflow start ticket".to_owned(),
                 })?;
-            if wait {
-                match pending.receiver.recv_timeout(START_WAIT_TIMEOUT) {
-                    Ok(result) => StartRead::Ready(result),
-                    Err(RecvTimeoutError::Timeout) => StartRead::NotReady,
-                    Err(RecvTimeoutError::Disconnected) => StartRead::Disconnected,
-                }
+            // `Err(true)` is a disconnected channel, `Err(false)` an empty one.
+            let received = if wait {
+                pending
+                    .receiver
+                    .recv_timeout(START_WAIT_TIMEOUT)
+                    .map_err(|error| error == RecvTimeoutError::Disconnected)
             } else {
-                match pending.receiver.try_recv() {
-                    Ok(result) => StartRead::Ready(result),
-                    Err(TryRecvError::Empty) => StartRead::NotReady,
-                    Err(TryRecvError::Disconnected) => StartRead::Disconnected,
-                }
+                pending
+                    .receiver
+                    .try_recv()
+                    .map_err(|error| error == TryRecvError::Disconnected)
+            };
+            match received {
+                Ok(result) => StartRead::Ready(result),
+                Err(false) => StartRead::NotReady,
+                Err(true) => StartRead::Disconnected,
             }
         };
 
@@ -2544,26 +2649,19 @@ impl Runtime {
     /// for the dedicated cleanup thread to join before Core is released.  In
     /// either mode no task is detached while it still owns a Core connection.
     fn abort_pending_starts(&mut self, wait: bool) -> Vec<JoinHandle<()>> {
-        let handle = self.core.as_ref().map(|core| core.tokio_handle());
-        let tasks = self
-            .pending_starts
-            .drain()
-            .map(|(_, pending)| pending.task)
-            .collect::<Vec<_>>();
-        for task in &tasks {
-            task.abort();
-        }
+        let unjoined = abort_and_settle(
+            self.core.as_ref(),
+            wait,
+            self.pending_starts.drain().map(|(_, pending)| pending.task),
+        );
         if wait {
-            if let Some(handle) = handle {
-                handle.block_on(async {
-                    for task in tasks {
-                        let _ = task.await;
-                    }
-                });
-            }
+            // Without Core there is no executor to join on; an explicit
+            // shutdown then drops the already-aborted handles rather than
+            // handing them on.
+            drop(unjoined);
             Vec::new()
         } else {
-            tasks
+            unjoined
         }
     }
 
@@ -2572,28 +2670,18 @@ impl Runtime {
     /// A continued-as-new close event is returned as a terminal outcome with
     /// successor metadata; the bridge never follows it implicitly.
     fn wait_workflow_json(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = client_protocol::decode_wait_request(text).map_err(protocol_failure)?;
-        let connection = self
-            .client
-            .as_ref()
-            .cloned()
-            .ok_or_else(client_not_connected)?;
-        let handle = core_tokio_handle(&self.core)?;
+        let (request, connection, handle) =
+            self.decode_client_request(input, client_protocol::decode_wait_request)?;
         if !self.pending_waits.contains_key(&request) {
             if self.pending_waits.len() >= self.client_limits.pending_waits {
-                return Err(Failure {
-                    status: STATUS_RESOURCE_EXHAUSTED,
-                    message: format!(
-                        "too many Temporal workflow waits are pending (limit {})",
-                        self.client_limits.pending_waits
-                    ),
-                });
+                return Err(pending_limit_failure(
+                    "workflow waits",
+                    self.client_limits.pending_waits,
+                ));
             }
-            self.pending_waits.try_reserve(1).map_err(|_| Failure {
-                status: STATUS_INTERNAL,
-                message: "could not reserve a Temporal workflow wait slot".to_owned(),
-            })?;
+            self.pending_waits
+                .try_reserve(1)
+                .map_err(|_| slot_reservation_failure("workflow wait"))?;
             self.pending_waits.insert(
                 request.clone(),
                 Box::pin(client_protocol::wait_workflow(connection, request.clone())),
@@ -2683,11 +2771,7 @@ impl Runtime {
     /// worker and leaves the connected client available for a corrected retry.
     fn start_worker(&mut self, config: WorkerConfigInput) -> Operation {
         self.ensure_no_worker_graph()?;
-        let client = self
-            .client
-            .as_ref()
-            .cloned()
-            .ok_or_else(client_not_connected)?;
+        let client = self.connection()?;
         // Keep the validated worker namespace beside the native graph. Child
         // workflow commands do not expose namespace in the language-level
         // command, but Core needs the worker namespace to populate failure
@@ -2751,6 +2835,13 @@ impl Runtime {
         Ok(Vec::new())
     }
 
+    /// The live worker with its Core executor, or `None` when no live worker
+    /// is running, which both shutdown steps treat as already done.
+    fn live_worker_mut(&mut self) -> Option<(&mut PollLanes, tokio::runtime::Handle)> {
+        let worker = self.worker.as_mut()?;
+        Some((worker, live_worker_tokio_handle(&self.core)))
+    }
+
     /// Stops the child worker from taking new tasks while leaving it owned by
     /// the graph; absence is already stopped (#1028).
     ///
@@ -2767,10 +2858,9 @@ impl Runtime {
     /// leased to OCaml remain valid, so a running callback finishes normally.
     /// The call never blocks on Core or the network.
     fn initiate_worker_shutdown(&mut self) -> Operation {
-        let Some(worker) = self.worker.as_mut() else {
+        let Some((worker, handle)) = self.live_worker_mut() else {
             return Ok(Vec::new());
         };
-        let handle = live_worker_tokio_handle(&self.core);
         // `initiate_shutdown` synchronously calls `tokio::spawn`.
         let _runtime_guard = handle.enter();
         worker.initiate_shutdown();
@@ -2806,10 +2896,9 @@ impl Runtime {
     /// refused finalization keeps the worker in the graph and reports a
     /// worker failure; runtime close then disposes it.
     fn shutdown_worker(&mut self) -> Operation {
-        let Some(worker) = self.worker.as_mut() else {
+        let Some((worker, handle)) = self.live_worker_mut() else {
             return Ok(Vec::new());
         };
-        let handle = live_worker_tokio_handle(&self.core);
         {
             // `initiate_shutdown` synchronously calls `tokio::spawn`; keep
             // the guard narrower than the subsequent blocking finalization.
@@ -2901,24 +2990,28 @@ impl Runtime {
                 .ok_or_else(not_ready)?
                 .map_err(poll_lane_failure)?
         };
-        let semantic = match workflow_protocol::activation_from_core(&activation) {
-            Ok(semantic) => semantic,
-            Err(error) => {
-                self.reject_replay_workflow_delivery(
-                    &activation.run_id,
+        // Each conversion failure carries the static reason Core receives.
+        let converted = workflow_protocol::activation_from_core(&activation)
+            .map_err(|error| {
+                (
                     "semantic replay activation conversion failed",
-                )?;
-                return Err(core_conversion_failure(error));
-            }
-        };
-        let encoded = match workflow_protocol::encode_activation(&semantic) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                self.reject_replay_workflow_delivery(
-                    &activation.run_id,
-                    "semantic replay activation JSON encoding failed",
-                )?;
-                return Err(protocol_failure(error));
+                    core_conversion_failure(error),
+                )
+            })
+            .and_then(|semantic| {
+                let encoded = workflow_protocol::encode_activation(&semantic).map_err(|error| {
+                    (
+                        "semantic replay activation JSON encoding failed",
+                        protocol_failure(error),
+                    )
+                })?;
+                Ok((semantic, encoded))
+            });
+        let (semantic, encoded) = match converted {
+            Ok(converted) => converted,
+            Err((reason, failure)) => {
+                self.reject_replay_workflow_delivery(&activation.run_id, reason)?;
+                return Err(failure);
             }
         };
         if let Err(error) = retain_workflow_activation(&mut self.workflow_activations, semantic) {
@@ -2931,18 +3024,49 @@ impl Runtime {
         Ok(encoded.into_bytes())
     }
 
-    /// Waits for workflow-lane readiness without consuming the queued task.
+    /// Waits for workflow-lane readiness; see [`Self::wait_live_lane`].
+    fn wait_workflow(&self) -> Operation {
+        self.wait_live_lane(LiveLane::Workflow)
+    }
+
+    /// Waits for remote-activity-lane readiness; see [`Self::wait_live_lane`].
+    fn wait_activity(&self) -> Operation {
+        self.wait_live_lane(LiveLane::Activity)
+    }
+
+    /// Waits for readiness on either lane; see [`Self::wait_live_lane`].
+    fn wait_any(&self) -> Operation {
+        self.wait_live_lane(LiveLane::Any)
+    }
+
+    /// Waits for readiness on `lane` of the live worker without consuming a
+    /// task.
     ///
     /// The native C stub invokes this while the OCaml runtime lock is released.
     /// A bounded timeout keeps a supervisor mailbox responsive to lifecycle
-    /// commands when Core is quiet; callers retry after `STATUS_NOT_READY`.
-    fn wait_workflow(&self) -> Operation {
+    /// commands when Core is quiet; callers retry after `STATUS_NOT_READY`,
+    /// and `STATUS_INVALID_STATE` reports a lane closed without queued work.
+    /// The diagnostics name the lane; see [`LiveLane`].
+    fn wait_live_lane(&self, lane: LiveLane) -> Operation {
         let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
-        live_readiness_outcome(
-            worker.wait_workflow(),
-            "Temporal workflow readiness wait timed out; retry",
-            "Temporal workflow readiness wait ended during worker shutdown",
-        )
+        let (wait, timed_out, shut_down): (fn(&PollLanes) -> ReadinessWait, _, _) = match lane {
+            LiveLane::Workflow => (
+                PollLanes::wait_workflow,
+                "Temporal workflow readiness wait timed out; retry",
+                "Temporal workflow readiness wait ended during worker shutdown",
+            ),
+            LiveLane::Activity => (
+                PollLanes::wait_activity,
+                "Temporal activity readiness wait timed out; retry",
+                "Temporal activity readiness wait ended during worker shutdown",
+            ),
+            LiveLane::Any => (
+                PollLanes::wait_any,
+                "Temporal worker readiness wait timed out; retry",
+                "Temporal worker readiness wait ended during worker shutdown",
+            ),
+        };
+        live_readiness_outcome(wait(worker), timed_out, shut_down)
     }
 
     /// Waits for replay activation readiness and records the terminal shutdown
@@ -2989,21 +3113,22 @@ impl Runtime {
     /// Completes one replay activation after strict semantic validation and
     /// removes its one-shot lease only after Core accepts the completion.
     fn complete_replay_workflow(&mut self, input: &[u8]) -> Operation {
-        let (semantic, completion) = self.leased_workflow_completion(
+        self.deliver_leased_workflow_completion(
             input,
             "replay workflow completion does not match a leased activation",
             "Temporal replay worker namespace is not available",
-        )?;
-        let handle = core_tokio_handle(&self.core)?;
-        let worker = self
-            .replay_worker
-            .as_ref()
-            .ok_or_else(replay_worker_not_running)?;
-        handle
-            .block_on(worker.complete_workflow(completion))
-            .map_err(replay_worker_failure)?;
-        self.workflow_activations.remove(&semantic.run_id);
-        Ok(Vec::new())
+            |runtime, completion| {
+                let handle = core_tokio_handle(&runtime.core)?;
+                let worker = runtime
+                    .replay_worker
+                    .as_ref()
+                    .ok_or_else(replay_worker_not_running)?;
+                handle
+                    .block_on(worker.complete_workflow(completion))
+                    .map_err(replay_worker_failure)?;
+                Ok(Vec::new())
+            },
+        )
     }
 
     /// Retires a replay activation that could not be decoded by OCaml while
@@ -3089,18 +3214,37 @@ impl Runtime {
 
     /// Strictly validates and submits one leased workflow completion.
     fn complete_workflow(&mut self, input: &[u8]) -> Operation {
-        let (semantic, completion) = self.leased_workflow_completion(
+        self.deliver_leased_workflow_completion(
             input,
-            "workflow completion does not match a leased activation",
-            "Temporal workflow worker namespace is not available",
-        )?;
-        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
-        let handle = live_worker_tokio_handle(&self.core);
-        handle
-            .block_on(worker.complete_workflow(completion))
-            .map_err(worker_bridge_failure)?;
+            LIVE_COMPLETION_UNMATCHED,
+            LIVE_COMPLETION_NAMESPACE_MISSING,
+            |runtime, completion| {
+                let worker = runtime.worker.as_ref().ok_or_else(worker_not_running)?;
+                live_worker_tokio_handle(&runtime.core)
+                    .block_on(worker.complete_workflow(completion))
+                    .map_err(worker_bridge_failure)?;
+                Ok(Vec::new())
+            },
+        )
+    }
+
+    /// Validates one leased workflow completion exactly once (see
+    /// [`Self::leased_workflow_completion`] for `unmatched` and
+    /// `namespace_missing`), hands the converted value to `deliver`, and
+    /// removes the run's semantic handoff only after `deliver` succeeds,
+    /// returning its bytes. Any failure leaves the handoff in place.
+    fn deliver_leased_workflow_completion(
+        &mut self,
+        input: &[u8],
+        unmatched: &'static str,
+        namespace_missing: &'static str,
+        deliver: impl FnOnce(&mut Self, WorkflowActivationCompletion) -> Operation,
+    ) -> Operation {
+        let (semantic, completion) =
+            self.leased_workflow_completion(input, unmatched, namespace_missing)?;
+        let output = deliver(self, completion)?;
         self.workflow_activations.remove(&semantic.run_id);
-        Ok(Vec::new())
+        Ok(output)
     }
 
     /// Strictly validates one leased workflow completion and admits it
@@ -3117,18 +3261,19 @@ impl Runtime {
     /// the ledger lease was retired by admission for the same reason. The
     /// owner Domain never waits for Core or the network on this path.
     fn submit_workflow_completion(&mut self, input: &[u8]) -> Operation {
-        let (semantic, completion) = self.leased_workflow_completion(
+        self.deliver_leased_workflow_completion(
             input,
-            "workflow completion does not match a leased activation",
-            "Temporal workflow worker namespace is not available",
-        )?;
-        let handle = core_tokio_handle(&self.core)?;
-        let worker = self.worker.as_mut().ok_or_else(worker_not_running)?;
-        let ticket = worker
-            .submit_workflow_completion(&handle, completion)
-            .map_err(worker_bridge_failure)?;
-        self.workflow_activations.remove(&semantic.run_id);
-        Ok(ticket.to_string().into_bytes())
+            LIVE_COMPLETION_UNMATCHED,
+            LIVE_COMPLETION_NAMESPACE_MISSING,
+            |runtime, completion| {
+                let handle = core_tokio_handle(&runtime.core)?;
+                let worker = runtime.worker.as_mut().ok_or_else(worker_not_running)?;
+                let ticket = worker
+                    .submit_workflow_completion(&handle, completion)
+                    .map_err(worker_bridge_failure)?;
+                Ok(ticket.to_string().into_bytes())
+            },
+        )
     }
 
     /// Takes every published workflow-completion outcome without waiting, as
@@ -3175,11 +3320,7 @@ impl Runtime {
         let rejection = self.reject_workflow_delivery_with_reason(&run_id, REASON);
         self.workflow_activations.remove(&run_id);
         rejection?;
-        write_rejected_workflow_diagnostic(std::io::stderr().lock(), REASON);
-        self.worker
-            .as_ref()
-            .expect("rejected workflow delivery retains worker")
-            .wait_workflow_delivery_rejection_backoff();
+        self.report_rejected_workflow(REASON);
         Ok(Vec::new())
     }
 
@@ -3236,35 +3377,6 @@ impl Runtime {
         Err(not_ready())
     }
 
-    /// Waits for remote-activity-lane readiness without consuming its task.
-    ///
-    /// As with workflow readiness, this is a blocking native call with a
-    /// bounded duration so the owner supervisor can process shutdown messages.
-    fn wait_activity(&self) -> Operation {
-        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
-        live_readiness_outcome(
-            worker.wait_activity(),
-            "Temporal activity readiness wait timed out; retry",
-            "Temporal activity readiness wait ended during worker shutdown",
-        )
-    }
-
-    /// Waits for readiness on either live-worker lane without consuming a task.
-    ///
-    /// The worker loop uses this for its single idle native wait so a task on
-    /// the lane it did not expect wakes the supervisor at once rather than
-    /// after the bounded timeout (#806). Statuses match the lane-specific
-    /// waits: `STATUS_NOT_READY` on timeout and `STATUS_INVALID_STATE` once a
-    /// lane has closed without queued work.
-    fn wait_any(&self) -> Operation {
-        let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
-        live_readiness_outcome(
-            worker.wait_any(),
-            "Temporal worker readiness wait timed out; retry",
-            "Temporal worker readiness wait ended during worker shutdown",
-        )
-    }
-
     /// Applies the fixed native backoff used only after an explicitly
     /// retryable activity-completion outcome.
     ///
@@ -3304,12 +3416,20 @@ impl Runtime {
         reason: &'static str,
     ) -> Operation {
         self.reject_workflow_delivery_with_reason(run_id, reason)?;
+        self.report_rejected_workflow(reason);
+        Err(not_ready())
+    }
+
+    /// After Core accepted a workflow rejection: writes the static `reason`
+    /// to stderr and applies the redelivery backoff, because Core may
+    /// redeliver the failed workflow task at once. A successful rejection
+    /// always leaves the worker in the graph.
+    fn report_rejected_workflow(&self, reason: &'static str) {
         write_rejected_workflow_diagnostic(std::io::stderr().lock(), reason);
         self.worker
             .as_ref()
             .expect("rejected workflow delivery retains worker")
             .wait_workflow_delivery_rejection_backoff();
-        Err(not_ready())
     }
 
     /// Fails and retires an activity task that was never exposed to OCaml,
@@ -3329,9 +3449,8 @@ impl Runtime {
     /// Strictly validates and submits one leased remote-activity completion.
     fn complete_activity(&mut self, input: &[u8]) -> Operation {
         let text = decode_semantic_input(input)?;
-        let semantic = activity_protocol::decode_completion(text).map_err(protocol_failure)?;
-        let task_token =
-            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
+        let (semantic, task_token) =
+            decode_with_task_token(text, activity_protocol::decode_completion)?;
         let completion =
             activity_protocol::completion_to_core(&semantic).map_err(core_conversion_failure)?;
         let worker = self.worker.as_ref().ok_or_else(worker_not_running)?;
@@ -3351,9 +3470,8 @@ impl Runtime {
     /// never as a fabricated synchronous result from this operation.
     fn record_activity_heartbeat(&mut self, input: &[u8]) -> Operation {
         let text = decode_semantic_input(input)?;
-        let semantic = activity_protocol::decode_heartbeat(text).map_err(protocol_failure)?;
-        let task_token =
-            activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
+        let (semantic, task_token) =
+            decode_with_task_token(text, activity_protocol::decode_heartbeat)?;
         let details = semantic
             .details
             .iter()
@@ -3380,11 +3498,7 @@ impl Runtime {
     /// completion path would make a retained async handle depend on a poll
     /// task that has already been retired.
     fn async_activity_client(&self) -> std::result::Result<Client, Failure> {
-        let connection = self
-            .client
-            .as_ref()
-            .cloned()
-            .ok_or_else(client_not_connected)?;
+        let connection = self.connection()?;
         let namespace = self
             .worker_namespace
             .clone()
@@ -3411,16 +3525,24 @@ impl Runtime {
     /// No entry in the worker ledger is read or retired here; the OCaml async
     /// lease owns the capability until Core accepts a terminal request.
     fn complete_async_activity(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = AsyncActivityRequest::decode_completion(text)?;
-        self.async_activity_blocking(request)
+        self.async_activity_blocking_json(input, AsyncActivityRequest::decode_completion)
     }
 
     /// Records a heartbeat for an asynchronously completed activity through
     /// the same namespace-bound client handle used for terminal operations.
     fn record_async_activity_heartbeat(&mut self, input: &[u8]) -> Operation {
-        let text = decode_semantic_input(input)?;
-        let request = AsyncActivityRequest::decode_heartbeat(text)?;
+        self.async_activity_blocking_json(input, AsyncActivityRequest::decode_heartbeat)
+    }
+
+    /// Strictly decodes one async activity document with `decode` and runs
+    /// it with [`Self::async_activity_blocking`]; malformed input fails
+    /// before any client or RPC exists.
+    fn async_activity_blocking_json(
+        &mut self,
+        input: &[u8],
+        decode: fn(&str) -> std::result::Result<AsyncActivityRequest, Failure>,
+    ) -> Operation {
+        let request = decode(decode_semantic_input(input)?)?;
         self.async_activity_blocking(request)
     }
 
@@ -3960,17 +4082,34 @@ fn workflow_rejection_run_id(
 ) -> std::result::Result<String, Failure> {
     let text = decode_semantic_input(input)?;
     let semantic = workflow_protocol::decode_activation(text).map_err(protocol_failure)?;
-    match pending.get(&semantic.run_id) {
-        Some(leased) if leased == &semantic => Ok(semantic.run_id),
-        Some(_) => Err(Failure {
-            status: STATUS_PROTOCOL,
-            message: "workflow rejection does not match the leased activation".to_owned(),
-        }),
-        None => Err(Failure {
-            status: STATUS_PROTOCOL,
-            message: "workflow rejection does not match a leased activation".to_owned(),
-        }),
-    }
+    ensure_leased_rejection(
+        pending
+            .get(&semantic.run_id)
+            .map(|leased| leased == &semantic),
+        "workflow rejection does not match the leased activation",
+        "workflow rejection does not match a leased activation",
+    )?;
+    Ok(semantic.run_id)
+}
+
+/// Accepts a rejection only when its document equals the one retained at the
+/// handoff: `matched` is `None` when nothing is leased under the document's
+/// identity (`missing`) and `Some(false)` when the retained document differs
+/// (`mismatched`). Both failures are `STATUS_PROTOCOL` and change nothing.
+fn ensure_leased_rejection(
+    matched: Option<bool>,
+    mismatched: &'static str,
+    missing: &'static str,
+) -> std::result::Result<(), Failure> {
+    let message = match matched {
+        Some(true) => return Ok(()),
+        Some(false) => mismatched,
+        None => missing,
+    };
+    Err(Failure {
+        status: STATUS_PROTOCOL,
+        message: message.to_owned(),
+    })
 }
 
 /// Retains every semantic activity handoff under Core's opaque token. Multiple
@@ -4036,23 +4175,18 @@ fn activity_rejection_task(
     input: &[u8],
 ) -> std::result::Result<ActivityRejection, Failure> {
     let text = decode_semantic_input(input)?;
-    let semantic = activity_protocol::decode_task(text).map_err(protocol_failure)?;
-    let task_token =
-        activity_protocol::decode_token(&semantic.task_token).map_err(protocol_failure)?;
-    match pending.get(&task_token) {
-        Some(tasks) if tasks.contains(&semantic) => Ok(ActivityRejection {
-            task_token,
-            task: semantic,
-        }),
-        Some(_) => Err(Failure {
-            status: STATUS_PROTOCOL,
-            message: "activity rejection does not match a leased task".to_owned(),
-        }),
-        None => Err(Failure {
-            status: STATUS_PROTOCOL,
-            message: "activity rejection does not match a leased task token".to_owned(),
-        }),
-    }
+    let (semantic, task_token) = decode_with_task_token(text, activity_protocol::decode_task)?;
+    ensure_leased_rejection(
+        pending
+            .get(&task_token)
+            .map(|tasks| tasks.contains(&semantic)),
+        "activity rejection does not match a leased task",
+        "activity rejection does not match a leased task token",
+    )?;
+    Ok(ActivityRejection {
+        task_token,
+        task: semantic,
+    })
 }
 
 /// Extracts the canonical opaque activity token only when the complete task
@@ -4063,6 +4197,23 @@ fn activity_rejection_token(
     input: &[u8],
 ) -> std::result::Result<Vec<u8>, Failure> {
     activity_rejection_task(pending, input).map(|rejection| rejection.task_token)
+}
+
+/// Validates the build ID repeated inside a versioning mode and requires it
+/// to equal the worker's top-level `build_id`, so the server never receives
+/// contradictory routing metadata.
+fn validate_versioning_build_id(
+    build_id: &str,
+    top_level: &str,
+) -> std::result::Result<(), Failure> {
+    validate_identifier("versioning.build_id", build_id)?;
+    if build_id != top_level {
+        return Err(Failure {
+            status: STATUS_CONFIGURATION,
+            message: "versioning.build_id must match build_id".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 impl WorkerConfigInput {
@@ -4076,13 +4227,7 @@ impl WorkerConfigInput {
                 build_id: self.build_id,
             },
             WorkerVersioningInput::LegacyBuildId { build_id } => {
-                validate_identifier("versioning.build_id", &build_id)?;
-                if build_id != self.build_id {
-                    return Err(Failure {
-                        status: STATUS_CONFIGURATION,
-                        message: "versioning.build_id must match build_id".to_owned(),
-                    });
-                }
+                validate_versioning_build_id(&build_id, &self.build_id)?;
                 WorkerVersioningStrategy::LegacyBuildIdBased { build_id }
             }
             WorkerVersioningInput::DeploymentBased {
@@ -4092,13 +4237,7 @@ impl WorkerConfigInput {
                 default_versioning_behavior,
             } => {
                 validate_identifier("versioning.deployment_name", &deployment_name)?;
-                validate_identifier("versioning.build_id", &build_id)?;
-                if build_id != self.build_id {
-                    return Err(Failure {
-                        status: STATUS_CONFIGURATION,
-                        message: "versioning.build_id must match build_id".to_owned(),
-                    });
-                }
+                validate_versioning_build_id(&build_id, &self.build_id)?;
                 let default_versioning_behavior = match default_versioning_behavior.as_deref() {
                     None => None,
                     Some("auto_upgrade") => Some(VersioningBehavior::AutoUpgrade),
@@ -4991,51 +5130,145 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_new_with_worker_threads(
     runtime: *mut *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    // Canonicalize any writable handle slot even when the independent result
-    // pointer is invalid. A caller can therefore inspect a known null value on
-    // every failing return instead of retaining indeterminate ownership state.
-    if !runtime.is_null() {
-        // SAFETY: A non-null runtime argument promises writable pointer storage.
-        unsafe { ptr::write(runtime, ptr::null_mut()) };
+    // SAFETY: The caller upholds the slot and result contracts documented
+    // above, which are exactly `invoke_into_slot`'s.
+    unsafe {
+        invoke_into_slot(runtime, RUNTIME_SLOT_IS_NULL, output, || {
+            let worker_threads = runtime_worker_threads(worker_threads)?;
+            let created = create_runtime(
+                core_log_level()?,
+                worker_threads,
+                diagnostics::CoreLogWriter::spawn_stderr,
+            )?;
+            Ok((Box::into_raw(Box::new(created)), Vec::new()))
+        })
+    }
+}
+
+/// Defines one exported `extern "C"` function that releases a boxed handle
+/// through the caller's pointer-to-pointer slot with [`release_boxed_slot`],
+/// applying the release closure to the reclaimed box.
+///
+/// Each use passes the export's complete documentation, including its own
+/// `# Safety` section. Every such section states `release_boxed_slot`'s slot
+/// contract (a null or exclusively owned slot) and names the constructor
+/// whose `Box::into_raw` is the only source of non-null values in the slot,
+/// which is exactly what the generated `unsafe` block relies on. Only the
+/// symbol name, slot parameter, handle type, and release closure vary.
+macro_rules! release_slot_export {
+    ($(#[$meta:meta])* fn $name:ident($slot:ident: $handle:ty) => $release:expr;) => {
+        $(#[$meta])*
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name($slot: *mut *mut $handle) -> Status {
+            // SAFETY: The export's `# Safety` section forwards the slot
+            // contract of `release_boxed_slot` unchanged, and every non-null
+            // value in this slot came from `Box::into_raw` in the constructor
+            // that section names, so it is reclaimed here exactly once.
+            unsafe { release_boxed_slot($slot, $release) }
+        }
+    };
+}
+
+/// The failure for a null runtime output slot.
+const RUNTIME_SLOT_IS_NULL: &str = "runtime output pointer is null";
+
+/// Reads Core's log level from the environment, rejecting an invalid value
+/// with `STATUS_CONFIGURATION` before anything is allocated.
+fn core_log_level() -> std::result::Result<Option<diagnostics::CoreLogLevel>, Failure> {
+    diagnostics::core_log_level_from_env().map_err(|message| Failure {
+        status: STATUS_CONFIGURATION,
+        message,
+    })
+}
+
+/// A value an output-slot export resets its slot to before anything else
+/// happens: null for a handle slot, `u32::MAX` for an identifier slot.
+trait SlotValue: Copy {
+    /// The value every failing return leaves in the slot.
+    const EMPTY: Self;
+}
+
+impl<T> SlotValue for *mut T {
+    const EMPTY: Self = ptr::null_mut();
+}
+
+impl SlotValue for u32 {
+    const EMPTY: Self = u32::MAX;
+}
+
+/// Shared body of every export that publishes one value through a caller's
+/// output slot (a runtime, shared runtime, or metric meter handle, or a
+/// metric identifier).
+///
+/// A non-null `slot` is reset to [`SlotValue::EMPTY`] first, even when
+/// `output` is invalid, so the caller can inspect a known value on every
+/// failing return instead of retaining indeterminate ownership state. A null
+/// `output` is then `STATUS_INVALID_ARGUMENT`. Everything else runs inside
+/// [`invoke`], so a panic is contained: a null `slot` fails with
+/// `STATUS_INVALID_ARGUMENT` and the message `null_slot` before `operation`
+/// runs, and the value `operation` returns is written to the slot as the
+/// closure's last step, so a published value is never paired with a failure
+/// from the operation. The returned bytes become the result value.
+///
+/// # Safety
+///
+/// `slot` must be null or point to writable storage for one `T` that does not
+/// already hold a live owned value and that nothing else accesses until this
+/// call returns. `output` follows the result contract of
+/// [`ocaml_temporal_core_v4_check_abi_version`].
+unsafe fn invoke_into_slot<T: SlotValue>(
+    slot: *mut T,
+    null_slot: &'static str,
+    output: *mut Result,
+    operation: impl FnOnce() -> std::result::Result<(T, Vec<u8>), Failure>,
+) -> Status {
+    if !slot.is_null() {
+        // SAFETY: A non-null slot promises writable storage for one `T`.
+        unsafe { ptr::write(slot, T::EMPTY) };
     }
     if output.is_null() {
         return STATUS_INVALID_ARGUMENT;
     }
-    if runtime.is_null() {
-        // SAFETY: The result pointer was checked above and the closure does
-        // not inspect the missing runtime slot.
-        return unsafe {
-            invoke(output, || {
-                Err(Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime output pointer is null".to_owned(),
-                })
-            })
-        };
-    }
-
-    // SAFETY: Both output locations were validated above.
+    // SAFETY: The result pointer was checked above; the slot is checked in
+    // the closure before it is written.
     unsafe {
         invoke(output, || {
-            let worker_threads = runtime_worker_threads(worker_threads)?;
-            let log_level = diagnostics::core_log_level_from_env().map_err(|message| Failure {
-                status: STATUS_CONFIGURATION,
-                message,
-            })?;
-            let created = create_runtime(
-                log_level,
-                worker_threads,
-                diagnostics::CoreLogWriter::spawn_stderr,
-            )?;
-            let owned = Box::into_raw(Box::new(created));
-
-            // SAFETY: The runtime slot remains exclusively owned by this call
-            // until it returns and was validated before invoking the closure.
-            ptr::write(runtime, owned);
-            Ok(Vec::new())
+            if slot.is_null() {
+                return Err(Failure {
+                    status: STATUS_INVALID_ARGUMENT,
+                    message: null_slot.to_owned(),
+                });
+            }
+            let (value, bytes) = operation()?;
+            // SAFETY: The slot was checked above and is exclusively owned by
+            // this call until it returns.
+            ptr::write(slot, value);
+            Ok(bytes)
         })
     }
 }
+
+/// Borrows a live shared handle (a shared runtime or a metric meter) passed
+/// across the native ABI, refusing a null pointer with
+/// `STATUS_INVALID_ARGUMENT` and the message `null_handle`.
+///
+/// # Safety
+///
+/// A non-null `handle` must identify a live handle that is not released
+/// during `'a`.
+unsafe fn live_handle<'a, T>(
+    handle: *const T,
+    null_handle: &'static str,
+) -> std::result::Result<&'a T, Failure> {
+    // SAFETY: Upheld by the caller as documented above.
+    unsafe { handle.as_ref() }.ok_or_else(|| Failure {
+        status: STATUS_INVALID_ARGUMENT,
+        message: null_handle.to_owned(),
+    })
+}
+
+/// The failure for a null shared-runtime handle.
+const SHARED_RUNTIME_IS_NULL: &str = "shared runtime handle is null";
 
 /// Create a Core runtime that several instance graphs can share (#832).
 ///
@@ -5112,62 +5345,45 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_new_with_telemetr
     shared: *mut *mut SharedRuntime,
     output: *mut Result,
 ) -> Status {
-    // Canonicalize the slot first, as in `runtime_new_with_worker_threads`,
-    // so every failing return leaves a known null value.
-    if !shared.is_null() {
-        // SAFETY: A non-null slot promises writable pointer storage.
-        unsafe { ptr::write(shared, ptr::null_mut()) };
-    }
-    if output.is_null() {
-        return STATUS_INVALID_ARGUMENT;
-    }
-    // SAFETY: The result pointer was checked above; the slot and the input
-    // span are checked in the closure before use.
+    // SAFETY: The slot and result contracts documented above are exactly
+    // `invoke_into_slot`'s; the input span is checked before use.
     unsafe {
-        invoke(output, || {
-            if shared.is_null() {
-                return Err(Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "shared runtime output pointer is null".to_owned(),
-                });
-            }
-            if input_len > MAX_TELEMETRY_CONFIG_BYTES {
-                return Err(Failure {
-                    status: STATUS_CONFIGURATION,
-                    message: format!(
-                        "runtime telemetry configuration exceeds {MAX_TELEMETRY_CONFIG_BYTES} bytes"
-                    ),
-                });
-            }
-            // SAFETY: The caller promises the readable span documented above.
-            let bytes = borrow_span(input, input_len, "telemetry input")?;
-            // Validate everything that allocates nothing before building Core.
-            let telemetry = telemetry::parse_telemetry_config(bytes)?;
-            let worker_threads = runtime_worker_threads(worker_threads)?;
-            let log_level = diagnostics::core_log_level_from_env().map_err(|message| Failure {
-                status: STATUS_CONFIGURATION,
-                message,
-            })?;
-            let core = create_shared_core(
-                log_level,
-                worker_threads,
-                &telemetry,
-                diagnostics::CoreLogWriter::spawn_stderr,
-            )?;
-            // Only a Prometheus endpoint listens; an OTLP exporter reports
-            // the empty address like a runtime without an exporter.
-            let address = core
-                .metrics
-                .as_ref()
-                .and_then(telemetry::MetricsExporter::bound_address)
-                .map(|address| address.to_string())
-                .unwrap_or_default();
-            let owned = Box::into_raw(Box::new(SharedRuntime::new(core)?));
-            // SAFETY: The slot was validated above and is exclusively owned
-            // by this call until it returns.
-            ptr::write(shared, owned);
-            Ok(address.into_bytes())
-        })
+        invoke_into_slot(
+            shared,
+            "shared runtime output pointer is null",
+            output,
+            || {
+                if input_len > MAX_TELEMETRY_CONFIG_BYTES {
+                    return Err(Failure {
+                        status: STATUS_CONFIGURATION,
+                        message: format!(
+                            "runtime telemetry configuration exceeds {MAX_TELEMETRY_CONFIG_BYTES} bytes"
+                        ),
+                    });
+                }
+                // SAFETY: The caller promises the readable span documented above.
+                let bytes = borrow_span(input, input_len, "telemetry input")?;
+                // Validate everything that allocates nothing before building Core.
+                let telemetry = telemetry::parse_telemetry_config(bytes)?;
+                let worker_threads = runtime_worker_threads(worker_threads)?;
+                let core = create_shared_core(
+                    core_log_level()?,
+                    worker_threads,
+                    &telemetry,
+                    diagnostics::CoreLogWriter::spawn_stderr,
+                )?;
+                // Only a Prometheus endpoint listens; an OTLP exporter reports
+                // the empty address like a runtime without an exporter.
+                let address = core
+                    .metrics
+                    .as_ref()
+                    .and_then(telemetry::MetricsExporter::bound_address)
+                    .map(|address| address.to_string())
+                    .unwrap_or_default();
+                let owned = Box::into_raw(Box::new(SharedRuntime::new(core)?));
+                Ok((owned, address.into_bytes()))
+            },
+        )
     }
 }
 
@@ -5194,36 +5410,18 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_new_attached(
     runtime: *mut *mut Runtime,
     output: *mut Result,
 ) -> Status {
-    if !runtime.is_null() {
-        // SAFETY: A non-null runtime argument promises writable pointer storage.
-        unsafe { ptr::write(runtime, ptr::null_mut()) };
-    }
-    if output.is_null() {
-        return STATUS_INVALID_ARGUMENT;
-    }
-    // SAFETY: The result pointer was checked above; both input pointers are
-    // checked in the closure before use.
+    // SAFETY: The slot and result contracts documented above are exactly
+    // `invoke_into_slot`'s.
     unsafe {
-        invoke(output, || {
-            if runtime.is_null() {
-                return Err(Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "runtime output pointer is null".to_owned(),
-                });
-            }
+        invoke_into_slot(runtime, RUNTIME_SLOT_IS_NULL, output, || {
             // SAFETY: The caller promises a null or live, unreleased handle.
-            let shared = shared.as_ref().ok_or_else(|| Failure {
-                status: STATUS_INVALID_ARGUMENT,
-                message: "shared runtime handle is null".to_owned(),
-            })?;
-            let owned = Box::into_raw(Box::new(shared.attach()?));
-            // SAFETY: The slot was validated above.
-            ptr::write(runtime, owned);
-            Ok(Vec::new())
+            let shared = live_handle(shared, SHARED_RUNTIME_IS_NULL)?;
+            Ok((Box::into_raw(Box::new(shared.attach()?)), Vec::new()))
         })
     }
 }
 
+release_slot_export! {
 /// Release a shared-runtime handle and clear the caller's slot, waiting
 /// until its Core reference has been dropped.
 ///
@@ -5239,27 +5437,19 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_new_attached(
 /// `shared` must be null or point to a slot initialized by
 /// [`ocaml_temporal_core_v4_shared_runtime_new`]. The slot must not be
 /// accessed concurrently, and the caller must not be on a Tokio worker.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_free(
-    shared: *mut *mut SharedRuntime,
-) -> Status {
-    // SAFETY: The slot contract is forwarded unchanged; non-null values in
-    // this slot come from `Box::into_raw` in `shared_runtime_new`.
-    unsafe { release_boxed_slot(shared, |shared| shared.release(true)) }
+fn ocaml_temporal_core_v4_shared_runtime_free(shared: SharedRuntime) =>
+    |shared| shared.release(true);
 }
 
+release_slot_export! {
 /// Transfer a shared-runtime handle's reference to its cleanup thread
 /// without waiting. Reserved for the OCaml custom-block finalizer.
 ///
 /// # Safety
 ///
 /// As for [`ocaml_temporal_core_v4_shared_runtime_free`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_dispose(
-    shared: *mut *mut SharedRuntime,
-) -> Status {
-    // SAFETY: As for `shared_runtime_free`.
-    unsafe { release_boxed_slot(shared, |shared| shared.release(false)) }
+fn ocaml_temporal_core_v4_shared_runtime_dispose(shared: SharedRuntime) =>
+    |shared| shared.release(false);
 }
 
 /// Shared body of every export that releases a boxed handle through the
@@ -5326,42 +5516,25 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_shared_runtime_metric_meter(
     meter: *mut *mut MetricMeter,
     output: *mut Result,
 ) -> Status {
-    if !meter.is_null() {
-        // SAFETY: A non-null slot promises writable pointer storage.
-        unsafe { ptr::write(meter, ptr::null_mut()) };
-    }
-    if output.is_null() {
-        return STATUS_INVALID_ARGUMENT;
-    }
-    // SAFETY: The result pointer was checked above; the other pointers are
-    // checked in the closure before use.
+    // SAFETY: The slot and result contracts documented above are exactly
+    // `invoke_into_slot`'s.
     unsafe {
-        invoke(output, || {
-            if meter.is_null() {
-                return Err(Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "metric meter output pointer is null".to_owned(),
-                });
-            }
+        invoke_into_slot(meter, "metric meter output pointer is null", output, || {
             // SAFETY: The caller promises a null or live, unreleased handle.
-            let shared = shared.as_ref().ok_or_else(|| Failure {
-                status: STATUS_INVALID_ARGUMENT,
-                message: "shared runtime handle is null".to_owned(),
-            })?;
-            let core = &shared.core;
-            if let Some(temporal_meter) = core.telemetry().get_temporal_metric_meter() {
-                let global_tag_names = core
-                    .metrics
-                    .as_ref()
-                    .map(|exporter| exporter.global_tag_names().to_vec())
-                    .unwrap_or_default();
-                let owned =
-                    Box::into_raw(Box::new(MetricMeter::new(temporal_meter, global_tag_names)));
-                // SAFETY: The slot was validated above and is exclusively
-                // owned by this call until it returns.
-                ptr::write(meter, owned);
-            }
-            Ok(Vec::new())
+            let core = &live_handle(shared, SHARED_RUNTIME_IS_NULL)?.core;
+            // Without a metrics exporter the slot stays null.
+            let owned = match core.telemetry().get_temporal_metric_meter() {
+                Some(temporal_meter) => {
+                    let global_tag_names = core
+                        .metrics
+                        .as_ref()
+                        .map(|exporter| exporter.global_tag_names().to_vec())
+                        .unwrap_or_default();
+                    Box::into_raw(Box::new(MetricMeter::new(temporal_meter, global_tag_names)))
+                }
+                None => ptr::null_mut(),
+            };
+            Ok((owned, Vec::new()))
         })
     }
 }
@@ -5392,52 +5565,38 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_register_json(
     id: *mut u32,
     output: *mut Result,
 ) -> Status {
-    if !id.is_null() {
-        // SAFETY: A non-null slot promises writable storage.
-        unsafe { ptr::write(id, u32::MAX) };
-    }
-    if output.is_null() {
-        return STATUS_INVALID_ARGUMENT;
-    }
-    // SAFETY: The result pointer was checked above; the other pointers are
-    // checked in the closure before use.
+    // SAFETY: The identifier slot and result contracts documented above are
+    // exactly `invoke_into_slot`'s; the input span is checked before use.
     unsafe {
-        invoke(output, || {
-            if id.is_null() {
-                return Err(Failure {
-                    status: STATUS_INVALID_ARGUMENT,
-                    message: "metric identifier output pointer is null".to_owned(),
-                });
-            }
-            // SAFETY: The caller promises a null or live handle.
-            let meter = meter.as_ref().ok_or_else(|| Failure {
-                status: STATUS_INVALID_ARGUMENT,
-                message: "metric meter handle is null".to_owned(),
-            })?;
-            // SAFETY: The caller promises the readable span documented above.
-            // An oversized document is a rejected registration like any
-            // other, so it reports `STATUS_CONFIGURATION` as documented
-            // rather than `input_span`'s generic `STATUS_PROTOCOL` (#1226).
-            let bytes = input_span(
-                input,
-                input_len,
-                telemetry::MAX_SDK_INSTRUMENT_DOCUMENT_BYTES,
-            )
-            .map_err(|failure| {
-                if failure.status == STATUS_PROTOCOL {
-                    Failure {
-                        status: STATUS_CONFIGURATION,
-                        ..failure
+        invoke_into_slot(
+            id,
+            "metric identifier output pointer is null",
+            output,
+            || {
+                // SAFETY: The caller promises a null or live handle.
+                let meter = live_handle(meter, "metric meter handle is null")?;
+                // SAFETY: The caller promises the readable span documented above.
+                // An oversized document is a rejected registration like any
+                // other, so it reports `STATUS_CONFIGURATION` as documented
+                // rather than `input_span`'s generic `STATUS_PROTOCOL` (#1226).
+                let bytes = input_span(
+                    input,
+                    input_len,
+                    telemetry::MAX_SDK_INSTRUMENT_DOCUMENT_BYTES,
+                )
+                .map_err(|failure| {
+                    if failure.status == STATUS_PROTOCOL {
+                        Failure {
+                            status: STATUS_CONFIGURATION,
+                            ..failure
+                        }
+                    } else {
+                        failure
                     }
-                } else {
-                    failure
-                }
-            })?;
-            let registered = meter.register(bytes)?;
-            // SAFETY: The slot was validated above.
-            ptr::write(id, registered);
-            Ok(Vec::new())
-        })
+                })?;
+                Ok((meter.register(bytes)?, Vec::new()))
+            },
+        )
     }
 }
 
@@ -5498,6 +5657,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_release(
     catch_unwind(AssertUnwindSafe(|| meter.release(id))).unwrap_or(STATUS_PANIC)
 }
 
+release_slot_export! {
 /// Release an SDK metrics recorder and clear the caller's slot. Dropping it
 /// touches only memory (never Core or Tokio), so this is safe from a GC
 /// finalizer and on any thread. Calling again with the now-null slot is safe.
@@ -5507,18 +5667,10 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_release(
 /// `meter` must be null or point to a slot initialized by
 /// [`ocaml_temporal_core_v4_shared_runtime_metric_meter`]. No other call on
 /// the handle may be running or start afterwards.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v4_metric_meter_free(
-    meter: *mut *mut MetricMeter,
-) -> Status {
-    // SAFETY: The slot contract is forwarded unchanged; non-null values in
-    // this slot come from `Box::into_raw` in `shared_runtime_metric_meter`.
-    unsafe {
-        release_boxed_slot(meter, |meter| {
-            drop(meter);
-            STATUS_OK
-        })
-    }
+fn ocaml_temporal_core_v4_metric_meter_free(meter: MetricMeter) => |meter| {
+    drop(meter);
+    STATUS_OK
+};
 }
 
 /// Connect the runtime graph's single official Temporal client from strict
@@ -6539,6 +6691,7 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_disconnect(
     unsafe { invoke(output, || runtime_mut(runtime)?.disconnect_client()) }
 }
 
+release_slot_export! {
 /// Destroy one native runtime and clear the caller's slot.
 ///
 /// The graph is disposed on its cleanup thread and this call waits for it at
@@ -6553,13 +6706,11 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_client_disconnect(
 /// `runtime` must be null or point to a slot initialized by
 /// [`ocaml_temporal_core_v4_runtime_new`]. The slot must not be accessed
 /// concurrently, and all future child handles must be closed first.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_free(runtime: *mut *mut Runtime) -> Status {
-    // SAFETY: The slot contract is forwarded unchanged; non-null values in
-    // this slot come from `Box::into_raw` in `runtime_new`.
-    unsafe { release_boxed_slot(runtime, |runtime| runtime.close(true)) }
+fn ocaml_temporal_core_v4_runtime_free(runtime: Runtime) =>
+    |runtime| runtime.close(true);
 }
 
+release_slot_export! {
 /// Transfer a runtime to its cleanup thread without waiting for destruction.
 ///
 /// This is reserved for the OCaml custom-block finalizer. Normal supervisor
@@ -6570,12 +6721,8 @@ pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_free(runtime: *mut *mut 
 ///
 /// `runtime` has the same exclusive slot contract as
 /// [`ocaml_temporal_core_v4_runtime_free`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ocaml_temporal_core_v4_runtime_dispose(
-    runtime: *mut *mut Runtime,
-) -> Status {
-    // SAFETY: As for `runtime_free`.
-    unsafe { release_boxed_slot(runtime, |runtime| runtime.close(false)) }
+fn ocaml_temporal_core_v4_runtime_dispose(runtime: Runtime) =>
+    |runtime| runtime.close(false);
 }
 
 /// Release both owned buffers in a result and reset it to the empty state.
@@ -6634,9 +6781,15 @@ pub unsafe fn test_invoke_panic(output: *mut Result) -> Status {
 /// runtime owner or depending on timing alone.
 #[doc(hidden)]
 pub fn test_runtime_cleanup_counts() -> (u64, u64) {
+    load_counter_pair(&RUNTIMES_CREATED, &RUNTIMES_CLEANED)
+}
+
+/// Reads two process-local lifecycle counters, first then second, for a
+/// test hook.
+fn load_counter_pair(first: &AtomicU64, second: &AtomicU64) -> (u64, u64) {
     (
-        RUNTIMES_CREATED.load(Ordering::Acquire),
-        RUNTIMES_CLEANED.load(Ordering::Acquire),
+        first.load(Ordering::Acquire),
+        second.load(Ordering::Acquire),
     )
 }
 
@@ -6669,10 +6822,7 @@ pub fn test_registered_client_calls() -> usize {
 /// writer close) returned. Not part of the C ABI.
 #[doc(hidden)]
 pub fn test_core_runtime_counts() -> (u64, u64) {
-    (
-        SHARED_RUNTIMES_CREATED.load(Ordering::Acquire),
-        CORE_RUNTIMES_DROPPED.load(Ordering::Acquire),
-    )
+    load_counter_pair(&SHARED_RUNTIMES_CREATED, &CORE_RUNTIMES_DROPPED)
 }
 
 /// Reports whether two live instance graphs run on the same Core runtime,
@@ -7112,14 +7262,36 @@ mod worker_config_tests {
         }
     }
 
+    /// Returns the configuration failure of `worker`, panicking with `why`
+    /// when the configuration is unexpectedly accepted.
+    fn rejected(worker: WorkerConfigInput, why: &str) -> super::Failure {
+        match worker.into_core() {
+            Err(failure) => failure,
+            Ok(_) => panic!("{why}"),
+        }
+    }
+
+    /// A deployment-based worker named `agents` on the top-level build ID,
+    /// with the given worker-versioning switch and default behavior.
+    fn deployment(use_worker_versioning: bool, behavior: Option<&str>) -> WorkerConfigInput {
+        let mut worker = config(MIN_CACHED_WORKFLOW_POLLS);
+        worker.versioning = super::WorkerVersioningInput::DeploymentBased {
+            deployment_name: "agents".to_owned(),
+            build_id: worker.build_id.clone(),
+            use_worker_versioning,
+            default_versioning_behavior: behavior.map(str::to_owned),
+        };
+        worker
+    }
+
     /// Rejects the configuration that Core would otherwise report only after
     /// a live worker startup, keeping the public boundary deterministic.
     #[test]
     fn cached_workflows_require_two_workflow_pollers() {
-        let failure = match config(MIN_CACHED_WORKFLOW_POLLS - 1).into_core() {
-            Err(failure) => failure,
-            Ok(_) => panic!("cached workflows must require two workflow pollers"),
-        };
+        let failure = rejected(
+            config(MIN_CACHED_WORKFLOW_POLLS - 1),
+            "cached workflows must require two workflow pollers",
+        );
         assert_eq!(failure.status, STATUS_CONFIGURATION);
         assert!(
             failure
@@ -7155,10 +7327,7 @@ mod worker_config_tests {
     fn worker_identifiers_reject_nul() {
         let mut worker = config(MIN_CACHED_WORKFLOW_POLLS);
         worker.namespace.push('\0');
-        let failure = match worker.into_core() {
-            Err(failure) => failure,
-            Ok(_) => panic!("worker identifiers must reject NUL"),
-        };
+        let failure = rejected(worker, "worker identifiers must reject NUL");
         assert_eq!(failure.status, STATUS_CONFIGURATION);
         assert!(failure.message.contains("namespace must not contain NUL"));
     }
@@ -7188,10 +7357,7 @@ mod worker_config_tests {
         worker.versioning = super::WorkerVersioningInput::LegacyBuildId {
             build_id: "different-build".to_owned(),
         };
-        let failure = match worker.into_core() {
-            Err(failure) => failure,
-            Ok(_) => panic!("mismatched legacy build IDs must fail closed"),
-        };
+        let failure = rejected(worker, "mismatched legacy build IDs must fail closed");
         assert_eq!(failure.status, STATUS_CONFIGURATION);
         assert_eq!(failure.message, "versioning.build_id must match build_id");
     }
@@ -7201,13 +7367,7 @@ mod worker_config_tests {
     /// that do not specify an explicit versioning option.
     #[test]
     fn deployment_based_selects_core_versioning_strategy() {
-        let mut worker = config(MIN_CACHED_WORKFLOW_POLLS);
-        worker.versioning = super::WorkerVersioningInput::DeploymentBased {
-            deployment_name: "agents".to_owned(),
-            build_id: worker.build_id.clone(),
-            use_worker_versioning: true,
-            default_versioning_behavior: Some("pinned".to_owned()),
-        };
+        let worker = deployment(true, Some("pinned"));
         let core = worker
             .into_core()
             .expect("valid deployment routing should be accepted");
@@ -7229,17 +7389,11 @@ mod worker_config_tests {
     /// avoids silently carrying a policy that Core would ignore.
     #[test]
     fn deployment_behavior_requires_worker_versioning() {
-        let mut worker = config(MIN_CACHED_WORKFLOW_POLLS);
-        worker.versioning = super::WorkerVersioningInput::DeploymentBased {
-            deployment_name: "agents".to_owned(),
-            build_id: worker.build_id.clone(),
-            use_worker_versioning: false,
-            default_versioning_behavior: Some("auto_upgrade".to_owned()),
-        };
-        let failure = match worker.into_core() {
-            Err(failure) => failure,
-            Ok(_) => panic!("disabled deployment versioning must reject a default behavior"),
-        };
+        let worker = deployment(false, Some("auto_upgrade"));
+        let failure = rejected(
+            worker,
+            "disabled deployment versioning must reject a default behavior",
+        );
         assert_eq!(failure.status, STATUS_CONFIGURATION);
         assert!(
             failure
@@ -7254,17 +7408,11 @@ mod worker_config_tests {
     /// deployment (issue #817).
     #[test]
     fn worker_versioning_requires_default_behavior() {
-        let mut worker = config(MIN_CACHED_WORKFLOW_POLLS);
-        worker.versioning = super::WorkerVersioningInput::DeploymentBased {
-            deployment_name: "agents".to_owned(),
-            build_id: worker.build_id.clone(),
-            use_worker_versioning: true,
-            default_versioning_behavior: None,
-        };
-        let failure = match worker.into_core() {
-            Err(failure) => failure,
-            Ok(_) => panic!("versioned workers must not complete with UNSPECIFIED behavior"),
-        };
+        let worker = deployment(true, None);
+        let failure = rejected(
+            worker,
+            "versioned workers must not complete with UNSPECIFIED behavior",
+        );
         assert_eq!(failure.status, STATUS_CONFIGURATION);
         assert_eq!(
             failure.message,
@@ -7277,13 +7425,7 @@ mod worker_config_tests {
     /// completion behavior and no default may be supplied.
     #[test]
     fn deployment_without_worker_versioning_accepts_no_behavior() {
-        let mut worker = config(MIN_CACHED_WORKFLOW_POLLS);
-        worker.versioning = super::WorkerVersioningInput::DeploymentBased {
-            deployment_name: "agents".to_owned(),
-            build_id: worker.build_id.clone(),
-            use_worker_versioning: false,
-            default_versioning_behavior: None,
-        };
+        let worker = deployment(false, None);
         let core = worker
             .into_core()
             .expect("unversioned deployment metadata should be accepted");

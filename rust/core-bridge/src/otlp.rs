@@ -36,9 +36,10 @@
 //! bypasses OCaml still cannot configure a header or endpoint outside the
 //! documented grammar.
 
-use crate::abi::{Failure, STATUS_CONFIGURATION};
+use crate::abi::Failure;
+use crate::telemetry::{GlobalTag, invalid, owned_pairs};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
@@ -139,14 +140,6 @@ impl std::fmt::Debug for OtlpHeader {
     }
 }
 
-/// One constant metric attribute, as in the Prometheus configuration.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct OtlpGlobalTag {
-    name: String,
-    value: String,
-}
-
 /// OTLP push-export options, a strict subset of Core's
 /// [`OtelCollectorOptions`] with the same defaults. The OCaml encoder writes
 /// every member explicitly.
@@ -167,10 +160,11 @@ pub(crate) struct OtlpConfig {
     /// Aggregation temporality of sums and histograms.
     #[serde(default)]
     temporality: OtlpTemporality,
-    /// Constant attributes attached to every series, in caller order. Core
-    /// records them as resource attributes of the export.
+    /// Constant attributes attached to every series, in caller order, with
+    /// the Prometheus tag shape. Core records them as resource attributes of
+    /// the export.
     #[serde(default)]
-    global_tags: Vec<OtlpGlobalTag>,
+    global_tags: Vec<GlobalTag>,
     /// Record durations as floating-point seconds instead of integer
     /// milliseconds.
     #[serde(default)]
@@ -185,31 +179,19 @@ fn default_period_ms() -> u64 {
 impl OtlpConfig {
     /// Names of the configured global tags, in configuration order.
     pub(crate) fn global_tag_names(&self) -> Vec<String> {
-        self.global_tags
-            .iter()
-            .map(|tag| tag.name.clone())
-            .collect()
+        GlobalTag::names(&self.global_tags)
     }
 
     /// Global tags as `(name, value)` pairs for the shared tag validator.
     pub(crate) fn global_tag_pairs(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
-        self.global_tags
-            .iter()
-            .map(|tag| (tag.name.as_str(), tag.value.as_str()))
-    }
-}
-
-/// Builds a configuration failure with a constant-shaped message.
-fn invalid(message: String) -> Failure {
-    Failure {
-        status: STATUS_CONFIGURATION,
-        message,
+        GlobalTag::pairs(&self.global_tags)
     }
 }
 
 /// Whether `text` is a canonical decimal number of at most `max_digits`
-/// digits: ASCII digits only, without a leading zero unless it is `0`.
-fn canonical_decimal(text: &str, max_digits: usize) -> bool {
+/// digits: ASCII digits only, without a leading zero unless it is `0`. Also
+/// the port rule of the Prometheus `bind_address` grammar.
+pub(crate) fn canonical_decimal(text: &str, max_digits: usize) -> bool {
     !text.is_empty()
         && text.len() <= max_digits
         && text.bytes().all(|byte| byte.is_ascii_digit())
@@ -428,16 +410,53 @@ impl DetachableMeter {
             None => detached(),
         }
     }
+
+    /// Creates a value with `create` from Core's meter while it is attached,
+    /// and from [`NoOpCoreMeter`] (given a clone of `input`, taken before the
+    /// lock) once it is detached. This is the whole body of every delegating
+    /// [`CoreMeter`] method except `extend_attributes`.
+    fn create_or_no_op<I: Clone, T>(&self, input: I, create: fn(&dyn CoreMeter, I) -> T) -> T {
+        let fallback = input.clone();
+        self.with_meter(
+            |meter| create(meter, input),
+            || create(&NoOpCoreMeter, fallback),
+        )
+    }
+}
+
+/// Implements [`CoreMeter`] methods that take one owned argument and are
+/// answered by Core's meter while attached and by [`NoOpCoreMeter`] after
+/// release, through [`DetachableMeter::create_or_no_op`]. Each entry keeps
+/// its own attributes (documentation).
+macro_rules! delegate_or_no_op {
+    ($($(#[$meta:meta])* fn $name:ident($input:ty) -> $output:ty;)*) => {
+        $(
+            $(#[$meta])*
+            fn $name(&self, input: $input) -> $output {
+                self.create_or_no_op(input, |meter, input| meter.$name(input))
+            }
+        )*
+    };
 }
 
 impl CoreMeter for DetachableMeter {
-    /// Core's OpenTelemetry attributes while attached, no-op ones afterwards.
-    fn new_attributes(&self, attribs: NewAttributes) -> MetricAttributes {
-        let fallback = attribs.clone();
-        self.with_meter(
-            |meter| meter.new_attributes(attribs),
-            || NoOpCoreMeter.new_attributes(fallback),
-        )
+    delegate_or_no_op! {
+        /// Core's OpenTelemetry attributes while attached, no-op ones afterwards.
+        fn new_attributes(NewAttributes) -> MetricAttributes;
+        /// Core's counter while attached, a no-op counter afterwards.
+        fn counter(MetricParameters) -> Counter;
+        /// Core's histogram while attached, a no-op histogram afterwards.
+        fn histogram(MetricParameters) -> Histogram;
+        /// Core's `f64` histogram while attached, a no-op one afterwards.
+        fn histogram_f64(MetricParameters) -> HistogramF64;
+        /// Core's duration histogram while attached, a no-op one afterwards.
+        fn histogram_duration(MetricParameters) -> HistogramDuration;
+        /// Core's gauge while attached, a no-op gauge afterwards.
+        fn gauge(MetricParameters) -> Gauge;
+        /// Core's `f64` gauge while attached, a no-op one afterwards.
+        fn gauge_f64(MetricParameters) -> GaugeF64;
+        /// Core's up-down counter while attached, a no-op one afterwards.
+        fn up_down_counter(MetricParameters) -> UpDownCounter;
     }
 
     /// After release the existing attributes are returned unchanged: they
@@ -453,62 +472,6 @@ impl CoreMeter for DetachableMeter {
         self.with_meter(
             |meter| meter.extend_attributes(existing, attribs),
             || fallback,
-        )
-    }
-
-    fn counter(&self, params: MetricParameters) -> Counter {
-        let fallback = params.clone();
-        self.with_meter(
-            |meter| meter.counter(params),
-            || NoOpCoreMeter.counter(fallback),
-        )
-    }
-
-    fn histogram(&self, params: MetricParameters) -> Histogram {
-        let fallback = params.clone();
-        self.with_meter(
-            |meter| meter.histogram(params),
-            || NoOpCoreMeter.histogram(fallback),
-        )
-    }
-
-    fn histogram_f64(&self, params: MetricParameters) -> HistogramF64 {
-        let fallback = params.clone();
-        self.with_meter(
-            |meter| meter.histogram_f64(params),
-            || NoOpCoreMeter.histogram_f64(fallback),
-        )
-    }
-
-    fn histogram_duration(&self, params: MetricParameters) -> HistogramDuration {
-        let fallback = params.clone();
-        self.with_meter(
-            |meter| meter.histogram_duration(params),
-            || NoOpCoreMeter.histogram_duration(fallback),
-        )
-    }
-
-    fn gauge(&self, params: MetricParameters) -> Gauge {
-        let fallback = params.clone();
-        self.with_meter(
-            |meter| meter.gauge(params),
-            || NoOpCoreMeter.gauge(fallback),
-        )
-    }
-
-    fn gauge_f64(&self, params: MetricParameters) -> GaugeF64 {
-        let fallback = params.clone();
-        self.with_meter(
-            |meter| meter.gauge_f64(params),
-            || NoOpCoreMeter.gauge_f64(fallback),
-        )
-    }
-
-    fn up_down_counter(&self, params: MetricParameters) -> UpDownCounter {
-        let fallback = params.clone();
-        self.with_meter(
-            |meter| meter.up_down_counter(params),
-            || NoOpCoreMeter.up_down_counter(fallback),
         )
     }
 }
@@ -587,16 +550,12 @@ pub(crate) fn start_otlp(
     config: &OtlpConfig,
 ) -> Result<OtlpExporter, Failure> {
     let url = validate_endpoint(&config.endpoint)?;
-    let headers: HashMap<String, String> = config
-        .headers
-        .iter()
-        .map(|header| (header.name.clone(), header.value.clone()))
-        .collect();
-    let global_tags: HashMap<String, String> = config
-        .global_tags
-        .iter()
-        .map(|tag| (tag.name.clone(), tag.value.clone()))
-        .collect();
+    let headers = owned_pairs(
+        config
+            .headers
+            .iter()
+            .map(|header| (header.name.as_str(), header.value.as_str())),
+    );
     let options = OtelCollectorOptions::builder()
         .url(url)
         .headers(headers)
@@ -605,7 +564,7 @@ pub(crate) fn start_otlp(
             OtlpTemporality::Cumulative => MetricTemporality::Cumulative,
             OtlpTemporality::Delta => MetricTemporality::Delta,
         })
-        .global_tags(global_tags)
+        .global_tags(owned_pairs(config.global_tag_pairs()))
         .use_seconds_for_durations(config.durations_as_seconds)
         .protocol(match config.protocol {
             OtlpTransport::Grpc => OtlpProtocol::Grpc,
