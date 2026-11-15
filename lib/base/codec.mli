@@ -37,6 +37,16 @@ val of_payload :
     JSON or Protobuf; public payload callers normally rely on [string]. *)
 val valid_utf_8 : string -> bool
 
+(** [validate_cancellation_reason ~subject reason] applies the text contract a
+    workflow-issued cancellation reason must meet before it is recorded as a
+    command in durable history: non-empty, free of NUL bytes, at most 65,536
+    bytes, and valid UTF-8. A violation is an [Error.defect] whose message is
+    [subject ^ " cancellation reason " ^ rule], for example
+    ["child cancellation reason must not be empty"]. The child-workflow and
+    external-workflow cancellation paths share it so their limits cannot drift
+    apart from each other or from the Rust bridge's command validator. *)
+val validate_cancellation_reason : subject:string -> string -> (unit, Error.t) result
+
 (** Encodes OCaml strings as JSON using Temporal's [json/plain] encoding name.
     Yojson performs the JSON parsing and printing. Invalid UTF-8 and JSON values
     that are not strings produce [Error.t]. *)
