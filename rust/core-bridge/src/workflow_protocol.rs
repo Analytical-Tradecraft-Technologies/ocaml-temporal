@@ -1092,6 +1092,28 @@ fn bounded_text(value: &str, path: &str) -> Result<(), ProtocolError> {
     }
 }
 
+/// Validates the reason carried by an external-workflow or child-workflow
+/// cancellation command before it is recorded in history: non-empty, free of
+/// NUL bytes, and within the ordinary text limit. This is the Rust half of the
+/// contract `cancellation_reason` in `lib/protocol/workflow_protocol.ml`
+/// enforces; the OCaml side also checks UTF-8, which `&str` already
+/// guarantees here.
+fn cancellation_reason(reason: &str) -> Result<(), ProtocolError> {
+    if reason.is_empty() {
+        return Err(ProtocolError::invalid(
+            "$.commands.reason",
+            "reason must not be empty",
+        ));
+    }
+    if reason.as_bytes().contains(&0) {
+        return Err(ProtocolError::invalid(
+            "$.commands.reason",
+            "reason must not contain NUL",
+        ));
+    }
+    bounded_text(reason, "$.commands.reason")
+}
+
 /// Validates a signal sender identity carried in Core's ordinary text field.
 ///
 /// Unlike a Temporal identifier, an identity may be empty, but it still must
@@ -1975,40 +1997,10 @@ fn validate_completion(value: &Completion) -> Result<(), ProtocolError> {
                 if !run_id.is_empty() {
                     identifier(run_id, "$.commands.run_id")?;
                 }
-                if reason.is_empty() {
-                    return Err(ProtocolError::invalid(
-                        "$.commands.reason",
-                        "reason must not be empty",
-                    ));
-                }
-                if reason.as_bytes().contains(&0) {
-                    return Err(ProtocolError::invalid(
-                        "$.commands.reason",
-                        "reason must not contain NUL",
-                    ));
-                }
-                bounded_text(reason, "$.commands.reason")?;
+                cancellation_reason(reason)?;
             }
             CompletionCommand::CancelChildWorkflow { reason, .. } => {
-                if reason.is_empty() {
-                    return Err(ProtocolError::invalid(
-                        "$.commands.reason",
-                        "reason must not be empty",
-                    ));
-                }
-                if reason.as_bytes().contains(&0) {
-                    return Err(ProtocolError::invalid(
-                        "$.commands.reason",
-                        "reason must not contain NUL",
-                    ));
-                }
-                bounded_text(reason, "$.commands.reason")?;
-                if std::str::from_utf8(reason.as_bytes()).is_err() {
-                    return Err(ProtocolError::invalid(
-                        "$.commands.reason",
-                        "reason must be valid UTF-8",
-                    ));
-                }
+                cancellation_reason(reason)?;
             }
             CompletionCommand::RequestCancelActivity { .. }
             | CompletionCommand::RequestCancelLocalActivity { .. } => {}
