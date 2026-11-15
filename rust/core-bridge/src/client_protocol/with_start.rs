@@ -152,30 +152,26 @@ enum UpdateWithStartOutcomeDocument {
     },
 }
 
-/// Strictly parses one signal-with-start request after duplicate-key and
-/// byte-limit checks.
-pub(crate) fn decode_signal_with_start_request(
-    input: &str,
-) -> Result<SignalWithStartRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_payload_object,
-        "invalid client signal-with-start request",
-        validate_signal_with_start_request,
-    )
-}
+request_decoders! {
+    /// Strictly parses one signal-with-start request after duplicate-key and
+    /// byte-limit checks.
+    pub(crate) fn decode_signal_with_start_request(
+        input: &str,
+    ) -> Result<SignalWithStartRequest, protocol::ProtocolError> {
+        parse: protocol::decode_payload_object,
+        invalid: "invalid client signal-with-start request",
+        validate: validate_signal_with_start_request,
+    }
 
-/// Strictly parses one update-with-start request after duplicate-key and
-/// byte-limit checks.
-pub(crate) fn decode_update_with_start_request(
-    input: &str,
-) -> Result<UpdateWithStartRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_payload_object,
-        "invalid client update-with-start request",
-        validate_update_with_start_request,
-    )
+    /// Strictly parses one update-with-start request after duplicate-key and
+    /// byte-limit checks.
+    pub(crate) fn decode_update_with_start_request(
+        input: &str,
+    ) -> Result<UpdateWithStartRequest, protocol::ProtocolError> {
+        parse: protocol::decode_payload_object,
+        invalid: "invalid client update-with-start request",
+        validate: validate_update_with_start_request,
+    }
 }
 
 /// Compares two signal-with-start requests as one logical operation: the
@@ -215,7 +211,7 @@ fn validate_signal_with_start_request(
         ));
     }
     validate_identifier(&value.signal_name, "$.signal_name")?;
-    validate_message_payloads(&value.signal_input, "$.signal_input")
+    validate_payloads(&value.signal_input, "$.signal_input")
 }
 
 /// Validates the embedded start and the update. Temporal refuses a cron
@@ -237,22 +233,12 @@ fn validate_update_with_start_request(
             "update-with-start does not accept a start delay",
         ));
     }
-    validate_identifier(&value.update_id, "$.update_id")?;
-    validate_identifier(&value.update_name, "$.update_name")?;
-    validate_message_payloads(&value.update_input, "$.update_input")
-}
-
-/// Requires every message argument at `path` to convert into a Temporal
-/// payload before the request can reach the service.
-fn validate_message_payloads(
-    input: &[workflow_protocol::Payload],
-    path: &str,
-) -> Result<(), protocol::ProtocolError> {
-    for payload in input {
-        workflow_protocol::payload_to_core(payload)
-            .map_err(|_| protocol::ProtocolError::invalid(path, "invalid Temporal payload"))?;
-    }
-    Ok(())
+    validate_update_message(
+        &value.update_id,
+        &value.update_name,
+        &value.update_input,
+        "$.update_input",
+    )
 }
 
 /// Signals a workflow, starting it first when its workflow ID has no open
@@ -269,16 +255,14 @@ pub(crate) async fn signal_with_start_workflow(
     request: SignalWithStartRequest,
 ) -> Result<StartWorkflowResponse, ClientOperationError> {
     let rpc_request = signal_with_start_execution_request(&request, connection.identity())?;
-    let budget = rpc_budget(request.start.rpc_timeout_ms, START_RPC_TIMEOUT);
-    let started = tokio::time::Instant::now();
+    let clock = RpcClock::start(request.start.rpc_timeout_ms, START_RPC_TIMEOUT);
     let mut service = connection.clone();
-    let response = budgeted_rpc(
-        budget,
-        started,
-        service.signal_with_start_workflow_execution(budgeted_request(rpc_request, budget)),
-        |status| map_start_status(&request.start.workflow_id, status),
-    )
-    .await?;
+    let response = clock
+        .call(
+            service.signal_with_start_workflow_execution(clock.request(rpc_request)),
+            |status| map_start_status(&request.start.workflow_id, status),
+        )
+        .await?;
     start_response_from_core(&request.start, response.run_id, response.started)
 }
 
@@ -292,8 +276,7 @@ fn signal_with_start_execution_request(
     identity: &str,
 ) -> Result<SignalWithStartWorkflowExecutionRequest, ClientOperationError> {
     let start = start_execution_request(&request.start, identity)?;
-    let signal_input =
-        payloads_to_core(&request.signal_input).map_err(ClientOperationError::Core)?;
+    let signal_input = payloads_to_core(&request.signal_input)?;
     Ok(SignalWithStartWorkflowExecutionRequest {
         namespace: start.namespace,
         workflow_id: start.workflow_id,
@@ -360,30 +343,25 @@ pub(crate) async fn update_with_start_within(
             // Nothing has been sent, so a conversion failure is a rejection.
             Err(error) => return UpdateWithStartOutcome::Rejected(error),
         };
-    let deadline_exceeded = || ClientOperationError::Rpc {
-        code: "deadline_exceeded".to_owned(),
-    };
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = AcceptanceDeadline::after(budget);
     let mut service = connection.clone();
     let mut accepted_start: Option<StartWorkflowResponse> = None;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        let Some(attempt) = deadline.next_attempt(&rpc_request) else {
             return settle(start, accepted_start, deadline_exceeded());
-        }
-        let attempt = budgeted_request(rpc_request.clone(), remaining);
-        let attempt_started = tokio::time::Instant::now();
-        let response =
-            match tokio::time::timeout_at(deadline, service.execute_multi_operation(attempt)).await
-            {
-                Err(_) => return settle(start, accepted_start, deadline_exceeded()),
-                Ok(Err(status)) => {
-                    let map = |status| map_multi_operation_status(&start.workflow_id, status);
-                    let error = budget_status(attempt_started, remaining, map)(status);
-                    return settle(start, accepted_start, error);
-                }
-                Ok(Ok(response)) => response.into_inner(),
-            };
+        };
+        let map =
+            attempt.status_map(|status| map_multi_operation_status(&start.workflow_id, status));
+        let response = match tokio::time::timeout_at(
+            deadline.instant(),
+            service.execute_multi_operation(attempt.request),
+        )
+        .await
+        {
+            Err(_) => return settle(start, accepted_start, deadline_exceeded()),
+            Ok(Err(status)) => return settle(start, accepted_start, map(status)),
+            Ok(Ok(response)) => response.into_inner(),
+        };
         let (start_response, update_response) = match split_multi_operation_response(response) {
             Ok(pair) => pair,
             Err(error) => return settle(start, accepted_start, error),
@@ -417,11 +395,9 @@ pub(crate) async fn update_with_start_within(
             };
         }
         accepted_start = Some(start_response);
-        let pause_until = tokio::time::Instant::now() + UPDATE_READMISSION_PAUSE;
-        if pause_until >= deadline {
+        if !deadline.pause_for_readmission().await {
             return settle(start, accepted_start, deadline_exceeded());
         }
-        tokio::time::sleep_until(pause_until).await;
     }
 }
 
@@ -517,7 +493,10 @@ const MULTI_OPERATION_ABORTED_SUFFIX: &str =
 /// checked before decoding, as for query failures, because lenient protobuf
 /// decoding could otherwise accept an unrelated detail.
 fn map_multi_operation_status(workflow_id: &str, status: Status) -> ClientOperationError {
-    let Some(failure) = multi_operation_failure(status.details()) else {
+    let Some(failure) = typed_status_detail::<MultiOperationExecutionFailure>(
+        status.details(),
+        MULTI_OPERATION_FAILURE_TYPE_URL,
+    ) else {
         return map_rpc_status(status);
     };
     let culprit = failure
@@ -549,17 +528,6 @@ fn map_multi_operation_status(workflow_id: &str, status: Status) -> ClientOperat
         },
         None => map_rpc_status(status),
     }
-}
-
-/// Decodes the `MultiOperationExecutionFailure` status detail, or `None`
-/// when the first detail is absent, malformed, or of another type.
-fn multi_operation_failure(details: &[u8]) -> Option<MultiOperationExecutionFailure> {
-    let status = RpcStatus::decode(details).ok()?;
-    let detail = status.details.first()?;
-    if detail.type_url != MULTI_OPERATION_FAILURE_TYPE_URL {
-        return None;
-    }
-    MultiOperationExecutionFailure::decode(detail.value.as_slice()).ok()
 }
 
 /// Encodes one update-with-start outcome and validates the strictly
@@ -618,59 +586,32 @@ fn validate_update_with_start_outcome(
                 } => {
                     validate_identifier(update_id, "$.update.update_id")?;
                     validate_execution(execution, "$.update.execution")?;
-                    if let Some(outcome) = outcome {
-                        validate_update_outcome(outcome)?;
-                    }
+                    validate_update_outcome(outcome.as_ref())?;
                 }
-                UpdateResultDocument::Error { error } => {
-                    validate_error_document(error, "$.update.error", false)?
-                }
+                UpdateResultDocument::Error { error } => validate_error_document(
+                    error,
+                    "$.update.error",
+                    false,
+                    INVALID_OUTCOME_ERROR_KIND,
+                )?,
             }
         }
         UpdateWithStartOutcomeDocument::Rejected { error } => {
-            validate_error_document(error, "$.error", true)?
+            validate_error_document(error, "$.error", true, INVALID_OUTCOME_ERROR_KIND)?
         }
         UpdateWithStartOutcomeDocument::Unknown {
             request_id,
             workflow_id,
-        } => {
-            validate_identifier(request_id, "$.request_id")?;
-            validate_identifier(workflow_id, "$.workflow_id")?;
-        }
+        } => validate_unknown_start(request_id, workflow_id)?,
     }
     Ok(())
 }
 
-/// Validates one error document at `path`. A query failure is never valid
-/// here, and an already-started failure only where `already_started` allows
-/// it (a start rejection).
-fn validate_error_document(
-    error: &ClientErrorDocument,
-    path: &str,
-    already_started: bool,
-) -> Result<(), protocol::ProtocolError> {
-    match error {
-        ClientErrorDocument::AlreadyStarted {
-            workflow_id,
-            existing_run_id,
-        } if already_started => {
-            validate_identifier(workflow_id, &format!("{path}.workflow_id"))?;
-            if let Some(run_id) = existing_run_id {
-                validate_identifier(run_id, &format!("{path}.existing_run_id"))?;
-            }
-            Ok(())
-        }
-        ClientErrorDocument::Rpc { code } | ClientErrorDocument::Protocol { code } => {
-            validate_identifier(code, &format!("{path}.code"))
-        }
-        ClientErrorDocument::AlreadyStarted { .. } | ClientErrorDocument::QueryFailed { .. } => {
-            Err(protocol::ProtocolError::invalid(
-                format!("{path}.kind"),
-                "error kind is not valid for this update-with-start outcome",
-            ))
-        }
-    }
-}
+/// Diagnostic for an error document whose kind an update-with-start outcome
+/// cannot carry: a query failure anywhere, or an already-started failure on
+/// the update half.
+const INVALID_OUTCOME_ERROR_KIND: &str =
+    "error kind is not valid for this update-with-start outcome";
 
 // Unit tests live in a separate file (repository rule); the `#[path]` module
 // keeps them able to reach this file's private helpers.

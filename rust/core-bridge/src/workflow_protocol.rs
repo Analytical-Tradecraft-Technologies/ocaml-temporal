@@ -65,13 +65,7 @@ fn decode_bytes(value: EncodedBytes) -> Result<Vec<u8>, &'static str> {
     if value.encoding != "base64" {
         return Err("unsupported payload encoding");
     }
-    let decoded = STANDARD
-        .decode(value.data.as_bytes())
-        .map_err(|_| "payload is not canonical padded base64")?;
-    if decoded.len() > MAX_PAYLOAD_BYTES || STANDARD.encode(&decoded) != value.data {
-        return Err("payload is not canonical padded base64");
-    }
-    Ok(decoded)
+    protocol::decode_canonical_base64(&value.data).ok_or("payload is not canonical padded base64")
 }
 
 impl Serialize for Payload {
@@ -1081,7 +1075,7 @@ pub(crate) fn identifier(value: &str, path: &str) -> Result<(), ProtocolError> {
 
 /// Retains the ordinary text ceiling while the foundation parser temporarily
 /// allows larger base64 strings at semantic payload paths.
-fn bounded_text(value: &str, path: &str) -> Result<(), ProtocolError> {
+pub(crate) fn bounded_text(value: &str, path: &str) -> Result<(), ProtocolError> {
     if value.len() > MAX_STRING_BYTES {
         Err(ProtocolError::invalid(
             path,
@@ -1171,6 +1165,40 @@ pub(crate) fn validate_time(
 /// them before they reach Core.
 const MAX_DURATION_SECONDS: i64 = 315_576_000_000;
 
+/// An exact protobuf time value whose components the semantic validators
+/// range-check through [`validate_time`].
+///
+/// Timestamps and durations share one component rule, except that a duration
+/// must also be nonnegative and within the protobuf maximum; the
+/// implementations select that variant, so a call site cannot pass the wrong
+/// `duration` flag. `Option` forwards to its value and accepts absence, which
+/// is how the protocol represents an unset nullable time field.
+pub(crate) trait ProtoTime: Copy {
+    /// Validates this value, reporting a range failure at `path`.
+    fn validate_at(self, path: &str) -> Result<(), ProtocolError>;
+}
+
+impl ProtoTime for Timestamp {
+    /// Any whole-second count is a timestamp; only the fraction is bounded.
+    fn validate_at(self, path: &str) -> Result<(), ProtocolError> {
+        validate_time(self.seconds, self.nanoseconds, false, path)
+    }
+}
+
+impl ProtoTime for Duration {
+    /// A duration must also be nonnegative and at most the protobuf maximum.
+    fn validate_at(self, path: &str) -> Result<(), ProtocolError> {
+        validate_time(self.seconds, self.nanoseconds, true, path)
+    }
+}
+
+impl<T: ProtoTime> ProtoTime for Option<T> {
+    /// An absent value is valid; a present one is checked as itself.
+    fn validate_at(self, path: &str) -> Result<(), ProtocolError> {
+        self.map_or(Ok(()), |value| value.validate_at(path))
+    }
+}
+
 /// Rejects an explicitly zero activity close timeout. Temporal treats zero as
 /// unset, so a zero close timeout either leaves the command without any close
 /// timeout (rejected by the server on every retry) or, for local activities,
@@ -1185,7 +1213,7 @@ fn validate_close_timeout(value: &Option<Duration>, path: &str) -> Result<(), Pr
 }
 
 /// Parses canonical unsigned decimal seeds and exact floating-point bits.
-fn validate_uint64_decimal(value: &str, path: &str) -> Result<u64, ProtocolError> {
+pub(crate) fn validate_uint64_decimal(value: &str, path: &str) -> Result<u64, ProtocolError> {
     if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
         return Err(ProtocolError::invalid(
             path,
@@ -1207,18 +1235,7 @@ fn validate_uint64_decimal(value: &str, path: &str) -> Result<u64, ProtocolError
 /// Validates the retry policy constraints shared by the OCaml and Rust
 /// semantic layers before a command can reach Temporal Core.
 pub(crate) fn validate_retry_policy(value: &RetryPolicy, path: &str) -> Result<(), ProtocolError> {
-    validate_time(
-        value.initial_interval.seconds,
-        value.initial_interval.nanoseconds,
-        true,
-        &format!("{path}.initial_interval"),
-    )?;
-    validate_time(
-        value.maximum_interval.seconds,
-        value.maximum_interval.nanoseconds,
-        true,
-        &format!("{path}.maximum_interval"),
-    )?;
+    validate_retry_intervals(value, path)?;
     let initial_is_zero =
         value.initial_interval.seconds == 0 && value.initial_interval.nanoseconds == 0;
     if initial_is_zero {
@@ -2224,18 +2241,7 @@ fn validate_inbound_priority(value: &WorkflowPriority, path: &str) -> Result<(),
 /// canonical coefficient bit pattern, a non-negative attempt count, and
 /// bounded error-type text.
 fn validate_inbound_retry_policy(value: &RetryPolicy, path: &str) -> Result<(), ProtocolError> {
-    validate_time(
-        value.initial_interval.seconds,
-        value.initial_interval.nanoseconds,
-        true,
-        &format!("{path}.initial_interval"),
-    )?;
-    validate_time(
-        value.maximum_interval.seconds,
-        value.maximum_interval.nanoseconds,
-        true,
-        &format!("{path}.maximum_interval"),
-    )?;
+    validate_retry_intervals(value, path)?;
     validate_uint64_decimal(
         &value.backoff_coefficient_bits,
         &format!("{path}.backoff_coefficient_bits"),
@@ -2246,7 +2252,31 @@ fn validate_inbound_retry_policy(value: &RetryPolicy, path: &str) -> Result<(), 
             "maximum attempts must not be negative",
         ));
     }
-    for (index, error_type) in value.non_retryable_error_types.iter().enumerate() {
+    validate_error_types(&value.non_retryable_error_types, path)
+}
+
+/// Range-checks both retry intervals as normalized nonnegative durations at
+/// `{path}.initial_interval` and then `{path}.maximum_interval`: the first rule
+/// shared by the outbound [`validate_retry_policy`] and the permissive inbound
+/// [`validate_inbound_retry_policy`].
+fn validate_retry_intervals(value: &RetryPolicy, path: &str) -> Result<(), ProtocolError> {
+    value
+        .initial_interval
+        .validate_at(&format!("{path}.initial_interval"))?;
+    value
+        .maximum_interval
+        .validate_at(&format!("{path}.maximum_interval"))
+}
+
+/// Bounds every non-retryable error type of a received retry policy as
+/// ordinary text at `{path}.non_retryable_error_types[<index>]`.
+///
+/// This is the permissive rule for policies Temporal delivered (workflow
+/// start events and activity tasks), where an empty or unusual type name is
+/// legitimate; the outbound [`validate_retry_policy`] applies its stricter
+/// non-empty, NUL-free rule itself.
+pub(crate) fn validate_error_types(values: &[String], path: &str) -> Result<(), ProtocolError> {
+    for (index, error_type) in values.iter().enumerate() {
         bounded_text(
             error_type,
             &format!("{path}.non_retryable_error_types[{index}]"),
@@ -2255,42 +2285,22 @@ fn validate_inbound_retry_policy(value: &RetryPolicy, path: &str) -> Result<(), 
     Ok(())
 }
 
-/// Strictly decodes one workflow activation.
-pub fn decode_activation(input: &str) -> Result<Activation, ProtocolError> {
-    protocol::decode_validated_semantic(
-        input,
-        "invalid workflow activation semantics",
-        validate_activation,
-    )
-}
+protocol::semantic_codecs! {
+    /// Strictly decodes one workflow activation.
+    pub fn decode_activation(input: &str);
+    /// Validates, normalizes, and reparses one outgoing workflow activation.
+    pub fn encode_activation(value: &Activation);
+    validate: validate_activation,
+    invalid: "invalid workflow activation semantics",
+    unencodable: "could not encode workflow activation",
 
-/// Validates, normalizes, and reparses one outgoing workflow activation.
-pub fn encode_activation(value: &Activation) -> Result<String, ProtocolError> {
-    protocol::encode_validated_semantic(
-        value,
-        validate_activation,
-        "could not encode workflow activation",
-        decode_activation,
-    )
-}
-
-/// Strictly decodes one successful workflow completion.
-pub fn decode_completion(input: &str) -> Result<Completion, ProtocolError> {
-    protocol::decode_validated_semantic(
-        input,
-        "invalid workflow completion semantics",
-        validate_completion,
-    )
-}
-
-/// Validates, normalizes, and reparses one outgoing workflow completion.
-pub fn encode_completion(value: &Completion) -> Result<String, ProtocolError> {
-    protocol::encode_validated_semantic(
-        value,
-        validate_completion,
-        "could not encode workflow completion",
-        decode_completion,
-    )
+    /// Strictly decodes one successful workflow completion.
+    pub fn decode_completion(input: &str);
+    /// Validates, normalizes, and reparses one outgoing workflow completion.
+    pub fn encode_completion(value: &Completion);
+    validate: validate_completion,
+    invalid: "invalid workflow completion semantics",
+    unencodable: "could not encode workflow completion",
 }
 
 /// Why an official Core protobuf could not be represented losslessly.
@@ -2415,11 +2425,21 @@ fn addressable_map_key(key: &str) -> bool {
 fn inbound_payload_map_from_core<'a>(
     entries: impl IntoIterator<Item = (&'a String, &'a api_common::Payload)>,
 ) -> Result<BTreeMap<String, Payload>, CoreConversionError> {
-    entries
-        .into_iter()
-        .filter(|(key, _)| addressable_map_key(key))
-        .map(|(key, payload)| Ok((key.clone(), payload_from_core(payload)?)))
-        .collect()
+    payload_map_from_core(
+        entries
+            .into_iter()
+            .filter(|(key, _)| addressable_map_key(key)),
+    )
+}
+
+/// Reports whether a payload body or any of its metadata values exceeds
+/// [`MAX_PAYLOAD_BYTES`], the byte rule every payload check shares whether the
+/// payload is a Core protobuf or a semantic value.
+fn oversized_payload<'a>(data: &[u8], metadata: impl IntoIterator<Item = &'a Vec<u8>>) -> bool {
+    data.len() > MAX_PAYLOAD_BYTES
+        || metadata
+            .into_iter()
+            .any(|bytes| bytes.len() > MAX_PAYLOAD_BYTES)
 }
 
 /// Copies one inbound Core payload.
@@ -2436,12 +2456,7 @@ fn inbound_payload_map_from_core<'a>(
 pub(crate) fn payload_from_core(
     value: &api_common::Payload,
 ) -> Result<Payload, CoreConversionError> {
-    if value.data.len() > MAX_PAYLOAD_BYTES
-        || value
-            .metadata
-            .values()
-            .any(|bytes| bytes.len() > MAX_PAYLOAD_BYTES)
-    {
+    if oversized_payload(&value.data, value.metadata.values()) {
         return Err(invalid_core("Core payload exceeds the protocol byte limit"));
     }
     if value
@@ -2469,12 +2484,7 @@ pub(crate) fn payload_from_core(
 /// accepted payload (up to the protocol limit) is cloned only once, when it is
 /// actually converted for Core.
 pub(crate) fn validate_payload_limits(value: &Payload) -> Result<(), CoreConversionError> {
-    if value.data.len() > MAX_PAYLOAD_BYTES
-        || value
-            .metadata
-            .values()
-            .any(|bytes| bytes.len() > MAX_PAYLOAD_BYTES)
-    {
+    if oversized_payload(&value.data, value.metadata.values()) {
         return Err(invalid_core(
             "semantic payload exceeds the protocol byte limit",
         ));
@@ -2500,12 +2510,7 @@ fn validate_payload_map(
 ) -> Result<(), ProtocolError> {
     for (key, payload) in values {
         identifier(key, path)?;
-        if payload.data.len() > MAX_PAYLOAD_BYTES
-            || payload
-                .metadata
-                .values()
-                .any(|value| value.len() > MAX_PAYLOAD_BYTES)
-        {
+        if oversized_payload(&payload.data, payload.metadata.values()) {
             return Err(ProtocolError::invalid(
                 path,
                 "payload exceeds the byte limit",
@@ -2515,8 +2520,8 @@ fn validate_payload_map(
     Ok(())
 }
 
-/// Converts an outbound memo or search-attribute map into the map type of
-/// the Core command field that carries it.
+/// Converts an outbound memo, search-attribute, or header map into the map
+/// type of the Core command field that carries it.
 fn payload_map_to_core<M>(values: &BTreeMap<String, Payload>) -> Result<M, CoreConversionError>
 where
     M: FromIterator<(String, api_common::Payload)>,
@@ -2527,10 +2532,11 @@ where
         .collect()
 }
 
-/// Converts the memo or search-attribute map of a Core command back to the
-/// semantic protocol, copying every payload. Keys are kept as Core holds
-/// them; the semantic validator checks them before any reuse.
-fn payload_map_from_core<'a>(
+/// Converts a Core payload map (a command's memo, search attributes, or
+/// headers, or an activity task's headers) to the semantic protocol, copying
+/// every payload. Keys are kept as Core holds them; the semantic validator
+/// checks them before any reuse.
+pub(crate) fn payload_map_from_core<'a>(
     entries: impl IntoIterator<Item = (&'a String, &'a api_common::Payload)>,
 ) -> Result<BTreeMap<String, Payload>, CoreConversionError> {
     entries
@@ -3400,15 +3406,7 @@ pub fn activation_from_core(
                             search_attributes: value
                                 .search_attributes
                                 .as_ref()
-                                .map(|attributes| {
-                                    attributes
-                                        .indexed_fields
-                                        .iter()
-                                        .map(|(key, payload)| {
-                                            Ok((key.clone(), payload_from_core(payload)?))
-                                        })
-                                        .collect::<Result<_, CoreConversionError>>()
-                                })
+                                .map(|attributes| payload_map_from_core(&attributes.indexed_fields))
                                 .transpose()?,
                             workflow_execution_expiration_time: value
                                 .workflow_execution_expiration_time
@@ -3774,14 +3772,13 @@ fn retry_policy_from_core(
 fn inbound_retry_policy_from_core(
     value: &api_common::RetryPolicy,
 ) -> Result<RetryPolicy, CoreConversionError> {
-    let interval = |duration: Option<&prost_wkt_types::Duration>| match duration {
-        Some(duration) if duration.seconds >= 0 && duration.nanos >= 0 => {
-            duration_from_core(duration)
-        }
-        Some(_) | None => Ok(Duration {
-            seconds: 0,
-            nanoseconds: 0,
-        }),
+    let interval = |duration| {
+        inbound_interval_from_core(duration).map(|interval| {
+            interval.unwrap_or(Duration {
+                seconds: 0,
+                nanoseconds: 0,
+            })
+        })
     };
     Ok(RetryPolicy {
         initial_interval: interval(value.initial_interval.as_ref())?,
@@ -3794,6 +3791,26 @@ fn inbound_retry_policy_from_core(
             .map(|error_type| inbound_text(error_type))
             .collect(),
     })
+}
+
+/// Converts one retry interval recorded by Temporal, where a negative or
+/// absent interval means "unset" and becomes `None`.
+///
+/// Temporal Server skips retry-policy validation when `maximum_attempts` is
+/// 1, so a peer SDK can record a negative interval; refusing it would fail a
+/// started workflow's first activation or an activity task forever (#1016,
+/// #1213). A nonnegative interval that is not normalized is still rejected.
+/// Workflow start events store `None` as a zero duration, while activity
+/// tasks keep it nullable.
+pub(crate) fn inbound_interval_from_core(
+    duration: Option<&prost_wkt_types::Duration>,
+) -> Result<Option<Duration>, CoreConversionError> {
+    match duration {
+        Some(duration) if duration.seconds >= 0 && duration.nanos >= 0 => {
+            duration_from_core(duration).map(Some)
+        }
+        Some(_) | None => Ok(None),
+    }
 }
 
 /// Maps an OCaml-facing cancellation choice to the pinned Core enum.
@@ -4129,10 +4146,7 @@ fn command_to_core(
                     target: Some(target),
                     signal_name: signal_name.clone(),
                     args: payload_vec_to_core(input)?,
-                    headers: headers
-                        .iter()
-                        .map(|(key, payload)| Ok((key.clone(), payload_to_core(payload)?)))
-                        .collect::<Result<_, CoreConversionError>>()?,
+                    headers: payload_map_to_core(headers)?,
                 },
             )
         }
@@ -4494,11 +4508,7 @@ fn command_from_core(
                 signal_name: value.signal_name.clone(),
                 input: payload_vec_from_core(&value.args)?,
                 child_workflow_only,
-                headers: value
-                    .headers
-                    .iter()
-                    .map(|(key, payload)| Ok((key.clone(), payload_from_core(payload)?)))
-                    .collect::<Result<_, CoreConversionError>>()?,
+                headers: payload_map_from_core(&value.headers)?,
             })
         }
         Variant::RequestCancelExternalWorkflowExecution(value) => {

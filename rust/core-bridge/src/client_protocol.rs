@@ -41,6 +41,7 @@ use temporalio_common::protos::temporal::api::{
     },
 };
 
+use crate::workflow_protocol::ProtoTime as _;
 use crate::{protocol, workflow_protocol};
 
 // Signal-with-start and update-with-start (#1151) live in a child module so
@@ -944,35 +945,65 @@ fn validate_start_outcome_document(
         StartWorkflowOutcomeDocument::Accepted { execution, .. } => {
             validate_execution(execution, "$.execution")?
         }
-        StartWorkflowOutcomeDocument::Rejected { error } => match error {
-            ClientErrorDocument::AlreadyStarted {
-                workflow_id,
-                existing_run_id,
-            } => {
-                validate_identifier(workflow_id, "$.error.workflow_id")?;
-                if let Some(run_id) = existing_run_id {
-                    validate_identifier(run_id, "$.error.existing_run_id")?;
-                }
-            }
-            ClientErrorDocument::Rpc { code } => validate_identifier(code, "$.error.code")?,
-            ClientErrorDocument::Protocol { code } => validate_identifier(code, "$.error.code")?,
-            // A query handler failure can never reject a workflow start.
-            ClientErrorDocument::QueryFailed { .. } => {
-                return Err(protocol::ProtocolError::invalid(
-                    "$.error.kind",
-                    "query_failed is not a valid start rejection",
-                ));
-            }
-        },
+        // A query handler failure can never reject a workflow start.
+        StartWorkflowOutcomeDocument::Rejected { error } => validate_error_document(
+            error,
+            "$.error",
+            true,
+            "query_failed is not a valid start rejection",
+        )?,
         StartWorkflowOutcomeDocument::Unknown {
             request_id,
             workflow_id,
-        } => {
-            validate_identifier(request_id, "$.request_id")?;
-            validate_identifier(workflow_id, "$.workflow_id")?;
-        }
+        } => validate_unknown_start(request_id, workflow_id)?,
     }
     Ok(())
+}
+
+/// Validates the reconciliation identity of an uncertain start outcome
+/// (`$.request_id`, then `$.workflow_id`), shared by plain starts and
+/// update-with-start.
+fn validate_unknown_start(
+    request_id: &str,
+    workflow_id: &str,
+) -> Result<(), protocol::ProtocolError> {
+    validate_identifier_fields(
+        "$",
+        [("request_id", request_id), ("workflow_id", workflow_id)],
+    )
+}
+
+/// Validates one error document at `path`. A query failure is never valid
+/// in an outcome document, and an already-started failure only where
+/// `already_started` allows it (a start rejection); either refusal is
+/// reported at `{path}.kind` with `invalid_kind`.
+fn validate_error_document(
+    error: &ClientErrorDocument,
+    path: &str,
+    already_started: bool,
+    invalid_kind: &'static str,
+) -> Result<(), protocol::ProtocolError> {
+    match error {
+        ClientErrorDocument::AlreadyStarted {
+            workflow_id,
+            existing_run_id,
+        } if already_started => {
+            validate_identifier(workflow_id, &format!("{path}.workflow_id"))?;
+            if let Some(run_id) = existing_run_id {
+                validate_identifier(run_id, &format!("{path}.existing_run_id"))?;
+            }
+            Ok(())
+        }
+        ClientErrorDocument::Rpc { code } | ClientErrorDocument::Protocol { code } => {
+            validate_identifier(code, &format!("{path}.code"))
+        }
+        ClientErrorDocument::AlreadyStarted { .. } | ClientErrorDocument::QueryFailed { .. } => {
+            Err(protocol::ProtocolError::invalid(
+                format!("{path}.kind"),
+                invalid_kind,
+            ))
+        }
+    }
 }
 
 impl ClientOperationError {
@@ -1036,14 +1067,186 @@ fn decode_request<T: serde::de::DeserializeOwned>(
     Ok(request)
 }
 
-/// Strictly parses one start request after duplicate-key and byte-limit checks.
-pub fn decode_start_request(input: &str) -> Result<StartWorkflowRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_payload_object,
-        "invalid client start request",
-        validate_start_request,
-    )
+/// Defines the public strict decoders of client request documents.
+///
+/// Each entry is written with the exact signature it produces and names the
+/// three parts [`decode_request`] combines: the structural parser (`parse`),
+/// the Serde diagnostic (`invalid`), and the semantic validator (`validate`).
+/// The parser choice is deliberately spelled out per entry: requests that
+/// carry payloads use [`protocol::decode_payload_object`], every other
+/// request the ordinary [`protocol::decode_object`]. The entry's own doc
+/// comment is emitted on the generated function.
+macro_rules! request_decoders {
+    ($(
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident(input: &str $(,)?) -> Result<$request:ty, protocol::ProtocolError> {
+            parse: $parse:path,
+            invalid: $invalid:literal,
+            validate: $validate:path $(,)?
+        }
+    )*) => {$(
+        $(#[$meta])*
+        $vis fn $name(input: &str) -> Result<$request, protocol::ProtocolError> {
+            decode_request(input, $parse, $invalid, $validate)
+        }
+    )*};
+}
+// A path import, so that the `with_start` child module (declared above this
+// definition) reaches the macro through its `use super::*`.
+use request_decoders;
+
+/// Defines the public encoders of client response documents.
+///
+/// Each entry is written with the exact signature it produces and lists the
+/// `check` expressions that must succeed, in order, before the response is
+/// rendered by [`encode_document`], which strictly reparses it before
+/// ownership leaves Rust. An entry with no checks encodes a response whose
+/// fields carry no semantic bounds beyond its closed Serde shape. The entry's
+/// own doc comment is emitted on the generated function.
+macro_rules! response_encoders {
+    ($(
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident(
+            $response:ident: &$document:ty $(,)?
+        ) -> Result<String, protocol::ProtocolError> {
+            $(check: $check:expr),* $(,)?
+        }
+    )*) => {$(
+        $(#[$meta])*
+        $vis fn $name($response: &$document) -> Result<String, protocol::ProtocolError> {
+            $($check?;)*
+            encode_document($response)
+        }
+    )*};
+}
+
+request_decoders! {
+    /// Strictly parses one start request after duplicate-key and byte-limit checks.
+    pub fn decode_start_request(
+        input: &str,
+    ) -> Result<StartWorkflowRequest, protocol::ProtocolError> {
+        parse: protocol::decode_payload_object,
+        invalid: "invalid client start request",
+        validate: validate_start_request,
+    }
+
+    /// Strictly parses one exact-run wait request.
+    pub fn decode_wait_request(
+        input: &str,
+    ) -> Result<WaitWorkflowRequest, protocol::ProtocolError> {
+        parse: protocol::decode_object,
+        invalid: "invalid client wait request",
+        validate: validate_wait_request,
+    }
+
+    /// Strictly parses one exact-run cancellation request.
+    pub fn decode_cancel_request(
+        input: &str,
+    ) -> Result<CancelWorkflowRequest, protocol::ProtocolError> {
+        parse: protocol::decode_object,
+        invalid: "invalid client cancel request",
+        validate: validate_cancel_request,
+    }
+
+    /// Strictly parses one exact-run termination request.
+    pub fn decode_terminate_request(
+        input: &str,
+    ) -> Result<TerminateWorkflowRequest, protocol::ProtocolError> {
+        parse: protocol::decode_object,
+        invalid: "invalid client terminate request",
+        validate: validate_terminate_request,
+    }
+
+    /// Strictly parses one exact-run reset request.
+    pub fn decode_reset_request(
+        input: &str,
+    ) -> Result<ResetWorkflowRequest, protocol::ProtocolError> {
+        parse: protocol::decode_object,
+        invalid: "invalid client reset request",
+        validate: validate_reset_request,
+    }
+
+    /// Strictly parses one exact-run signal request.
+    ///
+    /// Like [`decode_start_request`], this uses the payload-aware parser: base64
+    /// payload data may use the 128 MiB per-field allowance, while
+    /// [`validate_signal_request`] immediately reapplies the 65,536-byte text
+    /// limit to every identifier and payload metadata key. Using the generic
+    /// object parser here would cap signal input at 49,152 raw bytes (issue #771).
+    pub fn decode_signal_request(
+        input: &str,
+    ) -> Result<SignalWorkflowRequest, protocol::ProtocolError> {
+        parse: protocol::decode_payload_object,
+        invalid: "invalid client signal request",
+        validate: validate_signal_request,
+    }
+
+    /// Strictly parses one exact-run query request.
+    ///
+    /// Query arguments are payloads, so the payload-aware parser applies the same
+    /// per-field and whole-document bounds as start and signal input; the semantic
+    /// validator then bounds identifiers and metadata keys as ordinary text.
+    pub fn decode_query_request(
+        input: &str,
+    ) -> Result<QueryWorkflowRequest, protocol::ProtocolError> {
+        parse: protocol::decode_payload_object,
+        invalid: "invalid client query request",
+        validate: validate_query_request,
+    }
+
+    /// Strictly parses a request that starts one workflow update.
+    ///
+    /// Update arguments use the payload-aware parser for the same reason as
+    /// signal input; [`validate_update_request`] keeps every identifier and
+    /// metadata key within the ordinary text limit.
+    pub fn decode_update_request(
+        input: &str,
+    ) -> Result<UpdateWorkflowRequest, protocol::ProtocolError> {
+        parse: protocol::decode_payload_object,
+        invalid: "invalid client update request",
+        validate: validate_update_request,
+    }
+
+    /// Strictly parses a request that polls a previously admitted update.
+    pub fn decode_poll_update_request(
+        input: &str,
+    ) -> Result<PollWorkflowUpdateRequest, protocol::ProtocolError> {
+        parse: protocol::decode_object,
+        invalid: "invalid client update poll request",
+        validate: validate_poll_update_request,
+    }
+
+    /// Strictly parses one bounded visibility page request.
+    pub fn decode_visibility_request(
+        input: &str,
+    ) -> Result<VisibilityRequest, protocol::ProtocolError> {
+        parse: protocol::decode_object,
+        invalid: "invalid visibility request",
+        validate: validate_visibility_request,
+    }
+
+    /// Strictly parses one complete-history fetch request.
+    pub fn decode_history_request(input: &str) -> Result<HistoryRequest, protocol::ProtocolError> {
+        parse: protocol::decode_object,
+        invalid: "invalid history request",
+        validate: validate_history_request,
+    }
+
+    /// Strictly parses one describe request (#1152).
+    pub fn decode_describe_request(
+        input: &str,
+    ) -> Result<DescribeRequest, protocol::ProtocolError> {
+        parse: protocol::decode_object,
+        invalid: "invalid describe request",
+        validate: validate_describe_request,
+    }
+
+    /// Strictly parses one visibility count request (#1152).
+    pub fn decode_count_request(input: &str) -> Result<CountRequest, protocol::ProtocolError> {
+        parse: protocol::decode_object,
+        invalid: "invalid count request",
+        validate: validate_count_request,
+    }
 }
 
 /// Compares two validated start requests using every logical field, including
@@ -1085,256 +1288,106 @@ pub(crate) fn encode_start_ticket(ticket: &str) -> Result<String, protocol::Prot
     })
 }
 
-/// Strictly parses one exact-run wait request.
-pub fn decode_wait_request(input: &str) -> Result<WaitWorkflowRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_object,
-        "invalid client wait request",
-        validate_wait_request,
-    )
-}
+response_encoders! {
+    /// Encodes and reparses a start response before ownership leaves Rust.
+    pub fn encode_start_response(
+        response: &StartWorkflowResponse,
+    ) -> Result<String, protocol::ProtocolError> {
+        check: validate_execution(&response.execution, "$.execution"),
+    }
 
-/// Strictly parses one exact-run cancellation request.
-pub fn decode_cancel_request(
-    input: &str,
-) -> Result<CancelWorkflowRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_object,
-        "invalid client cancel request",
-        validate_cancel_request,
-    )
-}
+    /// Encodes and reparses an exact-run wait response before ownership leaves Rust.
+    pub fn encode_wait_response(
+        response: &WaitWorkflowResponse,
+    ) -> Result<String, protocol::ProtocolError> {
+        check: validate_wait_response(response),
+    }
 
-/// Strictly parses one exact-run termination request.
-pub fn decode_terminate_request(
-    input: &str,
-) -> Result<TerminateWorkflowRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_object,
-        "invalid client terminate request",
-        validate_terminate_request,
-    )
-}
-
-/// Strictly parses one exact-run reset request.
-pub fn decode_reset_request(input: &str) -> Result<ResetWorkflowRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_object,
-        "invalid client reset request",
-        validate_reset_request,
-    )
-}
-
-/// Encodes and reparses the new execution identity returned after reset.
-pub fn encode_reset_response(
-    response: &ResetWorkflowResponse,
-) -> Result<String, protocol::ProtocolError> {
-    validate_identifier(&response.execution.namespace, "$.execution.namespace")?;
-    validate_identifier(&response.execution.workflow_id, "$.execution.workflow_id")?;
-    validate_identifier(&response.execution.run_id, "$.execution.run_id")?;
-    encode_document(response)
-}
-
-/// Strictly parses one exact-run signal request.
-///
-/// Like [`decode_start_request`], this uses the payload-aware parser: base64
-/// payload data may use the 128 MiB per-field allowance, while
-/// [`validate_signal_request`] immediately reapplies the 65,536-byte text
-/// limit to every identifier and payload metadata key. Using the generic
-/// object parser here would cap signal input at 49,152 raw bytes (issue #771).
-pub fn decode_signal_request(
-    input: &str,
-) -> Result<SignalWorkflowRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_payload_object,
-        "invalid client signal request",
-        validate_signal_request,
-    )
-}
-
-/// Strictly parses one exact-run query request.
-///
-/// Query arguments are payloads, so the payload-aware parser applies the same
-/// per-field and whole-document bounds as start and signal input; the semantic
-/// validator then bounds identifiers and metadata keys as ordinary text.
-pub fn decode_query_request(input: &str) -> Result<QueryWorkflowRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_payload_object,
-        "invalid client query request",
-        validate_query_request,
-    )
-}
-
-/// Strictly parses a request that starts one workflow update.
-///
-/// Update arguments use the payload-aware parser for the same reason as
-/// signal input; [`validate_update_request`] keeps every identifier and
-/// metadata key within the ordinary text limit.
-pub fn decode_update_request(
-    input: &str,
-) -> Result<UpdateWorkflowRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_payload_object,
-        "invalid client update request",
-        validate_update_request,
-    )
-}
-
-/// Strictly parses a request that polls a previously admitted update.
-pub fn decode_poll_update_request(
-    input: &str,
-) -> Result<PollWorkflowUpdateRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_object,
-        "invalid client update poll request",
-        validate_poll_update_request,
-    )
-}
-
-/// Strictly parses one bounded visibility page request.
-pub fn decode_visibility_request(
-    input: &str,
-) -> Result<VisibilityRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_object,
-        "invalid visibility request",
-        validate_visibility_request,
-    )
-}
-
-/// Strictly parses one complete-history fetch request.
-pub fn decode_history_request(input: &str) -> Result<HistoryRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_object,
-        "invalid history request",
-        validate_history_request,
-    )
-}
-
-/// Strictly parses one describe request (#1152).
-pub fn decode_describe_request(input: &str) -> Result<DescribeRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_object,
-        "invalid describe request",
-        validate_describe_request,
-    )
-}
-
-/// Strictly parses one visibility count request (#1152).
-pub fn decode_count_request(input: &str) -> Result<CountRequest, protocol::ProtocolError> {
-    decode_request(
-        input,
-        protocol::decode_object,
-        "invalid count request",
-        validate_count_request,
-    )
-}
-
-/// Validates, encodes and reparses one describe answer before it crosses the
-/// ABI.
-pub fn encode_describe_response(
-    response: &DescribeResponse,
-) -> Result<String, protocol::ProtocolError> {
-    validate_describe_response(response)?;
-    encode_document(response)
-}
-
-/// Encodes and reparses one count answer before it crosses the ABI.
-pub fn encode_count_response(response: &CountResponse) -> Result<String, protocol::ProtocolError> {
-    encode_document(response)
-}
-
-/// Encodes and reparses a start response before ownership leaves Rust.
-pub fn encode_start_response(
-    response: &StartWorkflowResponse,
-) -> Result<String, protocol::ProtocolError> {
-    validate_execution(&response.execution, "$.execution")?;
-    encode_document(response)
-}
-
-/// Encodes and reparses a positive cancellation acknowledgement before it
-/// crosses the native boundary.
-pub fn encode_cancel_response(
-    response: &CancelWorkflowResponse,
-) -> Result<String, protocol::ProtocolError> {
-    if !response.acknowledged {
-        return Err(protocol::ProtocolError::invalid(
+    /// Encodes and reparses a positive cancellation acknowledgement before it
+    /// crosses the native boundary.
+    pub fn encode_cancel_response(
+        response: &CancelWorkflowResponse,
+    ) -> Result<String, protocol::ProtocolError> {
+        // Only a successful RPC produces an acknowledgement, so `false` would
+        // misreport an operation that never happened.
+        check: require(
+            response.acknowledged,
             "$.acknowledged",
             "cancellation acknowledgement must be true",
-        ));
+        ),
     }
-    encode_document(response)
-}
 
-/// Encodes and reparses a positive termination acknowledgement.
-pub fn encode_terminate_response(
-    response: &TerminateWorkflowResponse,
-) -> Result<String, protocol::ProtocolError> {
-    if !response.acknowledged {
-        return Err(protocol::ProtocolError::invalid(
+    /// Encodes and reparses a positive termination acknowledgement.
+    pub fn encode_terminate_response(
+        response: &TerminateWorkflowResponse,
+    ) -> Result<String, protocol::ProtocolError> {
+        check: require(
+            response.acknowledged,
             "$.acknowledged",
             "termination acknowledgement must be true",
-        ));
+        ),
     }
-    encode_document(response)
-}
 
-/// Encodes and reparses a positive signal acknowledgement before it crosses
-/// the native boundary.
-pub fn encode_signal_response(
-    response: &SignalWorkflowResponse,
-) -> Result<String, protocol::ProtocolError> {
-    if !response.acknowledged {
-        return Err(protocol::ProtocolError::invalid(
+    /// Encodes and reparses the new execution identity returned after reset.
+    pub fn encode_reset_response(
+        response: &ResetWorkflowResponse,
+    ) -> Result<String, protocol::ProtocolError> {
+        check: validate_execution(&response.execution, "$.execution"),
+    }
+
+    /// Encodes and reparses a positive signal acknowledgement before it crosses
+    /// the native boundary.
+    pub fn encode_signal_response(
+        response: &SignalWorkflowResponse,
+    ) -> Result<String, protocol::ProtocolError> {
+        check: require(
+            response.acknowledged,
             "$.acknowledged",
             "signal acknowledgement must be true",
-        ));
+        ),
     }
-    encode_document(response)
-}
 
-/// Encodes and reparses one query result before ownership leaves Rust.
-pub fn encode_query_response(
-    response: &QueryWorkflowResponse,
-) -> Result<String, protocol::ProtocolError> {
-    validate_query_response(response)?;
-    encode_document(response)
-}
+    /// Encodes and reparses one query result before ownership leaves Rust.
+    pub fn encode_query_response(
+        response: &QueryWorkflowResponse,
+    ) -> Result<String, protocol::ProtocolError> {
+        check: validate_payloads(&response.result, "$.result"),
+    }
 
-/// Encodes and reparses update admission before ownership leaves Rust.
-pub fn encode_update_response(
-    response: &UpdateWorkflowResponse,
-) -> Result<String, protocol::ProtocolError> {
-    validate_update_response(response)?;
-    encode_document(response)
-}
+    /// Encodes and reparses update admission before ownership leaves Rust.
+    pub fn encode_update_response(
+        response: &UpdateWorkflowResponse,
+    ) -> Result<String, protocol::ProtocolError> {
+        check: validate_update_response(response),
+    }
 
-/// Encodes and reparses a bounded update poll response before ownership leaves
-/// Rust. A missing outcome is a normal pending result, not an error.
-pub fn encode_poll_update_response(
-    response: &PollWorkflowUpdateResponse,
-) -> Result<String, protocol::ProtocolError> {
-    validate_poll_update_response(response)?;
-    encode_document(response)
-}
+    /// Encodes and reparses a bounded update poll response before ownership leaves
+    /// Rust. A missing outcome is a normal pending result, not an error.
+    pub fn encode_poll_update_response(
+        response: &PollWorkflowUpdateResponse,
+    ) -> Result<String, protocol::ProtocolError> {
+        check: validate_update_outcome(response.outcome.as_ref()),
+    }
 
-/// Encodes and reparses one visibility page before it crosses the ABI.
-pub fn encode_visibility_response(
-    response: &VisibilityPage,
-) -> Result<String, protocol::ProtocolError> {
-    validate_visibility_page(response)?;
-    encode_document(response)
+    /// Encodes and reparses one visibility page before it crosses the ABI.
+    pub fn encode_visibility_response(
+        response: &VisibilityPage,
+    ) -> Result<String, protocol::ProtocolError> {
+        check: validate_visibility_page(response),
+    }
+
+    /// Validates, encodes and reparses one describe answer before it crosses the
+    /// ABI.
+    pub fn encode_describe_response(
+        response: &DescribeResponse,
+    ) -> Result<String, protocol::ProtocolError> {
+        check: validate_describe_response(response),
+    }
+
+    /// Encodes and reparses one count answer before it crosses the ABI.
+    pub fn encode_count_response(
+        response: &CountResponse,
+    ) -> Result<String, protocol::ProtocolError> {}
 }
 
 /// Maximum transport attempts, including the first, that one exact-run history
@@ -1454,12 +1507,18 @@ where
         if matches!(status.code(), Code::Cancelled | Code::DeadlineExceeded)
             && started.elapsed() >= budget
         {
-            ClientOperationError::Rpc {
-                code: "deadline_exceeded".to_owned(),
-            }
+            deadline_exceeded()
         } else {
             map(status)
         }
+    }
+}
+
+/// The typed error every budgeted client operation reports once its budget
+/// has expired, whichever timer observed the expiry (#499).
+fn deadline_exceeded() -> ClientOperationError {
+    ClientOperationError::Rpc {
+        code: "deadline_exceeded".to_owned(),
     }
 }
 
@@ -1487,9 +1546,55 @@ where
         Ok(result) => Ok(result
             .map_err(budget_status(started, budget, map))?
             .into_inner()),
-        Err(_) => Err(ClientOperationError::Rpc {
-            code: "deadline_exceeded".to_owned(),
-        }),
+        Err(_) => Err(deadline_exceeded()),
+    }
+}
+
+/// The clock of one budgeted client RPC: its total budget and the instant
+/// that budget began.
+///
+/// Keeping the two together means the request deadline and Core retry window
+/// ([`budgeted_request`]) and the outer timeout and status mapping
+/// ([`budgeted_rpc`]) of one call are always measured from the same budget
+/// and start instant.
+#[derive(Clone, Copy)]
+struct RpcClock {
+    /// Total budget of the call.
+    budget: Duration,
+    /// Instant at which the budget began.
+    started: tokio::time::Instant,
+}
+
+impl RpcClock {
+    /// Starts, now, the caller's `rpc_timeout_ms` budget or `default` (see
+    /// [`rpc_budget`]).
+    fn start(rpc_timeout_ms: Option<u64>, default: Duration) -> Self {
+        Self::starting_now(rpc_budget(rpc_timeout_ms, default))
+    }
+
+    /// Starts an already selected `budget` now, as each history page does.
+    fn starting_now(budget: Duration) -> Self {
+        Self {
+            budget,
+            started: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Wraps `message` for Core's retrying connection with this budget.
+    fn request<T>(self, message: T) -> Request<T> {
+        budgeted_request(message, self.budget)
+    }
+
+    /// Awaits `call`, built from [`Self::request`], within this budget.
+    async fn call<T, M>(
+        self,
+        call: impl std::future::Future<Output = Result<Response<T>, Status>>,
+        map: M,
+    ) -> Result<T, ClientOperationError>
+    where
+        M: FnOnce(Status) -> ClientOperationError,
+    {
+        budgeted_rpc(self.budget, self.started, call, map).await
     }
 }
 
@@ -1550,8 +1655,7 @@ pub async fn list_visibility(
     request: VisibilityRequest,
 ) -> Result<VisibilityPage, ClientOperationError> {
     const VISIBILITY_RPC_TIMEOUT: Duration = Duration::from_secs(10);
-    let budget = rpc_budget(request.rpc_timeout_ms, VISIBILITY_RPC_TIMEOUT);
-    let started = tokio::time::Instant::now();
+    let clock = RpcClock::start(request.rpc_timeout_ms, VISIBILITY_RPC_TIMEOUT);
     let token = request
         .next_page_token
         .as_deref()
@@ -1566,21 +1670,17 @@ pub async fn list_visibility(
         })
         .transpose()?;
     let mut service = connection.clone();
-    let response = budgeted_rpc(
-        budget,
-        started,
-        service.list_workflow_executions(budgeted_request(
-            ListWorkflowExecutionsRequest {
+    let response = clock
+        .call(
+            service.list_workflow_executions(clock.request(ListWorkflowExecutionsRequest {
                 namespace: request.namespace,
                 query: request.query,
                 page_size: request.page_size as i32,
                 next_page_token: token.unwrap_or_default(),
-            },
-            budget,
-        )),
-        map_rpc_status,
-    )
-    .await?;
+            })),
+            map_rpc_status,
+        )
+        .await?;
     let mut executions = Vec::with_capacity(response.executions.len());
     for info in response.executions {
         let execution = info.execution.ok_or_else(|| {
@@ -1643,10 +1743,7 @@ pub async fn fetch_history(
     loop {
         let page = GetWorkflowExecutionHistoryRequest {
             namespace: request.namespace.clone(),
-            execution: Some(WorkflowExecution {
-                workflow_id: request.workflow_id.clone(),
-                run_id: request.run_id.clone(),
-            }),
+            execution: core_execution(request.workflow_id.clone(), request.run_id.clone()),
             // Validation bounds the size to 1..=1000, so it always fits; zero
             // asks for the server's default. The server caps it at its own
             // `limit.historyMaxPageSize` (256 by default).
@@ -1659,14 +1756,13 @@ pub async fn fetch_history(
             history_event_filter_type: i32::from(HistoryEventFilterType::AllEvent),
             skip_archival: false,
         };
-        let started = tokio::time::Instant::now();
-        let response = budgeted_rpc(
-            budget,
-            started,
-            service.get_workflow_execution_history(budgeted_request(page, budget)),
-            map_rpc_status,
-        )
-        .await?;
+        let clock = RpcClock::starting_now(budget);
+        let response = clock
+            .call(
+                service.get_workflow_execution_history(clock.request(page)),
+                map_rpc_status,
+            )
+            .await?;
         if let Some(history) = response.history
             && !history.events.is_empty()
         {
@@ -1713,25 +1809,17 @@ pub async fn describe_workflow(
     connection: Connection,
     request: DescribeRequest,
 ) -> Result<DescribeResponse, ClientOperationError> {
-    let budget = rpc_budget(request.rpc_timeout_ms, READ_RPC_TIMEOUT);
-    let started = tokio::time::Instant::now();
+    let clock = RpcClock::start(request.rpc_timeout_ms, READ_RPC_TIMEOUT);
     let mut service = connection.clone();
-    let response = budgeted_rpc(
-        budget,
-        started,
-        service.describe_workflow_execution(budgeted_request(
-            DescribeWorkflowExecutionRequest {
+    let response = clock
+        .call(
+            service.describe_workflow_execution(clock.request(DescribeWorkflowExecutionRequest {
                 namespace: request.namespace.clone(),
-                execution: Some(WorkflowExecution {
-                    workflow_id: request.workflow_id.clone(),
-                    run_id: request.run_id.clone(),
-                }),
-            },
-            budget,
-        )),
-        map_rpc_status,
-    )
-    .await?;
+                execution: core_execution(request.workflow_id.clone(), request.run_id.clone()),
+            })),
+            map_rpc_status,
+        )
+        .await?;
     let malformed = |message| ClientOperationError::Core(workflow_protocol::invalid_core(message));
     let info = response
         .workflow_execution_info
@@ -1844,22 +1932,17 @@ pub async fn count_workflows(
     connection: Connection,
     request: CountRequest,
 ) -> Result<CountResponse, ClientOperationError> {
-    let budget = rpc_budget(request.rpc_timeout_ms, READ_RPC_TIMEOUT);
-    let started = tokio::time::Instant::now();
+    let clock = RpcClock::start(request.rpc_timeout_ms, READ_RPC_TIMEOUT);
     let mut service = connection.clone();
-    let response = budgeted_rpc(
-        budget,
-        started,
-        service.count_workflow_executions(budgeted_request(
-            CountWorkflowExecutionsRequest {
+    let response = clock
+        .call(
+            service.count_workflow_executions(clock.request(CountWorkflowExecutionsRequest {
                 namespace: request.namespace,
                 query: request.query,
-            },
-            budget,
-        )),
-        map_rpc_status,
-    )
-    .await?;
+            })),
+            map_rpc_status,
+        )
+        .await?;
     let count = u64::try_from(response.count).map_err(|_| {
         ClientOperationError::Core(workflow_protocol::invalid_core(
             "visibility count is negative",
@@ -1879,27 +1962,22 @@ pub async fn cancel_workflow(
     // wait. Bound it so a stalled server cannot hold the owner Domain mailbox
     // forever; callers can retry the same request ID when the outcome is
     // uncertain.
-    let budget = rpc_budget(request.rpc_timeout_ms, CONTROL_RPC_TIMEOUT);
-    let started = tokio::time::Instant::now();
+    let clock = RpcClock::start(request.rpc_timeout_ms, CONTROL_RPC_TIMEOUT);
     let mut service = connection.clone();
     let request = RequestCancelWorkflowExecutionRequest {
         namespace: request.namespace,
-        workflow_execution: Some(WorkflowExecution {
-            workflow_id: request.workflow_id,
-            run_id: request.run_id,
-        }),
+        workflow_execution: core_execution(request.workflow_id, request.run_id),
         identity: connection.identity().to_owned(),
         request_id: request.request_id,
         reason: request.reason,
         ..Default::default()
     };
-    budgeted_rpc(
-        budget,
-        started,
-        service.request_cancel_workflow_execution(budgeted_request(request, budget)),
-        map_rpc_status,
-    )
-    .await?;
+    clock
+        .call(
+            service.request_cancel_workflow_execution(clock.request(request)),
+            map_rpc_status,
+        )
+        .await?;
     Ok(CancelWorkflowResponse { acknowledged: true })
 }
 
@@ -1911,32 +1989,24 @@ pub async fn reset_workflow(
     connection: Connection,
     request: ResetWorkflowRequest,
 ) -> Result<ResetWorkflowResponse, ClientOperationError> {
-    let budget = rpc_budget(request.rpc_timeout_ms, CONTROL_RPC_TIMEOUT);
-    let started = tokio::time::Instant::now();
+    let clock = RpcClock::start(request.rpc_timeout_ms, CONTROL_RPC_TIMEOUT);
     let mut service = connection.clone();
     let namespace = request.namespace.clone();
     let workflow_id = request.workflow_id.clone();
-    let response = budgeted_rpc(
-        budget,
-        started,
-        service.reset_workflow_execution(budgeted_request(
-            ResetWorkflowExecutionRequest {
+    let response = clock
+        .call(
+            service.reset_workflow_execution(clock.request(ResetWorkflowExecutionRequest {
                 namespace: request.namespace,
-                workflow_execution: Some(WorkflowExecution {
-                    workflow_id: request.workflow_id,
-                    run_id: request.run_id,
-                }),
+                workflow_execution: core_execution(request.workflow_id, request.run_id),
                 reason: request.reason,
                 workflow_task_finish_event_id: request.workflow_task_finish_event_id,
                 request_id: request.request_id,
                 identity: connection.identity().to_owned(),
                 ..Default::default()
-            },
-            budget,
-        )),
-        map_rpc_status,
-    )
-    .await?;
+            })),
+            map_rpc_status,
+        )
+        .await?;
     if response.run_id.is_empty() {
         return Err(ClientOperationError::Core(workflow_protocol::invalid_core(
             "Temporal reset response omitted run ID",
@@ -1949,16 +2019,11 @@ pub async fn reset_workflow(
             run_id: response.run_id,
         },
     };
-    validate_identifier(&response.execution.namespace, "$.execution.namespace")
-        .and_then(|_| {
-            validate_identifier(&response.execution.workflow_id, "$.execution.workflow_id")
-        })
-        .and_then(|_| validate_identifier(&response.execution.run_id, "$.execution.run_id"))
-        .map_err(|_| {
-            ClientOperationError::Core(workflow_protocol::invalid_core(
-                "Temporal reset response had invalid execution identity",
-            ))
-        })?;
+    validate_execution(&response.execution, "$.execution").map_err(|_| {
+        ClientOperationError::Core(workflow_protocol::invalid_core(
+            "Temporal reset response had invalid execution identity",
+        ))
+    })?;
     Ok(response)
 }
 
@@ -1975,10 +2040,7 @@ pub async fn terminate_workflow(
     let mut service = connection.clone();
     let request = TerminateWorkflowExecutionRequest {
         namespace: request.namespace,
-        workflow_execution: Some(WorkflowExecution {
-            workflow_id: request.workflow_id,
-            run_id: request.run_id,
-        }),
+        workflow_execution: core_execution(request.workflow_id, request.run_id),
         reason: request.reason,
         identity: connection.identity().to_owned(),
         ..Default::default()
@@ -2017,29 +2079,24 @@ pub async fn signal_workflow(
     // for workflow code to process the message. Keep the owner Domain
     // responsive when the server is unavailable; callers can retry the same
     // request ID after an uncertain timeout.
-    let budget = rpc_budget(request.rpc_timeout_ms, CONTROL_RPC_TIMEOUT);
-    let started = tokio::time::Instant::now();
-    let payloads = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
+    let clock = RpcClock::start(request.rpc_timeout_ms, CONTROL_RPC_TIMEOUT);
+    let payloads = payloads_to_core(&request.input)?;
     let mut service = connection.clone();
     let request = SignalWorkflowExecutionRequest {
         namespace: request.namespace,
-        workflow_execution: Some(WorkflowExecution {
-            workflow_id: request.workflow_id,
-            run_id: request.run_id,
-        }),
+        workflow_execution: core_execution(request.workflow_id, request.run_id),
         signal_name: request.signal_name,
         input: Some(payloads),
         identity: connection.identity().to_owned(),
         request_id: request.request_id,
         ..Default::default()
     };
-    budgeted_rpc(
-        budget,
-        started,
-        service.signal_workflow_execution(budgeted_request(request, budget)),
-        map_rpc_status,
-    )
-    .await?;
+    clock
+        .call(
+            service.signal_workflow_execution(clock.request(request)),
+            map_rpc_status,
+        )
+        .await?;
     Ok(SignalWorkflowResponse { acknowledged: true })
 }
 
@@ -2058,16 +2115,12 @@ pub async fn query_workflow(
     // incorrectly rejects healthy slow workers, so the default is a longer
     // bounded service budget; a caller may select its own (#499).
     const QUERY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
-    let budget = rpc_budget(request.rpc_timeout_ms, QUERY_RPC_TIMEOUT);
-    let started = tokio::time::Instant::now();
-    let query_args = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
+    let clock = RpcClock::start(request.rpc_timeout_ms, QUERY_RPC_TIMEOUT);
+    let query_args = payloads_to_core(&request.input)?;
     let mut service = connection.clone();
     let request = QueryWorkflowExecutionRequest {
         namespace: request.namespace,
-        execution: Some(WorkflowExecution {
-            workflow_id: request.workflow_id,
-            run_id: request.run_id,
-        }),
+        execution: core_execution(request.workflow_id, request.run_id),
         query: Some(WorkflowQuery {
             query_type: request.query_type,
             query_args: Some(query_args),
@@ -2078,13 +2131,12 @@ pub async fn query_workflow(
         // enum variant names that can change with protobuf regeneration.
         query_reject_condition: 1,
     };
-    let response = budgeted_rpc(
-        budget,
-        started,
-        service.query_workflow(budgeted_request(request, budget)),
-        map_query_status,
-    )
-    .await?;
+    let response = clock
+        .call(
+            service.query_workflow(clock.request(request)),
+            map_query_status,
+        )
+        .await?;
     if response.query_rejected.is_some() {
         return Err(ClientOperationError::Rpc {
             code: "failed_precondition".to_owned(),
@@ -2108,6 +2160,82 @@ const UPDATE_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(30);
 /// misbehaving server that answers immediately from driving a hot RPC loop for
 /// the whole acceptance budget.
 const UPDATE_READMISSION_PAUSE: Duration = Duration::from_millis(100);
+
+/// The shared total budget of an update acceptance loop, which
+/// [`update_workflow_within`] and update-with-start both run.
+///
+/// Every attempt carries what remains of the budget as its gRPC deadline, so
+/// a real server ends its long poll (answering `Admitted`) before the local
+/// timeout fires, and an update answered only as admitted is re-issued after
+/// [`UPDATE_READMISSION_PAUSE`] while time remains. Expiry is reported by the
+/// caller as [`deadline_exceeded`].
+#[derive(Clone, Copy)]
+struct AcceptanceDeadline(tokio::time::Instant);
+
+/// One budgeted attempt of an update acceptance loop.
+struct AcceptanceAttempt<T> {
+    /// The re-sent message, carrying what remains of the budget.
+    request: Request<T>,
+    /// When the attempt began, for [`budget_status`].
+    started: tokio::time::Instant,
+    /// The budget the attempt was given, for [`budget_status`].
+    remaining: Duration,
+}
+
+impl<T> AcceptanceAttempt<T> {
+    /// Wraps a status mapper so that a transport or server deadline expiring
+    /// with this attempt's budget is the typed `deadline_exceeded` error.
+    ///
+    /// The returned mapper copies the attempt's clock rather than borrowing
+    /// the attempt, so the request can still be moved into the call.
+    fn status_map<M>(&self, map: M) -> impl FnOnce(Status) -> ClientOperationError + use<T, M>
+    where
+        M: FnOnce(Status) -> ClientOperationError,
+    {
+        budget_status(self.started, self.remaining, map)
+    }
+}
+
+impl AcceptanceDeadline {
+    /// Starts a budget that expires `budget` from now.
+    fn after(budget: Duration) -> Self {
+        Self(tokio::time::Instant::now() + budget)
+    }
+
+    /// The instant at which the budget expires.
+    fn instant(self) -> tokio::time::Instant {
+        self.0
+    }
+
+    /// Prepares one more attempt of `message`, or returns `None` once the
+    /// budget has expired.
+    ///
+    /// Core may retry a transient transport failure inside the attempt; both
+    /// its retry window and every transport attempt's deadline are limited to
+    /// what remains of the shared budget ([`budgeted_request`]).
+    fn next_attempt<T: Clone>(self, message: &T) -> Option<AcceptanceAttempt<T>> {
+        let remaining = self
+            .0
+            .saturating_duration_since(tokio::time::Instant::now());
+        (!remaining.is_zero()).then(|| AcceptanceAttempt {
+            request: budgeted_request(message.clone(), remaining),
+            started: tokio::time::Instant::now(),
+            remaining,
+        })
+    }
+
+    /// Waits out [`UPDATE_READMISSION_PAUSE`] before an admitted-only update
+    /// is re-issued. Returns `false` without waiting when the pause would
+    /// reach the deadline, because no further attempt could then be made.
+    async fn pause_for_readmission(self) -> bool {
+        let pause_until = tokio::time::Instant::now() + UPDATE_READMISSION_PAUSE;
+        if pause_until >= self.0 {
+            return false;
+        }
+        tokio::time::sleep_until(pause_until).await;
+        true
+    }
+}
 
 /// Starts one update through Temporal's workflow service and waits until the
 /// workflow worker has accepted it. Temporal deliberately does not allow the
@@ -2142,27 +2270,21 @@ pub(crate) async fn update_workflow_within(
     budget: Duration,
 ) -> Result<UpdateWorkflowResponse, ClientOperationError> {
     let rpc_request = update_execution_request(&request, connection.identity())?;
-    let deadline_exceeded = || ClientOperationError::Rpc {
-        code: "deadline_exceeded".to_owned(),
-    };
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = AcceptanceDeadline::after(budget);
     let mut service = connection.clone();
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        let Some(attempt) = deadline.next_attempt(&rpc_request) else {
             return Err(deadline_exceeded());
-        }
-        // Core may retry a transient transport failure inside this attempt;
-        // both its retry window and every transport attempt's deadline are
-        // limited to what remains of the shared acceptance budget.
-        let attempt = budgeted_request(rpc_request.clone(), remaining);
-        let attempt_started = tokio::time::Instant::now();
-        let response =
-            tokio::time::timeout_at(deadline, service.update_workflow_execution(attempt))
-                .await
-                .map_err(|_| deadline_exceeded())?
-                .map_err(budget_status(attempt_started, remaining, map_rpc_status))?
-                .into_inner();
+        };
+        let map = attempt.status_map(map_rpc_status);
+        let response = tokio::time::timeout_at(
+            deadline.instant(),
+            service.update_workflow_execution(attempt.request),
+        )
+        .await
+        .map_err(|_| deadline_exceeded())?
+        .map_err(map)?
+        .into_inner();
         // Validate identity on every attempt, including admitted-only ones, so
         // a server answering for another update fails closed immediately.
         let response_stage = response.stage;
@@ -2181,11 +2303,9 @@ pub(crate) async fn update_workflow_within(
         // bridge does not know, without an outcome: the update is not known
         // to be durable. Re-issue it if the budget still allows one more
         // attempt.
-        let pause_until = tokio::time::Instant::now() + UPDATE_READMISSION_PAUSE;
-        if pause_until >= deadline {
+        if !deadline.pause_for_readmission().await {
             return Err(deadline_exceeded());
         }
-        tokio::time::sleep_until(pause_until).await;
     }
 }
 
@@ -2197,13 +2317,10 @@ fn update_execution_request(
     request: &UpdateWorkflowRequest,
     identity: &str,
 ) -> Result<UpdateWorkflowExecutionRequest, ClientOperationError> {
-    let input = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
+    let input = payloads_to_core(&request.input)?;
     Ok(UpdateWorkflowExecutionRequest {
         namespace: request.namespace.clone(),
-        workflow_execution: Some(WorkflowExecution {
-            workflow_id: request.workflow_id.clone(),
-            run_id: request.run_id.clone(),
-        }),
+        workflow_execution: core_execution(request.workflow_id.clone(), request.run_id.clone()),
         wait_policy: Some(WaitPolicy {
             lifecycle_stage: i32::from(UpdateWorkflowExecutionLifecycleStage::Accepted),
         }),
@@ -2329,10 +2446,7 @@ pub async fn poll_workflow_update(
             PollWorkflowExecutionUpdateRequest {
                 namespace: request.namespace,
                 update_ref: Some(update::v1::UpdateRef {
-                    workflow_execution: Some(WorkflowExecution {
-                        workflow_id: request.workflow_id,
-                        run_id: request.run_id,
-                    }),
+                    workflow_execution: core_execution(request.workflow_id, request.run_id),
                     update_id: request.update_id,
                 }),
                 identity: connection.identity().to_owned(),
@@ -2409,14 +2523,6 @@ pub(crate) fn encode_start_outcome(
     encode_document(&document)
 }
 
-/// Encodes and reparses an exact-run wait response before ownership leaves Rust.
-pub fn encode_wait_response(
-    response: &WaitWorkflowResponse,
-) -> Result<String, protocol::ProtocolError> {
-    validate_wait_response(response)?;
-    encode_document(response)
-}
-
 /// Maximum time one start RPC may block the supervisor owner or a Tokio task.
 ///
 /// A hung Temporal start must not pin the sole owner Domain forever (sync ABI)
@@ -2441,18 +2547,16 @@ pub async fn start_workflow(
     request: StartWorkflowRequest,
 ) -> Result<StartWorkflowResponse, ClientOperationError> {
     let rpc_request = start_execution_request(&request, connection.identity())?;
-    let budget = rpc_budget(request.rpc_timeout_ms, START_RPC_TIMEOUT);
-    let started = tokio::time::Instant::now();
+    let clock = RpcClock::start(request.rpc_timeout_ms, START_RPC_TIMEOUT);
     // Connection owns Core's retry policy; its underlying workflow service
     // skips that policy and gives up on the first transient transport error.
     let mut service = connection.clone();
-    let response = budgeted_rpc(
-        budget,
-        started,
-        service.start_workflow_execution(budgeted_request(rpc_request, budget)),
-        |status| map_start_status(&request.workflow_id, status),
-    )
-    .await?;
+    let response = clock
+        .call(
+            service.start_workflow_execution(clock.request(rpc_request)),
+            |status| map_start_status(&request.workflow_id, status),
+        )
+        .await?;
     start_response_from_core(&request, response.run_id, response.started)
 }
 
@@ -2465,10 +2569,15 @@ fn start_execution_request(
     request: &StartWorkflowRequest,
     identity: &str,
 ) -> Result<StartWorkflowExecutionRequest, ClientOperationError> {
-    let payloads = payloads_to_core(&request.input).map_err(ClientOperationError::Core)?;
-    let memo = metadata_to_memo(&request.memo).map_err(ClientOperationError::Core)?;
-    let search_attributes = metadata_to_search_attributes(&request.search_attributes)
-        .map_err(ClientOperationError::Core)?;
+    let payloads = payloads_to_core(&request.input)?;
+    // Temporal represents each indexed search attribute as one payload;
+    // callers that need multiple values encode a list with their codec first.
+    let memo = metadata_payload_map(&request.memo)
+        .map_err(ClientOperationError::Core)?
+        .map(|fields| Memo { fields });
+    let search_attributes = metadata_payload_map(&request.search_attributes)
+        .map_err(ClientOperationError::Core)?
+        .map(|indexed_fields| SearchAttributes { indexed_fields });
     let retry_policy = request
         .retry_policy
         .as_ref()
@@ -2571,10 +2680,7 @@ pub async fn wait_workflow(
     loop {
         let mut poll = GetWorkflowExecutionHistoryRequest {
             namespace: request.namespace.clone(),
-            execution: Some(WorkflowExecution {
-                workflow_id: request.workflow_id.clone(),
-                run_id: request.run_id.clone(),
-            }),
+            execution: core_execution(request.workflow_id.clone(), request.run_id.clone()),
             next_page_token: std::mem::take(&mut next_page_token),
             skip_archival: false,
             wait_new_event: true,
@@ -2693,6 +2799,16 @@ fn outcome_from_event(
     Ok(outcome)
 }
 
+/// Builds the protobuf address of one workflow run. An empty `run_id`
+/// selects the workflow's current run, which every exact-run RPC accepts and
+/// Temporal resolves when it handles the call (#791).
+fn core_execution(workflow_id: String, run_id: String) -> Option<WorkflowExecution> {
+    Some(WorkflowExecution {
+        workflow_id,
+        run_id,
+    })
+}
+
 /// Converts Core payloads without dropping order or metadata.
 fn payloads_from_core(
     value: Option<&Payloads>,
@@ -2708,33 +2824,19 @@ fn payloads_from_core(
         .unwrap_or_else(|| Ok(Vec::new()))
 }
 
-/// Converts semantic payloads into the protobuf payload container.
+/// Converts the semantic payloads of an outgoing request into the protobuf
+/// payload container, reporting a payload Core cannot carry as the typed
+/// client error every request builder returns.
 fn payloads_to_core(
     values: &[workflow_protocol::Payload],
-) -> Result<Payloads, workflow_protocol::CoreConversionError> {
+) -> Result<Payloads, ClientOperationError> {
     Ok(Payloads {
         payloads: values
             .iter()
             .map(workflow_protocol::payload_to_core)
-            .collect::<Result<_, _>>()?,
+            .collect::<Result<_, _>>()
+            .map_err(ClientOperationError::Core)?,
     })
-}
-
-/// Converts named OCaml metadata to Temporal's memo map while preserving the
-/// validation guarantees established by [`validate_metadata`].
-fn metadata_to_memo(
-    fields: &[MetadataField],
-) -> Result<Option<Memo>, workflow_protocol::CoreConversionError> {
-    Ok(metadata_payload_map(fields)?.map(|fields| Memo { fields }))
-}
-
-/// Converts named OCaml search attributes to Temporal's indexed-field map.
-/// Temporal represents each indexed field as one payload; callers that need
-/// multiple values should encode a list using their normal codec first.
-fn metadata_to_search_attributes(
-    fields: &[MetadataField],
-) -> Result<Option<SearchAttributes>, workflow_protocol::CoreConversionError> {
-    Ok(metadata_payload_map(fields)?.map(|indexed_fields| SearchAttributes { indexed_fields }))
 }
 
 /// Converts named OCaml metadata to the key-to-payload map shared by memo and
@@ -2811,7 +2913,9 @@ fn map_start_status(workflow_id: &str, status: Status) -> ClientOperationError {
 /// otherwise the status message (the server's copy of it) is used.
 fn map_query_status(status: Status) -> ClientOperationError {
     if status.code() == Code::InvalidArgument
-        && let Some(detail) = query_failed_detail(status.details())
+        && let Some(detail) = typed_status_detail::<
+            temporalio_common::protos::temporal::api::errordetails::v1::QueryFailedFailure,
+        >(status.details(), QUERY_FAILED_TYPE_URL)
     {
         let message = match detail.failure {
             Some(failure) if !failure.message.is_empty() => failure.message,
@@ -2828,21 +2932,22 @@ fn map_query_status(status: Status) -> ClientOperationError {
 const QUERY_FAILED_TYPE_URL: &str =
     "type.googleapis.com/temporal.api.errordetails.v1.QueryFailedFailure";
 
-/// Decodes the `QueryFailedFailure` status detail from encoded
-/// `google.rpc.Status` bytes. Core's generic `decode_status_detail` ignores
-/// the `Any` type URL, and protobuf decoding is lenient enough that an
-/// unrelated detail (for example a `BadRequest`) could decode as this message,
-/// so the type URL is checked first. Malformed bytes are treated as absent.
-fn query_failed_detail(
-    details: &[u8],
-) -> Option<temporalio_common::protos::temporal::api::errordetails::v1::QueryFailedFailure> {
+/// Decodes the first detail of encoded `google.rpc.Status` bytes as `M`
+/// (the query failure, or update-with-start's multi-operation failure).
+///
+/// Core's generic `decode_status_detail` ignores the `Any` type URL, and
+/// protobuf decoding is lenient enough that an unrelated detail (for example
+/// a `BadRequest`) could decode as `M`, so the detail is used only when its
+/// type URL is exactly `type_url`. Malformed bytes or a missing detail are
+/// treated as absent.
+fn typed_status_detail<M: prost::Message + Default>(details: &[u8], type_url: &str) -> Option<M> {
     use prost::Message;
     let status = temporalio_common::protos::google::rpc::Status::decode(details).ok()?;
     let detail = status.details.first()?;
-    if detail.type_url != QUERY_FAILED_TYPE_URL {
+    if detail.type_url != type_url {
         return None;
     }
-    Message::decode(detail.value.as_slice()).ok()
+    M::decode(detail.value.as_slice()).ok()
 }
 
 /// Makes a handler-controlled message safe for the closed error document:
@@ -2908,12 +3013,17 @@ pub(crate) fn rpc_code(code: Code) -> &'static str {
 
 /// Validates one start request's identifiers and payload ownership bounds.
 fn validate_start_request(value: &StartWorkflowRequest) -> Result<(), protocol::ProtocolError> {
-    validate_identifier(&value.request_id, "$.request_id")?;
-    validate_identifier(&value.namespace, "$.namespace")?;
-    validate_identifier(&value.workflow_id, "$.workflow_id")?;
-    validate_identifier(&value.workflow_type, "$.workflow_type")?;
-    validate_identifier(&value.task_queue, "$.task_queue")?;
-    validate_input_payloads(&value.input)?;
+    validate_identifier_fields(
+        "$",
+        [
+            ("request_id", &value.request_id),
+            ("namespace", &value.namespace),
+            ("workflow_id", &value.workflow_id),
+            ("workflow_type", &value.workflow_type),
+            ("task_queue", &value.task_queue),
+        ],
+    )?;
+    validate_payloads(&value.input, "$.input")?;
     validate_metadata(&value.memo, "$.memo")?;
     validate_metadata(&value.search_attributes, "$.search_attributes")?;
     validate_start_policies(value)?;
@@ -3048,6 +3158,22 @@ fn validate_metadata(fields: &[MetadataField], path: &str) -> Result<(), protoco
     Ok(())
 }
 
+/// Validates the members every exact-run client request shares: with
+/// `timed`, first the caller's RPC budget ([`validate_rpc_timeout`]), then the
+/// namespace, workflow ID, and run selector ([`validate_run_target`]).
+///
+/// This is a macro rather than a function because each request is its own
+/// closed Serde struct: the members share names, not a type. It expands to
+/// exactly those calls, in that order, and evaluates to their `Result`.
+macro_rules! validate_exact_run {
+    ($request:expr) => {
+        validate_run_target(&$request.namespace, &$request.workflow_id, &$request.run_id)
+    };
+    (timed $request:expr) => {
+        validate_rpc_timeout($request.rpc_timeout_ms).and_then(|()| validate_exact_run!($request))
+    };
+}
+
 /// Validates the namespace, workflow ID, and run selector that every
 /// exact-run request uses to address one workflow execution.
 fn validate_run_target(
@@ -3078,27 +3204,29 @@ fn validate_reason(reason: &str) -> Result<(), protocol::ProtocolError> {
     Ok(())
 }
 
-/// Requires every request argument at `$.input` to convert into a Temporal
-/// payload before the request can reach the service.
-fn validate_input_payloads(
-    input: &[workflow_protocol::Payload],
+/// Requires every payload of the list at `path` (request arguments, query
+/// results, or update and workflow outcomes) to convert into a Temporal
+/// payload, reporting the first one that cannot as `invalid Temporal payload`
+/// at `path`.
+fn validate_payloads(
+    payloads: &[workflow_protocol::Payload],
+    path: &str,
 ) -> Result<(), protocol::ProtocolError> {
-    for payload in input {
+    for payload in payloads {
         workflow_protocol::payload_to_core(payload)
-            .map_err(|_| protocol::ProtocolError::invalid("$.input", "invalid Temporal payload"))?;
+            .map_err(|_| protocol::ProtocolError::invalid(path, "invalid Temporal payload"))?;
     }
     Ok(())
 }
 
 /// Validates one exact-run wait request.
 fn validate_wait_request(value: &WaitWorkflowRequest) -> Result<(), protocol::ProtocolError> {
-    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)
+    validate_exact_run!(value)
 }
 
 /// Validates one exact-run cancellation request and keeps its reason bounded.
 fn validate_cancel_request(value: &CancelWorkflowRequest) -> Result<(), protocol::ProtocolError> {
-    validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
+    validate_exact_run!(timed value)?;
     validate_identifier(&value.request_id, "$.request_id")?;
     validate_reason(&value.reason)
 }
@@ -3107,15 +3235,13 @@ fn validate_cancel_request(value: &CancelWorkflowRequest) -> Result<(), protocol
 fn validate_terminate_request(
     value: &TerminateWorkflowRequest,
 ) -> Result<(), protocol::ProtocolError> {
-    validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
+    validate_exact_run!(timed value)?;
     validate_reason(&value.reason)
 }
 
 /// Validates one exact-run reset request and its Temporal event boundary.
 fn validate_reset_request(value: &ResetWorkflowRequest) -> Result<(), protocol::ProtocolError> {
-    validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
+    validate_exact_run!(timed value)?;
     validate_identifier(&value.request_id, "$.request_id")?;
     if value.workflow_task_finish_event_id <= 1 {
         return Err(protocol::ProtocolError::invalid(
@@ -3129,11 +3255,15 @@ fn validate_reset_request(value: &ResetWorkflowRequest) -> Result<(), protocol::
 /// Validates one exact-run signal request and every payload conversion before
 /// it can reach the official Temporal service.
 fn validate_signal_request(value: &SignalWorkflowRequest) -> Result<(), protocol::ProtocolError> {
-    validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
-    validate_identifier(&value.signal_name, "$.signal_name")?;
-    validate_identifier(&value.request_id, "$.request_id")?;
-    validate_input_payloads(&value.input)
+    validate_exact_run!(timed value)?;
+    validate_identifier_fields(
+        "$",
+        [
+            ("signal_name", &value.signal_name),
+            ("request_id", &value.request_id),
+        ],
+    )?;
+    validate_payloads(&value.input, "$.input")
 }
 
 /// Validates one exact-run query request and every argument payload before it
@@ -3141,39 +3271,45 @@ fn validate_signal_request(value: &SignalWorkflowRequest) -> Result<(), protocol
 /// empty argument list, but accepting and validating the closed list keeps
 /// protocol behavior explicit for the future typed-input extension.
 fn validate_query_request(value: &QueryWorkflowRequest) -> Result<(), protocol::ProtocolError> {
-    validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
+    validate_exact_run!(timed value)?;
     validate_identifier(&value.query_type, "$.query_type")?;
-    validate_input_payloads(&value.input)
-}
-
-/// Validates every payload in a successful query response before it leaves the
-/// Rust-owned connection and crosses the JSON ABI.
-fn validate_query_response(value: &QueryWorkflowResponse) -> Result<(), protocol::ProtocolError> {
-    for payload in &value.result {
-        workflow_protocol::payload_to_core(payload).map_err(|_| {
-            protocol::ProtocolError::invalid("$.result", "invalid Temporal payload")
-        })?;
-    }
-    Ok(())
+    validate_payloads(&value.input, "$.input")
 }
 
 /// Validates one update admission request and every argument payload.
 fn validate_update_request(value: &UpdateWorkflowRequest) -> Result<(), protocol::ProtocolError> {
-    validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
-    validate_identifier(&value.update_id, "$.update_id")?;
-    validate_identifier(&value.update_name, "$.update_name")?;
-    validate_input_payloads(&value.input)
+    validate_exact_run!(timed value)?;
+    validate_update_message(
+        &value.update_id,
+        &value.update_name,
+        &value.input,
+        "$.input",
+    )
+}
+
+/// Validates the update half every update request shares, in order: the
+/// update ID at `$.update_id`, the handler name at `$.update_name`, and the
+/// argument payloads at `input_path`. The plain update request and the
+/// update half of update-with-start differ only in where their arguments sit.
+fn validate_update_message(
+    update_id: &str,
+    update_name: &str,
+    input: &[workflow_protocol::Payload],
+    input_path: &str,
+) -> Result<(), protocol::ProtocolError> {
+    validate_identifier_fields(
+        "$",
+        [("update_id", update_id), ("update_name", update_name)],
+    )?;
+    validate_payloads(input, input_path)
 }
 
 /// Validates one update poll request.
 fn validate_poll_update_request(
     value: &PollWorkflowUpdateRequest,
 ) -> Result<(), protocol::ProtocolError> {
-    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
-    validate_identifier(&value.update_id, "$.update_id")?;
-    Ok(())
+    validate_exact_run!(value)?;
+    validate_identifier(&value.update_id, "$.update_id")
 }
 
 /// Validates update output payloads and recursive failure trees before JSON
@@ -3181,39 +3317,21 @@ fn validate_poll_update_request(
 fn validate_update_response(value: &UpdateWorkflowResponse) -> Result<(), protocol::ProtocolError> {
     validate_identifier(&value.update_id, "$.update_id")?;
     validate_execution(&value.execution, "$.execution")?;
-    if let Some(outcome) = &value.outcome {
-        validate_update_outcome(outcome)?;
-    }
-    Ok(())
-}
-
-/// Validates an optional bounded poll outcome.
-fn validate_poll_update_response(
-    value: &PollWorkflowUpdateResponse,
-) -> Result<(), protocol::ProtocolError> {
-    if let Some(outcome) = &value.outcome {
-        validate_update_outcome(outcome)?;
-    }
-    Ok(())
+    validate_update_outcome(value.outcome.as_ref())
 }
 
 /// Validates either successful update payloads or a recursive failure tree.
-fn validate_update_outcome(value: &UpdateOutcome) -> Result<(), protocol::ProtocolError> {
+/// An absent outcome is valid: the update is accepted but still pending.
+fn validate_update_outcome(value: Option<&UpdateOutcome>) -> Result<(), protocol::ProtocolError> {
     match value {
-        UpdateOutcome::Completed { result } => {
-            for payload in result {
-                workflow_protocol::payload_to_core(payload).map_err(|_| {
-                    protocol::ProtocolError::invalid("$.outcome.result", "invalid Temporal payload")
-                })?;
-            }
-        }
-        UpdateOutcome::Failed { failure } => {
+        None => Ok(()),
+        Some(UpdateOutcome::Completed { result }) => validate_payloads(result, "$.outcome.result"),
+        Some(UpdateOutcome::Failed { failure }) => {
             workflow_protocol::validate_failure(failure, "$.outcome.failure").map_err(|_| {
                 protocol::ProtocolError::invalid("$.outcome.failure", "invalid Temporal failure")
-            })?;
+            })
         }
     }
-    Ok(())
 }
 
 /// Validates a visibility request before any RPC or token decoding occurs.
@@ -3234,19 +3352,25 @@ fn validate_visibility_request(value: &VisibilityRequest) -> Result<(), protocol
                 "page token exceeds the protocol string safety limit or contains NUL",
             ));
         }
-        base64::engine::general_purpose::STANDARD
-            .decode(token)
-            .map_err(|_| {
-                protocol::ProtocolError::invalid("$.next_page_token", "invalid base64 page token")
-            })?;
+        validate_page_token(token)?;
     }
     Ok(())
 }
 
+/// Requires an opaque visibility page token to be base64, the only form in
+/// which the bridge hands Temporal's token bytes across the JSON boundary.
+fn validate_page_token(token: &str) -> Result<(), protocol::ProtocolError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .map(drop)
+        .map_err(|_| {
+            protocol::ProtocolError::invalid("$.next_page_token", "invalid base64 page token")
+        })
+}
+
 /// Validates a history fetch request before any RPC occurs.
 fn validate_history_request(value: &HistoryRequest) -> Result<(), protocol::ProtocolError> {
-    validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)?;
+    validate_exact_run!(timed value)?;
     match value.page_size {
         Some(size) if !(1..=1_000).contains(&size) => Err(protocol::ProtocolError::invalid(
             "$.page_size",
@@ -3258,8 +3382,7 @@ fn validate_history_request(value: &HistoryRequest) -> Result<(), protocol::Prot
 
 /// Validates a describe request before any RPC occurs.
 fn validate_describe_request(value: &DescribeRequest) -> Result<(), protocol::ProtocolError> {
-    validate_rpc_timeout(value.rpc_timeout_ms)?;
-    validate_run_target(&value.namespace, &value.workflow_id, &value.run_id)
+    validate_exact_run!(timed value)
 }
 
 /// Validates a count request before any RPC occurs; the query follows the
@@ -3288,28 +3411,21 @@ fn validate_visibility_query(query: &str) -> Result<(), protocol::ProtocolError>
 /// unique, valid metadata keys and payloads.
 fn validate_describe_response(value: &DescribeResponse) -> Result<(), protocol::ProtocolError> {
     validate_execution(&value.execution, "$.execution")?;
-    validate_identifier(&value.workflow_type, "$.workflow_type")?;
-    validate_identifier(&value.task_queue, "$.task_queue")?;
+    validate_identifier_fields(
+        "$",
+        [
+            ("workflow_type", &value.workflow_type),
+            ("task_queue", &value.task_queue),
+        ],
+    )?;
     if !is_visibility_status_name(&value.status) || value.status == "unspecified" {
         return Err(protocol::ProtocolError::invalid(
             "$.status",
             "unknown execution status",
         ));
     }
-    workflow_protocol::validate_time(
-        value.start_time.seconds,
-        value.start_time.nanoseconds,
-        false,
-        "$.start_time",
-    )?;
-    if let Some(close_time) = &value.close_time {
-        workflow_protocol::validate_time(
-            close_time.seconds,
-            close_time.nanoseconds,
-            false,
-            "$.close_time",
-        )?;
-    }
+    value.start_time.validate_at("$.start_time")?;
+    value.close_time.validate_at("$.close_time")?;
     if i64::try_from(value.history_length).is_err() {
         return Err(protocol::ProtocolError::invalid(
             "$.history_length",
@@ -3320,14 +3436,18 @@ fn validate_describe_response(value: &DescribeResponse) -> Result<(), protocol::
     validate_metadata(&value.search_attributes, "$.search_attributes")?;
     for (index, activity) in value.pending_activities.iter().enumerate() {
         let path = format!("$.pending_activities[{index}]");
-        validate_identifier(&activity.activity_id, &format!("{path}.activity_id"))?;
-        validate_identifier(&activity.activity_type, &format!("{path}.activity_type"))?;
-        if !is_pending_activity_state_name(&activity.state) {
-            return Err(protocol::ProtocolError::invalid(
-                format!("{path}.state"),
-                "unknown pending activity state",
-            ));
-        }
+        validate_identifier_fields(
+            &path,
+            [
+                ("activity_id", &activity.activity_id),
+                ("activity_type", &activity.activity_type),
+            ],
+        )?;
+        require(
+            is_pending_activity_state_name(&activity.state),
+            format!("{path}.state"),
+            "unknown pending activity state",
+        )?;
         if i32::try_from(activity.attempt).is_err() {
             return Err(protocol::ProtocolError::invalid(
                 format!("{path}.attempt"),
@@ -3372,39 +3492,43 @@ fn pending_activity_state(state: i32) -> String {
 fn is_pending_activity_state_name(state: &str) -> bool {
     match state {
         "scheduled" | "started" | "cancel_requested" | "paused" | "pause_requested" => true,
-        _ => state
-            .strip_prefix(UNKNOWN_STATUS_PREFIX)
-            .and_then(|digits| digits.parse::<i32>().ok().map(|value| (digits, value)))
-            .is_some_and(|(digits, value)| {
-                !(1..=MAX_KNOWN_PENDING_ACTIVITY_STATE).contains(&value)
-                    && value.to_string() == digits
-            }),
+        _ => is_unknown_wire_name(state, 1..=MAX_KNOWN_PENDING_ACTIVITY_STATE),
     }
+}
+
+/// Returns whether `name` is the fallback spelling of an enum wire value this
+/// bridge does not name: [`UNKNOWN_STATUS_PREFIX`] followed by the canonical
+/// decimal form of a value outside `named`, so one wire value has exactly
+/// one spelling. Execution statuses and pending-activity states share it.
+fn is_unknown_wire_name(name: &str, named: std::ops::RangeInclusive<i32>) -> bool {
+    name.strip_prefix(UNKNOWN_STATUS_PREFIX)
+        .and_then(|digits| digits.parse::<i32>().ok().map(|value| (digits, value)))
+        .is_some_and(|(digits, value)| !named.contains(&value) && value.to_string() == digits)
 }
 
 /// Validates every reduced visibility row and the opaque continuation token.
 fn validate_visibility_page(value: &VisibilityPage) -> Result<(), protocol::ProtocolError> {
     for (index, execution) in value.executions.iter().enumerate() {
         let path = format!("$.executions[{index}]");
-        validate_identifier(&execution.workflow_id, &format!("{path}.workflow_id"))?;
-        validate_identifier(&execution.run_id, &format!("{path}.run_id"))?;
-        validate_identifier(&execution.workflow_type, &format!("{path}.workflow_type"))?;
-        validate_identifier(&execution.task_queue, &format!("{path}.task_queue"))?;
-        if !is_visibility_status_name(&execution.status) {
-            return Err(protocol::ProtocolError::invalid(
-                format!("{path}.status"),
-                "unknown visibility status",
-            ));
-        }
+        validate_identifier_fields(
+            &path,
+            [
+                ("workflow_id", &execution.workflow_id),
+                ("run_id", &execution.run_id),
+                ("workflow_type", &execution.workflow_type),
+                ("task_queue", &execution.task_queue),
+            ],
+        )?;
+        require(
+            is_visibility_status_name(&execution.status),
+            format!("{path}.status"),
+            "unknown visibility status",
+        )?;
     }
-    if let Some(token) = &value.next_page_token {
-        base64::engine::general_purpose::STANDARD
-            .decode(token)
-            .map_err(|_| {
-                protocol::ProtocolError::invalid("$.next_page_token", "invalid base64 page token")
-            })?;
-    }
-    Ok(())
+    value
+        .next_page_token
+        .as_deref()
+        .map_or(Ok(()), validate_page_token)
 }
 
 /// Highest `WorkflowExecutionStatus` wire value this bridge names. Other
@@ -3451,68 +3575,72 @@ fn is_visibility_status_name(status: &str) -> bool {
     match status {
         "running" | "completed" | "failed" | "canceled" | "terminated" | "continued_as_new"
         | "timed_out" | "paused" | "unspecified" => true,
-        _ => status
-            .strip_prefix(UNKNOWN_STATUS_PREFIX)
-            .and_then(|digits| digits.parse::<i32>().ok().map(|value| (digits, value)))
-            .is_some_and(|(digits, value)| {
-                !(0..=MAX_KNOWN_VISIBILITY_STATUS).contains(&value) && value.to_string() == digits
-            }),
+        _ => is_unknown_wire_name(status, 0..=MAX_KNOWN_VISIBILITY_STATUS),
     }
 }
 
 /// Validates one execution reference.
 fn validate_execution(value: &ExecutionRef, path: &str) -> Result<(), protocol::ProtocolError> {
-    validate_identifier(&value.namespace, &format!("{path}.namespace"))?;
-    validate_identifier(&value.workflow_id, &format!("{path}.workflow_id"))?;
-    validate_identifier(&value.run_id, &format!("{path}.run_id"))?;
-    Ok(())
+    validate_execution_identity(&value.namespace, &value.workflow_id, &value.run_id, path)
 }
 
-/// Validates one outcome, including required continued-as-new successor data.
+/// Validates a concrete execution identity at `{path}.namespace`,
+/// `{path}.workflow_id`, and `{path}.run_id`, in that order. Execution
+/// references and successor metadata share this rule; a request's run
+/// selector, which may be empty, uses [`validate_run_target`] instead.
+fn validate_execution_identity(
+    namespace: &str,
+    workflow_id: &str,
+    run_id: &str,
+    path: &str,
+) -> Result<(), protocol::ProtocolError> {
+    validate_identifier_fields(
+        path,
+        [
+            ("namespace", namespace),
+            ("workflow_id", workflow_id),
+            ("run_id", run_id),
+        ],
+    )
+}
+
+/// Validates one outcome: its payloads or failure first, then the successor
+/// metadata it carries (required for continued-as-new).
 fn validate_outcome(value: &WorkflowOutcome) -> Result<(), protocol::ProtocolError> {
-    let validate_successor = |successor: &SuccessorRef| validate_successor_shape(successor);
     match value {
-        WorkflowOutcome::Completed { result, successor } => {
-            for payload in result {
-                workflow_protocol::payload_to_core(payload).map_err(|_| {
-                    protocol::ProtocolError::invalid("$.outcome.result", "invalid Temporal payload")
-                })?;
-            }
-            if let Some(successor) = successor {
-                validate_successor(successor)?;
-            }
-        }
-        WorkflowOutcome::Failed { failure, successor } => {
-            workflow_protocol::validate_failure(failure, "$.outcome.failure")?;
-            if let Some(successor) = successor {
-                validate_successor(successor)?;
-            }
+        WorkflowOutcome::Completed { result, .. } => validate_payloads(result, "$.outcome.result")?,
+        WorkflowOutcome::Failed { failure, .. } => {
+            workflow_protocol::validate_failure(failure, "$.outcome.failure")?
         }
         WorkflowOutcome::Cancelled { details } | WorkflowOutcome::Terminated { details } => {
-            for payload in details {
-                workflow_protocol::payload_to_core(payload).map_err(|_| {
-                    protocol::ProtocolError::invalid(
-                        "$.outcome.details",
-                        "invalid Temporal payload",
-                    )
-                })?;
-            }
+            validate_payloads(details, "$.outcome.details")?
         }
-        WorkflowOutcome::TimedOut { successor } => {
-            if let Some(successor) = successor {
-                validate_successor(successor)?;
-            }
-        }
-        WorkflowOutcome::ContinuedAsNew { successor } => validate_successor(successor)?,
+        WorkflowOutcome::TimedOut { .. } | WorkflowOutcome::ContinuedAsNew { .. } => {}
     }
-    Ok(())
+    outcome_successor(value).map_or(Ok(()), validate_successor_shape)
+}
+
+/// Returns the successor run an outcome names, if any: optional for
+/// completion, failure, and timeout (a retry or cron successor), required for
+/// continue-as-new, and impossible for cancellation and termination.
+fn outcome_successor(value: &WorkflowOutcome) -> Option<&SuccessorRef> {
+    match value {
+        WorkflowOutcome::Completed { successor, .. }
+        | WorkflowOutcome::Failed { successor, .. }
+        | WorkflowOutcome::TimedOut { successor } => successor.as_ref(),
+        WorkflowOutcome::ContinuedAsNew { successor } => Some(successor),
+        WorkflowOutcome::Cancelled { .. } | WorkflowOutcome::Terminated { .. } => None,
+    }
 }
 
 /// Validates the shape of successor metadata without assuming its parent run.
 fn validate_successor_shape(value: &SuccessorRef) -> Result<(), protocol::ProtocolError> {
-    validate_identifier(&value.namespace, "$.outcome.successor.namespace")?;
-    validate_identifier(&value.workflow_id, "$.outcome.successor.workflow_id")?;
-    validate_identifier(&value.run_id, "$.outcome.successor.run_id")
+    validate_execution_identity(
+        &value.namespace,
+        &value.workflow_id,
+        &value.run_id,
+        "$.outcome.successor",
+    )
 }
 
 /// Enforces that a successor remains in the same execution chain and is a new
@@ -3550,21 +3678,18 @@ fn validate_successor_for_execution(
 /// still has to name a concrete run, which then differs from the empty
 /// selector automatically.
 fn validate_wait_response(value: &WaitWorkflowResponse) -> Result<(), protocol::ProtocolError> {
-    validate_identifier(&value.execution.namespace, "$.execution.namespace")?;
-    validate_identifier(&value.execution.workflow_id, "$.execution.workflow_id")?;
+    validate_identifier_fields(
+        "$.execution",
+        [
+            ("namespace", &value.execution.namespace),
+            ("workflow_id", &value.execution.workflow_id),
+        ],
+    )?;
     validate_run_selector(&value.execution.run_id, "$.execution.run_id")?;
     validate_outcome(&value.outcome)?;
-    let successor = match &value.outcome {
-        WorkflowOutcome::Completed { successor, .. }
-        | WorkflowOutcome::Failed { successor, .. }
-        | WorkflowOutcome::TimedOut { successor } => successor.as_ref(),
-        WorkflowOutcome::ContinuedAsNew { successor } => Some(successor),
-        WorkflowOutcome::Cancelled { .. } | WorkflowOutcome::Terminated { .. } => None,
-    };
-    if let Some(successor) = successor {
-        validate_successor_for_execution(successor, &value.execution)?;
-    }
-    Ok(())
+    outcome_successor(&value.outcome).map_or(Ok(()), |successor| {
+        validate_successor_for_execution(successor, &value.execution)
+    })
 }
 
 /// Serializes, strictly reparses, and validates a client response.
@@ -3597,6 +3722,33 @@ fn validate_run_selector(value: &str, path: &str) -> Result<(), protocol::Protoc
         Ok(())
     } else {
         validate_identifier(value, path)
+    }
+}
+
+/// Validates named identifier members of one document object, in order, each
+/// at `{path}.{name}`. Pairing every member with its name keeps the reported
+/// path from drifting away from the field that was checked.
+fn validate_identifier_fields<'a, S: AsRef<str> + ?Sized + 'a>(
+    path: &str,
+    fields: impl IntoIterator<Item = (&'a str, &'a S)>,
+) -> Result<(), protocol::ProtocolError> {
+    fields.into_iter().try_for_each(|(name, value)| {
+        validate_identifier(value.as_ref(), &format!("{path}.{name}"))
+    })
+}
+
+/// Refuses a document whose `condition` does not hold, reporting `message`
+/// at `path`: acknowledgement flags and the closed vocabularies of response
+/// rows use it.
+fn require(
+    condition: bool,
+    path: impl Into<String>,
+    message: &'static str,
+) -> Result<(), protocol::ProtocolError> {
+    if condition {
+        Ok(())
+    } else {
+        Err(protocol::ProtocolError::invalid(path, message))
     }
 }
 
