@@ -158,6 +158,24 @@
         "descriptor_sha256": "8c92175f70af3c521cb8fedd9713fe928b64b386953345b87867768233b5947c",
         "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
       }
+    },
+    "live-2026-11-16-start-metadata": {
+      "kind": "live",
+      "captured_on": "2026-11-16",
+      "sdk_commit": "77c3624d66dbcde2102a25711f9fd557b27e7b46",
+      "sdk_tree_dirty": false,
+      "core_revision": "8fe478ee179ed754614d230f39586f3edb57da71",
+      "temporal_server_image": "temporalio/server:1.32.2@sha256:7bf69188a6232fea14869b9cef3d94aa82a1601d99517f7e86c71f22da4e0670",
+      "temporal_cli_image": "temporalio/admin-tools:1.32.2@sha256:4a95866efba29d7e17ab012df5232795e8b0ad0f7d5f9d1ec4df321f7792a754",
+      "worker_toolchains": [
+        "OCaml 5.4.1 (Unix)"
+      ],
+      "capture_command": "make history-corpus-capture HISTORY_CORPUS_CAPTURE_ID=live-2026-11-16-start-metadata HISTORY_CORPUS_GENERATIONS=corpus-v7-start-metadata",
+      "protobuf_export": {
+        "tool": "Python protobuf 6.33.6 json_format",
+        "descriptor_sha256": "8c92175f70af3c521cb8fedd9713fe928b64b386953345b87867768233b5947c",
+        "descriptor_source": "protoc --include_imports over the pinned Core temporal/api/history/v1/message.proto"
+      }
     }
   },
   "entries": [
@@ -2255,6 +2273,71 @@
       },
       "replay_definitions": "corpus-v6-child-start-metadata",
       "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-11-16-start-metadata-start-metadata-full",
+      "purpose": "Root run started with a memo, keyword and integer search attributes, execution/run/task timeouts, a retry policy and a start delay; it reads them through Workflow.start_metadata and Workflow.Info and starts its timer only when they match the frozen expectation.",
+      "features": [
+        "start-metadata",
+        "start-delay",
+        "timer"
+      ],
+      "workflow_type": "corpus.start_metadata",
+      "workflow_id": "history-corpus-start-metadata-full",
+      "run_id": "01a1df65-68f4-7e57-afd0-6916f9c2a6f4",
+      "capture": "live-2026-11-16-start-metadata",
+      "generation": "corpus-v7-start-metadata",
+      "history": {
+        "protobuf": "histories/live-2026-11-16-start-metadata-start-metadata-full.pb",
+        "protobuf_sha256": "4b4814254a74ecda5ba6cdca1b96ac4b6b2366061ce0b798f78cc47ffd8ff3f8",
+        "json": "histories/live-2026-11-16-start-metadata-start-metadata-full.json",
+        "json_sha256": "6d75cad9898315c4e9fce243a1314db22601fbe80d5fa22d4ca3bc1b2ddccacc"
+      },
+      "replay_definitions": "corpus-v7-start-metadata",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "live-2026-11-16-start-metadata-start-metadata-absent",
+      "purpose": "Root run started with no start options; it observes absent maps, no expiration, timeouts or retry policy, and Temporal's default task timeout.",
+      "features": [
+        "start-metadata",
+        "timer"
+      ],
+      "workflow_type": "corpus.start_metadata",
+      "workflow_id": "history-corpus-start-metadata-absent",
+      "run_id": "01a1df65-6900-7da3-a04a-273be7c524c8",
+      "capture": "live-2026-11-16-start-metadata",
+      "generation": "corpus-v7-start-metadata",
+      "history": {
+        "protobuf": "histories/live-2026-11-16-start-metadata-start-metadata-absent.pb",
+        "protobuf_sha256": "89f5651aa3208ec72b4089490a2cc77efdf5f990677a47abbf4200bcf7d75797",
+        "json": "histories/live-2026-11-16-start-metadata-start-metadata-absent.json",
+        "json_sha256": "b0e000c5fa1e97608f29bc4c752350ebab22bc222f40a83a0623e8461744ff9b"
+      },
+      "replay_definitions": "corpus-v7-start-metadata",
+      "expected": "replays_ok"
+    },
+    {
+      "id": "negative-start-metadata-memo",
+      "purpose": "Negative control: corpus.start_metadata expecting another memo value must not start its timer, so the recorded full start-metadata history is reported as nondeterministic.",
+      "features": [
+        "start-metadata",
+        "timer",
+        "negative-control"
+      ],
+      "workflow_type": "corpus.start_metadata",
+      "workflow_id": "history-corpus-start-metadata-full",
+      "run_id": "01a1df65-68f4-7e57-afd0-6916f9c2a6f4",
+      "capture": "live-2026-11-16-start-metadata",
+      "history": {
+        "protobuf": "histories/live-2026-11-16-start-metadata-start-metadata-full.pb",
+        "protobuf_sha256": "4b4814254a74ecda5ba6cdca1b96ac4b6b2366061ce0b798f78cc47ffd8ff3f8",
+        "json": "histories/live-2026-11-16-start-metadata-start-metadata-full.json",
+        "json_sha256": "6d75cad9898315c4e9fce243a1314db22601fbe80d5fa22d4ca3bc1b2ddccacc"
+      },
+      "replay_definitions": "negative-start-metadata-memo",
+      "expected": "nondeterminism",
+      "negative_control_of": "live-2026-11-16-start-metadata-start-metadata-full"
     }
   ]
 }
