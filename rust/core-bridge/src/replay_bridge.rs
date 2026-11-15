@@ -161,17 +161,16 @@ fn validate_workflow_id(workflow_id: &str) -> Result<(), ReplayInputError> {
 
 /// Decodes one canonical base64 protobuf payload after validating the wire
 /// object's exact fields and the shared JSON resource limits.
+///
+/// The body follows the same canonical padded base64 rule and
+/// [`MAX_PAYLOAD_BYTES`] bound as every other bridge payload, so it is
+/// decoded by [`protocol::decode_canonical_base64`]; any rejection there is
+/// this module's single encoding error.
 fn decode_history_bytes(payload: &ReplayPayload) -> Result<Vec<u8>, ReplayInputError> {
     if payload.encoding != "base64" {
         return Err(ReplayInputError::InvalidEncoding);
     }
-    let decoded = STANDARD
-        .decode(payload.data.as_bytes())
-        .map_err(|_| ReplayInputError::InvalidEncoding)?;
-    if decoded.len() > MAX_PAYLOAD_BYTES || STANDARD.encode(&decoded) != payload.data {
-        return Err(ReplayInputError::InvalidEncoding);
-    }
-    Ok(decoded)
+    protocol::decode_canonical_base64(&payload.data).ok_or(ReplayInputError::InvalidEncoding)
 }
 
 /// Parses a replay document through the duplicate-aware shared JSON parser,

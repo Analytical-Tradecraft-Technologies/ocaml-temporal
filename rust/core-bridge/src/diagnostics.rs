@@ -30,7 +30,7 @@ use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use temporalio_client::errors::ClientConnectError;
@@ -186,7 +186,7 @@ impl CoreLogShared {
     /// Locks the sender slot, recovering from poisoning: the slot is a plain
     /// `Option` that no panic can leave logically inconsistent.
     fn sender(&self) -> MutexGuard<'_, Option<SyncSender<String>>> {
-        self.sender.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::sync::lock(&self.sender)
     }
 }
 
