@@ -36,7 +36,7 @@ opam_dune build --root . ./main.exe ./main.bc ./worker_environment.exe \
 # custom runtime must find the static archives through $CAMLORIGIN.
 ./_build/default/main.bc
 ./_build/default/worker_environment.exe
-# Offline replay of a frozen corpus history through the relocated package
-# (#497); prepare-consumer copies the history next to this script.
-./_build/default/installed_replay.exe timer-history.pb
+# Offline replay of a successful and a failed frozen corpus history through the
+# relocated package (#497); prepare-consumer copies both next to this script.
+./_build/default/installed_replay.exe timer-history.pb failed-history.pb
 printf '%s\n' 'Precompiled SDK consumer passed; no SDK OCaml, C, or Rust compilation.'

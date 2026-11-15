@@ -648,6 +648,15 @@ and the relocated binary-only consumer (`test/bridge/test_prebuilt_library.sh`,
 prepared by `scripts/ocaml-library-artifact.py prepare-consumer`) both copy
 the history next to the consumer and run it. No new capture was made.
 
+Update (2026-11-16): the consumer now also replays the failed-workflow corpus
+history `task-failure-business-permanent.pb`, so the installed package itself
+checks both successful and failed histories. The recorded code, which returns
+a non-retryable application error, replays cleanly, and the same workflow
+type changed to succeed is `Nondeterminism` at the recorded
+`WorkflowExecutionFailed` event. `make test-install`, the prebuilt consumer
+and `scripts/check-source-archive-consumer.sh` pass the history as the
+executable's second argument.
+
 The oversized-history bound now has direct evidence.
 `test/replay_cli/test_replay_cli.ml` creates a sparse file of
 `Temporal.Replay.History.max_bytes + 1` bytes with `Unix.ftruncate` and
