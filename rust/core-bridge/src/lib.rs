@@ -15,6 +15,7 @@ pub mod protocol;
 mod replay_bridge;
 #[doc(hidden)]
 pub mod sigpipe;
+mod sync;
 mod telemetry;
 #[doc(hidden)]
 pub mod worker_bridge;

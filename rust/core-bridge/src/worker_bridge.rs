@@ -4,11 +4,18 @@
 //! shared by the Rust-owned workflow and activity poll lanes so that task
 //! identity, completion, and worker finalization cannot race through separate
 //! ad-hoc state machines.
+//!
+//! Every mutex here (task ledgers and lane readiness state) is locked through
+//! [`crate::sync::lock`], which recovers a poisoned guard. A panic while a
+//! ledger lock was held must not stop later callers: shutdown and disposal
+//! still have to read and retire the remaining completion debts rather than
+//! panic again on the poisoned mutex.
 
+use crate::sync::lock;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use temporalio_common::protos::TaskToken;
 use temporalio_common::protos::coresdk::{
@@ -177,16 +184,6 @@ async fn retire_workflow_in_core(
     let _ = worker.complete_workflow_activation(completion).await;
 }
 
-/// Locks a worker's task ledger, recovering the guard from a poisoned lock.
-///
-/// Every ledger access in this module goes through here. A panic while the
-/// lock was held does not stop later callers: shutdown and disposal must
-/// still be able to read and retire the remaining completion debts rather
-/// than panic again on the poisoned mutex.
-fn lock_ledger(ledger: &Mutex<TaskLedger>) -> MutexGuard<'_, TaskLedger> {
-    ledger.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// Restores the ledger lease of a workflow completion that Core rejected.
 ///
 /// A rejected request never landed with Core, so no follow-up activation for
@@ -196,7 +193,7 @@ fn lock_ledger(ledger: &Mutex<TaskLedger>) -> MutexGuard<'_, TaskLedger> {
 /// Shared by the synchronous and the admitted (asynchronous) completion
 /// paths, which differ only in where Core is awaited.
 fn restore_rejected_workflow_lease(ledger: &Mutex<TaskLedger>, run_id: &str, was_eviction: bool) {
-    let mut ledger = lock_ledger(ledger);
+    let mut ledger = lock(ledger);
     if ledger.restore_rejected_workflow_completion(run_id) && was_eviction {
         ledger.restore_eviction_lease(run_id);
     }
@@ -804,7 +801,7 @@ where
                     };
                     if let Ok(activation) = message {
                         let run_id = activation.run_id;
-                        lock_ledger(ledger).force_remove_workflow(&run_id);
+                        lock(ledger).force_remove_workflow(&run_id);
                         acknowledge(run_id).await;
                     }
                 }
@@ -904,10 +901,7 @@ impl AnyLaneWake {
     /// Wakes every combined waiter after a lane's predicate changed. Callers
     /// must not hold any lane `state` mutex (see the lock order above).
     fn notify(&self) {
-        let mut generation = self
-            .generation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut generation = lock(&self.generation);
         *generation = generation.wrapping_add(1);
         self.wake.notify_all();
     }
@@ -970,10 +964,7 @@ impl Readiness {
         sender: &mpsc::UnboundedSender<ReadyTask<T>>,
         message: ReadyTask<T>,
     ) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock(&self.state);
         let sent = if sender.send(message).is_err() {
             // The owner has gone away. No future caller can drain this lane,
             // but marking it closed also prevents a defensive waiter from
@@ -1021,10 +1012,7 @@ impl Readiness {
         receiver: &mut mpsc::UnboundedReceiver<ReadyTask<T>>,
         report_failure: bool,
     ) -> Option<ReadyTask<T>> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock(&self.state);
         match receiver.try_recv() {
             Ok(message) => {
                 // A successful receive is paired with exactly one successful
@@ -1068,10 +1056,7 @@ impl Readiness {
         receiver: &mut mpsc::UnboundedReceiver<ReadyTask<T>>,
     ) -> Option<ReadyTask<T>> {
         let message = receiver.recv().await?;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock(&self.state);
         debug_assert!(state.pending > 0);
         state.pending = state.pending.saturating_sub(1);
         Some(message)
@@ -1091,10 +1076,7 @@ impl Readiness {
 
     /// Records a fatal poll-lane error and wakes the owner immediately.
     fn fail(&self, error: PollLaneError) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock(&self.state);
         state.error = Some(error);
         self.wake.notify_all();
         drop(state);
@@ -1115,10 +1097,7 @@ impl Readiness {
     /// Shared body of [`Self::close`] and [`Self::close_after_core_shutdown`].
     /// The Core flag is sticky: a later bridge-side close never clears it.
     fn close_inner(&self, core_stream_ended: bool) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock(&self.state);
         state.closed = true;
         state.core_stream_ended |= core_stream_ended;
         self.wake.notify_all();
@@ -1130,27 +1109,17 @@ impl Readiness {
     /// A full completion window uses it so a lane failure is still reported
     /// while queued activations wait for a credit.
     fn failure(&self) -> Option<PollLaneError> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .error
-            .clone()
+        lock(&self.state).error.clone()
     }
 
     /// Reports whether Core has terminated the stream feeding this lane.
     fn core_stream_ended(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .core_stream_ended
+        lock(&self.state).core_stream_ended
     }
 
     /// Blocks until work, a fatal error, or terminal closure is observable.
     fn wait(&self) -> ReadinessWait {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock(&self.state);
         let deadline = Instant::now() + READINESS_WAIT_TIMEOUT;
         loop {
             // Queued messages always win over terminal flags: the supervisor
@@ -1188,14 +1157,8 @@ impl Readiness {
 /// wake mutex, and no producer holds two lane mutexes, so this cannot
 /// deadlock with them.
 fn observe_both(workflow: &Readiness, activity: &Readiness) -> [LaneObservation; 2] {
-    let workflow_state = workflow
-        .state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let activity_state = activity
-        .state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let workflow_state = lock(&workflow.state);
+    let activity_state = lock(&activity.state);
     [&*workflow_state, &*activity_state].map(|state| LaneObservation {
         pending: state.pending > 0,
         error: state.error.clone(),
@@ -1220,10 +1183,7 @@ fn wait_any_lane(
 ) -> ReadinessWait {
     debug_assert!(Arc::ptr_eq(&workflow.any, &activity.any));
     let any = &workflow.any;
-    let mut generation = any
-        .generation
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut generation = lock(&any.generation);
     let deadline = Instant::now() + READINESS_WAIT_TIMEOUT;
     loop {
         let [workflow_lane, activity_lane] = observe_both(workflow, activity);
@@ -1540,7 +1500,7 @@ impl PollLanes {
             .take_or_failure(&mut self.workflow_ready)?;
         match ready {
             Ok(activation) => {
-                let lease = lock_ledger(&self.ledger)
+                let lease = lock(&self.ledger)
                     .lease_workflow_activation(&activation.run_id, activation.is_only_eviction());
                 match lease {
                     Ok(()) => {
@@ -1563,7 +1523,7 @@ impl PollLanes {
                             &run_id,
                             "workflow activation lease handoff failed",
                         ));
-                        lock_ledger(&self.ledger).abandon_workflow_admission(&run_id);
+                        lock(&self.ledger).abandon_workflow_admission(&run_id);
                         Some(Err(PollLaneError::Admission(AdmitError::InvalidIdentity)))
                     }
                 }
@@ -1600,7 +1560,7 @@ impl PollLanes {
                     } else {
                         ActivityAdmission::Start
                     };
-                    let lease = lock_ledger(&self.ledger).handoff_activity(&task.task_token, kind);
+                    let lease = lock(&self.ledger).handoff_activity(&task.task_token, kind);
                     match lease {
                         Ok(()) => return Some(Ok(task)),
                         Err(error) if is_stale_activity_cancellation(&task, error) => {
@@ -1623,7 +1583,7 @@ impl PollLanes {
                                 &task_token,
                                 "activity task lease handoff failed",
                             ));
-                            lock_ledger(&self.ledger).abandon_activity_admission(&task_token);
+                            lock(&self.ledger).abandon_activity_admission(&task_token);
                             return Some(Err(PollLaneError::Admission(
                                 AdmitError::InvalidIdentity,
                             )));
@@ -1669,7 +1629,7 @@ impl PollLanes {
         if self.shutdown_started {
             return;
         }
-        lock_ledger(&self.ledger).begin_draining();
+        lock(&self.ledger).begin_draining();
     }
 
     /// Waits for the next workflow-lane message without holding the OCaml lock.
@@ -1744,7 +1704,7 @@ impl PollLanes {
         // can race the ledger, so disposal tombstones no longer provide a
         // safety property and must be released even if the caller skips a
         // redundant post-join force-completion pass.
-        lock_ledger(&self.ledger).clear_dispose_retired();
+        lock(&self.ledger).clear_dispose_retired();
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1787,7 +1747,7 @@ impl PollLanes {
             },
         )
         .await;
-        lock_ledger(&self.ledger).clear_dispose_retired();
+        lock(&self.ledger).clear_dispose_retired();
         match outcome {
             ReplayLaneJoin::Joined(result) => result,
             ReplayLaneJoin::TimedOut => {
@@ -1886,7 +1846,7 @@ impl PollLanes {
             Ok(Ok(())) => Ok(retirement),
             Ok(Err(error)) => Err(ShutdownDrainError::Lane(error)),
             Err(_elapsed) => {
-                lock_ledger(&self.ledger).mark_lost_poll_lease();
+                lock(&self.ledger).mark_lost_poll_lease();
                 Err(ShutdownDrainError::TimedOut)
             }
         }
@@ -1954,7 +1914,7 @@ impl PollLanes {
         // No producer remains, so this pass retires the last tasks published
         // between the final wait and each lane's exit.
         self.retire_visible_for_shutdown(retirement).await;
-        lock_ledger(&self.ledger).clear_dispose_retired();
+        lock(&self.ledger).clear_dispose_retired();
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1966,7 +1926,7 @@ impl PollLanes {
     /// language side already reported them as unknown.
     async fn retire_visible_for_shutdown(&mut self, retirement: &mut ShutdownRetirement) {
         self.completions.clear_for_shutdown();
-        let (workflows, activities) = lock_ledger(&self.ledger).take_leased_for_shutdown();
+        let (workflows, activities) = lock(&self.ledger).take_leased_for_shutdown();
         retirement.abandoned_leases += workflows.len() + activities.len();
         for (run_id, eviction_only) in workflows {
             retire_workflow_in_core(self.worker.as_ref(), &run_id, eviction_only, || {
@@ -2004,7 +1964,7 @@ impl PollLanes {
         let eviction_only = activation.is_only_eviction();
         let run_id = activation.run_id;
         // Retire before awaiting Core; see `drain_and_join_for_shutdown`.
-        lock_ledger(&self.ledger).force_remove_workflow(&run_id);
+        lock(&self.ledger).force_remove_workflow(&run_id);
         retirement.undelivered += 1;
         retire_workflow_in_core(self.worker.as_ref(), &run_id, eviction_only, || {
             shutdown_retirement_message("workflow activation was not delivered before shutdown")
@@ -2025,7 +1985,7 @@ impl PollLanes {
         if matches!(task.variant, Some(activity_task::Variant::Cancel(_))) {
             return;
         }
-        lock_ledger(&self.ledger).force_remove_activity(&task.task_token);
+        lock(&self.ledger).force_remove_activity(&task.task_token);
         retirement.undelivered += 1;
         retire_activity_in_core(
             self.worker.as_ref(),
@@ -2055,7 +2015,7 @@ impl PollLanes {
 
     /// Reports whether every task admitted before shutdown has completed.
     pub fn can_finalize(&self) -> bool {
-        lock_ledger(&self.ledger).can_finalize()
+        lock(&self.ledger).can_finalize()
     }
 
     /// Reports whether any workflow or activity completion debt remains.
@@ -2066,7 +2026,7 @@ impl PollLanes {
     /// disposal should continue to use [`Self::can_finalize`], which also
     /// requires the explicit draining phase.
     pub fn has_outstanding_tasks(&self) -> bool {
-        lock_ledger(&self.ledger).outstanding() != 0
+        lock(&self.ledger).outstanding() != 0
     }
 
     /// Best-effort Core completion for every task still owned by this worker.
@@ -2097,7 +2057,7 @@ impl PollLanes {
         self.completions.clear_for_shutdown();
         // Complete ledger debt first so Core can finish poll loops that are
         // blocked waiting for outstanding-task permits during shutdown.
-        let (workflows, activity_tokens) = lock_ledger(&self.ledger).take_all_outstanding();
+        let (workflows, activity_tokens) = lock(&self.ledger).take_all_outstanding();
         let mut completed_workflow_ids: HashSet<String> =
             workflows.iter().map(|(run_id, _)| run_id.clone()).collect();
         for (run_id, eviction_only) in &workflows {
@@ -2189,7 +2149,7 @@ impl PollLanes {
     /// otherwise keep Core's poll future alive) and again after the join (to
     /// retire any activation published at the join boundary).
     pub async fn abandon_replay_for_dispose(&mut self) {
-        let (mut workflow_ids, _) = lock_ledger(&self.ledger).take_all_outstanding_for_replay();
+        let (mut workflow_ids, _) = lock(&self.ledger).take_all_outstanding_for_replay();
         let mut seen_workflows: HashSet<String> = workflow_ids.iter().cloned().collect();
 
         // `take_all_outstanding_for_replay` includes both activations already leased to
@@ -2202,7 +2162,7 @@ impl PollLanes {
                 // An activation admitted after the ledger snapshot still
                 // owns a Core completion debt. Remove it now and include it
                 // exactly once in this empty-completion pass.
-                lock_ledger(&self.ledger).force_remove_workflow(&run_id);
+                lock(&self.ledger).force_remove_workflow(&run_id);
                 if seen_workflows.insert(run_id.clone()) {
                     workflow_ids.push(run_id);
                 }
@@ -2234,7 +2194,7 @@ impl PollLanes {
         if !completed.insert(run_id.to_owned()) {
             return false;
         }
-        lock_ledger(ledger).retire_workflow_for_dispose(run_id);
+        lock(ledger).retire_workflow_for_dispose(run_id);
         true
     }
 
@@ -2250,7 +2210,7 @@ impl PollLanes {
         if !completed.insert(task_token.to_vec()) {
             return false;
         }
-        lock_ledger(ledger).retire_activity_for_dispose(task_token);
+        lock(ledger).retire_activity_for_dispose(task_token);
         true
     }
 
@@ -2354,7 +2314,7 @@ impl PollLanes {
         run_id: &str,
         retire: fn(&mut TaskLedger, &str) -> Result<(), CompleteError>,
     ) -> Result<bool, WorkerBridgeError> {
-        let mut ledger = lock_ledger(&self.ledger);
+        let mut ledger = lock(&self.ledger);
         let was_eviction = ledger.is_eviction_lease(run_id);
         retire(&mut ledger, run_id).map_err(WorkerBridgeError::Completion)?;
         Ok(was_eviction)
@@ -2377,7 +2337,7 @@ impl PollLanes {
         // this await would probe `true`, deterministically failing the
         // ordering test.
         #[cfg(test)]
-        lock_ledger(&self.ledger).probe_complete_completion(&run_id);
+        lock(&self.ledger).probe_complete_completion(&run_id);
         let Some(core_result) = self
             .send_workflow_completion(completion, wait, is_empty)
             .await?
@@ -2474,7 +2434,7 @@ impl PollLanes {
     /// Checks, without changing the ledger, that `task_token` is leased to
     /// OCaml, so a completion, heartbeat, or rejection for it is authorized.
     fn ensure_activity_leased(&self, task_token: &[u8]) -> Result<(), WorkerBridgeError> {
-        lock_ledger(&self.ledger)
+        lock(&self.ledger)
             .ensure_activity_leased(task_token)
             .map_err(WorkerBridgeError::Completion)
     }
@@ -2490,7 +2450,7 @@ impl PollLanes {
             .complete_activity_task(completion)
             .await
             .map_err(|error| WorkerBridgeError::CoreActivity(error.to_string()))?;
-        lock_ledger(&self.ledger)
+        lock(&self.ledger)
             .complete_activity(&task_token)
             .map_err(WorkerBridgeError::Completion)
     }
@@ -2601,7 +2561,7 @@ impl PollLanes {
         // always probes `false`. A regression that retired after this await
         // would probe `true`, deterministically failing the ordering test.
         #[cfg(test)]
-        lock_ledger(&self.ledger).probe_reject_completion(run_id);
+        lock(&self.ledger).probe_reject_completion(run_id);
         // An eviction acknowledgement is empty; see `complete_replay_workflow`
         // for why a stranded one is success.
         let Some(core_result) = self
@@ -2618,9 +2578,7 @@ impl PollLanes {
     /// retired its lease before handing the failure to Core.
     #[cfg(test)]
     pub(crate) fn reject_completion_probes(&self) -> Vec<bool> {
-        lock_ledger(&self.ledger)
-            .reject_completion_probes()
-            .to_vec()
+        lock(&self.ledger).reject_completion_probes().to_vec()
     }
 
     /// Test-only view of the terminal-completion ordering probes recorded by
@@ -2628,9 +2586,7 @@ impl PollLanes {
     /// completion retired its lease before handing the completion to Core.
     #[cfg(test)]
     pub(crate) fn complete_completion_probes(&self) -> Vec<bool> {
-        lock_ledger(&self.ledger)
-            .complete_completion_probes()
-            .to_vec()
+        lock(&self.ledger).complete_completion_probes().to_vec()
     }
 
     /// Fails a remote activity task that semantic conversion could not expose.
@@ -2660,7 +2616,7 @@ impl PollLanes {
             .complete_activity_task(completion)
             .await
             .map_err(|error| WorkerBridgeError::CoreActivity(error.to_string()));
-        let ledger_result = lock_ledger(&self.ledger)
+        let ledger_result = lock(&self.ledger)
             .retire_rejected_activity(task_token)
             .map_err(WorkerBridgeError::Completion);
         core_result.and(ledger_result)
@@ -2677,7 +2633,7 @@ impl PollLanes {
     #[allow(clippy::result_large_err)]
     pub async fn finalize(self) -> Result<(), (Self, WorkerBridgeError)> {
         let (outstanding, lost_poll_lease) = {
-            let ledger_state = lock_ledger(&self.ledger);
+            let ledger_state = lock(&self.ledger);
             (ledger_state.outstanding(), ledger_state.lost_poll_lease)
         };
         if outstanding != 0 {
@@ -2823,7 +2779,7 @@ async fn run_workflow_lane(
                 return;
             }
         };
-        let admission = lock_ledger(&ledger)
+        let admission = lock(&ledger)
             .admit_polled_workflow_activation(&activation.run_id, activation.is_only_eviction());
         match admission {
             Ok(Admission::New) => {
@@ -2832,7 +2788,7 @@ async fn run_workflow_lane(
                     // The ready channel is closed. Retire the just-admitted
                     // identity and complete Core so disposal cannot leave an
                     // uncompleted poll debt behind.
-                    lock_ledger(&ledger).abandon_workflow_admission(&run_id);
+                    lock(&ledger).abandon_workflow_admission(&run_id);
                     force_fail_undeliverable_workflow(
                         worker.as_ref(),
                         &run_id,
@@ -2848,7 +2804,7 @@ async fn run_workflow_lane(
                 // activation that is still queued or leased to OCaml. Drop the
                 // duplicate delivery, persist a fatal drain blocker, and
                 // surface a lane error instead.
-                lock_ledger(&ledger).mark_lost_poll_lease();
+                lock(&ledger).mark_lost_poll_lease();
                 drop(activation);
                 if !signal.enqueue(&sender, Err(PollLaneError::DuplicateIdentity)) {
                     return;
@@ -2874,7 +2830,7 @@ async fn run_workflow_lane(
                 // Core's follow-up eviction. A second poll with the same run
                 // ID is therefore diagnostic only: dropping it is safer than
                 // sending a duplicate Core completion.
-                lock_ledger(&ledger).mark_lost_poll_lease();
+                lock(&ledger).mark_lost_poll_lease();
                 drop(activation);
                 if !signal.enqueue(&sender, Err(PollLaneError::Admission(error))) {
                     return;
@@ -2965,7 +2921,7 @@ async fn run_activity_lane(
                 continue;
             }
         };
-        let admission = lock_ledger(&ledger).admit_polled_activity(&task.task_token, kind);
+        let admission = lock(&ledger).admit_polled_activity(&task.task_token, kind);
         if is_ignorable_activity_cancellation(kind, &admission) {
             // See `is_ignorable_activity_cancellation`: an unknown, retired,
             // or repeated cancellation owns no Core completion debt, so it
@@ -2981,7 +2937,7 @@ async fn run_activity_lane(
                     // Ready channel closed after admission. Only Start-shaped
                     // debts need a Core completion; cancel notifications do not.
                     if admitted_start {
-                        lock_ledger(&ledger).abandon_activity_admission(&task_token);
+                        lock(&ledger).abandon_activity_admission(&task_token);
                         force_fail_undeliverable_activity(
                             worker.as_ref(),
                             &task_token,
@@ -3000,7 +2956,7 @@ async fn run_activity_lane(
                 // duplicate path, and persist the fatal drain blocker. A
                 // duplicate Cancel never reaches this arm: it was dropped
                 // above as an ignorable update.
-                lock_ledger(&ledger).mark_lost_poll_lease();
+                lock(&ledger).mark_lost_poll_lease();
                 drop(task);
                 if !signal.enqueue(&sender, Err(PollLaneError::DuplicateIdentity)) {
                     return;
@@ -3019,7 +2975,7 @@ async fn run_activity_lane(
                     force_fail_undeliverable_activity(worker.as_ref(), &task.task_token, reason)
                         .await;
                 } else {
-                    lock_ledger(&ledger).mark_lost_poll_lease();
+                    lock(&ledger).mark_lost_poll_lease();
                     drop(task);
                 }
                 if !signal.enqueue(&sender, Err(PollLaneError::Admission(error))) {
@@ -3750,223 +3706,16 @@ impl Default for TaskLedger {
     }
 }
 
-/// Readiness coverage for the workflow-completion window, kept in its own
-/// file; as a child module it can reach the private readiness helpers.
+/// Readiness coverage for the workflow-completion window; as a child module
+/// it can reach the private readiness helpers.
 #[cfg(test)]
+#[path = "../tests/support/completion_window_readiness.rs"]
 mod completion_window_readiness_tests;
 
+/// Readiness-signal coverage for the private poll-lane helpers.
 #[cfg(test)]
-mod readiness_tests {
-    use super::{
-        ACTIVITY_COMPLETION_RETRY_BACKOFF, AnyLaneWake, PollLaneError, Readiness, ReadinessWait,
-        ReadyTask, WORKFLOW_DELIVERY_REJECTION_BACKOFF, wait_any_lane,
-    };
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::Duration;
-    use tokio::sync::mpsc;
-
-    /// Keeps the completion retry delay positive and bounded so a future
-    /// change cannot accidentally reintroduce a tight loop or make shutdown
-    /// wait for an unbounded interval.
-    #[test]
-    fn completion_retry_backoff_is_positive_and_bounded() {
-        assert!(ACTIVITY_COMPLETION_RETRY_BACKOFF > Duration::ZERO);
-        assert!(ACTIVITY_COMPLETION_RETRY_BACKOFF <= Duration::from_secs(1));
-        assert!(WORKFLOW_DELIVERY_REJECTION_BACKOFF > Duration::ZERO);
-        assert!(WORKFLOW_DELIVERY_REJECTION_BACKOFF <= Duration::from_secs(1));
-    }
-
-    /// Confirms a notification committed before waiting is observed immediately.
-    #[test]
-    fn notification_before_wait_returns_ready() {
-        let signal = Readiness::new();
-        let (sender, mut receiver) = mpsc::unbounded_channel::<ReadyTask<()>>();
-
-        assert!(signal.enqueue(&sender, Ok(())));
-        assert_eq!(signal.wait(), ReadinessWait::Ready);
-        assert!(signal.take(&mut receiver).is_some());
-    }
-
-    /// Confirms queued work cannot be received before its pending count exists.
-    ///
-    /// The producer runs on another OS thread to exercise the same ordering as
-    /// a Tokio poll lane racing an owner-domain drain.
-    #[test]
-    fn queued_work_has_a_linearizable_send_and_receive_order() {
-        let signal = Arc::new(Readiness::new());
-        let (sender, mut receiver) = mpsc::unbounded_channel::<ReadyTask<usize>>();
-        let producer_signal = Arc::clone(&signal);
-        let producer = thread::spawn(move || {
-            for value in 0..128 {
-                assert!(producer_signal.enqueue(&sender, Ok(value)));
-            }
-        });
-
-        let mut received = Vec::new();
-        while received.len() < 128 {
-            assert_eq!(signal.wait(), ReadinessWait::Ready);
-            while let Some(Ok(value)) = signal.take(&mut receiver) {
-                received.push(value);
-            }
-        }
-        producer.join().expect("producer must not panic");
-        received.sort_unstable();
-        assert_eq!(received, (0..128).collect::<Vec<_>>());
-    }
-
-    /// Confirms closing a quiet lane wakes a waiter instead of leaving it
-    /// blocked until the bounded timeout expires.
-    #[test]
-    fn shutdown_wakes_a_waiting_owner() {
-        let signal = Arc::new(Readiness::new());
-        let waiter_signal = Arc::clone(&signal);
-        let waiter = thread::spawn(move || waiter_signal.wait());
-        assert_close_wakes(waiter, || signal.close());
-    }
-
-    /// Runs `close` once `waiter` has had time to block, then asserts that
-    /// the waiter returned `Shutdown` rather than waiting out its timeout.
-    fn assert_close_wakes(waiter: thread::JoinHandle<ReadinessWait>, close: impl FnOnce()) {
-        thread::sleep(Duration::from_millis(10));
-        close();
-
-        assert_eq!(
-            waiter.join().expect("waiter must not panic"),
-            ReadinessWait::Shutdown
-        );
-    }
-
-    /// Confirms a quiet lane returns control to its supervisor after the
-    /// documented bound instead of waiting forever for an event.
-    #[test]
-    fn quiet_lane_wait_is_bounded() {
-        let signal = Readiness::new();
-
-        assert_eq!(signal.wait(), ReadinessWait::TimedOut);
-    }
-
-    /// Confirms a fatal lane error remains observable after its wakeup.
-    #[test]
-    fn lane_error_wakes_and_remains_terminal() {
-        let signal = Readiness::new();
-        let error = PollLaneError::Core("poll failed".to_owned());
-        signal.fail(error.clone());
-
-        assert_eq!(signal.wait(), ReadinessWait::Error(error.clone()));
-        assert_eq!(signal.wait(), ReadinessWait::Error(error));
-    }
-
-    /// A lane that yields locally instead of waiting on its native condition
-    /// still sees the fatal error after all previously queued work is drained.
-    #[test]
-    fn nonblocking_poll_sees_error_after_queued_work() {
-        let signal = Readiness::new();
-        let (sender, mut receiver) = mpsc::unbounded_channel::<ReadyTask<usize>>();
-        let error = PollLaneError::Core("poll failed".to_owned());
-
-        assert!(signal.enqueue(&sender, Ok(7)));
-        signal.fail(error.clone());
-        assert_eq!(signal.take_or_failure(&mut receiver), Some(Ok(7)));
-        assert_eq!(signal.take_or_failure(&mut receiver), Some(Err(error)));
-    }
-
-    /// Builds the workflow/activity signal pair exactly as a live worker does.
-    fn lane_pair() -> (Arc<Readiness>, Arc<Readiness>) {
-        let any = Arc::new(AnyLaneWake::default());
-        (
-            Arc::new(Readiness::sharing(&any)),
-            Arc::new(Readiness::sharing(&any)),
-        )
-    }
-
-    /// Regression for #806: work committed on the lane the owner was not
-    /// expecting must end a combined wait. A lane-specific wait on the quiet
-    /// lane would keep timing out however often it was repeated. The test
-    /// asserts the outcome rather than elapsed time, so scheduler delays on a
-    /// loaded runner cannot make it fail: a wait that happens to time out
-    /// before the producer runs is simply repeated, as the worker loop does.
-    #[test]
-    fn combined_wait_wakes_for_either_lane() {
-        for activity_side in [true, false] {
-            let (workflow, activity) = lane_pair();
-            let (sender, mut receiver) = mpsc::unbounded_channel::<ReadyTask<()>>();
-            let producer_signal = Arc::clone(if activity_side { &activity } else { &workflow });
-            let waiter_workflow = Arc::clone(&workflow);
-            let waiter_activity = Arc::clone(&activity);
-            let waiter = thread::spawn(move || {
-                for _ in 0..100 {
-                    match wait_any_lane(&waiter_workflow, &waiter_activity, None) {
-                        ReadinessWait::TimedOut => continue,
-                        other => return other,
-                    }
-                }
-                ReadinessWait::TimedOut
-            });
-            assert!(producer_signal.enqueue(&sender, Ok(())));
-            let result = waiter.join().expect("waiter must not panic");
-
-            assert_eq!(result, ReadinessWait::Ready);
-            // The wait is only a wake signal; the task is still drainable.
-            assert!(producer_signal.take(&mut receiver).is_some());
-        }
-    }
-
-    /// Queued work on one lane wins over a fatal error or closure on the
-    /// other, and the combined wait never consumes that work.
-    #[test]
-    fn combined_wait_prefers_work_then_error_then_shutdown() {
-        let (workflow, activity) = lane_pair();
-        let (sender, mut receiver) = mpsc::unbounded_channel::<ReadyTask<()>>();
-        let error = PollLaneError::Core("poll failed".to_owned());
-
-        assert!(activity.enqueue(&sender, Ok(())));
-        workflow.fail(error.clone());
-        assert_eq!(
-            wait_any_lane(&workflow, &activity, None),
-            ReadinessWait::Ready
-        );
-        assert_eq!(
-            wait_any_lane(&workflow, &activity, None),
-            ReadinessWait::Ready
-        );
-        assert!(activity.take(&mut receiver).is_some());
-        assert_eq!(
-            wait_any_lane(&workflow, &activity, None),
-            ReadinessWait::Error(error)
-        );
-
-        let (workflow, activity) = lane_pair();
-        activity.close();
-        assert_eq!(
-            wait_any_lane(&workflow, &activity, None),
-            ReadinessWait::Shutdown
-        );
-    }
-
-    /// Closing either lane wakes a combined waiter instead of leaving it
-    /// blocked until the bounded timeout.
-    #[test]
-    fn combined_wait_wakes_on_shutdown() {
-        let (workflow, activity) = lane_pair();
-        let waiter_workflow = Arc::clone(&workflow);
-        let waiter_activity = Arc::clone(&activity);
-        let waiter = thread::spawn(move || wait_any_lane(&waiter_workflow, &waiter_activity, None));
-        assert_close_wakes(waiter, || workflow.close());
-    }
-
-    /// Two quiet lanes still return control to the supervisor within the
-    /// documented bound, preserving shutdown responsiveness.
-    #[test]
-    fn quiet_combined_wait_is_bounded() {
-        let (workflow, activity) = lane_pair();
-
-        assert_eq!(
-            wait_any_lane(&workflow, &activity, None),
-            ReadinessWait::TimedOut
-        );
-    }
-}
+#[path = "../tests/support/worker_readiness.rs"]
+mod readiness_tests;
 
 /// Tests for the bounded replay completion await (issue #965).
 ///
@@ -3974,136 +3723,5 @@ mod readiness_tests {
 /// drop, so these tests drive [`await_reply_unless_stranded`] with reply
 /// futures that model each Core outcome directly.
 #[cfg(test)]
-mod stranded_completion_tests {
-    use super::{
-        GuardedCompletion, REPLAY_STRANDED_COMPLETION_GRACE, Readiness, ReplayLaneJoin, TaskLedger,
-        await_reply_unless_stranded, join_replay_lane_within,
-    };
-    use std::sync::Mutex;
-    use std::time::{Duration, Instant};
-    use temporalio_common::protos::coresdk::workflow_activation::WorkflowActivation;
-    use tokio::sync::mpsc;
-
-    /// Builds the current-thread runtime with timers that the helper needs.
-    fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("test runtime should start")
-    }
-
-    /// A reply that never arrives after Core's stream ended is classified as
-    /// stranded instead of waiting for the much longer overall bound.
-    #[test]
-    fn pending_reply_after_core_shutdown_is_stranded() {
-        let signal = Readiness::new();
-        signal.close_after_core_shutdown();
-        let outcome = runtime().block_on(await_reply_unless_stranded(
-            std::future::pending(),
-            &signal,
-            Duration::from_secs(60),
-        ));
-        assert!(
-            matches!(outcome, GuardedCompletion::Stranded),
-            "{outcome:?}"
-        );
-    }
-
-    /// A bridge-initiated close does not prove Core's stream has ended, so a
-    /// pending reply is only released by the overall bound.
-    #[test]
-    fn bridge_close_alone_does_not_strand_a_reply() {
-        let signal = Readiness::new();
-        signal.close();
-        let outcome = runtime().block_on(await_reply_unless_stranded(
-            std::future::pending(),
-            &signal,
-            REPLAY_STRANDED_COMPLETION_GRACE * 2,
-        ));
-        assert!(
-            matches!(outcome, GuardedCompletion::TimedOut),
-            "{outcome:?}"
-        );
-    }
-
-    /// A reply that is already available wins even when Core's stream has
-    /// ended, so a processed completion is never misreported as stranded.
-    #[test]
-    fn ready_reply_is_returned_after_core_shutdown() {
-        let signal = Readiness::new();
-        signal.close_after_core_shutdown();
-        let outcome = runtime().block_on(await_reply_unless_stranded(
-            std::future::ready(Ok(())),
-            &signal,
-            Duration::from_secs(60),
-        ));
-        assert!(
-            matches!(outcome, GuardedCompletion::Finished(Ok(()))),
-            "{outcome:?}"
-        );
-    }
-
-    /// A reply that arrives within the grace period after Core's stream ended
-    /// is still returned rather than abandoned.
-    #[test]
-    fn late_reply_within_grace_is_returned() {
-        let signal = Readiness::new();
-        signal.close_after_core_shutdown();
-        let outcome = runtime().block_on(await_reply_unless_stranded(
-            async {
-                tokio::time::sleep(REPLAY_STRANDED_COMPLETION_GRACE / 5).await;
-                Ok(())
-            },
-            &signal,
-            Duration::from_secs(60),
-        ));
-        assert!(
-            matches!(outcome, GuardedCompletion::Finished(Ok(()))),
-            "{outcome:?}"
-        );
-    }
-
-    /// The replay lane join bound covers acknowledgement waits too (PR #966
-    /// review). A lane that never exits publishes one activation whose
-    /// acknowledgement never completes; the join must still return
-    /// `TimedOut` close to its injected 200 ms bound, with the lane aborted.
-    #[test]
-    fn lane_join_bound_includes_a_stuck_acknowledgement() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("test runtime should start");
-        runtime.block_on(async {
-            let signal = Readiness::new();
-            let (sender, mut ready) = mpsc::unbounded_channel();
-            let ledger = Mutex::new(TaskLedger::new());
-            let activation = WorkflowActivation {
-                run_id: "run-stuck-ack".to_owned(),
-                ..Default::default()
-            };
-            assert!(signal.enqueue(&sender, Ok(activation)));
-            let lane = tokio::spawn(std::future::pending::<()>());
-            let lane_probe = lane.abort_handle();
-            let started = Instant::now();
-            let outcome = join_replay_lane_within(
-                lane,
-                Duration::from_millis(200),
-                &signal,
-                &mut ready,
-                &ledger,
-                |_run_id| std::future::pending::<()>(),
-            )
-            .await;
-            assert!(matches!(outcome, ReplayLaneJoin::TimedOut), "{outcome:?}");
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "the join overran its bound: {:?}",
-                started.elapsed()
-            );
-            assert!(
-                lane_probe.is_finished(),
-                "the timed-out lane must be aborted"
-            );
-        });
-    }
-}
+#[path = "../tests/support/stranded_completion.rs"]
+mod stranded_completion_tests;

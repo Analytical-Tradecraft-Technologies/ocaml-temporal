@@ -47,7 +47,7 @@
 //! bounded however many tokens application code heartbeats.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use temporalio_client::Client;
@@ -179,7 +179,7 @@ impl HeartbeatThrottle {
     /// leaves the state consistent if it panics, so a poisoned lock is used
     /// as is.
     fn lock(&self) -> MutexGuard<'_, ThrottleState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::sync::lock(&self.state)
     }
 
     /// Admits one heartbeat for `task_token`.

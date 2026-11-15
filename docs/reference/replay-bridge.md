@@ -418,8 +418,8 @@ cover:
 `replay_worker_accepts_one_history_document` runs under a 30-second test
 deadline that names the step it was blocked in, so a regression of issue #965
 fails fast instead of consuming the CI job timeout. The
-`stranded_completion_tests` module in
-[`worker_bridge.rs`](../../rust/core-bridge/src/worker_bridge.rs) checks each
+`stranded_completion_tests` module of `worker_bridge.rs` (source
+[`tests/support/stranded_completion.rs`](../../rust/core-bridge/tests/support/stranded_completion.rs)) checks each
 outcome of the bounded completion await with model reply futures: a pending
 reply after Core's shutdown is stranded, a bridge-only close is not, and a
 ready or late-but-within-grace reply is returned. Its
