@@ -152,6 +152,11 @@ let _activity_context_heartbeat :
 let _activity_context_details : T.Activity.context -> T.Payload.t list =
   T.Activity.Context.details
 
+let _activity_context_details_as :
+    'a.
+    T.Activity.context -> 'a T.Codec.t -> ('a option, T.Error.t) result =
+  T.Activity.Context.details_as
+
 let _activity_context_heartbeat_timeout :
     T.Activity.context -> T.Duration.t option =
   T.Activity.Context.heartbeat_timeout
@@ -265,24 +270,29 @@ let _activity_cancel :
   T.Activity.cancel
 
 let _activity_retry_policy_make :
-    initial_interval:T.Duration.t ->
-    backoff_coefficient:float ->
-    maximum_interval:T.Duration.t ->
-    maximum_attempts:int ->
+    ?initial_interval:T.Duration.t ->
+    ?backoff_coefficient:float ->
+    ?maximum_interval:T.Duration.t ->
+    ?maximum_attempts:int ->
     ?non_retryable_error_types:string list ->
     unit -> (T.Retry_policy.t, T.Error.t) result =
   T.Retry_policy.make
 
+(* Every field is optional so a caller can override one and keep Temporal's
+   server defaults for the rest (#1145). *)
+let _activity_retry_policy_partial : (T.Retry_policy.t, T.Error.t) result =
+  T.Retry_policy.make ~maximum_attempts:3 ()
+
 let _activity_retry_policy_initial_interval :
-    T.Retry_policy.t -> T.Duration.t =
+    T.Retry_policy.t -> T.Duration.t option =
   T.Retry_policy.initial_interval
 
 let _activity_retry_policy_backoff :
-    T.Retry_policy.t -> float =
+    T.Retry_policy.t -> float option =
   T.Retry_policy.backoff_coefficient
 
 let _activity_retry_policy_maximum_interval :
-    T.Retry_policy.t -> T.Duration.t =
+    T.Retry_policy.t -> T.Duration.t option =
   T.Retry_policy.maximum_interval
 
 let _activity_retry_policy_maximum_attempts :
@@ -442,6 +452,12 @@ let _duration_of_seconds : int64 -> T.Duration.t = T.Duration.of_seconds
 let _duration_of_minutes : int64 -> T.Duration.t = T.Duration.of_minutes
 let _duration_of_hours : int64 -> T.Duration.t = T.Duration.of_hours
 let _duration_to_ms : T.Duration.t -> int64 = T.Duration.to_ms
+let _duration_of_days : int64 -> T.Duration.t = T.Duration.of_days
+let _duration_maximum : T.Duration.t = T.Duration.maximum
+let _duration_add : T.Duration.t -> T.Duration.t -> T.Duration.t =
+  T.Duration.add
+let _duration_compare : T.Duration.t -> T.Duration.t -> int = T.Duration.compare
+let _duration_to_seconds : T.Duration.t -> int64 = T.Duration.to_seconds
 
 let _error_make :
     ?non_retryable:bool ->
@@ -1216,6 +1232,8 @@ let _time_compare : T.Time.t -> T.Time.t -> int = T.Time.compare
 let _time_seconds : T.Time.t -> int64 = T.Time.seconds
 let _time_nanoseconds : T.Time.t -> int = T.Time.nanoseconds
 let _time_equal : T.Time.t -> T.Time.t -> bool = T.Time.equal
+let _time_add : T.Time.t -> T.Duration.t -> T.Time.t = T.Time.add
+let _time_diff : T.Time.t -> T.Time.t -> T.Duration.t = T.Time.diff
 let _workflow_context_active : unit -> bool = T.Workflow_context.is_active
 
 let _workflow_local_create : 'a. unit -> 'a T.Workflow_context.Local.t =

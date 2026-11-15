@@ -478,6 +478,24 @@ module Context = struct
              data = Bytes.copy data;
            })
 
+  (** Decodes the single payload that a typed {!heartbeat} records. The
+      arity rule follows signal and update dispatch: zero payloads mean no
+      details and more than one is a non-retryable [`Codec] error, because
+      choosing one of several values would silently change their meaning. *)
+  let details_as context codec =
+    match details context with
+    | [] -> Ok None
+    | [ payload ] -> Result.map Option.some (Codec.decode codec payload)
+    | payloads ->
+        Error
+          (Error.make ~non_retryable:true ~category:`Codec
+             ~message:
+               (Printf.sprintf
+                  "heartbeat details contain %d payloads; details_as decodes \
+                   exactly one"
+                  (List.length payloads))
+             ())
+
   (** Returns the server-supplied heartbeat interval, if configured. *)
   let heartbeat_timeout context =
     Temporal_base.Activity_context.heartbeat_timeout context

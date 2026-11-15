@@ -68,10 +68,11 @@ let report () =
   let retry =
     Option.fold ~none:"-"
       ~some:(fun policy ->
-        Printf.sprintf "%Ld/%g/%Ld/%d/%s"
-          (Duration.to_ms (Policy.initial_interval policy))
-          (Policy.backoff_coefficient policy)
-          (Duration.to_ms (Policy.maximum_interval policy))
+        Printf.sprintf "%s/%s/%s/%d/%s"
+          (show_duration (Policy.initial_interval policy))
+          (Option.fold ~none:"-" ~some:(Printf.sprintf "%g")
+             (Policy.backoff_coefficient policy))
+          (show_duration (Policy.maximum_interval policy))
           (Policy.maximum_attempts policy)
           (String.concat "," (Policy.non_retryable_error_types policy)))
       (Info.retry_policy info)
@@ -270,6 +271,25 @@ let check_continue_as_new context =
        "attempt=1 first=%s from=%s by=continue-as-new exec=60000 run=30000 task=7000 retry=%s memo=start-info-memo"
        first_run first_run retry_report)
 
+(** A start whose retry policy sets only [maximum_attempts] (#1145) sends
+    the other fields unset; Temporal fills in its defaults (1 s initial
+    interval, coefficient 2, maximum 100 times the initial interval) before
+    recording the start event, and [Workflow.Info.retry_policy] reads that
+    effective policy back, live and on replay. *)
+let check_partial_retry_policy context =
+  let id = workflow_id context "partial-retry" in
+  let retry_policy = get (Retry_policy.make ~maximum_attempts:3 ()) in
+  let handle =
+    get
+      (Client.start context.client ~workflow:reporting ~retry_policy
+         ~task_queue:context.queue ~id ~input:"report" ())
+  in
+  track context id;
+  expect_report context "partial retry policy" handle
+    (Printf.sprintf
+       "attempt=1 first=%s from=- by=- exec=- run=- task=10000 retry=1000/2/100000/3/ memo=-"
+       (run_id handle))
+
 (** Starts the worker process, runs every check, and terminates all fixture
     executions and the worker even when a check fails. *)
 let check address =
@@ -285,6 +305,7 @@ let check address =
       stop context.worker)
     (fun () ->
       check_root context;
+      check_partial_retry_policy context;
       check_retry context;
       check_continue_as_new context;
       print_endline "workflow start info live regression: ok")

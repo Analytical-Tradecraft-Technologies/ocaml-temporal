@@ -14,6 +14,10 @@ that workflow code reads back, through `Workflow.info` and
 - A run started without options reports attempt 1, itself as the chain
   origin, no predecessor, no execution or run timeout, Temporal's recorded
   10 second default task timeout, no retry policy, and no memo.
+- A run started with a retry policy that sets only `maximum_attempts`
+  (#1145) reports the effective policy Temporal recorded: the server's
+  default 1 second initial interval, coefficient 2, and 100 second maximum
+  interval, with the requested three attempts.
 - A run started with execution, run, and task timeouts, a retry policy, and
   a memo fails its first attempt. The retry run reports attempt 2, the failed
   run as predecessor and chain origin, the `` `Retry `` initiator, and every

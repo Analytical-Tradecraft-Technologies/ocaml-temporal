@@ -1057,6 +1057,21 @@ let test_start_execution_policy_protocol () =
     (fun (label, path, request) ->
       check_error_path label path (Protocol.encode_start_request request))
     invalid;
+  (* A zero interval is Temporal's "unset" value (#1145) and is sent so the
+     server applies its default; a maximum below a set initial interval is
+     still rejected. *)
+  ignore
+    (unwrap
+       (Protocol.encode_start_request
+          {
+            start_request with
+            retry_policy =
+              Some
+                {
+                  retry_policy with
+                  initial_interval = { seconds = 0L; nanoseconds = 0 };
+                };
+          }));
   require_error
     (Protocol.encode_start_request
        {
@@ -1065,7 +1080,7 @@ let test_start_execution_policy_protocol () =
            Some
              {
                retry_policy with
-               initial_interval = { seconds = 0L; nanoseconds = 0 };
+               maximum_interval = { seconds = 0L; nanoseconds = 999_999_999 };
              };
        })
 

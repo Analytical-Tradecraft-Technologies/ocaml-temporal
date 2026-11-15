@@ -83,7 +83,8 @@ for those rules.
   that retained capability and, through `Async_context.info`, the same
   `Activity.Info.t` that a synchronous callback reads. The attempt-scoped
   `Context` instead supplies
-  copied heartbeat details and timeout metadata for callbacks that complete
+  copied heartbeat details (raw, or decoded with `Context.details_as`) and
+  timeout metadata for callbacks that complete
   during dispatch, and `Context.info` returns an abstract `Activity.Info.t`
   with the namespace, scheduling workflow, activity ID and type, attempt,
   local-activity flag, Core-reported scheduling timestamps, and effective
@@ -141,8 +142,9 @@ for those rules.
   not introduce workflow effects or change error ownership.
 - `Temporal.Time` and `Temporal.Duration` make timestamp and timer units
   explicit. Workflow time is integer seconds plus normalized nanoseconds;
-  workflow timer durations are non-negative whole milliseconds. See the
-  [workflow-time reference](workflow-time.md).
+  workflow timer durations are non-negative whole milliseconds.
+  `Time.add`, `Time.diff`, and `Duration.add` are total, saturating
+  arithmetic. See the [workflow-time reference](workflow-time.md).
 
 ### Application lifecycle and interactions
 

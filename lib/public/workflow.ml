@@ -415,27 +415,34 @@ module Info = struct
   (** Returns the recorded workflow task timeout. *)
   let task_timeout info = Option.map duration info.run.task_timeout
 
-  (** Rebuilds the public policy from the recorded start event. The server
-      skips retry-policy validation when [maximum_attempts] is 1, so a
-      recorded policy can violate [Retry_policy.make]'s rules (a
-      coefficient below 1.0, an empty non-retryable type, a zero interval)
-      and the protocol layers deliberately accept it (#1016). Such a policy
-      has no public representation and is reported as [None] rather than
-      raising inside workflow code; with at most one attempt it never retries
-      anyway. The result depends only on history, so it is replay-stable. A
-      new value is built on every call; the public policy is immutable. *)
+  (** Rebuilds the public policy from the recorded start event. Temporal
+      fills unset fields with its defaults before recording the event, so a
+      normal policy has every field set. A recorded zero interval or zero
+      coefficient is Temporal's own "unset" value and reads as [None]. The
+      server skips retry-policy validation when [maximum_attempts] is 1, so a
+      recorded policy can still violate [Retry_policy.make]'s rules (a
+      coefficient below 1.0, an empty non-retryable type) and the protocol
+      layers deliberately accept it (#1016). Such a policy has no public
+      representation and is reported as [None] rather than raising inside
+      workflow code; with at most one attempt it never retries anyway. The
+      result depends only on history, so it is replay-stable. A new value is
+      built on every call; the public policy is immutable. *)
   let retry_policy info =
     Option.bind info.run.retry_policy
       (fun (policy : Temporal_sdk_kernel.Workflow_protocol.retry_policy) ->
-        let coefficient =
-          Int64.float_of_bits
-            (Int64.of_string ("0u" ^ policy.backoff_coefficient_bits))
+        let interval (value : Temporal_sdk_kernel.Workflow_protocol.duration) =
+          if Int64.equal value.seconds 0L && value.nanoseconds = 0 then None
+          else Some (duration value)
+        in
+        let bits = Int64.of_string ("0u" ^ policy.backoff_coefficient_bits) in
+        let backoff_coefficient =
+          if Int64.equal bits 0L then None else Some (Int64.float_of_bits bits)
         in
         Result.to_option
           (Retry_policy.make
-             ~initial_interval:(duration policy.initial_interval)
-             ~backoff_coefficient:coefficient
-             ~maximum_interval:(duration policy.maximum_interval)
+             ?initial_interval:(interval policy.initial_interval)
+             ?backoff_coefficient
+             ?maximum_interval:(interval policy.maximum_interval)
              ~maximum_attempts:policy.maximum_attempts
              ~non_retryable_error_types:policy.non_retryable_error_types ()))
 

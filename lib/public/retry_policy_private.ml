@@ -31,18 +31,24 @@ let unsigned_int64_decimal bits =
 (** Copies a validated policy at the last public-to-runtime boundary.  The
     accessors preserve the exact float chosen by the caller; converting its
     bits again therefore produces the same replay-stable representation as
-    activity commands without exposing the private record field. *)
+    activity commands without exposing the private record field.  An unset
+    field becomes the protocol's zero value (a zero interval, or the bits of
+    [0.0] for the coefficient), which Temporal reads as "apply the server
+    default"; the Rust bridge sends unset intervals to Core as absent. *)
 let to_runtime (policy : Retry_policy.t) =
+  let interval_ms = function
+    | None -> 0L
+    | Some interval -> Duration.to_ms interval
+  in
   Temporal_sdk_kernel.Activation
   .{
-    initial_interval =
-      Duration.to_ms (Retry_policy.initial_interval policy);
+    initial_interval = interval_ms (Retry_policy.initial_interval policy);
     backoff_coefficient_bits =
-      unsigned_int64_decimal
-        (Int64.bits_of_float
-           (Retry_policy.backoff_coefficient policy));
-    maximum_interval =
-      Duration.to_ms (Retry_policy.maximum_interval policy);
+      (match Retry_policy.backoff_coefficient policy with
+      | None -> "0"
+      | Some coefficient ->
+          unsigned_int64_decimal (Int64.bits_of_float coefficient));
+    maximum_interval = interval_ms (Retry_policy.maximum_interval policy);
     maximum_attempts = Retry_policy.maximum_attempts policy;
     non_retryable_error_types =
       Retry_policy.non_retryable_error_types policy;

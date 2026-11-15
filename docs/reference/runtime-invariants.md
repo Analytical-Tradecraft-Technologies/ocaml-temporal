@@ -286,10 +286,12 @@ and bridge, read the [documentation guide](../README.md) first.
   that work is queued settles the future and the queued work emits nothing.
   The [split/merged activation regression](../../test/runtime/test_local_activity_backoff_order.ml)
   compares the command streams.
-- An activity retry policy is immutable once attached to a command. Its initial
-  interval is positive, its maximum interval is at least the initial interval,
-  its finite backoff coefficient is at least 1.0, and its maximum-attempt count
-  is between zero and Int32.max_int; zero means unlimited attempts. The
+- An activity retry policy is immutable once attached to a command. A zero
+  interval, the all-zero coefficient bit pattern, and zero attempts mean the
+  field is unset and Temporal applies its default (#1145). A set initial
+  interval is positive, a set maximum interval is at least a set initial
+  interval, a set backoff coefficient is finite and at least 1.0, and the
+  maximum-attempt count is between zero and Int32.max_int. The
   coefficient is serialized as canonical unsigned decimal IEEE-754 bits, not a
   JSON float, so OCaml, Rust, Core, and replay retain the same value.
 - The schedule-activity object always contains a retry-policy member. JSON null

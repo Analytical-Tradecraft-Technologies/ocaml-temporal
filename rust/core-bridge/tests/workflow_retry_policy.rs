@@ -223,7 +223,9 @@ fn policy_preserves_subsecond_intervals_and_unlimited_attempts() {
 }
 
 /// Invalid policies are rejected before either semantic encoding or Core
-/// conversion can observe them.
+/// conversion can observe them. Zero intervals and a zero coefficient are
+/// Temporal's "unset" values and are covered by
+/// `unset_fields_reach_core_as_absent`.
 #[test]
 fn policy_validation_is_strict_and_bilateral() {
     let policy = RetryPolicy {
@@ -243,13 +245,15 @@ fn policy_validation_is_strict_and_bilateral() {
     for (from, to) in [
         (
             "\"backoff_coefficient_bits\":\"4609434218613702656\"",
-            "\"backoff_coefficient_bits\":\"0\"",
+            // 0.5 is set but below the 1.0 minimum.
+            "\"backoff_coefficient_bits\":\"4602678819172646912\"",
+        ),
+        (
+            "\"backoff_coefficient_bits\":\"4609434218613702656\"",
+            // -0.0 is not the all-zero "unset" pattern.
+            "\"backoff_coefficient_bits\":\"9223372036854775808\"",
         ),
         ("\"maximum_attempts\":2", "\"maximum_attempts\":-1"),
-        (
-            "\"initial_interval\":{\"nanoseconds\":0,\"seconds\":1}",
-            "\"initial_interval\":{\"nanoseconds\":0,\"seconds\":0}",
-        ),
         (
             "\"backoff_coefficient_bits\":\"4609434218613702656\"",
             "\"backoff_coefficient_bits\":\"18446744073709551615\"",
@@ -263,12 +267,71 @@ fn policy_validation_is_strict_and_bilateral() {
     }
 
     // Compare the nanosecond component as well as whole seconds when checking
-    // the ordering of retry intervals.
+    // the ordering of two set retry intervals.
     let invalid = valid.replace(
         "\"maximum_interval\":{\"nanoseconds\":0,\"seconds\":2}",
-        "\"maximum_interval\":{\"nanoseconds\":0,\"seconds\":0}",
+        "\"maximum_interval\":{\"nanoseconds\":999999999,\"seconds\":0}",
     );
     assert!(workflow_protocol::decode_completion(&invalid).is_err());
+}
+
+/// A policy that sets only `maximum_attempts` (#1145) leaves the intervals
+/// and coefficient at the protocol's zero value. The bridge accepts it,
+/// sends both intervals to Core as absent so Core's local-activity logic and
+/// the server apply their defaults, and converts the Core command back to the
+/// identical semantic value.
+#[test]
+fn unset_fields_reach_core_as_absent() {
+    let zero = Duration {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+    let policy = RetryPolicy {
+        initial_interval: zero,
+        backoff_coefficient_bits: "0".to_owned(),
+        maximum_interval: zero,
+        maximum_attempts: 3,
+        non_retryable_error_types: Vec::new(),
+    };
+    let value = completion(Some(policy));
+    let encoded = workflow_protocol::encode_completion(&value).unwrap();
+    assert_eq!(
+        workflow_protocol::decode_completion(&encoded).unwrap(),
+        value
+    );
+
+    let core = workflow_protocol::completion_to_core(&value).unwrap();
+    let Some(workflow_completion::workflow_activation_completion::Status::Successful(success)) =
+        core.status.as_ref()
+    else {
+        panic!("completion should be successful");
+    };
+    let Some(
+        temporalio_protos::coresdk::workflow_commands::workflow_command::Variant::ScheduleActivity(
+            activity,
+        ),
+    ) = success.commands[0].variant.as_ref()
+    else {
+        panic!("completion should contain an activity command");
+    };
+    let core_policy = activity.retry_policy.as_ref().expect("policy is explicit");
+    assert!(core_policy.initial_interval.is_none());
+    assert!(core_policy.maximum_interval.is_none());
+    assert_eq!(core_policy.backoff_coefficient.to_bits(), 0);
+    assert_eq!(core_policy.maximum_attempts, 3);
+    assert_eq!(
+        workflow_protocol::completion_from_core(&core).unwrap(),
+        value
+    );
+
+    // Only a set maximum: the ordering rule does not apply to an unset
+    // initial interval, which the server fills in before its own check.
+    let only_maximum = encoded.replace(
+        "\"maximum_interval\":{\"nanoseconds\":0,\"seconds\":0}",
+        "\"maximum_interval\":{\"nanoseconds\":0,\"seconds\":10}",
+    );
+    assert_ne!(only_maximum, encoded);
+    assert!(workflow_protocol::decode_completion(&only_maximum).is_ok());
 }
 
 /// A missing retry field is different from an explicit null field.  This

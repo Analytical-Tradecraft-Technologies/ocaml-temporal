@@ -48,9 +48,23 @@ The decimal string is the canonical unsigned representation of the
 coefficient's IEEE-754 bits. The required schedule-activity member is JSON
 null when no policy is supplied. Rust and OCaml both reject omission, unknown
 members, non-canonical decimal text, NaN or infinity, coefficients below
-1.0, non-positive initial intervals, maximum intervals below the initial
-interval, out-of-range attempt counts, empty or NUL-containing error types,
-and oversized text.
+1.0, maximum intervals below a set initial interval, out-of-range attempt
+counts, empty or NUL-containing error types, and oversized text.
+
+Amendment (#1145, 2026-11): every constructor field is optional so a caller
+can override one field and keep Temporal's server defaults for the rest. An
+unset field is encoded as the protocol's zero value, which Temporal itself
+reads as "apply the default": a zero interval, the all-zero coefficient bit
+pattern `"0"` (not `-0.0`), or zero attempts. Both validators accept those
+zeros and compare the intervals only when both are set; a supplied value is
+still checked by the rules above. Rust sends an unset interval to Core as an
+absent duration, because Core's local-activity retry logic replaces only an
+absent interval with its default and would otherwise retry with no delay.
+The public constructor additionally rejects a lone maximum interval below
+the 1 second default initial interval, which the server would refuse once
+it fills in that default. The SDK deliberately does not substitute the
+defaults itself: operators can reconfigure them, and the effective policy is
+readable through `Workflow.Info.retry_policy`.
 
 Rust converts the validated semantic object to and from Temporal Core's
 protobuf retry policy. It uses `f64::from_bits` and `to_bits()`

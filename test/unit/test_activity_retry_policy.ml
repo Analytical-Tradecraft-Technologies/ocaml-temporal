@@ -37,21 +37,76 @@ let expect_invalid label result =
   | Error _ -> failwith (label ^ " returned the wrong error category")
   | Ok _ -> failwith (label ^ " accepted an invalid retry policy")
 
+(** Milliseconds of an optional interval, with [-1L] standing for unset so
+    assertions can compare plain integers. *)
+let interval_ms = function
+  | None -> -1L
+  | Some interval -> Temporal.Duration.to_ms interval
+
+(** Builds a policy that is expected to validate, failing the test with the
+    constructor's message otherwise. *)
+let expect_valid label result =
+  match result with
+  | Ok policy -> policy
+  | Error error ->
+      failwith (label ^ " was rejected: " ^ Temporal.Error.message error)
+
+(** Every field is optional (#1145): omitted fields stay unset so Temporal
+    applies its defaults, and each field can be overridden alone. *)
+let test_partial_overrides () =
+  let attempts_only =
+    expect_valid "attempts-only policy" (Retry_policy.make ~maximum_attempts:3 ())
+  in
+  assert (interval_ms (Retry_policy.initial_interval attempts_only) = -1L);
+  assert (Retry_policy.backoff_coefficient attempts_only = None);
+  assert (interval_ms (Retry_policy.maximum_interval attempts_only) = -1L);
+  assert (Retry_policy.maximum_attempts attempts_only = 3);
+  assert (Retry_policy.non_retryable_error_types attempts_only = []);
+  let empty = expect_valid "empty policy" (Retry_policy.make ()) in
+  assert (Retry_policy.maximum_attempts empty = 0);
+  let initial_only =
+    expect_valid "initial-only policy"
+      (Retry_policy.make ~initial_interval:(Temporal.Duration.of_ms 5L) ())
+  in
+  assert (interval_ms (Retry_policy.initial_interval initial_only) = 5L);
+  assert (interval_ms (Retry_policy.maximum_interval initial_only) = -1L);
+  let coefficient_only =
+    expect_valid "coefficient-only policy"
+      (Retry_policy.make ~backoff_coefficient:3.0 ())
+  in
+  assert (Retry_policy.backoff_coefficient coefficient_only = Some 3.0);
+  (* A lone maximum is checked against Temporal's 1 s default initial
+     interval, which the server fills in before its own ordering check. *)
+  let maximum_only =
+    expect_valid "maximum-only policy"
+      (Retry_policy.make ~maximum_interval:(Temporal.Duration.of_ms 1_000L) ())
+  in
+  assert (interval_ms (Retry_policy.maximum_interval maximum_only) = 1_000L);
+  expect_invalid "maximum-only below the default initial interval"
+    (Retry_policy.make ~maximum_interval:(Temporal.Duration.of_ms 999L) ());
+  ignore
+    (expect_valid "short maximum with explicit initial"
+       (Retry_policy.make ~initial_interval:(Temporal.Duration.of_ms 10L)
+          ~maximum_interval:(Temporal.Duration.of_ms 999L) ()));
+  expect_invalid "zero maximum interval"
+    (Retry_policy.make ~maximum_interval:(Temporal.Duration.of_ms 0L) ());
+  expect_invalid "zero coefficient"
+    (Retry_policy.make ~backoff_coefficient:0.0 ());
+  expect_invalid "negative zero coefficient"
+    (Retry_policy.make ~backoff_coefficient:(-0.0) ())
+
 let () =
+  test_partial_overrides ();
   let policy = valid_policy () in
-  assert (
-    Temporal.Duration.to_ms (Retry_policy.initial_interval policy) = 1_000L);
-  assert (Retry_policy.backoff_coefficient policy = 1.5);
-  assert (
-    Temporal.Duration.to_ms (Retry_policy.maximum_interval policy) = 60_000L);
+  assert (interval_ms (Retry_policy.initial_interval policy) = 1_000L);
+  assert (Retry_policy.backoff_coefficient policy = Some 1.5);
+  assert (interval_ms (Retry_policy.maximum_interval policy) = 60_000L);
   assert (Retry_policy.maximum_attempts policy = 3);
   assert (Retry_policy.non_retryable_error_types policy = [ "InvalidInput" ]);
   let boundary = boundary_policy () in
-  assert (
-    Temporal.Duration.to_ms (Retry_policy.initial_interval boundary) = 1L);
-  assert (
-    Temporal.Duration.to_ms (Retry_policy.maximum_interval boundary) = 1_001L);
-  assert (Retry_policy.backoff_coefficient boundary = 1.0);
+  assert (interval_ms (Retry_policy.initial_interval boundary) = 1L);
+  assert (interval_ms (Retry_policy.maximum_interval boundary) = 1_001L);
+  assert (Retry_policy.backoff_coefficient boundary = Some 1.0);
   (* Zero is a meaningful policy value, not a failed constructor default: it
      delegates the attempt limit to Temporal. *)
   assert (Retry_policy.maximum_attempts boundary = 0);

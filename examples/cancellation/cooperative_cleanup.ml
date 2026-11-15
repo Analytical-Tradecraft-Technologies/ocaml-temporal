@@ -182,14 +182,12 @@ let stop_reason context =
 (** Returns the step to resume from: the step that the previous attempt last
     reported in a heartbeat, or [0] on a first attempt. That step may not
     have finished, so it is repeated; steps must be idempotent for the same
-    reason as the ledger operations. *)
+    reason as the ledger operations. Details that do not decode as one step
+    number also restart from [0]. *)
 let resume_step context =
-  match Temporal.Activity.Context.details context with
-  | payload :: _ -> (
-      match Temporal.Codec.decode Temporal.Codec.int payload with
-      | Ok step -> step
-      | Error _ -> 0)
-  | [] -> 0
+  match Temporal.Activity.Context.details_as context Temporal.Codec.int with
+  | Ok (Some step) -> step
+  | Ok None | Error _ -> 0
 
 (** Runs steps [first] to [steps - 1], heartbeating before each one. It stops
     with the heartbeat's error as soon as a heartbeat reports a cancellation,

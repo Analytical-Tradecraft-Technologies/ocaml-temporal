@@ -113,7 +113,9 @@ type child_workflow_cancellation_type =
     command. The runtime stores the backoff coefficient as its canonical
     unsigned IEEE-754 bit string so replay and the JSON bridge never depend on
     a decimal float printer. Durations remain exact millisecond counts until
-    the semantic protocol converts them to protobuf seconds and nanoseconds. *)
+    the semantic protocol converts them to protobuf seconds and nanoseconds.
+    Zero intervals, a ["0"] coefficient, and zero attempts mark unset fields
+    that Temporal fills with its defaults. *)
 type retry_policy = {
   initial_interval : int64;
   backoff_coefficient_bits : string;

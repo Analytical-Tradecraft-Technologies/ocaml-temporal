@@ -34,6 +34,54 @@ range `0` through `999_999_999`; invalid values return a typed non-retryable
 `Temporal.Time.compare` and `Temporal.Time.equal` compare the integer
 representation exactly.
 
+## Time and duration arithmetic
+
+`Temporal.Time.add instant duration` moves an instant forward by a
+`Temporal.Duration.t`, and `Temporal.Time.diff later earlier` returns the
+elapsed `Duration.t` between two instants, truncated to whole milliseconds.
+`Temporal.Duration` adds `of_days` (a fixed 86,400 seconds, never a calendar
+day), `add`, `compare`, `to_seconds` (truncating), and `maximum`. All of them
+are pure integer arithmetic on replay-stable values, so they are safe in
+workflow code:
+
+```ocaml
+(* Sleeps until 24 hours after the run started, or not at all if that
+   moment has already passed. *)
+let sleep_until_one_day_after_start () =
+  let open Temporal.Result_syntax in
+  let* info = Temporal.Workflow.info () in
+  let* now = Temporal.Workflow.now () in
+  match Temporal.Workflow.Info.start_time info with
+  | None -> Ok ()
+  | Some start ->
+      let deadline = Temporal.Time.add start (Temporal.Duration.of_hours 24L) in
+      Temporal.Workflow.sleep (Temporal.Time.diff deadline now)
+
+(* True once seven days have elapsed since [since]. *)
+let week_elapsed ~since =
+  let open Temporal.Result_syntax in
+  let* now = Temporal.Workflow.now () in
+  Ok
+    (Temporal.Duration.compare
+       (Temporal.Time.diff now since)
+       (Temporal.Duration.of_days 7L)
+     >= 0)
+```
+
+The arithmetic is total and saturating (#1145). `Duration.add` stops at
+`Duration.maximum`, the protobuf limit of 10,000 years that every SDK
+duration already respects; `Time.add` stops at the last representable
+instant (`Int64.max_int` seconds); and `Time.diff` is zero when `later` is
+not after `earlier` and stops at `Duration.maximum`. Saturation was chosen
+over a `result` because overflow cannot happen for any value Temporal can
+use: its timestamps end at year 9999 and its durations at 10,000 years, so
+a `result` would force every caller to handle an unreachable error, while
+raising would turn a harmless bound into a workflow task failure. The
+whole-unit constructors, including `of_days`, keep their existing contract
+of raising `Invalid_argument` for a negative or out-of-range literal, since
+that is a programming error in the caller's constants. Because `diff`
+clamps at zero, use `Time.compare` when the order of two instants matters.
+
 Outside workflow execution, or for a synthetic activation that has no Temporal
 timestamp (such as cache eviction), `Temporal.Workflow.now ()` returns a typed
 defect. It never silently falls back to local wall-clock time, because doing so
