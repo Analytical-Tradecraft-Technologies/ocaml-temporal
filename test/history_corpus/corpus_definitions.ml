@@ -1033,10 +1033,14 @@ let start_metadata_summary () =
     match Info.retry_policy info with
     | None -> "-"
     | Some policy ->
-        Printf.sprintf "%Ld/%g/%Ld/%d"
-          (Temporal.Duration.to_ms (Temporal.Retry_policy.initial_interval policy))
-          (Temporal.Retry_policy.backoff_coefficient policy)
-          (Temporal.Duration.to_ms (Temporal.Retry_policy.maximum_interval policy))
+        (* The server records the effective policy with its defaults filled
+           in, so every optional field is present here and the text matches
+           the captured histories exactly; an absent field would print "-". *)
+        Printf.sprintf "%s/%s/%s/%d"
+          (milliseconds (Temporal.Retry_policy.initial_interval policy))
+          (Option.fold ~none:"-" ~some:(Printf.sprintf "%g")
+             (Temporal.Retry_policy.backoff_coefficient policy))
+          (milliseconds (Temporal.Retry_policy.maximum_interval policy))
           (Temporal.Retry_policy.maximum_attempts policy)
   in
   Ok
