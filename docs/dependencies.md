@@ -14,6 +14,9 @@ the interoperability regression in the pinned Python image; see
 [CI-only interoperability tooling](#ci-only-interoperability-tooling). It
 applies the OPAM policy to the CI-only closure of the Eio integration example
 as well; see [CI-only Eio example dependencies](#ci-only-eio-example-dependencies).
+Finally it runs `make third-party-notices-check`, which generates and audits
+the release third-party notices from the locked Cargo graph; see
+[Third-party notices in release archives](#third-party-notices-in-release-archives).
 The Makefile's `quality` target is a separate contributor/CI gate for RustSec,
 unused-dependency, and spelling checks.
 
@@ -683,11 +686,22 @@ package listed; no partial file is written. The list covers the whole locked
 graph, including platform-specific and build-only packages, so it is a superset
 of what any single platform links.
 
+`make third-party-notices-check` runs the same generation and audit on every
+pull request, from the standalone license job through `make license-check`, so
+a Cargo lock change (including a Dependabot bump) that moves a file-less crate
+to a version without a reviewed entry fails there rather than in the Release
+workflow. It emits the locked metadata from the development image, whose
+`CARGO_HOME` lies under `_build/` on the repository bind mount, and runs the
+generator in the digest-pinned Python image of the `sdk-interop-python` Compose
+service, which sees the downloaded package sources at the same paths. It writes
+`_build/third-party-notices/THIRD-PARTY-NOTICES.txt` for inspection.
+
 To add a reviewed notice when a Cargo update introduces a file-less package or
 version:
 
-1. Run the generator against fresh `cargo metadata --locked` output; it names
-   every package that needs review.
+1. Run `make third-party-notices-check` (or the generator against fresh
+   `cargo metadata --locked` output); it names every package that needs
+   review.
 2. Read the crate's `.cargo_vcs_info.json` (in the downloaded registry source)
    for the commit and path it was published from, or, for an older crate
    without one, find the commit that set the published version.
@@ -703,7 +717,7 @@ version:
    evidence. Never write a copyright holder that upstream does not state; if
    upstream publishes no licence text, record the evidence and ask a
    maintainer to decide on a `maintainer_exception`.
-5. Re-run the generator and `--audit`, and
+5. Re-run `make third-party-notices-check` (the generator and `--audit`), and
    `python3 -m unittest discover -s test/smoke -p 'test_*artifact*.py'`.
 
 Entries for versions no longer in the lock file are harmless and can be

@@ -201,6 +201,7 @@ Several entries may share one history file; they must agree on its checksum.
 | `live-2026-11-13-can-options` | `continue-as-new-options-first`, `continue-as-new-options-second` | Captured for [#1153](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/1153) with only the `corpus-v4-continue-as-new-options` generation, against Temporal Server 1.32.2 (Compose stack, digest-pinned), Core `8fe478ee`, OCaml 5.4.1, from a clean tree at the recorded `sdk_commit`. The worker ran natively on macOS. A run continues as new with its task queue named explicitly, a run timeout, a task timeout, a retry policy, a replacement memo and an empty search-attribute map, and the successor reports the timeouts, retry attempts and memo it received. |
 | `live-2026-11-13-cron` | `start-delay`, `cron-first`, `cron-second` | Captured for [#1158](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/1158) with only the `corpus-v5-cron-start-delay` generation, against Temporal Server 1.32.2 (Compose stack, digest-pinned), Core `8fe478ee`, OCaml 5.4.1, from a clean tree at the recorded `sdk_commit`. The worker ran natively on macOS. A root run started with a 2 s start delay, and the first two runs of an `@every 2s` cron chain: the first delayed to its scheduled time, the second started by the schedule and reporting the `` `Cron_schedule `` initiator. |
 | `live-2026-11-13-child-metadata` | `child-metadata-parent`, `child-metadata-child` | Captured for [#1135](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/1135) with only the `corpus-v6-child-start-metadata` generation, against Temporal Server 1.32.2 (Compose stack, digest-pinned), Core `8fe478ee`, OCaml 5.4.1, from a clean tree at the recorded `sdk_commit`. The worker ran natively on macOS; the capture script registered the `CorpusChildKeyword` keyword in `temporal-sdk-test` first. A parent starts its child with a memo and that keyword, and the child reports both through `Workflow.start_metadata`. |
+| `live-2026-11-16-start-metadata` | `start-metadata-full`, `start-metadata-absent` | Captured for [#512](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/512) with only the `corpus-v7-start-metadata` generation, against Temporal Server 1.32.2 (Compose stack, digest-pinned), Core `8fe478ee`, OCaml 5.4.1, from a clean tree at the recorded `sdk_commit`. The worker ran natively on macOS; the capture script registered the `CorpusStartKeyword` keyword and `CorpusStartInt` integer attributes in `temporal-sdk-test` first. One root run started with a memo, both search attributes, 90 s execution, 60 s run and 7 s task timeouts, a three-attempt retry policy and a 1 s start delay, and one started with no options. Each reads its start metadata through `Workflow.start_metadata` and `Workflow.Info` and starts its timer only when the values match the frozen expectation. |
 | `live-2026-10-11` | `lifecycle-{multi,loop,handlers}-{legacy,patched,deprecated,removed}`, `lifecycle-handover` | Captured for [#531](https://github.com/Analytical-Tradecraft-Technologies/ocaml-temporal/issues/531) with only the four `corpus-lifecycle-*` generations, against Temporal Server 1.32.0 (Compose stack, digest-pinned), Core `95e97686`, OCaml 5.4.1, from a clean tree at the recorded `sdk_commit`. The worker ran natively on macOS. The handover run was started by the legacy process and finished by a fresh patched process. |
 
 Derived cases reuse those histories against other definition sets:
@@ -221,6 +222,13 @@ UUID. Replay compares commands, not payloads, so the parent builds its child
 workflow ID from its draws: the reordered draws start the child under another
 ID, which Core must report as nondeterminism. This shows the corpus checks
 the random stream itself.
+A fifth, `negative-start-metadata-memo`, replays the
+`live-2026-11-16-start-metadata` full history against a definition that
+expects another memo value. `corpus.start_metadata` starts its timer only
+when the start metadata it reads matches its expectation, so this
+definition completes without the recorded timer and Core must report
+nondeterminism. This shows that replay rebuilds the recorded start metadata,
+and that the `replays_ok` entries observed exactly the frozen values.
 
 The `live-2026-10-11` histories are each replayed against every other
 lifecycle generation: `compat-lifecycle-<workflow>-<history stage>-on-<code
@@ -249,7 +257,8 @@ patched `corpus.patch`), `corpus-v1-patch-legacy`,
 `corpus-v1-patch-deprecated`, `negative-timer-removed`,
 `task-failure-corrected`, `initial-signals` and the four patch lifecycle
 generations `corpus-lifecycle-legacy`, `-patched`, `-deprecated` and
-`-removed`. The lifecycle generations share one body per workflow type and
+`-removed`, followed by one set per later capture (`corpus-v2-cancellation`
+through `corpus-v7-start-metadata`) and their negative-control sets. The lifecycle generations share one body per workflow type and
 differ only in a single gate function, so the stage is the only variable in
 their replay matrix. The same values are registered
 by the live capture worker and by the replay test, so capture and replay use
@@ -381,6 +390,7 @@ with a `not yet captured` feature and requires exactly those two problems.
 | `cron-schedule` | replayed | `live-2026-11-13-cron-cron-first`, `-cron-second` |
 | `cron-successor` | replayed | `live-2026-11-13-cron-cron-second` |
 | `child-start-metadata` | replayed | `live-2026-11-13-child-metadata-child-metadata-parent`, `-child-metadata-child` |
+| `start-metadata` | replayed | `live-2026-11-16-start-metadata-start-metadata-full`, `-start-metadata-absent` |
 | `activity` | replayed | `live-2026-10-08-activity` and others |
 | `activity-retry` | replayed | `live-2026-10-08-activity-retry` |
 | `signal` | replayed | `live-2026-10-08-interaction`, lifecycle handler cases |
@@ -424,7 +434,6 @@ with a `not yet captured` feature and requires exactly those two problems.
 | `local-activity` | not yet captured | A local activity and its marker, including a Core-directed backoff timer. |
 | `external-signal` | not yet captured | Signalling another workflow from workflow code. |
 | `external-cancellation` | not yet captured | Requesting cancellation of another workflow from workflow code. |
-| `start-metadata` | not yet captured | A start memo and search attributes read through `Workflow.start_metadata`. |
 | `search-attribute-upsert` | not yet captured | `Workflow.upsert_search_attributes`. |
 | `deterministic-time-random` | not yet captured | Commands that depend on `Workflow.now` or `Workflow.random_int`. |
 | `deployment-version` | not yet captured | A run on a deployment-versioned worker whose commands branch on `Workflow.current_deployment_version`. |
@@ -436,10 +445,10 @@ SDK/Core upgrade gate. #503 added the malformed-history controls and the
 feature coverage table; the `not yet captured` rows are its remaining gaps,
 each needing a live capture against a Temporal Server. The lifecycle matrix covers
 replay compatibility only; concurrent mixed-version workers and version
-routing are outside the corpus. Every current capture was produced at Core
-`95e97686`. The first Core pin bump, to `8fe478ee` (v1.1.0, #824), was the
+routing are outside the corpus. The captures before the first Core pin bump
+were produced at Core `95e97686`, later ones at `8fe478ee`. The first Core pin bump, to `8fe478ee` (v1.1.0, #824), was the
 first true cross-revision replay: every case kept its expected outcome, and
 its report is the evidence retained on that pull request. Cancellation,
 timeouts, workflow retries, local activities, external signals and
-cancellation, start metadata and search-attribute histories are not yet
+cancellation and search-attribute upsert histories are not yet
 represented (see [feature coverage](#feature-coverage)).

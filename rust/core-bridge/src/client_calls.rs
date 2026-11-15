@@ -51,14 +51,18 @@
 //! than a counter, so they are not guessable from one's own identity.
 //!
 //! Lock order: the registry mutex is never held while a slot mutex is taken.
+//! Both are locked through [`crate::sync::lock`], which recovers a poisoned
+//! guard: every critical section here is a single assignment or map edit, so
+//! a panicking holder cannot leave the data inconsistent.
 
 use crate::abi::{
     Failure, Operation, STATUS_CONFIGURATION, STATUS_INTERNAL, STATUS_INVALID_STATE,
     STATUS_NOT_READY, STATUS_PANIC,
 };
+use crate::sync::lock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::task::AbortHandle;
 
@@ -132,12 +136,6 @@ static CALLS: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::
 
 /// Next call identifier. Identifiers are never reused within a process.
 static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
-
-/// Locks a mutex whose protected data stays consistent even if a holder
-/// panicked: every critical section here is a single assignment or map edit.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// The failure an awaiting caller receives when its call can no longer
 /// produce an outcome: the runtime disconnected or closed, or the identifier

@@ -1,24 +1,15 @@
 //! Combined-readiness behavior with a workflow-completion window.
 //!
-//! [`super::wait_any_lane`] is private to the worker bridge, so this test
-//! lives in a child module of it rather than under `tests/`.
+//! Mounted from `worker_bridge.rs` with `#[path]` rather than built as an
+//! integration test because [`super::wait_any_lane`] is private to the
+//! worker bridge. The lane pair comes from the sibling readiness tests so
+//! both suites build their signals the same way.
 
-use super::{
-    AnyLaneWake, OutcomeGuard, Readiness, ReadinessWait, ReadyTask, WorkflowCompletions,
-    wait_any_lane,
-};
+use super::readiness_tests::lane_pair;
+use super::{OutcomeGuard, ReadinessWait, ReadyTask, WorkflowCompletions, wait_any_lane};
 use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc;
-
-/// Two lane signals sharing one combined wake, as one worker's lanes do.
-fn lane_pair() -> (Arc<Readiness>, Arc<Readiness>) {
-    let any = Arc::new(AnyLaneWake::default());
-    (
-        Arc::new(Readiness::sharing(&any)),
-        Arc::new(Readiness::sharing(&any)),
-    )
-}
 
 /// With the completion window full, a queued activation is not work the
 /// owner can take, so the combined wait does not report it (which would

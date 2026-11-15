@@ -265,6 +265,14 @@ printf '%s\n' "$pr_quality" | grep -Fq 'cargo-deny@0.20.2,cargo-machete@0.9.2,ty
 printf '%s\n' "$pr_quality" | grep -Fqx '        run: make quality'
 grep -Fqx '    name: Dependency license audit' "$pr_workflow"
 grep -Fqx '        run: make license-check OCAML_VERSION=5.2' "$pr_workflow"
+# That job generates and audits the release third-party notices, so a Cargo
+# lock bump to a file-less crate version without a reviewed notice fails the
+# pull request rather than the Release workflow.
+license_recipe=$(sed -n '/^license-check:/,/^$/p' "$makefile")
+printf '%s\n' "$license_recipe" | grep -Fqx '	$(MAKE) third-party-notices-check'
+notices_recipe=$(sed -n '/^third-party-notices-check:/,/^$/p' "$makefile")
+printf '%s\n' "$notices_recipe" | grep -Fq -- '--output $(NOTICES_DIR)/THIRD-PARTY-NOTICES.txt'
+printf '%s\n' "$notices_recipe" | grep -Fq -- '--audit $(NOTICES_DIR)/THIRD-PARTY-NOTICES.txt'
 grep -Fqx '      matrix: ${{ fromJSON(needs.changes.outputs.linux) }}' "$pr_workflow"
 # Native consumer failures stay visible even when their producer fails.
 for platform in macos windows; do

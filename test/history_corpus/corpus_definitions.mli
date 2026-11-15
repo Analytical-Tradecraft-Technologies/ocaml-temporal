@@ -196,6 +196,32 @@ val child_metadata_child_workflow_type : string
     capture registers it before the generation runs. *)
 val child_metadata_keyword : string Temporal.Search_attribute.key
 
+(** {1 Root start metadata workflow type (#512)}
+
+    Captured by the [corpus-v7-start-metadata] generation. *)
+
+(** [corpus.start_metadata]: reads its memo, two search attributes,
+    execution expiration time, timeouts, retry policy and first workflow task
+    backoff through [Workflow.start_metadata] and [Workflow.Info], and waits
+    on a timer only when they equal the frozen expectation for its input
+    (["full"] or ["absent"]), so replay checks the observed metadata. *)
+val start_metadata_workflow_type : string
+
+(** The keyword search attribute set on the ["full"] run; the capture
+    registers it before the generation runs. *)
+val start_metadata_keyword : string Temporal.Search_attribute.key
+
+(** The integer search attribute set on the ["full"] run; registered with
+    {!start_metadata_keyword}. *)
+val start_metadata_int : int64 Temporal.Search_attribute.key
+
+(** The workflow retry policy the capture client gives the ["full"] run. *)
+val start_metadata_policy : Temporal.Retry_policy.t
+
+(** The summary [corpus.start_metadata] must observe for a captured input;
+    the capture client requires the run to return exactly this. *)
+val start_metadata_expected : string -> string
+
 (** {1 Interaction handler names}
 
     Used by the capture driver to send the interactions recorded in history. *)
@@ -251,7 +277,13 @@ val definition_set_names : string list
     - ["corpus-v5-cron-start-delay"]: the cron schedule and start delay
       workflow of #1158.
     - ["corpus-v6-child-start-metadata"]: the child memo and search-attribute
-      workflows of #1135. *)
+      workflows of #1135.
+    - ["corpus-v7-start-metadata"]: the root start metadata workflow of
+      #512.
+    - ["negative-start-metadata-memo"]: [corpus.start_metadata] expecting
+      another memo value for its ["full"] input; replaying the
+      [corpus-v7-start-metadata] ["full"] history against it must report
+      nondeterminism. *)
 val definition_set : string -> workflow list option
 
 (** Activities registered by the live capture worker. Every activity used by a

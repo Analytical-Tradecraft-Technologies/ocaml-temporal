@@ -154,6 +154,20 @@ CASES = {
         "Child run started with that memo and search attribute; it reads "
         "both through Workflow.start_metadata.",
     ),
+    # corpus-v7-start-metadata (#512).
+    "start-metadata-full": (
+        ["start-metadata", "start-delay", "timer"],
+        "Root run started with a memo, keyword and integer search attributes, "
+        "execution/run/task timeouts, a retry policy and a start delay; it "
+        "reads them through Workflow.start_metadata and Workflow.Info and "
+        "starts its timer only when they match the frozen expectation.",
+    ),
+    "start-metadata-absent": (
+        ["start-metadata", "timer"],
+        "Root run started with no start options; it observes absent maps, no "
+        "expiration, timeouts or retry policy, and Temporal's default task "
+        "timeout.",
+    ),
 }
 
 # Patch lifecycle cases (issue #531). Each stage of the lifecycle captures the

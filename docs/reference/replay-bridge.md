@@ -418,8 +418,8 @@ cover:
 `replay_worker_accepts_one_history_document` runs under a 30-second test
 deadline that names the step it was blocked in, so a regression of issue #965
 fails fast instead of consuming the CI job timeout. The
-`stranded_completion_tests` module in
-[`worker_bridge.rs`](../../rust/core-bridge/src/worker_bridge.rs) checks each
+`stranded_completion_tests` module of `worker_bridge.rs` (source
+[`tests/support/stranded_completion.rs`](../../rust/core-bridge/tests/support/stranded_completion.rs)) checks each
 outcome of the bounded completion await with model reply futures: a pending
 reply after Core's shutdown is stranded, a bridge-only close is not, and a
 ready or late-but-within-grace reply is returned. Its
@@ -513,10 +513,14 @@ documented size message.
 The installed-package consumer
 [`installed_replay.ml`](../../test/fixtures/install-consumer/installed_replay.ml)
 runs `Temporal.Replay` from outside the SDK workspace, both after
-`make test-install` and in the relocated binary-only consumer. It replays the
-corpus history `live-2026-10-08-timer.pb`: the recorded `corpus.timer` code
-must pass, and the same type with its timer removed must be `Nondeterminism`
-at the recorded `TimerStarted` event. The
+`make test-install`, in the relocated binary-only consumer, and in the
+source-archive consumer. It replays two corpus histories. For the successful
+`live-2026-10-08-timer.pb`, the recorded `corpus.timer` code must pass, and
+the same type with its timer removed must be `Nondeterminism` at the recorded
+`TimerStarted` event. For the failed `task-failure-business-permanent.pb`, the
+recorded code, which returns a non-retryable application error, must pass,
+and the same type changed to succeed must be `Nondeterminism` at the recorded
+`WorkflowExecutionFailed` event. The
 [replay command's process test](../../test/replay_cli/test_replay_cli.ml)
 feeds a sparse file of `max_bytes + 1` bytes and requires exit status 3.
 

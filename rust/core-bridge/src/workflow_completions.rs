@@ -44,10 +44,14 @@
 //!
 //! Lock order: the state mutex is a leaf. It is never held while another
 //! bridge mutex is taken, and a publisher releases it before waking the
-//! combined readiness condition.
+//! combined readiness condition. It is locked through
+//! [`crate::sync::lock`], which recovers a poisoned guard: every critical
+//! section is a short sequence of counter and map updates, so the state stays
+//! consistent if a holder panicked.
 
+use crate::sync::lock;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Largest completion window derived from a worker configuration. Core
@@ -147,12 +151,6 @@ pub struct WorkflowCompletions {
     changed: Condvar,
     /// Wakes the worker's combined readiness wait after a publication.
     wake: WakeHook,
-}
-
-/// Locks a mutex whose state stays consistent if a holder panicked: every
-/// critical section is a short sequence of counter and map updates.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl WorkflowCompletions {
