@@ -45,24 +45,26 @@ esac
 rm -rf "$capture_dir"
 mkdir -p "$capture_dir"
 
-# The corpus-v6-child-start-metadata generation (#1135) sets the
-# CorpusChildKeyword search attribute on a child, and Temporal fails the
-# parent's workflow task for an unknown attribute. Register it (an existing
-# registration is fine), wait until the namespace lists it, then allow the
-# frontend's search-attribute cache a few seconds to refresh, so the captured
-# parent history does not record a failed workflow task.
-register_corpus_child_keyword() {
-  eval "$HISTORY_CORPUS_TEMPORAL_CLI"' operator search-attribute create --namespace "$namespace" --name CorpusChildKeyword --type Keyword' >/dev/null 2>&1 || true
+# The corpus-v6-child-start-metadata (#1135) and corpus-v7-start-metadata
+# (#512) generations set custom search attributes, and Temporal rejects an
+# unknown attribute (failing the parent's workflow task, or the client start).
+# register_search_attribute NAME TYPE registers one (an existing registration
+# is fine) and waits until the namespace lists it; the caller then allows the
+# frontend's search-attribute cache a few seconds to refresh, so a captured
+# history does not record a failed workflow task.
+register_search_attribute() {
+  attribute_name=$1
+  attribute_type=$2
+  eval "$HISTORY_CORPUS_TEMPORAL_CLI"' operator search-attribute create --namespace "$namespace" --name "$attribute_name" --type "$attribute_type"' >/dev/null 2>&1 || true
   attempts=0
-  until eval "$HISTORY_CORPUS_TEMPORAL_CLI"' operator search-attribute list --namespace "$namespace"' 2>/dev/null | grep -q CorpusChildKeyword; do
+  until eval "$HISTORY_CORPUS_TEMPORAL_CLI"' operator search-attribute list --namespace "$namespace"' 2>/dev/null | grep -q "$attribute_name"; do
     attempts=$((attempts + 1))
     if [ "$attempts" -ge 60 ]; then
-      echo "CorpusChildKeyword was not registered in $namespace" >&2
+      echo "$attribute_name was not registered in $namespace" >&2
       exit 1
     fi
     sleep 1
   done
-  sleep 5
 }
 
 # Generation order is fixed: the two older patch generations run before the
@@ -76,7 +78,15 @@ corpus-lifecycle-removed"
 for generation in ${HISTORY_CORPUS_GENERATIONS:-$default_generations}; do
   echo "history corpus capture: generation=$generation" >&2
   case "$generation" in
-    corpus-v6-child-start-metadata) register_corpus_child_keyword ;;
+    corpus-v6-child-start-metadata)
+      register_search_attribute CorpusChildKeyword Keyword
+      sleep 5
+      ;;
+    corpus-v7-start-metadata)
+      register_search_attribute CorpusStartKeyword Keyword
+      register_search_attribute CorpusStartInt Int
+      sleep 5
+      ;;
   esac
   # The prefix is shell text (it may carry quoted paths and leading
   # environment assignments, as Make's Compose commands do), so it is

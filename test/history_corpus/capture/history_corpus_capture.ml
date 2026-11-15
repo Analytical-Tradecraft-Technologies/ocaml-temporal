@@ -345,6 +345,48 @@ let corpus_v6_child_start_metadata client =
     };
   ]
 
+(** Scenarios captured by the [corpus-v7-start-metadata] generation (#512):
+    a root run started with every client start option that workflow code
+    reads back (a memo, a keyword and an integer search attribute, execution,
+    run and task timeouts, a retry policy and a start delay), and a run
+    started with none of them. Each must return exactly its frozen
+    [Defs.start_metadata_expected] summary; a mismatch fails the capture. *)
+let corpus_v7_start_metadata client =
+  let workflow_type = Defs.start_metadata_workflow_type in
+  let workflow = remote workflow_type Temporal.Codec.string Temporal.Codec.string in
+  let memo = require "encode memo" (Temporal.Codec.encode Temporal.Codec.string "start-memo") in
+  let search_attributes =
+    require "encode search attributes"
+      (Temporal.Search_attribute.encode
+         [
+           Temporal.Search_attribute.set Defs.start_metadata_keyword "corpus-start";
+           Temporal.Search_attribute.set Defs.start_metadata_int 42L;
+         ])
+  in
+  let full =
+    require "start full metadata"
+      (Temporal.Client.start client ~workflow ~task_queue:Defs.task_queue
+         ~id:"history-corpus-start-metadata-full" ~memo:[ ("corpus", memo) ]
+         ~search_attributes ~execution_timeout:(Temporal.Duration.of_seconds 90L)
+         ~run_timeout:(Temporal.Duration.of_seconds 60L)
+         ~task_timeout:(Temporal.Duration.of_seconds 7L) ~retry_policy:Defs.start_metadata_policy
+         ~start_delay:(Temporal.Duration.of_seconds 1L) ~input:"full" ())
+  in
+  let absent =
+    start client ~workflow ~id:"history-corpus-start-metadata-absent" ~input:"absent"
+  in
+  let check label handle input =
+    let observed = expect_completed label handle in
+    if observed <> Defs.start_metadata_expected input then
+      failwith (label ^ " observed " ^ observed)
+  in
+  check "start metadata full" full "full";
+  check "start metadata absent" absent "absent";
+  [
+    record ~case:"start-metadata-full" ~workflow_type full;
+    record ~case:"start-metadata-absent" ~workflow_type absent;
+  ]
+
 (** Captures one [corpus.patch] run under the current generation. *)
 let patch client ~case =
   let workflow_type = Defs.patch_workflow_type in
@@ -476,6 +518,7 @@ let scenarios generation client =
   | "corpus-v4-continue-as-new-options" -> corpus_v4_continue_as_new_options client
   | "corpus-v5-cron-start-delay" -> corpus_v5_cron_start_delay client
   | "corpus-v6-child-start-metadata" -> corpus_v6_child_start_metadata client
+  | "corpus-v7-start-metadata" -> corpus_v7_start_metadata client
   | other -> failwith ("generation has no capture scenarios: " ^ other)
 
 (** Converts a definition-set entry to a live worker registration. *)

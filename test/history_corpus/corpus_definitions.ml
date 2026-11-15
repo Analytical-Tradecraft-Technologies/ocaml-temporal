@@ -941,6 +941,150 @@ let child_metadata_parent_workflow =
         ~id:(Temporal.Workflow.Info.workflow_id info ^ "-child")
         ~memo:[ ("corpus", memo) ] ~search_attributes child_metadata_child_workflow ())
 
+(** {1 Root start metadata workflow (#512)}
+
+    Frozen with the [corpus-v7-start-metadata] capture. *)
+
+let start_metadata_workflow_type = "corpus.start_metadata"
+
+(** The keyword search attribute the capture client sets on the ["full"]
+    run. The capture script registers it, with {!start_metadata_int}, before
+    this generation runs, because Temporal rejects an unknown attribute. *)
+let start_metadata_keyword = Temporal.Search_attribute.keyword "CorpusStartKeyword"
+
+(** The integer search attribute the capture client sets on the ["full"]
+    run; registered with {!start_metadata_keyword}. *)
+let start_metadata_int = Temporal.Search_attribute.int64 "CorpusStartInt"
+
+(** The workflow retry policy the capture client gives the ["full"] run:
+    three attempts, a one-second initial interval doubling to at most ten
+    seconds. The run never fails, so the policy is recorded but never used. *)
+let start_metadata_policy =
+  match
+    Temporal.Retry_policy.make ~initial_interval:(Temporal.Duration.of_seconds 1L)
+      ~backoff_coefficient:2.0 ~maximum_interval:(Temporal.Duration.of_seconds 10L)
+      ~maximum_attempts:3 ()
+  with
+  | Ok policy -> policy
+  | Error error -> invalid_arg (Temporal.Error.message error)
+
+(** Whole milliseconds from [earlier] to [later], truncated toward zero. *)
+let milliseconds_between ~earlier later =
+  let open Int64 in
+  add
+    (mul (sub (Temporal.Time.seconds later) (Temporal.Time.seconds earlier)) 1000L)
+    (of_int ((Temporal.Time.nanoseconds later - Temporal.Time.nanoseconds earlier) / 1_000_000))
+
+(** Summarizes everything a client start can record that workflow code reads
+    back, from [Workflow.start_metadata] and [Workflow.Info] only:
+
+    ["START:memo=<m>;keyword=<k>;int=<i>;expiration=<e>;execution=<x>;run=<r>;task=<t>;retry=<p>;backoff=<b>"]
+
+    - [<m>]: the memo [corpus] value; [<k>] and [<i>]: the two search
+      attributes. Each is ["-"] when absent; a map recorded as present but
+      empty is ["{}"], so an absent map and an empty one stay distinct.
+    - [<e>]: the execution expiration time as milliseconds after the run's
+      start time, or ["-"] when none is recorded.
+    - [<x>], [<r>], [<t>]: the execution, run and task timeouts in
+      milliseconds, ["-"] when none is recorded.
+    - [<p>]: the retry policy as
+      ["<initial ms>/<coefficient>/<maximum ms>/<attempts>"], or ["-"].
+    - [<b>]: the first workflow task backoff in milliseconds (a start
+      delay), or ["-"].
+
+    Every value comes from the run's start event, so the summary is identical
+    under replay. *)
+let start_metadata_summary () =
+  let open Temporal.Result_syntax in
+  let module Info = Temporal.Workflow.Info in
+  let* metadata = Temporal.Workflow.start_metadata () in
+  let* info = Temporal.Workflow.info () in
+  let* memo =
+    match metadata.memo with
+    | None -> Ok "-"
+    | Some [] -> Ok "{}"
+    | Some entries -> (
+        match List.assoc_opt "corpus" entries with
+        | None -> Ok "-"
+        | Some payload -> Temporal.Codec.decode Temporal.Codec.string payload)
+  in
+  let attribute decode to_string =
+    match metadata.search_attributes with
+    | None -> Ok "-"
+    | Some [] -> Ok "{}"
+    | Some entries ->
+        let* value = decode entries in
+        Ok (Option.fold ~none:"-" ~some:to_string value)
+  in
+  let* keyword = attribute (Temporal.Search_attribute.decode start_metadata_keyword) Fun.id in
+  let* int = attribute (Temporal.Search_attribute.decode start_metadata_int) Int64.to_string in
+  let milliseconds = function
+    | None -> "-"
+    | Some value -> Int64.to_string (Temporal.Duration.to_ms value)
+  in
+  let expiration =
+    match (metadata.execution_expiration_time, Info.start_time info) with
+    | None, _ -> "-"
+    | Some expiration, Some start ->
+        Int64.to_string (milliseconds_between ~earlier:start expiration)
+    | Some _, None -> "no-start-time"
+  in
+  let retry =
+    match Info.retry_policy info with
+    | None -> "-"
+    | Some policy ->
+        Printf.sprintf "%Ld/%g/%Ld/%d"
+          (Temporal.Duration.to_ms (Temporal.Retry_policy.initial_interval policy))
+          (Temporal.Retry_policy.backoff_coefficient policy)
+          (Temporal.Duration.to_ms (Temporal.Retry_policy.maximum_interval policy))
+          (Temporal.Retry_policy.maximum_attempts policy)
+  in
+  Ok
+    (Printf.sprintf
+       "START:memo=%s;keyword=%s;int=%s;expiration=%s;execution=%s;run=%s;task=%s;retry=%s;backoff=%s"
+       memo keyword int expiration
+       (milliseconds (Info.execution_timeout info))
+       (milliseconds (Info.run_timeout info))
+       (milliseconds (Info.task_timeout info))
+       retry
+       (milliseconds (Info.first_workflow_task_backoff info)))
+
+(** The summary each captured input must observe. ["full"] is started with
+    every client start option a workflow can read back; ["absent"] with none,
+    so Temporal records only its default 10 s task timeout. *)
+let start_metadata_expected = function
+  | "full" ->
+      "START:memo=start-memo;keyword=corpus-start;int=42;expiration=90000;execution=90000;run=60000;task=7000;retry=1000/2/10000/3;backoff=1000"
+  | "absent" ->
+      "START:memo=-;keyword=-;int=-;expiration=-;execution=-;run=-;task=10000;retry=-;backoff=-"
+  | input -> "unexpected input " ^ input
+
+(** [corpus.start_metadata]: computes {!start_metadata_summary} and compares
+    it with [expected input]. When they match it waits on the corpus timer
+    and returns the summary; otherwise it returns ["MISMATCH:<summary>"] at
+    once. Replay compares commands, not payload values, so the timer is what
+    ties the recorded history to the metadata the workflow observed: a replay
+    that reconstructs different start metadata, or a definition expecting
+    different metadata, emits no timer where history recorded one, which Core
+    reports as nondeterminism. *)
+let start_metadata_workflow ~expected =
+  Temporal.Workflow.define ~name:start_metadata_workflow_type ~input:Temporal.Codec.string
+    ~output:Temporal.Codec.string (fun input ->
+      let open Temporal.Result_syntax in
+      let* summary = start_metadata_summary () in
+      if String.equal summary (expected input) then
+        let* () = Temporal.Workflow.sleep corpus_timer in
+        Ok summary
+      else Ok ("MISMATCH:" ^ summary))
+
+(** The negative control's expectation: the ["full"] run with a different
+    memo value, so the recorded history (which has the timer) must be
+    reported as nondeterministic. *)
+let start_metadata_expected_other_memo = function
+  | "full" ->
+      "START:memo=other-memo;keyword=corpus-start;int=42;expiration=90000;execution=90000;run=60000;task=7000;retry=1000/2/10000/3;backoff=1000"
+  | input -> start_metadata_expected input
+
 (** {1 Reused fixture definitions} *)
 
 (** The corrected generation of [test/integration/temporal/task_failure]. The
@@ -1020,6 +1164,10 @@ let definition_sets =
     ("corpus-v5-cron-start-delay", [ plain cron_start_delay_workflow ]);
     ( "corpus-v6-child-start-metadata",
       [ plain child_metadata_parent_workflow; plain child_metadata_child_workflow ] );
+    ( "corpus-v7-start-metadata",
+      [ plain (start_metadata_workflow ~expected:start_metadata_expected) ] );
+    ( "negative-start-metadata-memo",
+      [ plain (start_metadata_workflow ~expected:start_metadata_expected_other_memo) ] );
   ]
 
 (** Set names in declaration order. *)
