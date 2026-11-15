@@ -8,6 +8,7 @@
 //! are mirrored in `test/unit/test_metrics_config.ml`.
 
 use super::*;
+use crate::abi::STATUS_CONFIGURATION;
 use temporalio_common::telemetry::metrics::{CounterBase, MetricAttributable};
 
 /// A credential-shaped header value that no message may ever contain.
