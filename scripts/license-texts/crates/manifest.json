@@ -230,22 +230,22 @@
       "packages": [
         {
           "name": "tonic-prost",
-          "version": "0.14.6"
+          "version": "0.14.9"
         },
         {
           "name": "tonic-prost-build",
-          "version": "0.14.6"
+          "version": "0.14.9"
         }
       ],
       "license": "MIT",
       "files": [
         {
           "path": "tonic/LICENSE",
-          "upstream": "https://github.com/hyperium/tonic/blob/6cb6056b5a748bc5a29bd48f4602dbc4e552bb7d/LICENSE",
-          "sha256": "e24a56698aa6feaf3a02272b3624f9dc255d982970c5ed97ac4525a95056a5b3"
+          "upstream": "https://github.com/hyperium/tonic/blob/4c0f455c264fe2ec9f9ab5d0cc7fd2824d5daf70/LICENSE",
+          "sha256": "5c686e0f7978412b49187ae0e9f77e9b52eea9d8d2e6c0de8694b35817d873b1"
         }
       ],
-      "evidence": "Repository root LICENSE at the .cargo_vcs_info.json commit of both crates."
+      "evidence": "Repository root LICENSE at the .cargo_vcs_info.json commit 4c0f455c264fe2ec9f9ab5d0cc7fd2824d5daf70 shared by both crates (paths tonic-prost and tonic-prost-build, neither of which holds a licence file)."
     },
     {
       "packages": [

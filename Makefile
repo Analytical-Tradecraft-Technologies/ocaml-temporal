@@ -1453,10 +1453,36 @@ docs:
 # The OPAM licence audit first confirms that docs/dependencies.md still lists
 # exactly the locked and pinned inputs, so the reviewed inventory cannot drift
 # from what is built (#783). The inventory check is host-only POSIX shell.
-# It then audits the CI-only official Python SDK closure (#517).
+# It then audits the CI-only official Python SDK closure (#517) and generates
+# the release third-party notices from the locked Cargo graph.
 license-check: check-dependency-inventory
 	$(COMPOSE_RUN) sh scripts/check-licenses.sh
 	$(MAKE) python-license-check
+	$(MAKE) third-party-notices-check
+
+# Generates THIRD-PARTY-NOTICES.txt exactly as the Release workflow does and
+# audits it, so a Cargo lock change that introduces a crate version without a
+# licence file or a reviewed entry in scripts/license-texts/crates/manifest.json
+# fails the pull request instead of the release. Cargo metadata runs in the
+# development image, whose CARGO_HOME is /workspace/_build/cargo-home on the
+# repository bind mount, so the package sources it downloads keep the same
+# paths inside the digest-pinned Python image of the sdk-interop-python
+# service, which then runs the standard-library-only generator. Output:
+# _build/third-party-notices/THIRD-PARTY-NOTICES.txt.
+NOTICES_DIR := _build/third-party-notices
+.PHONY: third-party-notices-check
+third-party-notices-check:
+	mkdir -p $(NOTICES_DIR)
+	$(CARGO) metadata --manifest-path $(CARGO_MANIFEST) --locked --format-version 1 \
+		> $(NOTICES_DIR)/cargo-metadata.json
+	$(TEMPORAL_COMPOSE) run --rm --no-deps -T --workdir /workspace sdk-interop-python \
+		python3 -I scripts/generate-third-party-notices.py \
+			--metadata $(NOTICES_DIR)/cargo-metadata.json --project-license LICENSE \
+			--output $(NOTICES_DIR)/THIRD-PARTY-NOTICES.txt
+	$(TEMPORAL_COMPOSE) run --rm --no-deps -T --workdir /workspace sdk-interop-python \
+		python3 -I scripts/generate-third-party-notices.py \
+			--metadata $(NOTICES_DIR)/cargo-metadata.json --project-license LICENSE \
+			--audit $(NOTICES_DIR)/THIRD-PARTY-NOTICES.txt
 
 # Installs test/integration/sdk_interop/python/requirements.lock with its
 # hashes in the digest-pinned image of the sdk-interop-python Compose service
