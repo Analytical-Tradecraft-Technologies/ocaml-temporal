@@ -129,6 +129,11 @@ and continued runs; exact expiration timestamps; and malformed/unsupported
 fields. Native execution tests reconstruct the same workflow under replay and
 check ownership across a durable timer and subsequent activation. The
 installed consumer witness checks the public accessor's package boundary.
+The [replay history corpus](history-corpus.md) holds two live root histories
+(`live-2026-11-16-start-metadata`): one started with every option above that
+workflow code reads back, and one with none. Both replay on every PR and Core
+upgrade, and a negative control shows that a definition expecting other
+metadata is reported as nondeterministic.
 
 `make test-temporal-start-metadata-live` builds an independent OCaml
 client/worker executable, starts the pinned Temporal/PostgreSQL Compose stack,

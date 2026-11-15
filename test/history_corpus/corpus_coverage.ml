@@ -105,6 +105,10 @@ let table =
     (* Child memo and search attributes (#1135), captured by
        corpus-v6-child-start-metadata. *)
     replayed "child-start-metadata";
+    (* Root start metadata (#512): memo, search attributes, expiration,
+       timeouts, retry policy and start delay, captured by
+       corpus-v7-start-metadata. *)
+    replayed "start-metadata";
     (* Remote activities. *)
     replayed "activity";
     replayed "activity-retry";
@@ -188,9 +192,6 @@ let table =
     not_yet_captured "external-cancellation"
       "Requesting cancellation of another workflow from workflow code \
        (RequestCancelExternalWorkflowExecutionInitiated).";
-    not_yet_captured "start-metadata"
-      "A start memo and search attributes read through \
-       Workflow.start_metadata.";
     not_yet_captured "search-attribute-upsert"
       "Workflow.upsert_search_attributes \
        (UpsertWorkflowSearchAttributes).";
