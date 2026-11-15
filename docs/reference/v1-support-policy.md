@@ -29,6 +29,13 @@ future compiler. Record exact toolchain versions, image digests, source commit,
 Core revision, and artifact checksums for each release candidate. A green build
 on one platform never substitutes for the live result on another.
 
+### Platform scope outside the release matrix
+
+| Platform | Support level | Reason and evidence |
+| --- | --- | --- |
+| Linux musl libc (Alpine), amd64 and arm64 | **Best-effort, non-blocking** (#1165). Source builds are expected to work, but no release asset, live acceptance, or merge gate covers musl. | The separate [musl workflow](../../.github/workflows/musl.yml) runs `make verify-musl`, the full `make verify` gate (OCaml and Rust suites, the C ABI harness with UndefinedBehaviorSanitizer only because GCC ships no AddressSanitizer runtime for musl, and the installed-library consumer) in the digest-pinned Alpine image of [`Dockerfile.musl`](../../Dockerfile.musl), on native amd64 and arm64 runners. It runs on every master push and on pull requests that change the musl build inputs; it never gates a pull request, the merge queue, or a release. The Alpine image ships its own OCaml 5.5 patch release, so it checks the series only. On a musl host, `scripts/build-rust-bridge.sh` selects Rust's dynamic C runtime (`-C target-feature=-crt-static`, Alpine's own default) unless the caller already set rustflags, because the static default silently drops the bridge's shared library. musl's default thread stack is 128 KiB, which bridge calls on OCaml Domains overflowed, so on musl the installed library's link flags add `-Wl,-z,stack-size=8388608`: every executable that links the SDK records an 8 MiB default thread stack, which musl honours. The published Linux bundles stay glibc-only ([prebuilt OCaml](prebuilt-ocaml.md#compatibility-requirements)); whether a musl bundle joins the release asset set depends on the stable artifact set in #510. |
+| Any 32-bit target (x86, Arm, or other) | **Unsupported**, and not planned. | OCaml 5 has no native-code backend for any 32-bit architecture (32-bit hosts run bytecode only), while every lane here builds, tests, and links native code, and the Rust bridge with Temporal Core is only built for 64-bit targets. No lane attempts a 32-bit build, and a 32-bit build failure is not treated as a defect. |
+
 ## Feature matrix
 
 **Core candidate** means the MVP release must pass the named behavior on the

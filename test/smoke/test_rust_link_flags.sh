@@ -58,6 +58,16 @@ sh "$workspace_root/scripts/render-rust-link-flags.sh" \
 printf '(-lpthread -ldl)\n' >"$temporary_root/expected-non-windows.sexp"
 cmp "$temporary_root/expected-non-windows.sexp" "$non_windows_output"
 
+# musl hosts record an 8 MiB default thread stack in every linked executable
+# (#1165), after rustc's own libraries.
+musl_output=$temporary_root/musl-flags.sexp
+sh "$workspace_root/scripts/render-rust-link-flags.sh" \
+  'Linux-musl' \
+  "$temporary_root/target/debug" \
+  "$musl_output" \
+  '-lgcc_s -lc'
+test "$(cat "$musl_output")" = '(-lgcc_s -lc -Wl,-z,stack-size=8388608)'
+
 # Relocate the complete Windows bundle and remove Cargo's registry. The new
 # linker flags must point to the downloaded import libraries, including when
 # the consumer's checkout path contains spaces.

@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+# `uname -s` of the linking host, or Linux-musl for a Linux host whose Rust
+# host target uses musl libc (scripts/build-rust-bridge.sh decides).
 operating_system=$1
 # Either a relocated prebuilt bundle (containing import-libs) or the Cargo
 # output directory of the profile that produced the archive, such as
@@ -128,6 +130,18 @@ EOF
     # so installations below a directory containing spaces remain valid.
     escaped_search_dir=$(printf '%s' "$search_dir" | sed 's/\\/\\\\/g; s/"/\\"/g')
     printf '("-L%s" %s)\n' "$escaped_search_dir" "$native_link_flags" >"$output"
+    ;;
+  Linux-musl)
+    # musl gives threads it creates with default attributes, including OCaml
+    # Domains and systhreads, a 128 KiB stack, against glibc's usual 8 MiB.
+    # Bridge calls made on such a thread run Tokio's block_on and Temporal
+    # Core's futures on that stack and overflowed it with SIGSEGV (#1165).
+    # musl raises its default thread stack to the PT_GNU_STACK size recorded
+    # in the executable, up to 8 MiB, so the installed library asks every
+    # executable that links it to record 8 MiB. The option only sizes thread
+    # stacks: musl ignores it for the main thread, whose stack still follows
+    # the process limit.
+    printf '(%s -Wl,-z,stack-size=8388608)\n' "$native_link_flags" >"$output"
     ;;
   *)
     printf '(%s)\n' "$native_link_flags" >"$output"

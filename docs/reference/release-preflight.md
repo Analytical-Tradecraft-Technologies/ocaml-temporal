@@ -133,7 +133,9 @@ Compatible applications link the OCaml SDK, C stubs and Rust bridge
 directly without rebuilding them. Each SDK records its exact compiler and compiled
 dependency identities; incompatible environments must use matching dependencies
 or build from source. Linux assets target Debian 12 and need glibc 2.36 or newer, not musl/Alpine;
-the installer refuses an older host before unpacking (#1147).
+the installer refuses an older host before unpacking (#1147). musl hosts build
+from source, which the [support policy](v1-support-policy.md#platform-scope-outside-the-release-matrix)
+lists as best-effort.
 
 For the next version, first update the three version files and `SDK_VERSION`,
 and add the version's release notes as `docs/releases/<tag>.md` (see the

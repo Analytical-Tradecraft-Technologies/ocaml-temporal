@@ -323,11 +323,22 @@ the pin files, the Dependabot entries and the CI matrix stay in step.
 | `ocaml/opam:debian-12-ocaml-5.4` | `docker/ocaml-5.4/Dockerfile` |
 | `ocaml/opam:debian-12-ocaml-5.5` | `docker/ocaml-5.5/Dockerfile` |
 | `ocaml/opam:debian-12-ocaml-5.6` | `docker/ocaml-5.6/Dockerfile` (next-series readiness lane only, #1164) |
+| `ocaml/opam:alpine-3.23-ocaml-5.5` | `Dockerfile.musl` (best-effort musl lane only, #1165) |
 
 The 5.6 image carries the compiler's trunk (`ocaml-variants.5.6.0+trunk`) or
 an alpha until 5.6.0 is released. Only the non-blocking `OCaml next` lane of
 master builds uses it; it is not a supported compiler and produces no
 artifact.
+
+The Alpine (musl libc) image backs only `make verify-musl` and the
+non-blocking musl workflow (#1165). `Dockerfile.musl` pins it, together with
+the matching `rust:<version>-alpine3.23` image, on its own `FROM` lines, which
+the root Dependabot `docker` entry refreshes; it is not a supported release
+platform and produces no artifact. Alpine's `protoc` and `protobuf-dev`
+packages (BSD-3-Clause) replace Debian's Protocol Buffers packages as
+build-only tools, and the image's own gcc and `musl-dev` compile the C stubs
+and ring's C sources. musl itself is MIT. The OCaml and Rust packages built in
+the image are the same locked closures audited above.
 
 Each index contains native `linux/amd64` and `linux/arm64` images. The image
 build recipes are MIT (`ocurrent/docker-base-images`); the OCaml and OPAM
@@ -409,7 +420,7 @@ Python image is linked into or redistributed with the SDK.
 
 | Image | Used by | Native platforms | License |
 |---|---|---|---|
-| `rust` | `Dockerfile.dev` Rust toolchain stage and `Dockerfile.rust-ci` | Linux amd64 and arm64/v8 | Rust is Apache-2.0 OR MIT; image packaging (`rust-lang/docker-rust`) is Apache-2.0 OR MIT |
+| `rust` | `Dockerfile.dev` Rust toolchain stage, `Dockerfile.rust-ci`, and the `Dockerfile.musl` Rust toolchain stage (Alpine tag) | Linux amd64 and arm64/v8 | Rust is Apache-2.0 OR MIT; image packaging (`rust-lang/docker-rust`) is Apache-2.0 OR MIT |
 | `python` | Cargo license audit, release-preflight Cargo SBOM generation and audit, the official-SDK interoperability driver, and its Python license audit (CI-only) | Linux amd64, arm64/v8, and additional official architectures | CPython's PSF license stack (SPDX `Python-2.0`); image packaging (`docker-library/python`) is MIT |
 
 `ocamlformat` is deliberately absent. Version 0.28.1 is MIT licensed, but its

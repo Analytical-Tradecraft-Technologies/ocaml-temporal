@@ -80,6 +80,17 @@ master run green and only warns that the next compiler or the locked OPAM
 closure needs work before the `< 5.6` bound can be raised. These entries describe configured jobs, not evidence that a
 particular Actions run completed.
 
+The best-effort musl lane (#1165) is a separate workflow,
+`.github/workflows/musl.yml`, outside the Build graph and the required checks.
+It runs `make verify-musl` (the whole `make verify` gate in the Alpine image of
+`Dockerfile.musl`, Compose service `musl`, with its own `_build/musl` tree) on
+native amd64 and arm64 runners for every master push, for a manual dispatch,
+and for pull requests that change one of its listed build inputs; merge groups
+never run it. The glibc Rust producers cannot feed a musl link, so the lane
+compiles and tests its own bridge, and each job has `continue-on-error`. The
+[support policy](v1-support-policy.md#platform-scope-outside-the-release-matrix)
+records musl as best-effort and 32-bit targets as unsupported.
+
 ## Rust artifact sharing
 
 The free native GitHub runners produce four independent Rust bundles. Linux
@@ -148,7 +159,9 @@ the native macOS lane also run the sanitized C ABI harness
 (`test/bridge/test_abi.sh`, #1150). The Windows lane skips it because the
 harness builds with AddressSanitizer and UndefinedBehaviorSanitizer, whose
 runtimes the MinGW toolchain does not ship; Windows exercises the bridge
-through the OCaml and Rust suites. `make test-quality-contract` also runs the
+through the OCaml and Rust suites. The best-effort musl lane builds the harness
+with UndefinedBehaviorSanitizer in trap mode only, since GCC ships no sanitizer
+runtimes for musl. `make test-quality-contract` also runs the
 OPAM license-policy fixtures (`test/smoke/test_license_policy.sh`), which
 fail if `scripts/check-licenses.sh` ever accepts a GPL, missing, mixed or
 unreviewed license. They run on Linux and macOS; the Windows lane skips them

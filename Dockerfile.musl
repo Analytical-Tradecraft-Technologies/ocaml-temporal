@@ -1,0 +1,80 @@
+# Alpine Linux (musl libc) development image for the best-effort musl lane
+# (#1165). It mirrors Dockerfile.dev's `dev` stage on Alpine instead of
+# Debian 12, so `make verify-musl` runs the ordinary Make targets, build
+# scripts and Dune rules unchanged inside it. Both base images run natively on
+# amd64 and arm64, and their Rust host is `<arch>-unknown-linux-musl`, so
+# scripts/build-rust-bridge.sh builds the musl static library with no target
+# switch or cross toolchain; the Makefile's musl-version-check asserts that
+# rustc and ocamlopt both target musl before anything else runs.
+#
+# musl is a best-effort, non-blocking platform (docs/reference/v1-support-policy.md):
+# this image backs the separate musl CI workflow and is not a release lane.
+# The two FROM lines pin the official images by multi-architecture manifest
+# index digest; the root Dependabot docker entry refreshes them. Keep their
+# Alpine releases equal so the copied Rust toolchain and the OCaml image share
+# one musl ABI.
+FROM rust:1.100-alpine3.23@sha256:23ee60d5346e4042efbc9f9120d736be4b5c7f29becf2ebea181160422ca8d30 AS rust-toolchain
+# rust/rust-toolchain.toml is the single Rust version pin; as in
+# Dockerfile.dev, the base image only supplies rustup, and any other toolchain
+# is removed so test/smoke/test_rust_toolchain.sh sees the pinned compiler.
+COPY rust/rust-toolchain.toml scripts/rust-version.sh /tmp/rust-version/
+RUN rust_version="$(sh /tmp/rust-version/rust-version.sh /tmp/rust-version/rust-toolchain.toml)" \
+    && rustup toolchain install "$rust_version" --profile minimal --component clippy --component rustfmt \
+    && rustup default "$rust_version" \
+    && for toolchain in $(rustup toolchain list | awk '{ print $1 }'); do \
+        case "$toolchain" in "$rust_version"-*) ;; *) rustup toolchain uninstall "$toolchain" ;; esac; \
+    done \
+    && rm -rf /tmp/rust-version
+
+FROM ocaml/opam:alpine-3.23-ocaml-5.5@sha256:e2917e50faa33fa5a10478ad38aab4e181ee61b7d40c69818cd0fa081b68869d AS dev
+
+USER root
+# Build-only native tools, the Alpine equivalents of Dockerfile.dev's Debian
+# packages: protoc and the Google protobuf definitions for Temporal Core's
+# generated crates. The OCaml image already ships gcc and musl-dev, which
+# compile ring's C sources and link the OCaml executables. lld is omitted
+# because only the live-test executable batches use it, and this lane runs no
+# live server.
+RUN apk add --no-cache \
+        protobuf-dev \
+        protoc
+
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+
+# Make runs the container as the invoking user's numeric identity, which has
+# no passwd entry here. The Debian ocaml/opam images set HOME so opam still
+# finds its root under /home/opam; the Alpine image does not, so set it here.
+#
+# Rust's musl targets default to a static C runtime, which drops the bridge's
+# cdylib. scripts/build-rust-bridge.sh selects the dynamic runtime on a musl
+# host when no rustflags are set; the image sets the identical value for both
+# architectures so `cargo build`, `cargo test` and Clippy run by the Makefile
+# reuse the bridge build's fingerprints instead of compiling a second graph.
+ENV HOME=/home/opam \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=-crt-static" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=-crt-static" \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/workspace/_build/cargo-home \
+    CARGO_TARGET_DIR=/workspace/_build/rust \
+    PATH=/usr/local/cargo/bin:${PATH}
+
+USER opam
+WORKDIR /workspace
+COPY --chown=opam:opam temporal-sdk.opam temporal-sdk.opam.locked dune-project ./
+COPY --chown=opam:opam scripts/opam-locked-deps.sh scripts/opam-lock-overrides.txt ./scripts/
+# The same exact locked closure as Dockerfile.dev, checked after installation.
+RUN opam repository set-url default https://opam.ocaml.org \
+    && opam update \
+    && sh scripts/opam-locked-deps.sh install --no-depexts
+
+USER root
+# Make supplies a fresh value on every invocation, so cached toolchains and
+# dependencies remain reusable while runtime Cargo/opam HTTPS uses current roots.
+ARG CA_CERTIFICATES_REFRESH
+RUN test -n "${CA_CERTIFICATES_REFRESH}" \
+    && apk add --no-cache --upgrade ca-certificates \
+    && update-ca-certificates --fresh
+USER opam
+
+CMD ["opam", "exec", "--", "dune", "build"]

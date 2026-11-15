@@ -1512,6 +1512,33 @@ verify: version-check lint test
 
 check: verify license-check
 
+# Best-effort musl libc lane (#1165; docs/reference/v1-support-policy.md).
+# It runs the ordinary `verify` gate with SERVICE=musl, the Compose service
+# built from Dockerfile.musl (Alpine), so the same Make targets, build scripts
+# and Dune rules produce and link a musl Rust bridge natively on amd64 or
+# arm64. The service mounts host _build/musl as its _build tree, created here
+# first so the invoking user owns it rather than the Docker daemon. The Alpine
+# image's compiler patch level is not pinned to the Debian matrix's, so only
+# the series is checked. musl-version-check proves both toolchains target musl
+# before anything is built; it is only meaningful with SERVICE=musl.
+MUSL_OCAML_VERSION ?= 5.5
+.PHONY: verify-musl musl-version-check
+verify-musl:
+	mkdir -p _build/musl
+	COMPOSE_PROFILES=musl $(MAKE) SERVICE=musl OCAML_VERSION=$(MUSL_OCAML_VERSION) musl-version-check verify
+
+musl-version-check:
+	@rust_host="$$( $(COMPOSE_RUN) rustc -vV | sed -n 's/^host: //p' )"; \
+	case "$$rust_host" in \
+		*-unknown-linux-musl) ;; \
+		*) echo "expected a *-unknown-linux-musl Rust host, got '$$rust_host'; run make verify-musl" >&2; exit 1 ;; \
+	esac
+	@ocaml_target="$$( $(RUN) ocamlopt -config-var target )"; \
+	case "$$ocaml_target" in \
+		*-linux-musl) ;; \
+		*) echo "expected a *-linux-musl OCaml target, got '$$ocaml_target'; run make verify-musl" >&2; exit 1 ;; \
+	esac
+
 # Native targets are used by the non-Linux compatibility jobs. The default
 # developer path remains Docker Compose so no host OCaml toolchain is required.
 # Windows OCaml writes CRLF; normalize its output before exact comparisons.
