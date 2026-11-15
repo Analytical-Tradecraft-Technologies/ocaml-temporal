@@ -2,13 +2,20 @@
 """Validate platform bundles and prepare portable, versioned release archives."""
 
 import argparse
-import hashlib
-import importlib.util
 import json
 import re
 import sys
 import tarfile
 from pathlib import Path
+
+# `python3 -I` leaves this script's directory off the import path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from script_support import load_script  # noqa: E402
+
+# The SDK bundle tool validates each tested SDK and names the tools it ships;
+# the CI matrix lists the compilers every release must cover.
+ARTIFACT = load_script("ocaml-library-artifact")
+MATRIX = load_script("ci-matrix")
 
 
 # Rust-only bundles remain useful for compilers outside the published SDK matrix.
@@ -29,19 +36,9 @@ LICENSE_NAME = "LICENSE"
 NOTICES_NAME = "THIRD-PARTY-NOTICES.txt"
 
 
-def load_script(name):
-    """Import a sibling helper whose file name contains hyphens."""
-    spec = importlib.util.spec_from_file_location(name.replace("-", "_"), Path(__file__).with_name(f"{name}.py"))
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def sha256(path):
-    """Hash a library without loading the entire static archive into memory."""
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+# Bundle files and release archives are hashed by streaming, like SDK bundles,
+# so a static archive is never loaded into memory whole.
+sha256 = ARTIFACT.sha256
 
 
 def validate_bundle(bundle, platform):
@@ -151,25 +148,19 @@ def package_bridges(bundles, output, tag, commit, legal):
 
 def package_libraries(bundles, output, tag, commit, legal):
     """Require all sixteen tested SDKs and their matching released Rust inputs."""
-    spec = importlib.util.spec_from_file_location("ocaml_artifact", Path(__file__).with_name("ocaml-library-artifact.py"))
-    artifact = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(artifact)
-    spec = importlib.util.spec_from_file_location("ci_matrix", Path(__file__).with_name("ci-matrix.py"))
-    matrix = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(matrix)
     manifest_path = output / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     libraries = {}
     for platform in PLATFORMS:
-        for ocaml in matrix.COMPILERS:
+        for ocaml in MATRIX.COMPILERS:
             identity = f"{platform}-ocaml-{ocaml}"
             bundle = bundles / f"ocaml-sdk-{identity}"
-            metadata = artifact.validate(bundle, commit, ocaml, platform, "release")
+            metadata = ARTIFACT.validate(bundle, commit, ocaml, platform, "release")
             if metadata["rust_bridge_key"] != manifest["bridges"][platform]["key"]:
                 raise ValueError(f"SDK and released Rust bridge differ: {identity}")
             archive = output / f"ocaml-temporal-sdk-{tag}-{identity}.tar.gz"
             with tarfile.open(archive, "w:gz", compresslevel=1) as tar:
-                for name in ("library.tar.gz", "manifest.json", *artifact.TOOLS):
+                for name in ("library.tar.gz", "manifest.json", *ARTIFACT.TOOLS):
                     tar.add(bundle / name, arcname=name, recursive=False)
                 add_legal_files(tar, legal)
             verify_legal_files(archive, legal)
@@ -182,15 +173,18 @@ def package_libraries(bundles, output, tag, commit, legal):
 def main():
     """Read paths and the independently supplied release identity from CI."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bundles", required=True, type=Path)
-    parser.add_argument("--ocaml-bundles", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--tag", required=True)
-    parser.add_argument("--commit", required=True)
-    parser.add_argument("--license", required=True, type=Path,
-                        help="this project's LICENSE file")
-    parser.add_argument("--notices", required=True, type=Path,
-                        help="audited output of scripts/generate-third-party-notices.py")
+    # Every input is required: directories and files as paths, the release
+    # identity as plain strings.
+    for option, kind, text in (
+        ("--bundles", Path, None),
+        ("--ocaml-bundles", Path, None),
+        ("--output", Path, None),
+        ("--tag", str, None),
+        ("--commit", str, None),
+        ("--license", Path, "this project's LICENSE file"),
+        ("--notices", Path, "audited output of scripts/generate-third-party-notices.py"),
+    ):
+        parser.add_argument(option, required=True, type=kind, help=text)
     args = parser.parse_args()
     legal = legal_files(args.license, args.notices)
     package_bridges(args.bundles, args.output, args.tag, args.commit, legal)

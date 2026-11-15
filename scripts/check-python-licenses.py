@@ -33,38 +33,20 @@ This script uses only the standard library and never accesses the network.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import re
 import sys
 from dataclasses import dataclass
 from importlib.metadata import Distribution, distributions
 from pathlib import Path
-from types import ModuleType
 from typing import TextIO
 
-
-def load_license_policy() -> ModuleType:
-    """Load the shared SPDX parser and allowlist from the Cargo scanner.
-
-    The scanner's file name contains hyphens, so it is loaded by path, as
-    `generate-cargo-sbom.py` does. It is registered before execution because
-    its dataclasses resolve their module through `sys.modules`.
-    """
-
-    name = "check_cargo_licenses"
-    if name in sys.modules:
-        return sys.modules[name]
-    path = Path(__file__).with_name("check-cargo-licenses.py")
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load the license policy from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+# `python3 -I` leaves this script's directory off the import path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from script_support import load_script  # noqa: E402
 
 
-POLICY = load_license_policy()
+# The shared SPDX parser and permissive allowlist of the Cargo scanner.
+POLICY = load_script("check-cargo-licenses")
 
 # Classifiers that name exactly one SPDX license. "BSD License" and "Apache
 # Software License" omit the variant or version and are therefore ambiguous:

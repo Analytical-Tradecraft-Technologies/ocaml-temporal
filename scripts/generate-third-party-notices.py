@@ -23,14 +23,23 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
-import json
 import posixpath
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# `python3 -I` leaves this script's directory off the import path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from script_support import (  # noqa: E402
+    add_generate_or_audit,
+    load_json_object,
+    load_script,
+    package_fields,
+    package_list,
+    read_json,
+)
 
 
 HEADER = "ocaml-temporal third-party notices"
@@ -45,28 +54,8 @@ INVENTORY_LINE = re.compile(r"^  - (\S+) (\S+): (T[0-9]{4}(?:, T[0-9]{4})*)$")
 TEXT_HEADER = re.compile(r"^---- (T[0-9]{4}) ----$")
 
 
-def load_license_policy() -> Any:
-    """Import the Cargo licence scanner so all tools share one conclusion.
-
-    The scanner's file name contains hyphens, so it is loaded by path. The
-    module is registered before execution because its dataclasses resolve
-    their defining module through `sys.modules`.
-    """
-
-    name = "check_cargo_licenses"
-    if name in sys.modules:
-        return sys.modules[name]
-    path = Path(__file__).with_name("check-cargo-licenses.py")
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load Cargo license policy from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-LICENSE_POLICY = load_license_policy()
+# The Cargo licence scanner owns the policy, so all tools share one conclusion.
+LICENSE_POLICY = load_script("check-cargo-licenses")
 
 
 @dataclass(frozen=True)
@@ -117,14 +106,8 @@ def package_root(package: dict[str, Any]) -> Path:
 
     manifest = package.get("manifest_path")
     if not isinstance(manifest, str) or not manifest:
-        raise ValueError(f"{package_label(package)} has no manifest_path")
+        raise ValueError(f"{LICENSE_POLICY.package_label(package)} has no manifest_path")
     return Path(manifest).parent
-
-
-def package_label(package: dict[str, Any]) -> str:
-    """Name a package in diagnostics without assuming metadata is valid."""
-
-    return f"{package.get('name', '<missing-name>')} {package.get('version', '<missing-version>')}"
 
 
 def collect_files(package: dict[str, Any]) -> list[Notice]:
@@ -213,6 +196,14 @@ class ReviewedNotice:
     note: str
 
 
+def manifest_object(value: object, where: str, what: str) -> dict[str, object]:
+    """Require one reviewed-notice manifest value, described as `what`, to be an object."""
+
+    if not isinstance(value, dict):
+        raise ValueError(f"{where}: {what} must be an object")
+    return value
+
+
 def manifest_string(entry: dict[str, object], key: str, where: str) -> str:
     """Read one required non-empty string field of a reviewed-notice entry."""
 
@@ -245,8 +236,7 @@ def load_reviewed_entry(
     with an explicit `maintainer_exception`.
     """
 
-    if not isinstance(entry, dict):
-        raise ValueError(f"{where}: entry must be an object")
+    entry = manifest_object(entry, where, "entry")
     license = manifest_string(entry, "license", where)
     manifest_string(entry, "evidence", where)
     packages = []
@@ -260,8 +250,7 @@ def load_reviewed_entry(
     notices = []
     upstream_files = 0
     for item in manifest_list(entry, "files", where):
-        if not isinstance(item, dict):
-            raise ValueError(f"{where}: each file must be an object")
+        item = manifest_object(item, where, "each file")
         relative = manifest_string(item, "path", where)
         upstream = manifest_string(item, "upstream", where)
         digest = manifest_string(item, "sha256", where)
@@ -310,10 +299,7 @@ def load_reviewed(directory: Path) -> dict[tuple[str, str], ReviewedNotice]:
     """
 
     path = directory / REVIEWED_MANIFEST
-    try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read reviewed notices {path}: {exc}") from exc
+    manifest = read_json(path, "reviewed notices")
     entries = manifest.get("notices") if isinstance(manifest, dict) else None
     if not isinstance(entries, list):
         raise ValueError(f"{path}: expected an object with a notices list")
@@ -343,19 +329,15 @@ def third_party_packages(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     of what any one platform links.
     """
 
-    packages = metadata.get("packages")
-    if not isinstance(packages, list) or not packages:
-        raise ValueError("Cargo metadata contains no packages")
+    packages = package_list(metadata, "Cargo metadata")
     members = metadata.get("workspace_members")
     if not isinstance(members, list):
         raise ValueError("Cargo metadata is missing workspace_members")
     selected = []
     for package in packages:
-        if not isinstance(package, dict):
-            raise ValueError("Cargo metadata package is not an object")
-        name, version = package.get("name"), package.get("version")
-        if not (isinstance(name, str) and name and isinstance(version, str) and version):
-            raise ValueError("Cargo package is missing name or version")
+        package_fields(
+            package, "Cargo metadata", ("name", "version"), "Cargo package is missing name or version"
+        )
         if package.get("id") not in members:
             selected.append(package)
     return sorted(selected, key=lambda item: (item["name"], item["version"], item.get("source") or ""))
@@ -376,7 +358,7 @@ def collect(metadata: dict[str, Any], reviewed_dir: Path = REVIEWED_NOTICES) -> 
     results = []
     errors = []
     for package in third_party_packages(metadata):
-        label = package_label(package)
+        label = LICENSE_POLICY.package_label(package)
         concluded = LICENSE_POLICY.concluded_license(package)
         if concluded is None:
             errors.append(f"{label}: no concluded licence (run scripts/check-cargo-licenses.py)")
@@ -529,29 +511,17 @@ def audit(document: str, metadata: dict[str, Any], project_license: str) -> None
                 raise ValueError(f"duplicate notice text {match.group(1)}")
             headers.add(match.group(1))
     expected = {(package["name"], package["version"]) for package in third_party_packages(metadata)}
-    missing = sorted(expected - listed.keys())
-    if missing:
-        raise ValueError("packages missing from notices: " + ", ".join(" ".join(key) for key in missing))
-    unexpected = sorted(listed.keys() - expected)
-    if unexpected:
-        raise ValueError("notices list packages outside the Cargo graph: "
-                         + ", ".join(" ".join(key) for key in unexpected))
+    # Missing packages are reported before unexpected ones.
+    for difference, problem in (
+        (expected - listed.keys(), "packages missing from notices"),
+        (listed.keys() - expected, "notices list packages outside the Cargo graph"),
+    ):
+        if difference:
+            raise ValueError(f"{problem}: " + ", ".join(" ".join(key) for key in sorted(difference)))
     referenced = {identifier for ids in listed.values() for identifier in ids}
     if referenced != headers:
         raise ValueError("notice text references and texts differ: "
                          + ", ".join(sorted(referenced ^ headers)))
-
-
-def load_json(path: Path) -> dict[str, Any]:
-    """Load Cargo metadata and turn malformed input into a concise CLI error."""
-
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read JSON {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ValueError(f"JSON root in {path} must be an object")
-    return value
 
 
 def main() -> int:
@@ -565,12 +535,11 @@ def main() -> int:
     parser.add_argument("--reviewed-notices", type=Path, default=REVIEWED_NOTICES,
                         help="directory holding the reviewed-notice manifest.json "
                              "(default: scripts/license-texts/crates)")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--output", type=Path, help="notices file to write")
-    group.add_argument("--audit", type=Path, help="notices file to check for completeness")
+    add_generate_or_audit(parser, "--output", "notices file to write",
+                          "notices file to check for completeness")
     args = parser.parse_args()
     try:
-        metadata = load_json(args.metadata)
+        metadata = load_json_object(args.metadata)
         project_license = args.project_license.read_text(encoding="utf-8")
         if args.output is not None:
             document = generate(metadata, project_license, args.reviewed_notices)
