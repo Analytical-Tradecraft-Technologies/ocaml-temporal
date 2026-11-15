@@ -535,6 +535,26 @@ module Context : sig
       reads. *)
   val details : t -> Payload.t list
 
+  (** Decodes the previous attempt's heartbeat details with [codec], the
+      typed counterpart of {!details} and the inverse of {!heartbeat}.
+      Returns [Ok None] when there are no details (a first attempt, or a
+      previous attempt that never heartbeated), and [Ok (Some value)] when
+      exactly one payload decodes. A payload [codec] cannot decode returns
+      the codec's [`Codec] error, and more than one payload (possible only
+      from {!heartbeat_payloads} or another SDK) returns a non-retryable
+      [`Codec] error rather than silently ignoring the rest; read such
+      details with {!details}. Like {!details}, the result is fixed for the
+      attempt.
+
+      {[
+        let resume_from context =
+          match Temporal.Activity.Context.details_as context Temporal.Codec.int with
+          | Ok (Some index) -> Ok (index + 1)
+          | Ok None -> Ok 0
+          | Error _ as error -> error
+      ]} *)
+  val details_as : t -> 'a Codec.t -> ('a option, Error.t) result
+
   (** Returns the configured heartbeat interval, if one was supplied. An
       unset (zero) interval is [None]; a sub-millisecond remainder is rounded
       up to the next whole millisecond, as in {!Info.heartbeat_timeout}. *)

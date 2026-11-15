@@ -47,15 +47,34 @@ let run_with_retry activity child input =
     ~id:"follow-up" child activity_result
 ```
 
+Every labelled argument is optional. A field you omit is sent as unset and
+Temporal applies its own default: a 1 second initial interval, a backoff
+coefficient of 2.0, a maximum interval of 100 times the initial interval,
+and no attempt limit (for a local activity, Temporal Core applies the same
+defaults). Operators can change the server defaults, which is why the SDK
+never substitutes them itself. Overriding only the attempt count therefore
+keeps Temporal's backoff:
+
+```ocaml
+let three_attempts () = Temporal.Retry_policy.make ~maximum_attempts:3 ()
+```
+
 The constructor validates before a command is emitted and returns a typed
 `Error.t` for invalid configuration. Its fields have these meanings:
 
 - `initial_interval` and `maximum_interval` are positive whole-millisecond
-  durations, and the maximum must not be smaller than the initial interval.
+  durations. When both are given the maximum must not be smaller than the
+  initial interval. A `maximum_interval` given alone must be at least 1
+  second, the server's default initial interval, because Temporal would
+  otherwise reject every command carrying the policy; set
+  `initial_interval` too for a shorter maximum.
 - `backoff_coefficient` is finite and at least `1.0`. Temporal applies it
   between attempts, subject to the maximum interval.
-- `maximum_attempts = 0` means that no attempt-count limit is selected;
-  positive values include the initial attempt.
+- `maximum_attempts` is between `0` and `Int32.max_int` (2,147,483,647),
+  the range of Temporal's signed 32-bit field. Positive values include the
+  initial attempt. `0`, like omitting it, selects the server default, which
+  is unlimited unless the operator configured a limit; the wire format
+  cannot tell the two apart.
 - `non_retryable_error_types` is a copied list of Temporal application error
   type names. A matching application failure is not retried by this policy.
   Temporal compares each name with the failure's
@@ -69,7 +88,17 @@ The constructor validates before a command is emitted and returns a typed
 
 The accessor functions return
 copies or immutable scalar values, so changing a caller-owned list after
-construction cannot change a command already selected by workflow code.
+construction cannot change a command already selected by workflow code. The
+interval and coefficient accessors return `None` for a field left to the
+server default.
+
+On the wire an unset interval or coefficient is the protocol's zero value,
+which Temporal reads as "use the default"; the Rust bridge sends an unset
+interval to Core as absent, because Core's local-activity retry logic
+substitutes its default only for an absent interval. The policy Temporal
+actually applied is visible to the workflow it governs:
+`Temporal.Workflow.Info.retry_policy` returns the effective policy from the
+start event, with the server's defaults filled in.
 Passing no `~retry_policy` leaves the option absent; it does not create an
 OCaml policy or silently replace the service's default with a language-level
 one.

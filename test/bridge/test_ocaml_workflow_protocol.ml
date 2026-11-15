@@ -187,6 +187,47 @@ let test_continuation_initialize_metadata () =
   let decoded = unwrap (Protocol.decode_activation encoded) in
   if decoded <> value then failwith "continuation metadata did not round-trip"
 
+(** A zero interval or the all-zero coefficient pattern is Temporal's
+    "unset" value (#1145): the outbound validator accepts it so the server
+    applies its default, while set values keep their strict rules. *)
+let test_unset_retry_policy_fields () =
+  let zero : Protocol.duration = { seconds = 0L; nanoseconds = 0 } in
+  let unset : Protocol.retry_policy =
+    {
+      initial_interval = zero;
+      backoff_coefficient_bits = "0";
+      maximum_interval = zero;
+      maximum_attempts = 3;
+      non_retryable_error_types = [];
+    }
+  in
+  let accepted label policy =
+    match Protocol.validate_retry_policy policy with
+    | Ok () -> ()
+    | Error _ -> failwith (label ^ " was rejected")
+  in
+  let rejected label policy =
+    match Protocol.validate_retry_policy policy with
+    | Ok () -> failwith (label ^ " was accepted")
+    | Error _ -> ()
+  in
+  accepted "all fields unset" unset;
+  accepted "only maximum set"
+    { unset with maximum_interval = { seconds = 10L; nanoseconds = 0 } };
+  accepted "only initial set"
+    { unset with initial_interval = { seconds = 10L; nanoseconds = 0 } };
+  rejected "maximum below a set initial"
+    {
+      unset with
+      initial_interval = { seconds = 1L; nanoseconds = 0 };
+      maximum_interval = { seconds = 0L; nanoseconds = 999_999_999 };
+    };
+  (* -0.0 is not the all-zero bit pattern, and 0.5 is set but too small. *)
+  rejected "negative zero coefficient"
+    { unset with backoff_coefficient_bits = "9223372036854775808" };
+  rejected "coefficient below one"
+    { unset with backoff_coefficient_bits = "4602678819172646912" }
+
 (** Verifies every first-slice completion command and command ordering. *)
 let test_valid_completion () =
   let value =
@@ -1672,13 +1713,24 @@ let test_activity_retry_policy () =
     in
     if not (String.equal (Yojson.Safe.to_string no_retry_policy_json) "null") then
       failwith "omitted retry policy was not encoded as null";
+    (* The all-zero coefficient is Temporal's "unset" value (#1145); a set
+       coefficient below 1.0 is still rejected. *)
+    ignore
+      (unwrap
+         (Protocol.encode_completion
+            { completion with
+              commands =
+                [ schedule
+                    (Some
+                       { policy with backoff_coefficient_bits = "0" }) ] }));
     require_error
       (Protocol.encode_completion
          { completion with
            commands =
              [ schedule
                  (Some
-                    { policy with backoff_coefficient_bits = "0" }) ] })
+                    { policy with
+                      backoff_coefficient_bits = "4602678819172646912" }) ] })
     ;
     require_error
       (Protocol.encode_completion
@@ -2209,6 +2261,7 @@ let test_child_start_metadata () =
       {|"memo":{"k":{"metadata":{}}},|} ]
 
 let () =
+  test_unset_retry_policy_fields ();
   test_completion_versioning_behavior ();
   test_child_routing_options ();
   test_child_timeout_options ();

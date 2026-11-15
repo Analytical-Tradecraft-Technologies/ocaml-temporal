@@ -281,7 +281,9 @@ module Info : sig
   (** Returns the workflow retry policy ([?retry_policy] on [Client.start]),
       or [None] when the run is not retried. Temporal fills omitted policy
       fields with its defaults before recording the start event, so the
-      result is the effective policy rather than the literal request.
+      result is the effective policy rather than the literal request: a
+      start with [Retry_policy.make ~maximum_attempts:3 ()] reads back with
+      the server's initial interval, coefficient, and maximum interval set.
       Intervals are rounded up to whole milliseconds. Temporal does not
       validate a policy whose maximum attempts is 1, so another SDK can
       record one that {!Retry_policy.make} would reject (for

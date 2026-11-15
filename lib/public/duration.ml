@@ -32,4 +32,24 @@ let of_seconds = of_unit ~unit_ms:1_000L
 let of_minutes = of_unit ~unit_ms:60_000L
 let of_hours = of_unit ~unit_ms:3_600_000L
 
+(** A day is a fixed 86,400 seconds: durations measure elapsed time, so no
+    calendar or daylight-saving adjustment applies. *)
+let of_days = of_unit ~unit_ms:86_400_000L
+
+(** Saturation bound of the public arithmetic; see [max_ms]. *)
+let maximum = max_ms
+
+(** Both operands are at most [max_ms], so their sum is below [2 * max_ms],
+    far inside [Int64]; the addition itself therefore cannot wrap and only
+    the clamp is needed. *)
+let add left right = Int64.min max_ms (Int64.add left right)
+
+(** Durations are plain non-negative millisecond counts, so their order is
+    the integer order. *)
+let compare = Int64.compare
+
 let to_ms duration = duration
+
+(** Durations are non-negative, so division truncates toward zero, which is
+    the same as flooring. *)
+let to_seconds duration = Int64.div duration 1_000L

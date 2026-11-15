@@ -371,7 +371,10 @@ let summarize =
 previous attempt's last recorded heartbeat (empty on a first attempt). The
 value is fixed for the whole attempt: heartbeats sent by the current attempt
 are recorded for the next attempt and never replace what `details` returns,
-matching the other Temporal SDKs. `heartbeat_timeout` returns the server's
+matching the other Temporal SDKs. `Context.details_as context codec` is the
+typed inverse of `Context.heartbeat`: it returns `Ok None` without details,
+`Ok (Some value)` for one payload that decodes, and a `` `Codec `` error for
+an undecodable payload or for more than one payload (#1145). `heartbeat_timeout` returns the server's
 configured interval when one was supplied, and `None` when the server reports
 zero, which Temporal uses for an unset heartbeat timeout. `Context.heartbeat`
 and `Context.heartbeat_payloads` copy their payloads, validate and encode them

@@ -104,7 +104,8 @@ type child_workflow_cancellation_type =
 (** A validated retry policy for an activity or child-workflow command kept in
     exact, bridge-ready form. The coefficient is an unsigned decimal
     rendering of its IEEE-754 bits; the other numeric fields retain their
-    exact OCaml integer values. *)
+    exact OCaml integer values. A zero interval, a ["0"] coefficient, or
+    zero attempts means the field is unset and Temporal applies its default. *)
 type retry_policy = {
   initial_interval : int64;
   backoff_coefficient_bits : string;

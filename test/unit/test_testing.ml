@@ -194,11 +194,24 @@ let flaky_workflow =
     ~output:T.Codec.int (fun maximum_attempts ->
       T.Activity.execute ~retry_policy:(retry_policy ~maximum_attempts) flaky ())
 
+(** Runs [flaky] under a policy that sets only [maximum_attempts] (#1145),
+    leaving the intervals and coefficient to Temporal's defaults. *)
+let partial_policy_flaky_workflow =
+  T.Workflow.define ~name:"partial_policy_flaky_workflow" ~input:T.Codec.int
+    ~output:T.Codec.int (fun maximum_attempts ->
+      let* retry_policy = T.Retry_policy.make ~maximum_attempts () in
+      T.Activity.execute ~retry_policy flaky ())
+
 (** Retries follow the policy in virtual time; an exhausted budget surfaces
-    the last failure as an [Activity] error. *)
+    the last failure as an [Activity] error. A partial policy backs off with
+    Temporal's defaults (1 s, then doubling). *)
 let test_activity_retries () =
   with_environment
-    ~workflows:[ T.Testing.workflow flaky_workflow ]
+    ~workflows:
+      [
+        T.Testing.workflow flaky_workflow;
+        T.Testing.workflow partial_policy_flaky_workflow;
+      ]
     ~activities:[ T.Testing.activity flaky ]
     (fun environment ->
       flaky_attempts := [];
@@ -215,7 +228,19 @@ let test_activity_retries () =
       in
       expect "two attempts made" [ 2; 1 ] !flaky_attempts;
       expect_contains "final failure message" ~needle:"transient"
-        (T.Error.message error))
+        (T.Error.message error);
+      flaky_attempts := [];
+      let started = epoch_ms (T.Testing.now environment) in
+      expect "partial policy succeeded on third attempt" 3
+        (ok "partial policy"
+           (T.Testing.execute environment partial_policy_flaky_workflow 5));
+      expect "partial policy uses default backoff" 3_000L
+        (Int64.sub (epoch_ms (T.Testing.now environment)) started);
+      flaky_attempts := [];
+      ignore
+        (expect_error "partial policy attempt cap" `Activity
+           (T.Testing.execute environment partial_policy_flaky_workflow 2));
+      expect "partial policy capped attempts" [ 2; 1 ] !flaky_attempts)
 
 (** Fails non-retryably with an application error type and a detail. *)
 let rejecting =
@@ -626,16 +651,68 @@ let test_registration_rules () =
     (expect_error "use after shutdown" `Defect
        (T.Testing.skip environment (T.Duration.of_ms 1L)))
 
-(** Heartbeats its attempt number and fails until it sees the previous
-    attempt's heartbeat, proving details are handed to the next attempt. *)
+(** Heartbeats a checkpoint and fails until it sees the previous attempt's
+    heartbeat, proving details are handed to the next attempt and decoded by
+    the typed [details_as] (#1145). *)
 let resumable =
   T.Activity.define_with_context ~name:"resumable" ~input:T.Codec.unit
     ~output:T.Codec.string (fun context () ->
-      match T.Activity.Context.details context with
-      | [] ->
+      let* details = T.Activity.Context.details_as context T.Codec.string in
+      match details with
+      | None ->
           let* () = T.Activity.Context.heartbeat context T.Codec.string "checkpoint" in
           Error (T.Error.make ~category:`Activity ~message:"interrupted" ())
-      | payload :: _ -> T.Codec.decode T.Codec.string payload)
+      | Some checkpoint -> Ok checkpoint)
+
+(** Heartbeats two raw payloads and fails on its first attempt; the next
+    attempt reports how [details_as] treats the ambiguous details and how a
+    mismatched codec fails, so the test can pin both [`Codec] errors. *)
+let multi_detail =
+  T.Activity.define_with_context ~name:"multi_detail" ~input:T.Codec.unit
+    ~output:T.Codec.string (fun context () ->
+      match T.Activity.Context.details context with
+      | [] ->
+          let* first = T.Codec.encode T.Codec.int 1 in
+          let* second = T.Codec.encode T.Codec.int 2 in
+          let* () = T.Activity.Context.heartbeat_payloads context [ first; second ] in
+          Error (T.Error.make ~category:`Activity ~message:"interrupted" ())
+      | _ ->
+          let describe = function
+            | Ok _ -> "accepted"
+            | Error error ->
+                Printf.sprintf "%s/%b" (T.Error.kind error)
+                  (T.Error.view error).non_retryable
+          in
+          Ok (describe (T.Activity.Context.details_as context T.Codec.int)))
+
+(** Heartbeats an integer and fails on its first attempt; the next attempt
+    decodes it with the wrong codec and reports the error category. *)
+let mistyped_detail =
+  T.Activity.define_with_context ~name:"mistyped_detail" ~input:T.Codec.unit
+    ~output:T.Codec.string (fun context () ->
+      match T.Activity.Context.details context with
+      | [] ->
+          let* () = T.Activity.Context.heartbeat context T.Codec.int 7 in
+          Error (T.Error.make ~category:`Activity ~message:"interrupted" ())
+      | _ -> (
+          match T.Activity.Context.details_as context T.Codec.string with
+          | Ok _ -> Ok "accepted"
+          | Error error -> Ok (T.Error.kind error)))
+
+(** Runs [multi_detail] then [mistyped_detail] with two attempts each and
+    joins their reports. *)
+let detail_errors_workflow =
+  T.Workflow.define ~name:"detail_errors_workflow" ~input:T.Codec.unit
+    ~output:T.Codec.string (fun () ->
+      let* multi =
+        T.Activity.execute ~retry_policy:(retry_policy ~maximum_attempts:2)
+          multi_detail ()
+      in
+      let* mistyped =
+        T.Activity.execute ~retry_policy:(retry_policy ~maximum_attempts:2)
+          mistyped_detail ()
+      in
+      Ok (multi ^ " " ^ mistyped))
 
 (** Runs [resumable] as a remote activity, then [compose_greeting] as a local
     one. *)
@@ -675,16 +752,25 @@ let local_checkpoint_workflow =
 let test_local_activity_and_heartbeat_details () =
   with_environment
     ~workflows:
-      [ T.Testing.workflow local_workflow; T.Testing.workflow local_checkpoint_workflow ]
+      [
+        T.Testing.workflow local_workflow;
+        T.Testing.workflow local_checkpoint_workflow;
+        T.Testing.workflow detail_errors_workflow;
+      ]
     ~activities:
       [
         T.Testing.activity resumable;
         T.Testing.activity compose_greeting;
         T.Testing.activity local_checkpoint;
+        T.Testing.activity multi_detail;
+        T.Testing.activity mistyped_detail;
       ]
     (fun environment ->
       expect "remote attempt resumed from heartbeat" "Hello, checkpoint"
         (ok "execute" (T.Testing.execute environment local_workflow ()));
+      expect "details_as rejects several payloads and a mismatched codec"
+        "codec/true codec"
+        (ok "detail errors" (T.Testing.execute environment detail_errors_workflow ()));
       local_details_seen := [];
       ignore
         (expect_error "local attempts exhausted" `Activity
@@ -888,6 +974,50 @@ let test_child_retry_policy () =
       in
       expect "child without policy inherits retryability" false
         (T.Error.view error).non_retryable)
+
+(** Reports the retry policy that [Workflow.Info.retry_policy] exposes,
+    with ["unset"] for a field Temporal would default. *)
+let policy_reporter =
+  T.Workflow.define ~name:"policy_reporter" ~input:T.Codec.unit
+    ~output:T.Codec.string (fun () ->
+      let* info = T.Workflow.info () in
+      match T.Workflow.Info.retry_policy info with
+      | None -> Ok "none"
+      | Some policy ->
+          let interval = function
+            | None -> "unset"
+            | Some value -> Int64.to_string (T.Duration.to_ms value)
+          in
+          Ok
+            (Printf.sprintf "initial=%s coefficient=%s maximum=%s attempts=%d"
+               (interval (T.Retry_policy.initial_interval policy))
+               (match T.Retry_policy.backoff_coefficient policy with
+               | None -> "unset"
+               | Some value -> Printf.sprintf "%g" value)
+               (interval (T.Retry_policy.maximum_interval policy))
+               (T.Retry_policy.maximum_attempts policy)))
+
+(** A partial workflow retry policy is carried with its unset fields intact
+    and reads back through [Workflow.Info.retry_policy]. The in-process
+    environment records the literal policy, so unset fields stay [None]; a
+    real server fills them with its defaults first (see the live
+    acceptance test). *)
+let test_partial_workflow_retry_policy () =
+  with_environment ~workflows:[ T.Testing.workflow policy_reporter ]
+    ~activities:[]
+    (fun environment ->
+      let partial =
+        ok "partial policy" (T.Retry_policy.make ~maximum_attempts:4 ())
+      in
+      expect "partial policy read back"
+        "initial=unset coefficient=unset maximum=unset attempts=4"
+        (ok "partial"
+           (T.Testing.execute ~retry_policy:partial environment policy_reporter ()));
+      expect "full policy read back"
+        "initial=1000 coefficient=2 maximum=60000 attempts=3"
+        (ok "full"
+           (T.Testing.execute ~retry_policy:(retry_policy ~maximum_attempts:3)
+              environment policy_reporter ())))
 
 (** Counts [cancelled_activity] attempts. *)
 let cancelled_attempts = ref 0
@@ -1219,6 +1349,7 @@ let () =
   test_final_activation_commands_dropped ();
   test_core_job_order ();
   test_child_retry_policy ();
+  test_partial_workflow_retry_policy ();
   test_native_error_shapes ();
   test_native_origins_and_retryability ();
   test_time_history_and_mock_order ()

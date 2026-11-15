@@ -1234,23 +1234,23 @@ pub(crate) fn validate_uint64_decimal(value: &str, path: &str) -> Result<u64, Pr
 
 /// Validates the retry policy constraints shared by the OCaml and Rust
 /// semantic layers before a command can reach Temporal Core.
+///
+/// A zero interval or an all-zero coefficient bit pattern is Temporal's
+/// "unset" value (#1145): it is accepted so the server, or Core for a local
+/// activity, applies its default, and the interval ordering is checked only
+/// when both intervals are set. [`retry_policy_to_core`] sends an unset
+/// interval as absent.
 pub(crate) fn validate_retry_policy(value: &RetryPolicy, path: &str) -> Result<(), ProtocolError> {
     validate_retry_intervals(value, path)?;
-    let initial_is_zero =
-        value.initial_interval.seconds == 0 && value.initial_interval.nanoseconds == 0;
-    if initial_is_zero {
-        return Err(ProtocolError::invalid(
-            format!("{path}.initial_interval"),
-            "duration must be positive",
-        ));
-    }
-    if (
-        value.maximum_interval.seconds,
-        value.maximum_interval.nanoseconds,
-    ) < (
+    let initial = (
         value.initial_interval.seconds,
         value.initial_interval.nanoseconds,
-    ) {
+    );
+    let maximum = (
+        value.maximum_interval.seconds,
+        value.maximum_interval.nanoseconds,
+    );
+    if initial != (0, 0) && maximum != (0, 0) && maximum < initial {
         return Err(ProtocolError::invalid(
             format!("{path}.maximum_interval"),
             "maximum interval must be at least initial interval",
@@ -1261,13 +1261,13 @@ pub(crate) fn validate_retry_policy(value: &RetryPolicy, path: &str) -> Result<(
         &format!("{path}.backoff_coefficient_bits"),
     )?;
     let coefficient = f64::from_bits(bits);
-    if !coefficient.is_finite() {
+    if bits != 0 && !coefficient.is_finite() {
         return Err(ProtocolError::invalid(
             format!("{path}.backoff_coefficient_bits"),
             "backoff coefficient must be finite",
         ));
     }
-    if coefficient < 1.0 {
+    if bits != 0 && coefficient < 1.0 {
         return Err(ProtocolError::invalid(
             format!("{path}.backoff_coefficient_bits"),
             "backoff coefficient must be at least 1.0",
@@ -3715,6 +3715,10 @@ pub(crate) fn duration_from_core(
 
 /// Converts a validated semantic retry policy into Temporal Core's protobuf
 /// policy without changing the coefficient's floating-point bits.
+///
+/// An unset (zero) interval is sent as absent rather than as an explicit
+/// zero: the server treats both as unset, but Core's local-activity retry
+/// logic only substitutes its 1 second default for an absent interval.
 pub(crate) fn retry_policy_to_core(
     value: &RetryPolicy,
 ) -> Result<api_common::RetryPolicy, CoreConversionError> {
@@ -3724,35 +3728,38 @@ pub(crate) fn retry_policy_to_core(
         .backoff_coefficient_bits
         .parse::<u64>()
         .map_err(|_| invalid_core("retry policy coefficient bits are not canonical"))?;
+    let interval = |duration: Duration| {
+        (duration.seconds != 0 || duration.nanoseconds != 0).then(|| duration_to_core(duration))
+    };
     Ok(api_common::RetryPolicy {
-        initial_interval: Some(duration_to_core(value.initial_interval)),
+        initial_interval: interval(value.initial_interval),
         backoff_coefficient: f64::from_bits(coefficient_bits),
-        maximum_interval: Some(duration_to_core(value.maximum_interval)),
+        maximum_interval: interval(value.maximum_interval),
         maximum_attempts: value.maximum_attempts,
         non_retryable_error_types: value.non_retryable_error_types.clone(),
     })
 }
 
-/// Converts Core's effective retry policy back into the lossless semantic
-/// representation, rejecting missing required durations instead of guessing
-/// Core defaults on the OCaml side.
+/// Converts a Core command's retry policy back into the lossless semantic
+/// representation. An absent interval is the unset value that
+/// [`retry_policy_to_core`] produces and becomes the semantic zero; Core
+/// defaults are never guessed on the OCaml side.
 fn retry_policy_from_core(
     value: &api_common::RetryPolicy,
 ) -> Result<RetryPolicy, CoreConversionError> {
+    let interval = |duration: Option<&prost_wkt_types::Duration>| {
+        duration.map_or(
+            Ok(Duration {
+                seconds: 0,
+                nanoseconds: 0,
+            }),
+            duration_from_core,
+        )
+    };
     let policy = RetryPolicy {
-        initial_interval: duration_from_core(
-            value
-                .initial_interval
-                .as_ref()
-                .ok_or_else(|| invalid_core("Core retry policy initial interval is absent"))?,
-        )?,
+        initial_interval: interval(value.initial_interval.as_ref())?,
         backoff_coefficient_bits: value.backoff_coefficient.to_bits().to_string(),
-        maximum_interval: duration_from_core(
-            value
-                .maximum_interval
-                .as_ref()
-                .ok_or_else(|| invalid_core("Core retry policy maximum interval is absent"))?,
-        )?,
+        maximum_interval: interval(value.maximum_interval.as_ref())?,
         maximum_attempts: value.maximum_attempts,
         non_retryable_error_types: value.non_retryable_error_types.clone(),
     };

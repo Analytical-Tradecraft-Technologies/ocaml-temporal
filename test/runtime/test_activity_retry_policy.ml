@@ -130,8 +130,10 @@ let test_direct_translation_validation () =
     | Error _ -> ()
     | Ok _ -> failwith ("direct command translation accepted " ^ label)
   in
-  expect_rejected "a malformed coefficient"
-    { retry_policy with backoff_coefficient_bits = "0" };
+  expect_rejected "a coefficient below 1.0"
+    { retry_policy with backoff_coefficient_bits = "4602678819172646912" };
+  expect_rejected "a maximum interval below the initial interval"
+    { retry_policy with maximum_interval = 999L };
   expect_rejected "an invalid UTF-8 error type"
     {
       retry_policy with
@@ -176,8 +178,47 @@ let test_subsecond_boundary_translation () =
     when retry_policy_equal policy boundary_retry_policy -> ()
   | _ -> failwith "sub-second timeout or retry policy precision was lost"
 
+(** A policy built by [Retry_policy.make ~maximum_attempts:3 ()] (#1145)
+    reaches the runtime with zero intervals and the ["0"] coefficient, its
+    "unset" markers. The translator must keep them as protocol zeros, which
+    Temporal reads as "apply the default", rather than reject the command. *)
+let test_unset_fields_translation () =
+  let unset : Activation.retry_policy =
+    {
+      initial_interval = 0L;
+      backoff_coefficient_bits = "0";
+      maximum_interval = 0L;
+      maximum_attempts = 3;
+      non_retryable_error_types = [];
+    }
+  in
+  let command =
+    Activation.Schedule_activity
+      {
+        seq = 1L;
+        activity_id = "activity-1";
+        activity_type = "retryable_activity";
+        task_queue = "default";
+        arguments = [ encode_input "input" ];
+        schedule_to_close_timeout = Some 60_000L;
+        schedule_to_start_timeout = None;
+        start_to_close_timeout = None;
+        heartbeat_timeout = None;
+        retry_policy = Some unset;
+        priority = None;
+        cancellation_type = Activation.Try_cancel;
+        do_not_eagerly_execute = false;
+      }
+  in
+  match Temporal_runtime.Native_execution.command_to_protocol command with
+  | Ok (Protocol.Schedule_activity { retry_policy = Some policy; _ })
+    when retry_policy_equal policy unset -> ()
+  | Ok _ -> failwith "unset retry-policy fields were changed"
+  | Error _ -> failwith "unset retry-policy fields were rejected"
+
 let () =
   test_explicit_policy ();
   test_omitted_policy ();
   test_direct_translation_validation ();
-  test_subsecond_boundary_translation ()
+  test_subsecond_boundary_translation ();
+  test_unset_fields_translation ()

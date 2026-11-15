@@ -158,10 +158,13 @@ start-to-close timeout so existing workflows remain valid. All supplied
 timeouts are exact non-negative milliseconds and are converted to normalized
 protocol durations without floating-point arithmetic. Cancellation defaults to `Try_cancel`,
 and `do_not_eagerly_execute` defaults to `false`. An optional `~retry_policy` is immutable
-and validated before the activity command is allocated. Its initial interval must
-be positive, its maximum interval must not be smaller, its finite backoff
-coefficient must be at least `1.0`, and its maximum-attempt count is a signed 32-bit
-value where `0` means unlimited attempts. The policy's coefficient crosses JSON as
+and validated before the activity command is allocated. Each field may be unset,
+encoded as a zero interval, the all-zero coefficient bits, or zero attempts, so
+Temporal applies its default (#1145; the bridge sends an unset interval to Core
+as absent). A set initial interval must be positive, a set maximum interval must
+not be smaller than a set initial interval, a set backoff coefficient must be
+finite and at least `1.0`, and the maximum-attempt count is a signed 32-bit
+value. The policy's coefficient crosses JSON as
 canonical unsigned decimal IEEE-754 bits rather than a JSON float; this keeps
 OCaml, Rust, and Core lossless and makes replay independent of float formatting.
 Omitting the option emits the required JSON member as `null`, preserving the

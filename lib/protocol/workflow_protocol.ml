@@ -1791,18 +1791,22 @@ let uint64_bits path json =
   loop 0 0L 0L
 
 (** Validates a coefficient's exact bit representation and returns the
-    canonical decimal text retained by the semantic record. *)
+    canonical decimal text retained by the semantic record. The all-zero bit
+    pattern ([+0.0]) is Temporal's "unset" value and is accepted so the
+    server applies its default coefficient; every other value must be a
+    finite coefficient of at least 1.0. *)
 let retry_coefficient_bits path json =
   let* text = uint64_decimal path json in
   let* bits = uint64_bits path json in
   let value = Int64.float_of_bits bits in
-  match classify_float value with
-  | FP_nan | FP_infinite ->
-      Error (invalid path "backoff coefficient must be finite")
-  | FP_zero | FP_subnormal | FP_normal when value < 1.0 ->
-      Error (invalid path "backoff coefficient must be at least 1.0")
-  | FP_zero | FP_subnormal | FP_normal ->
-      Ok text
+  if Int64.equal bits 0L then Ok text
+  else
+    match classify_float value with
+    | FP_nan | FP_infinite ->
+        Error (invalid path "backoff coefficient must be finite")
+    | FP_zero | FP_subnormal | FP_normal when value < 1.0 ->
+        Error (invalid path "backoff coefficient must be at least 1.0")
+    | FP_zero | FP_subnormal | FP_normal -> Ok text
 
 (** Compares normalized durations without converting to floating point. *)
 let compare_duration left right =
@@ -1812,7 +1816,10 @@ let compare_duration left right =
 
 (** Decodes and validates the retry policy attached to an activity command.
     The same semantic policy is also carried by workflow initialization, so
-    this decoder must be defined before either protocol path uses it. *)
+    this decoder must be defined before either protocol path uses it. A zero
+    interval or coefficient is Temporal's "unset" value: it is accepted, the
+    server (or Core, for a local activity) applies its default, and the
+    interval ordering is checked only when both intervals are set. *)
 let retry_policy path json =
   let* entries =
     exact_object path
@@ -1828,11 +1835,14 @@ let retry_policy path json =
   let* initial_interval = duration (path ^ ".initial_interval") initial_json in
   let* maximum_json = field path "maximum_interval" entries in
   let* maximum_interval = duration (path ^ ".maximum_interval") maximum_json in
+  let is_unset (value : duration) =
+    Int64.equal value.seconds 0L && value.nanoseconds = 0
+  in
   if
-    Int64.equal initial_interval.seconds 0L
-    && initial_interval.nanoseconds = 0
-  then Error (invalid (path ^ ".initial_interval") "duration must be positive")
-  else if compare_duration maximum_interval initial_interval < 0 then
+    (not (is_unset initial_interval))
+    && (not (is_unset maximum_interval))
+    && compare_duration maximum_interval initial_interval < 0
+  then
     Error
       (invalid (path ^ ".maximum_interval")
          "maximum interval must be at least initial interval")

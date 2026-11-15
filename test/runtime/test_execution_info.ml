@@ -251,7 +251,8 @@ let test_unspecified_continue_as_new_reasons () =
     first-task backoff in milliseconds (#1158). *)
 type start_policy = {
   timeouts : int64 option * int64 option * int64 option;
-  retry : (int64 * float * int64 * int * string list) option;
+  retry :
+    (int64 option * float option * int64 option * int * string list) option;
   continued_from_run_id : string option;
   initiator : Temporal.Workflow.Info.continuation_initiator option;
   cron_schedule : string option;
@@ -274,9 +275,9 @@ let observe_start_policy () =
         retry =
           Option.map
             (fun policy ->
-              ( Temporal.Duration.to_ms (Policy.initial_interval policy),
+              ( ms (Policy.initial_interval policy),
                 Policy.backoff_coefficient policy,
-                Temporal.Duration.to_ms (Policy.maximum_interval policy),
+                ms (Policy.maximum_interval policy),
                 Policy.maximum_attempts policy,
                 Policy.non_retryable_error_types policy ))
             (Info.retry_policy info);
@@ -389,7 +390,9 @@ let test_workflow_start_policy () =
     }
   in
   let expected_timeouts = (Some 90_000L, Some 30_001L, Some 7_500L) in
-  let expected_retry = Some (250L, 1.5, 4_000L, 3, [ "Fatal"; "Invalid" ]) in
+  let expected_retry =
+    Some (Some 250L, Some 1.5, Some 4_000L, 3, [ "Fatal"; "Invalid" ])
+  in
   List.iter
     (fun (initiator, expected_initiator) ->
       List.iter
