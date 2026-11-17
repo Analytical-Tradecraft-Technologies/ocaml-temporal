@@ -10,4 +10,4 @@
 # the image: scripts/ocaml-image.sh reads it and the Makefile passes the
 # reference to Dockerfile.dev as OCAML_IMAGE. Never change the tag to another
 # series here; add or remove a directory together with scripts/ci-matrix.py.
-FROM ocaml/opam:debian-12-ocaml-5.6@sha256:41bb27f5ef1f0f875a9e63cf89c7a30556cc36bad24094c5f208dd2a1462c49e
+FROM ocaml/opam:debian-12-ocaml-5.6@sha256:ae0187297967e9ca0a6355bf4481db6d5d788e2908586b00b9d52730672c9af7
