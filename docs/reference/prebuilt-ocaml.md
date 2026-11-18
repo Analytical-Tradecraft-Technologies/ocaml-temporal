@@ -30,7 +30,9 @@ The first release must be published before these example assets are available.
 ## Compatibility requirements
 
 - Use the exact OCaml patch and platform on the bundle. Linux bundles are
-  built on Debian 12 and need glibc 2.36 or newer, not Alpine/musl. macOS
+  built on Debian 12 and need glibc 2.36 or newer, not Alpine/musl (build
+  from source there; musl is a best-effort platform in the
+  [support policy](v1-support-policy.md#platform-scope-outside-the-release-matrix)). macOS
   bundles are built on the macOS 15 ARM64 runner and need at least the macOS
   version they target. Windows bundles use x64 GNU/MinGW, not MSVC. The
   application still needs the platform's normal native linker and system

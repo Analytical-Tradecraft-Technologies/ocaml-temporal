@@ -1,0 +1,66 @@
+name: musl (best-effort)
+
+# Best-effort Linux musl libc lane (#1165): `make verify-musl` runs the full
+# `make verify` gate in the digest-pinned Alpine image of Dockerfile.musl on
+# native amd64 and arm64 runners, so the Rust bridge is compiled and tested for
+# x86_64- and aarch64-unknown-linux-musl and linked into the OCaml tests and
+# installed-library consumer. docs/reference/v1-support-policy.md records
+# musl as best-effort and non-blocking.
+#
+# It is a workflow of its own rather than a job of build-pr.yml: the shared
+# glibc Rust producers cannot feed a musl link, so this lane builds its own
+# bridge, and it must never gate a pull request, the merge queue or a
+# release. It is therefore absent from merge_group and from the required
+# checks, each job has continue-on-error, and pull requests run it only when
+# they change an input of the musl build. Every master push runs it; a newer
+# push cancels an older run.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - Dockerfile.musl
+      - .github/workflows/musl.yml
+      - rust/Cargo.lock
+      - rust/rust-toolchain.toml
+      - scripts/build-rust-bridge.sh
+      - scripts/copy-rust-bridge-artifacts.sh
+      - scripts/render-rust-link-flags.sh
+      - test/bridge/test_abi.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: musl-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: musl / ${{ matrix.target }} (non-blocking)
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    # A cold run builds the Alpine image and the locked OPAM closure, then
+    # compiles the Rust bridge and its integration tests with no shared
+    # producer or cache, before the OCaml suites.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Reclaim disposable GitHub-hosted runner disk
+        # Same headroom rule as the glibc verify lanes; the script only
+        # deletes preinstalled toolchains when less than 40 GiB is free.
+        if: matrix.runner == 'ubuntu-24.04' && runner.environment == 'github-hosted'
+        run: sh scripts/reclaim-runner-disk.sh 40 --prune-docker
+      - name: Build, lint, and test on musl
+        run: make verify-musl

@@ -51,6 +51,24 @@ consume() {
 consume
 cmp "$temporary_root/static.a" "$TEMPORAL_RUST_BRIDGE_DIR/libocaml_temporal_core_bridge.a"
 cmp "$temporary_root/shared" "$TEMPORAL_RUST_BRIDGE_DIR/bridge.dynamic"
+# A Linux consumer whose C library is musl must receive the musl thread
+# stack-size option from a prebuilt bundle, exactly as a source build does,
+# and a glibc consumer must not (#1165). Fake ldd binaries stand in for each C
+# library so the result does not depend on the host running this test.
+if [ "$(uname -s)" = Linux ]; then
+  printf '#!/bin/sh\necho "musl libc (x86_64)" >&2\nexit 1\n' >"$temporary_root/bin/ldd"
+  chmod +x "$temporary_root/bin/ldd"
+  consume
+  grep -Fq -- '-Wl,-z,stack-size=8388608' "$temporary_root/flags.sexp" || {
+    echo 'musl bundle consumer lost the thread stack-size option' >&2; exit 1;
+  }
+  printf '#!/bin/sh\necho "ldd (GNU libc) 2.39"\n' >"$temporary_root/bin/ldd"
+  consume
+  if grep -Fq -- 'stack-size' "$temporary_root/flags.sexp"; then
+    echo 'glibc bundle consumer received the musl stack-size option' >&2; exit 1
+  fi
+  rm "$temporary_root/bin/ldd"
+fi
 if (TEMPORAL_RUST_BRIDGE_KEY=wrong-key consume) >"$temporary_root/error" 2>&1; then
   echo 'accepted mismatched Rust artifact key' >&2; exit 1
 fi

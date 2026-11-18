@@ -56,7 +56,19 @@ fi
 
 mkdir -p "$output_dir"
 
-# rustc emits an ordered, whitespace-separated list of linker arguments.
+# GCC ships no sanitizer runtimes for musl targets: Alpine has neither libasan
+# nor libubsan, so the default flags cannot link there (#1165). On musl the
+# harness keeps UndefinedBehaviorSanitizer in trap mode, which needs no
+# runtime and aborts on the first finding, and drops only AddressSanitizer;
+# the best-effort musl lane therefore checks the ABI and undefined behaviour
+# but not memory errors, which the glibc and macOS lanes still cover.
+case "$(cc -dumpmachine)" in
+  *-musl*) sanitizer_flags='-fsanitize=undefined -fsanitize-trap=undefined' ;;
+  *) sanitizer_flags='-fsanitize=address,undefined' ;;
+esac
+
+# rustc emits an ordered, whitespace-separated list of linker arguments, and
+# sanitizer_flags is a fixed list of separate options.
 # shellcheck disable=SC2086
 cc \
   -std=c11 \
@@ -64,7 +76,7 @@ cc \
   -Wextra \
   -Werror \
   -pedantic \
-  -fsanitize=address,undefined \
+  $sanitizer_flags \
   -fno-omit-frame-pointer \
   -Irust/core-bridge/include \
   test/bridge/abi_harness.c \

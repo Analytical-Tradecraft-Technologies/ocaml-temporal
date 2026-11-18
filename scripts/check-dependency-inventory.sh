@@ -167,7 +167,7 @@ compare 'Linking-exception scope'
 # `:`. Recorded provenance in test fixtures is not a pin and is deliberately
 # excluded.
 for source in "$root/Dockerfile.dev" "$root"/docker/ocaml-*/Dockerfile \
-  "$root/Dockerfile.rust-ci" \
+  "$root/Dockerfile.rust-ci" "$root/Dockerfile.musl" \
   "$root/test/integration/temporal/compose.yaml" \
   "$root"/.github/workflows/*.yml "$root"/.github/actions/*/action.yml; do
   [ -f "$source" ] || continue

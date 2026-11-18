@@ -104,6 +104,28 @@ if ! rust_version_at_least "$actual_rust_version" "$required_rust_version"; then
   exit 1
 fi
 
+# Rust's musl targets link the C runtime statically by default (crt-static),
+# and with that default rustc silently drops the bridge's cdylib crate type,
+# so the shared library copied below would never be produced (#1165). Alpine's
+# packaged Rust already defaults to a dynamic C runtime; a rustup toolchain on
+# a musl host does not. The bridge is built for the host (no --target), so on
+# a musl host this selects the dynamic runtime through Cargo's per-target
+# rustflags variable. Any rustflags the caller already chose, through that
+# variable, RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS, are left untouched.
+# Dockerfile.musl sets the same value, so the Makefile's direct Cargo runs
+# share these build fingerprints. The static archive does not embed libc
+# either way; the OCaml executable links the musl C library itself.
+rust_host=$("$rustc_command" -vV | sed -n 's/^host: //p')
+case "$rust_host" in
+  *-linux-musl*)
+    rustflags_variable=CARGO_TARGET_$(printf '%s' "$rust_host" | tr 'abcdefghijklmnopqrstuvwxyz.-' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ__')_RUSTFLAGS
+    eval "caller_target_rustflags=\${$rustflags_variable:-}"
+    if [ -z "$caller_target_rustflags" ] && [ -z "${RUSTFLAGS:-}" ] && [ -z "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+      export "$rustflags_variable=-C target-feature=-crt-static"
+    fi
+    ;;
+esac
+
 # Select where Cargo's dependency sources come from (#778). A release source
 # archive (scripts/create-source-archive.sh) ships every locked crate, including
 # the pinned Temporal Core Git checkout, as rust/vendor.tar together with the
@@ -183,9 +205,15 @@ fi
 
 # rustc owns the platform-specific library list and its ordering. On Windows,
 # also preserve the Cargo build-script search path needed to resolve winapi's
-# bundled MinGW import archives from OCaml's foreign linker.
+# bundled MinGW import archives from OCaml's foreign linker. A musl host is
+# named Linux-musl so the renderer adds the thread stack-size link option
+# described there.
+link_system=$(uname -s)
+case "$rust_host" in
+  *-linux-musl*) link_system=Linux-musl ;;
+esac
 sh "$workspace_root/scripts/render-rust-link-flags.sh" \
-  "$(uname -s)" \
+  "$link_system" \
   "$artifact_root/$profile_dir" \
   "$link_flags_output" \
   "$native_link_flags" \
