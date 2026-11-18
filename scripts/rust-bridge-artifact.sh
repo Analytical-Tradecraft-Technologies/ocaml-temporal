@@ -18,6 +18,22 @@ platform() {
   esac
 }
 
+# Names this consumer's system for scripts/render-rust-link-flags.sh. A
+# bundle consumer may have no Rust toolchain, so a musl host is recognised
+# from its C library (`ldd --version` names musl on Alpine; glibc's ldd
+# names GNU libc even where musl tools are installed) instead of from rustc's
+# host triple, as scripts/build-rust-bridge.sh does for a source build. Both
+# paths must agree so that an application linking a prebuilt musl bundle
+# records the same 8 MiB thread stack size as a source build (#1165).
+link_system() {
+  system=$(uname -s)
+  if [ "$system" = Linux ] && ldd --version 2>&1 | grep -qi musl; then
+    printf 'Linux-musl\n'
+  else
+    printf '%s\n' "$system"
+  fi
+}
+
 # macOS supplies shasum; Linux and the Windows Cygwin environment supply
 # sha256sum. Both use the same portable checksum-file format.
 sha256() {
@@ -79,7 +95,7 @@ case "$command" in
       # Windows import libraries must use the consumer's path. No absolute
       # Cargo-registry or producer-workspace path is embedded in the bundle.
       sh "$workspace_root/scripts/render-rust-link-flags.sh" \
-        "$(uname -s)" "$bundle" "$7" "$(cat "$bundle/native-static-libs")"
+        "$(link_system)" "$bundle" "$7" "$(cat "$bundle/native-static-libs")"
       echo "Using prebuilt Rust bridge: $expected_key" >&2
     fi
     ;;
