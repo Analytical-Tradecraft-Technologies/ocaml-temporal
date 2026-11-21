@@ -13,7 +13,7 @@
 # index digest; the root Dependabot docker entry refreshes them. Keep their
 # Alpine releases equal so the copied Rust toolchain and the OCaml image share
 # one musl ABI.
-FROM rust:1.100-alpine3.23@sha256:23ee60d5346e4042efbc9f9120d736be4b5c7f29becf2ebea181160422ca8d30 AS rust-toolchain
+FROM rust:1.100-alpine3.23@sha256:9577a4edf61be25721f5fa4006ad463b83ea52c0a17c6e6b673c72c794aee738 AS rust-toolchain
 # rust/rust-toolchain.toml is the single Rust version pin; as in
 # Dockerfile.dev, the base image only supplies rustup, and any other toolchain
 # is removed so test/smoke/test_rust_toolchain.sh sees the pinned compiler.
