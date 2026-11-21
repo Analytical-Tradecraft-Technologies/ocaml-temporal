@@ -26,7 +26,7 @@ RUN rust_version="$(sh /tmp/rust-version/rust-version.sh /tmp/rust-version/rust-
     done \
     && rm -rf /tmp/rust-version
 
-FROM ocaml/opam:alpine-3.23-ocaml-5.5@sha256:e2917e50faa33fa5a10478ad38aab4e181ee61b7d40c69818cd0fa081b68869d AS dev
+FROM ocaml/opam:alpine-3.23-ocaml-5.6@sha256:c55c6fb398c97e63baa35275954d752f57c936729ac016c4517bfcd1a95dd3db AS dev
 
 USER root
 # Build-only native tools, the Alpine equivalents of Dockerfile.dev's Debian
