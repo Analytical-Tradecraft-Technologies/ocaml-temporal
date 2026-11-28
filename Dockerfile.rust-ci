@@ -1,6 +1,6 @@
 # Match Dockerfile.dev's Rust toolchain and Debian 12 C-library baseline.
 # Native amd64/arm64 runners build this image without cross compilation.
-FROM rust:1.100-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+FROM rust:1.100-bookworm@sha256:75d26c23c24cc6ea1cdabf0714a6bff8fd7bf3248716043fd7ae86dac7f41b94
 # rust/rust-toolchain.toml is the single Rust version pin, so this base image
 # only supplies rustup and Debian 12. Installing the pinned channel (a no-op
 # when the base already ships it) and removing any other toolchain means a
